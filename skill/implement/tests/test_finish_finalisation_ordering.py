@@ -35,16 +35,21 @@ logic is re-implemented here: the only test-local model is
 selection predicate, which lives in another repository (ContextHub).
 
 **Test-first slice.** The two ordering/candidacy expectations that the fix
-enables are marked ``xfail(strict=True)`` until the sibling implementation
-item (SA-0MVXUSJ2P009T97H) lands the re-ordering; the fixing change set removes
-the markers, so a stale marker (an unexpected pass) fails loudly instead of
-silently weakening the suite. The two unmarked companions (the single
-candidate transition and the final store state + read-back) hold today and
-guard against regressing the parts that are already correct. Each marked test
-fails on the pre-fix tree for the documented reason — the terminal write lands
-(and the assignee is released) before the completion comment, and the post-push
-verification is not part of the run at all; the observed output is recorded on
+enables were marked ``xfail(strict=True)`` until the sibling implementation
+item (SA-0MVXUSJ2P009T97H) landed the re-ordering; the fixing change set
+removed the markers, so a regression fails loudly instead of silently
+weakening the suite. The two unmarked companions (the single candidate
+transition and the final store state + read-back) guard against regressing the
+parts that were already correct. The observed pre-fix output is recorded on
 SA-0MVXUSIM7009DKX7.
+
+With the fix in place this module also pins the post-push verification
+semantics (SA-0MVXUSJ2P009T97H AC4): the check is cache-only, and a ``red`` or
+``missing`` verdict after a successful push refuses the terminal transition —
+the item ends ``open`` with an empty assignee, a comment names the pushed
+commit and the retained state, the failure is routed to triage, and the
+pushed commit is never reverted — while ``not_applicable`` still permits the
+transition and is recorded explicitly.
 """
 
 from __future__ import annotations
@@ -78,18 +83,6 @@ _FAKE_COMMIT = "1" * 40
 #: verification is a *read-only cache query* for exactly this command — it
 #: never starts a suite run (design A).
 _FULL_SUITE_COMMAND = "python3 -m pytest -q"
-
-#: Why the ordering expectations are red until the sibling item lands. Shared
-#: by the markers so the failure reason is one stable, greppable string.
-_ORDERING_XFAIL = (
-    "Pending SA-0MVXUSJ2P009T97H: phase_finish still writes the terminal "
-    "completed/in_review transition (and releases the assignee) inside its "
-    "StatusLifecycle block, and posts the completion comment afterwards while "
-    "the post-push verification is left to the session — so the item is "
-    "audit-dispatchable before the implement run is fully complete "
-    "(SA-0MVWFPI31000HP3H AC1/AC2, design A). The fixing change set removes "
-    "this marker."
-)
 
 #: Audit results fresher than this exclude an item from audit dispatch (the
 #: dispatcher's ``AUDIT_FRESHNESS_MS`` window).
@@ -202,8 +195,13 @@ def _cleanup_result() -> dict:
     return {"method": "wl_cleanup_worktree", "terminated": 0, "warning": ""}
 
 
+#: Sentinel: "stub a green full-suite cache entry" (the default verdict).
+_GREEN_ENTRY = object()
+
+
 @contextlib.contextmanager
-def _run_finish(tmp_path, monkeypatch):
+def _run_finish(tmp_path, monkeypatch, *, cache_entry=_GREEN_ENTRY,
+                suite_commands=(_FULL_SUITE_COMMAND,)):
     """Drive the real ``phase_finish`` and record one ordered timeline.
 
     Every external boundary is patched; the ``wl``/``StatusLifecycle`` store is
@@ -211,8 +209,18 @@ def _run_finish(tmp_path, monkeypatch):
     the patched ``show`` reads back, so lifecycle writes and reads are
     observable in order. The read-only cache boundary
     (``implement.query_cached``) marks the post-push verification: it is
-    stubbed to a green full-suite entry for the pushed tree and is never
-    allowed to start a run.
+    stubbed and is never allowed to start a run.
+
+    Args:
+        tmp_path: pytest temporary directory (the placeholder worktree).
+        monkeypatch: pytest monkeypatch fixture.
+        cache_entry: The cache entry the verification query returns:
+            ``_GREEN_ENTRY`` (default) for a green full-suite entry, ``None``
+            for a miss, or an explicit entry dict (e.g. ``exit_code: 1`` for a
+            red verdict).
+        suite_commands: The commands ``_resolve_full_suite_commands``
+            reports; an empty list models a repository that declares no
+            full-suite command (``not_applicable``).
 
     Yields:
         ``(report, events, final_item)`` — the finish report, the ordered
@@ -269,12 +277,27 @@ def _run_finish(tmp_path, monkeypatch):
         return {"workItem": dict(item)}
 
     def _query_cached(command, **kwargs):
-        """The read-only post-push verification's cache query (green entry)."""
-        _record("post_push_verification", command=command)
-        return {
-            "stdout": "1 passed",
+        """The read-only post-push verification's cache query."""
+        _record("post_push_verification", command=command,
+                cwd=kwargs.get("cwd"))
+        if cache_entry is _GREEN_ENTRY:
+            return {
+                "stdout": "1 passed",
+                "stderr": "",
+                "exit_code": 0,
+                "completed_at": time.time(),
+                "command": command,
+                "git_state": "stub-git-state",
+                "fingerprint_kind": "worktree",
+                "scope": "full",
+                "test_type": "full",
+                "cached": True,
+            }
+        if cache_entry is None:
+            return None
+        entry = {
+            "stdout": "",
             "stderr": "",
-            "exit_code": 0,
             "completed_at": time.time(),
             "command": command,
             "git_state": "stub-git-state",
@@ -283,6 +306,8 @@ def _run_finish(tmp_path, monkeypatch):
             "test_type": "full",
             "cached": True,
         }
+        entry.update(cache_entry)
+        return entry
 
     def _add_comment(work_item_id, comment):
         _record("completion_comment", body=comment)
@@ -299,12 +324,17 @@ def _run_finish(tmp_path, monkeypatch):
     # The read-back assertion is wrapped (and still executed for real) so its
     # position in the timeline is observable: parent AC4 requires it to run
     # *after* the terminal write, and the fail-loud guard's own behaviour is
-    # covered by ``test_finish_no_diff_status.py``.
+    # covered by ``test_finish_no_diff_status.py``. The event is recorded
+    # *after* the real assertion so the store read it performs
+    # (``StatusLifecycle.show`` → ``store_read``) is ordered before it and the
+    # read-back stays the phase's last action.
     real_assert_terminal_status = implement._assert_terminal_status
 
     def _assert_terminal_status(work_item_id):
-        _record("status_readback")
-        return real_assert_terminal_status(work_item_id)
+        try:
+            return real_assert_terminal_status(work_item_id)
+        finally:
+            _record("status_readback")
 
     with contextlib.ExitStack() as stack:
         stack.enter_context(
@@ -383,7 +413,7 @@ def _run_finish(tmp_path, monkeypatch):
             patch.object(
                 implement,
                 "_resolve_full_suite_commands",
-                return_value=[_FULL_SUITE_COMMAND],
+                return_value=list(suite_commands),
             )
         )
         stack.enter_context(patch.object(implement, "query_cached", _query_cached))
@@ -437,7 +467,6 @@ def _describe(index: int, event: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=_ORDERING_XFAIL)
 def test_post_push_steps_precede_the_terminal_write(tmp_path, monkeypatch):
     """Verification, completion comment and cleanup all precede the transition.
 
@@ -489,7 +518,6 @@ def test_post_push_steps_precede_the_terminal_write(tmp_path, monkeypatch):
         )
 
 
-@pytest.mark.xfail(strict=True, reason=_ORDERING_XFAIL)
 def test_item_is_not_an_audit_candidate_at_any_post_push_checkpoint(
     tmp_path, monkeypatch
 ):
@@ -616,3 +644,261 @@ def test_terminal_write_is_the_last_lifecycle_write_and_is_read_back(
         assert final_item["stage"] == "in_review"
         assert final_item["assignee"] == ""
         assert _is_audit_candidate(final_item)
+
+
+# ---------------------------------------------------------------------------
+# Post-push verification: read-only verdict and refusal semantics
+# (SA-0MVXUSJ2P009T97H AC4)
+# ---------------------------------------------------------------------------
+
+
+def test_post_push_verification_is_cache_only(tmp_path, monkeypatch):
+    """The verification reads the cache and never executes a suite.
+
+    Design A keeps the post-push check read-only: the dev-push pre-push hook
+    already ran the full suite against the pushed commit, so starting another
+    run inside ``finish`` would duplicate the integration gate. The cache
+    query is the only evidence boundary touched.
+    """
+    run_cached = MagicMock()
+    monkeypatch.setattr(implement, "run_cached", run_cached)
+
+    with _run_finish(tmp_path, monkeypatch) as (report, events, _final):
+        assert report["success"] is True, report["message"]
+        verification = report["steps"]["post_push_verification"]
+        assert verification["verdict"] == implement.POST_PUSH_VERDICT_GREEN
+        assert verification["executed"] is False
+        assert verification["success"] is True
+
+        queries = [
+            event for event in events if event["kind"] == "post_push_verification"
+        ]
+        assert len(queries) == 1, (
+            "the verification must query the cache once per resolved command; "
+            f"queries: {queries}"
+        )
+        assert queries[0]["cwd"] == report["worktree_path"], (
+            "the pushed-commit checkout must be queried before the "
+            f"main-checkout fallback; got cwd={queries[0]['cwd']!r}"
+        )
+
+    run_cached.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("cache_entry", "expected_verdict"),
+    [
+        (None, implement.POST_PUSH_VERDICT_MISSING),
+        (
+            {
+                "exit_code": 1,
+                "stdout": "FAILED skill/implement/tests/test_x.py::test_y - boom",
+                "stderr": "AssertionError: boom",
+            },
+            implement.POST_PUSH_VERDICT_RED,
+        ),
+    ],
+    ids=["missing", "red"],
+)
+def test_unproven_post_push_verdict_refuses_the_terminal_transition(
+    tmp_path, monkeypatch, cache_entry, expected_verdict
+):
+    """A red/missing cached verdict refuses the terminal transition (AC4).
+
+    After a successful push the item must not be marked complete on an
+    unproven full-suite verdict: it ends ``open`` with an empty assignee, a
+    comment names the pushed commit and the retained state, the failure is
+    routed to triage, and the pushed commit is neither reverted nor
+    force-removed (only one store read/write pair of lifecycle meaning exists
+    and no terminal write happens).
+    """
+    triage = MagicMock(
+        return_value={
+            "success": True,
+            "report": {"issueId": "OSL-TRIAGE", "created": True},
+        }
+    )
+    monkeypatch.setattr(
+        implement, "_route_post_push_failure_to_triage", triage
+    )
+
+    with _run_finish(tmp_path, monkeypatch, cache_entry=cache_entry) as (
+        report,
+        events,
+        final_item,
+    ):
+        assert report["success"] is False, report
+        verification = report["steps"]["post_push_verification"]
+        assert verification["verdict"] == expected_verdict
+        assert verification["success"] is False
+        assert verification["triage"]["report"]["issueId"] == "OSL-TRIAGE"
+        assert report["hash"] == "abc1234"
+
+        # The terminal transition never happened and the item was released.
+        assert _terminal_write_index(events) is None, (
+            "a refused run must never write the terminal completed/in_review "
+            f"transition; timeline: {[e['kind'] for e in events]}"
+        )
+        assert _normalise_status(final_item["status"]) == "open"
+        assert final_item["assignee"] == ""
+
+        # The refusal comment names the pushed commit and the retained state,
+        # and is posted before any retry could converge (no duplicated write).
+        comments = [
+            event["body"]
+            for event in events
+            if event["kind"] == "completion_comment"
+        ]
+        assert comments, "the refusal must be recorded on the work item"
+        refusal = comments[-1]
+        assert "abc1234" in refusal
+        assert "retained" in refusal
+        assert expected_verdict in refusal
+
+    triage.assert_called_once()
+    triaged = triage.call_args.args[0]
+    assert triaged["verdict"] == expected_verdict
+
+
+def test_not_applicable_verification_permits_the_transition(
+    tmp_path, monkeypatch
+):
+    """A repository with no full-suite command still transitions — loudly.
+
+    ``not_applicable`` is the documented escape hatch for a repo that resolves
+    no full-suite command at all; it permits the terminal transition but is
+    recorded in the report and the completion comment, so it can never be
+    mistaken for a green verdict.
+    """
+    with _run_finish(tmp_path, monkeypatch, suite_commands=()) as (
+        report,
+        events,
+        final_item,
+    ):
+        assert report["success"] is True, report["message"]
+        verification = report["steps"]["post_push_verification"]
+        assert verification["verdict"] == (
+            implement.POST_PUSH_VERDICT_NOT_APPLICABLE
+        )
+        assert verification["success"] is True
+        assert verification["reason"]
+        assert _terminal_write_index(events) is not None
+        assert _normalise_status(final_item["status"]) == "completed"
+
+        comments = [
+            event["body"]
+            for event in events
+            if event["kind"] == "completion_comment"
+        ]
+        assert comments and "Post-push verification: not_applicable" in comments[-1]
+
+
+# ---------------------------------------------------------------------------
+# The same rule on the other implement finalisation paths
+# (design A §3: the terminal write is the last lifecycle action everywhere)
+# ---------------------------------------------------------------------------
+
+
+def test_parent_advancement_comments_before_the_terminal_write(monkeypatch):
+    """``phase_parent`` posts its summary comment before advancing the parent.
+
+    A comment bumps ``updatedAt``, so posting it after the parent's
+    ``completed``/``in_review`` write would make the freshly audit-ready
+    parent churn once more. The terminal write is therefore the last lifecycle
+    action on the parent path too.
+    """
+    events: list[str] = []
+
+    with (
+        patch.object(implement, "is_code_freeze_active", return_value=False),
+        patch.object(
+            implement,
+            "wl_show",
+            return_value={"id": "OSL-PARENT", "status": "open"},
+        ),
+        patch.object(
+            implement,
+            "wl_show_children",
+            return_value=[
+                {"id": "OSL-CHILD", "status": "completed", "stage": "in_review"}
+            ],
+        ),
+        patch.object(
+            implement,
+            "_outbound_gate",
+            return_value={
+                "blocked": False,
+                "blockers": [],
+                "coordination_blockers": [],
+            },
+        ),
+        patch.object(implement, "wl_dep_blockers", return_value=[]),
+        patch.object(
+            implement,
+            "wl_add_comment",
+            side_effect=lambda wid, text: events.append("comment") or True,
+        ),
+        patch.object(
+            implement.StatusLifecycle,
+            "update_status",
+            MagicMock(side_effect=lambda *a, **k: events.append("terminal")),
+        ) as terminal,
+    ):
+        report = implement.phase_parent("OSL-PARENT", json_output=True)
+
+    assert report["parent_advanced"] is True, report
+    assert events == ["comment", "terminal"], (
+        "the parent summary comment must precede the terminal write; got "
+        f"{events}"
+    )
+    terminal.assert_called_once()
+    assert terminal.call_args.kwargs.get("stage") == "in_review"
+    assert terminal.call_args.kwargs.get("assignee") == ""
+
+
+def test_stranded_child_finalisation_comments_before_the_terminal_write(
+    monkeypatch,
+):
+    """``_finalise_stranded_child`` comments before its terminal write too.
+
+    The finaliser is not a ``StatusLifecycle`` exit, so its write is explicit;
+    the comment still precedes it so the write stays the last lifecycle
+    action of the path.
+    """
+    events: list[str] = []
+    terminal = MagicMock(side_effect=lambda *a, **k: events.append("terminal"))
+
+    with (
+        patch.object(
+            implement,
+            "wl_show",
+            return_value={
+                "id": "OSL-CHILD",
+                "status": "in-progress",
+                "assignee": "implement",
+            },
+        ),
+        patch.object(
+            implement,
+            "wl_add_comment",
+            side_effect=lambda cid, text: events.append("comment") or True,
+        ),
+        patch.object(implement.StatusLifecycle, "update_status", terminal),
+    ):
+        result = implement._finalise_stranded_child(
+            "OSL-CHILD",
+            {
+                "stranded": True,
+                "commit": "abc1234",
+                "evidence": "refs/wip/OSL-CHILD",
+            },
+            assignee="implement",
+        )
+
+    assert result["finalised"] is True, result
+    assert events == ["comment", "terminal"], (
+        "the finalisation comment must precede the terminal write; got "
+        f"{events}"
+    )
+    assert terminal.call_args.kwargs.get("stage") == "in_review"
+    assert terminal.call_args.kwargs.get("assignee") == ""

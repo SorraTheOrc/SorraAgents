@@ -314,6 +314,29 @@ def _stubbed_finish(sandbox: dict, pushed_commit: str, pushes: list[tuple]):
         )
         stack.enter_context(patch.object(implement, "wl_add_comment", return_value=True))
         stack.enter_context(patch.object(implement, "_surface_postfix_prose"))
+        # The read-only post-push verification (SA-0MVXUSJ2P009T97H) resolves
+        # the pushed tree's full-suite verdict from the test cache; this
+        # harness stubs the pre-push gate's cached green entry. Its own
+        # verdict/refusal semantics live in
+        # ``test_finish_finalisation_ordering.py``.
+        stack.enter_context(
+            patch.object(
+                implement,
+                "query_cached",
+                return_value={
+                    "stdout": "1 passed",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "completed_at": 1.0,
+                    "command": implement.PYTEST_CMD,
+                    "git_state": "stub-git-state",
+                    "fingerprint_kind": "worktree",
+                    "scope": "full",
+                    "test_type": "full",
+                    "cached": True,
+                },
+            )
+        )
         stack.enter_context(
             patch.object(implement.StatusLifecycle, "update_status", MagicMock())
         )

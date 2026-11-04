@@ -3943,6 +3943,346 @@ def _dev_push_gate_evidence(
     return evidence
 
 
+#: Verdicts of the read-only post-push verification step
+#: (design A, SA-0MVXUSED6008J04R). ``green`` and ``not_applicable`` permit
+#: the terminal ``completed``/``in_review`` transition; ``red`` and
+#: ``missing`` refuse it (SA-0MVXUSJ2P009T97H AC4). Any unexpected value is
+#: treated as ``missing`` — the refusal is fail-closed.
+POST_PUSH_VERDICT_GREEN = "green"
+POST_PUSH_VERDICT_RED = "red"
+POST_PUSH_VERDICT_MISSING = "missing"
+POST_PUSH_VERDICT_NOT_APPLICABLE = "not_applicable"
+
+
+def _post_push_verification_commands(cwd: str) -> tuple[list[str], str]:
+    """Resolve the full-suite commands the post-push verification checks.
+
+    Resolution mirrors :func:`run_tests` (the test skill's
+    ``full_suite_commands`` first, implement.py's legacy convention detection
+    second) without executing anything, so the verification step can query
+    the cache for exactly the command the dev-push gate ran.
+
+    Args:
+        cwd: The pushed-commit checkout (the worktree).
+
+    Returns:
+        ``(commands, reason)`` — the resolved commands and, when nothing was
+        resolved, why (recorded as the ``not_applicable`` reason).
+    """
+    try:
+        commands = _resolve_full_suite_commands(cwd)
+    except Exception as exc:  # noqa: BLE001 - resolution must not break finish
+        LOG.warning(
+            "Post-push verification: full-suite resolution failed (%s)", exc
+        )
+        return [], f"full-suite resolution failed: {exc}"
+    if commands is not None:
+        if not commands:
+            return [], "the repository declares no full-suite command"
+        return list(commands), ""
+    # The test skill is unavailable (partial install) or resolved no suite:
+    # fall back to the legacy convention detection, limited to the two
+    # commands with a canonical cache key. Other legacy tooling (a repo-local
+    # runner script, Unity) has no canonical command to look up, so it is
+    # reported as ``not_applicable`` with that reason rather than a silent
+    # green (never invent a command that the gate may not have run).
+    tooling = _detect_test_tooling(cwd)
+    if tooling == "pytest":
+        return [PYTEST_CMD], ""
+    if tooling == "npm":
+        return [NPM_TEST_CMD], ""
+    if tooling is None:
+        return [], "no full-suite command detected"
+    return [], f"legacy tooling {tooling!r} has no canonical full-suite command"
+
+
+def _resolve_post_push_verification(
+    worktree_path: str, repo_root: str
+) -> dict[str, Any]:
+    """Read-only full-suite verdict for the just-pushed commit (design A).
+
+    Part of :func:`phase_finish`'s finalisation window
+    (SA-0MVXUSJ2P009T97H, design SA-0MVXUSED6008J04R): after a successful dev
+    push the run resolves the full-suite verdict for the pushed tree from the
+    test cache. It **never executes a suite** — the dev-push pre-push hook ran
+    the full suite against this exact commit and cached the result.
+
+    The pushed-commit checkout (``worktree_path``) is queried first, then the
+    main checkout's cache (``repo_root``) as the documented fallback: the
+    pre-push hook mirrors its entry into the main-checkout
+    ``.worklog/cache``, while a worktree's own cache directory is separate.
+    The cache lookup binds the verdict to the current git state (HEAD + dirty
+    content), so an entry recorded for another tree can never be served.
+
+    Verdict vocabulary:
+
+    - ``green`` — every resolved full-suite command has a valid entry with
+      ``exit_code == 0``. Transition permitted.
+    - ``not_applicable`` — the repository resolves no full-suite command at
+      all (or only legacy tooling with no canonical command). Transition
+      permitted, recorded explicitly so it is never a silent green.
+    - ``red`` — an entry exists but reports a non-zero exit. Transition
+      refused.
+    - ``missing`` — no valid entry: absent, expired, unkeyable or a bypassed
+      pre-push gate. Transition refused.
+
+    Args:
+        worktree_path: The checkout that holds the pushed commit.
+        repo_root: The main checkout (cache mirror location).
+
+    Returns:
+        A structured verdict dict (``verdict``, ``success``, ``executed``,
+        ``commands``, ``entries``, ``reason``, ``checked_at``).
+    """
+    commands, reason = _post_push_verification_commands(worktree_path)
+    verification: dict[str, Any] = {
+        "verdict": POST_PUSH_VERDICT_NOT_APPLICABLE,
+        "success": True,
+        "executed": False,
+        "commands": commands,
+        "entries": [],
+        "reason": reason,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "cache_roots": [worktree_path, repo_root],
+    }
+    if not commands:
+        LOG.info("Post-push verification: not applicable (%s)", reason)
+        return verification
+
+    verdicts: list[str] = []
+    for command in commands:
+        entry: dict[str, Any] | None = None
+        cached_at: str | None = None
+        for cwd in (worktree_path, repo_root):
+            try:
+                entry = query_cached(command, cwd=cwd)
+            except Exception as exc:  # noqa: BLE001 - a broken cache is a miss
+                LOG.warning(
+                    "Post-push verification: cache query failed for %s in "
+                    "%s (%s)",
+                    command,
+                    cwd,
+                    exc,
+                )
+                entry = None
+            if entry is not None:
+                cached_at = cwd
+                break
+        if entry is None:
+            verdicts.append(POST_PUSH_VERDICT_MISSING)
+            verification["entries"].append(
+                {
+                    "command": command,
+                    "verdict": POST_PUSH_VERDICT_MISSING,
+                    "cache_root": None,
+                }
+            )
+            continue
+        exit_code = entry.get("exit_code")
+        try:
+            ok = int(exit_code) == 0
+        except (TypeError, ValueError):
+            ok = False
+        verdict = (
+            POST_PUSH_VERDICT_GREEN if ok else POST_PUSH_VERDICT_RED
+        )
+        verdicts.append(verdict)
+        verification["entries"].append(
+            {
+                "command": command,
+                "verdict": verdict,
+                "cache_root": cached_at,
+                "exit_code": exit_code,
+                "completed_at": entry.get("completed_at"),
+                "scope": entry.get("scope"),
+                "git_state": entry.get("git_state"),
+                "fingerprint_kind": entry.get("fingerprint_kind"),
+                "stdout": (entry.get("stdout") or "")[:4000],
+                "stderr": (entry.get("stderr") or "")[:4000],
+            }
+        )
+
+    # Red wins over missing (a real failure is more actionable than a gap),
+    # and green requires every command to be green.
+    if POST_PUSH_VERDICT_RED in verdicts:
+        verdict = POST_PUSH_VERDICT_RED
+    elif POST_PUSH_VERDICT_MISSING in verdicts:
+        verdict = POST_PUSH_VERDICT_MISSING
+    else:
+        verdict = POST_PUSH_VERDICT_GREEN
+    verification["verdict"] = verdict
+    verification["success"] = verdict == POST_PUSH_VERDICT_GREEN
+    if verdict == POST_PUSH_VERDICT_GREEN:
+        LOG.info(
+            "Post-push verification: green (full-suite cache entry for the "
+            "pushed tree)"
+        )
+    else:
+        LOG.warning(
+            "Post-push verification: %s — refusing the terminal transition",
+            verdict,
+        )
+    return verification
+
+
+def _post_push_failure_test_name(verification: dict[str, Any]) -> str:
+    """Name the failure a red/missing verification reports to triage.
+
+    A red entry carries the failing suite's output, so the first ``FAILED``/
+    ``✕`` line names the real test; a missing entry has no failing test and is
+    named after the verification itself.
+    """
+    for entry in verification.get("entries") or []:
+        if entry.get("verdict") != POST_PUSH_VERDICT_RED:
+            continue
+        output = f"{entry.get('stdout') or ''}\n{entry.get('stderr') or ''}"
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("FAILED "):
+                return line[len("FAILED ") :].split()[0]
+            if line.startswith("✕ "):
+                return line[2:].strip()
+        return f"post-push full-suite verification ({entry.get('command')})"
+    return "post-push full-suite verification: no valid full-suite cache entry"
+
+
+def _route_post_push_failure_to_triage(
+    verification: dict[str, Any], commit_hash: str, work_item_id: str
+) -> dict[str, Any]:
+    """File a red/missing post-push verification through the triage helper.
+
+    Fail-soft by design: a triage hiccup must never mask the verification
+    refusal that is being reported. The helper is the skill's canonical
+    ``check_or_create.py``, so an existing matching critical ``test-failure``
+    item is enhanced instead of duplicated.
+    """
+    excerpt_parts: list[str] = []
+    stack_trace = ""
+    for entry in verification.get("entries") or []:
+        if entry.get("verdict") == POST_PUSH_VERDICT_MISSING:
+            excerpt_parts.append(
+                f"No valid full-suite cache entry for: {entry.get('command')}"
+            )
+            continue
+        excerpt_parts.append(f"$ {entry.get('command')}")
+        excerpt_parts.append((entry.get("stdout") or "")[:1500])
+        if entry.get("stderr"):
+            stack_trace = (entry.get("stderr") or "")[:1500]
+    payload = {
+        "test_name": _post_push_failure_test_name(verification),
+        "stdout_excerpt": "\n".join(excerpt_parts)[:3000],
+        "stack_trace": stack_trace,
+        "commit_hash": commit_hash,
+        "parent_work_item_id": work_item_id,
+    }
+    helper = _SKILLS_ROOT / "triage" / "scripts" / "check_or_create.py"
+    if not helper.exists():
+        LOG.warning(
+            "Post-push verification triage helper not found at %s", helper
+        )
+        return {"success": False, "reason": "helper_not_found"}
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(helper), json.dumps(payload)],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        LOG.warning("Post-push verification triage failed: %s", exc)
+        return {"success": False, "reason": f"triage_failed: {exc}"}
+    result: dict[str, Any] = {
+        "success": proc.returncode == 0,
+        "returncode": proc.returncode,
+    }
+    try:
+        result["report"] = json.loads(proc.stdout.strip() or "{}")
+    except (json.JSONDecodeError, ValueError):
+        result["stdout"] = proc.stdout[-2000:]
+    if proc.returncode != 0:
+        result["stderr"] = proc.stderr[-2000:]
+        LOG.warning(
+            "Post-push verification triage helper exited %d: %s",
+            proc.returncode,
+            proc.stderr[-500:],
+        )
+    return result
+
+
+def _post_push_verification_refusal(
+    verification: dict[str, Any],
+    work_item_id: str,
+    commit_hash: str,
+    branch: str,
+    worktree_path: str,
+) -> tuple[str, str]:
+    """Build the refusal message and the work-item comment (AC4).
+
+    The refused state is named exactly: the pushed commit, the branch, the
+    retained worktree, the verdict and the cache state checked. Nothing was
+    reverted — the commit stays on ``dev`` and on its feature branch.
+
+    Returns:
+        ``(message, comment)`` — the RuntimeError text and the comment body.
+    """
+    verdict = verification.get("verdict")
+    reason = verification.get("reason") or ""
+    lines = [
+        f"Finish refused: post-push verification is {verdict}.",
+        f"- Commit: {commit_hash} (pushed to dev, not reverted)",
+        f"- Branch: {branch} (retained)",
+        f"- Worktree: {worktree_path} (retained)",
+        "- Full-suite commands checked:",
+    ]
+    for entry in verification.get("entries") or []:
+        detail = entry.get("verdict")
+        if entry.get("exit_code") is not None:
+            detail += f", exit_code={entry.get('exit_code')}"
+        if entry.get("cache_root"):
+            detail += f", cache_root={entry.get('cache_root')}"
+        lines.append(f"  - {entry.get('command')}: {detail}")
+    if reason:
+        lines.append(f"- Reason: {reason}")
+    if verdict == POST_PUSH_VERDICT_RED:
+        lines.append(
+            "The cached full-suite verdict for the pushed tree is red, so the "
+            "item is not marked complete. The failure has been routed to "
+            "triage."
+        )
+    else:
+        lines.append(
+            "No valid full-suite cache entry exists for the pushed tree "
+            "(absent, expired, unkeyable, or the pre-push gate was bypassed), "
+            "so a green verdict cannot be proven."
+        )
+    lines.extend(
+        [
+            (
+                "The work item was released to `open` with no assignee; the "
+                "pushed commit is neither reverted nor force-removed."
+            ),
+            (
+                "Remediation: run the full suite through the test skill, then "
+                "re-run finish (idempotent — the no-diff path converges):"
+            ),
+            "  python3 skill/test/scripts/run_tests.py --scope full",
+            (
+                f"  python3 skill/implement/scripts/implement.py finish "
+                f"{work_item_id}"
+            ),
+        ]
+    )
+    comment = "\n".join(lines)
+    message = (
+        f"Post-push verification refused the terminal transition for "
+        f"{work_item_id}: verdict={verdict}, commit={commit_hash}. The commit "
+        f"stays on dev and on branch {branch}; the worktree is retained. "
+        f"Run the full suite through the test skill and re-run finish."
+    )
+    return message, comment
+
+
 def git_push_to_dev(
     cwd: str,
     branch: str,
@@ -9028,21 +9368,41 @@ def phase_finish(
     8. Post-push ancestry assertion: the pushed commit must be an ancestor
        of refs/remotes/origin/dev or finish fails loudly naming the hash
        (SA-0MVPZG7A0000N66U AC2)
-    9. Clean up worktree processes (post-push, before removal —
+    9. Post-push full-suite verification (**read-only** — it never starts a
+       suite): resolve the full-suite verdict for the pushed tree from the
+       test cache. ``green`` / ``not_applicable`` permit the terminal
+       transition; ``red`` / ``missing`` refuse it — the item is released to
+       ``open`` with the pushed commit named, retained and never reverted,
+       and the failure is routed to triage (SA-0MVXUSJ2P009T97H AC4)
+    10. Clean up worktree processes (post-push, before removal —
        self-exclusion-safe, SA-0MVJC5KNT0044L2B)
-    10. Remove worktree — **deferred** when the finishing process belongs to
+    11. Remove worktree — **deferred** when the finishing process belongs to
         a driven child session (``IMPLEMENT_DRIVE_ACTIVE=1``) or when the
         caller opted in with ``--keep-worktree`` /
         ``IMPLEMENT_KEEP_WORKTREE=1``. Deferral keeps the tree, its branch
         and ``.implement_state.json`` so the session that owns the tree as
         its cwd keeps working after finish returns; the driver (or the
         caller, via ``implement.py cleanup <id>`` as its **last** bash
-        command, SA-0MVTHJ7QX005PXRG) removes it afterwards. Recorded in
-        ``report["steps"]["worktree_removal"]`` (SA-0MVTE8XAJ002IUDR)
-    11. Sync local parent branch (post-push, AC1/AC2)
-    12. Mark in_review
-    13. Read back the terminal status from the main-checkout store and
+        command, SA-0MVTHJ7QX005PXRG) removes it afterwards. That cleanup
+        is explicitly **not** a remaining lifecycle step of this run —
+        ownership passed to the driver/caller, and it can no longer change
+        the work item. Recorded in ``report["steps"]["worktree_removal"]``
+        (SA-0MVTE8XAJ002IUDR)
+    12. Sync local parent branch (post-push, AC1/AC2)
+    13. Completion comment (commit hash, branch, gate provenance, retained
+        tree) — **before** the terminal write, so no comment follows it and
+        the audit-freshness ordering rule is preserved (SA-0MTHC710X003ORZM)
+    14. Terminal write (``completed``/``in_review`` + assignee release) issued
+        by ``StatusLifecycle.__exit__`` — the run's **last lifecycle
+        action** (design A, SA-0MVXUSED6008J04R)
+    15. Read back the terminal status from the main-checkout store and
         fail loudly if it did not stick (OSL-0MVME1PI5005WU58)
+
+    Every step that can still change the work item — including the
+    verification, the completion comment and the (non-deferred) worktree
+    removal — runs inside the held, non-terminal ``StatusLifecycle`` window,
+    so the item never becomes an audit-dispatch candidate while the run is
+    unfinished (parent SA-0MVWFPI31000HP3H AC1/AC2).
 
     All implementation work MUST be done inside the worktree created by
     ``phase_start``. If the current directory is outside the worktree and the
@@ -9825,6 +10185,48 @@ def phase_finish(
                 worktree_path=worktree_path,
             )
 
+            # ── Step 6a.5: Post-push full-suite verification (read-only) ──
+            # Design A (SA-0MVXUSED6008J04R): after a successful push the run
+            # resolves the full-suite verdict for the pushed tree from the
+            # test cache — the dev-push pre-push hook already ran it against
+            # exactly this commit. Nothing is executed here. A ``red`` or
+            # ``missing`` verdict **refuses the terminal transition here**,
+            # before any terminal state is observable, so the item is never
+            # briefly audit-dispatchable on a run that cannot prove green
+            # (SA-0MVXUSJ2P009T97H AC4). The pushed commit is never reverted
+            # or force-removed: the refusal releases the item to ``open`` and
+            # names the commit, the retained branch/worktree and the
+            # remediation.
+            post_push_verification = _resolve_post_push_verification(
+                worktree_path, repo_root
+            )
+            report["steps"]["post_push_verification"] = post_push_verification
+            if post_push_verification["verdict"] not in (
+                POST_PUSH_VERDICT_GREEN,
+                POST_PUSH_VERDICT_NOT_APPLICABLE,
+            ):
+                refusal_message, refusal_comment = (
+                    _post_push_verification_refusal(
+                        post_push_verification,
+                        work_item_id,
+                        commit_hash,
+                        branch,
+                        worktree_path,
+                    )
+                )
+                # AC4: the refusal is routed through the triage helper for
+                # BOTH unprovable verdicts — a red entry files the real
+                # failing test, a missing entry files the verification gap
+                # itself — so the failure is never only a prose comment.
+                post_push_verification["triage"] = (
+                    _route_post_push_failure_to_triage(
+                        post_push_verification, commit_hash, work_item_id
+                    )
+                )
+                report["hash"] = commit_hash
+                wl_add_comment(work_item_id, refusal_comment)
+                raise RuntimeError(refusal_message)
+
             # ── Step 6b: Worktree removal ownership ───────────────────────
             # One owner per worktree (SA-0MVTE8XAJ002IUDR): a driven child
             # session's worktree belongs to the driver (removed once that
@@ -9928,7 +10330,56 @@ def phase_finish(
             if sync_result.get("warning"):
                 LOG.info("Parent-branch sync: %s", sync_result["warning"])
 
+            # ── Step 9: Completion comment (BEFORE the terminal write) ────
+            # Design A (SA-0MVXUSED6008J04R AC3): the comment carries the
+            # pushed commit hash and runs inside the held, non-terminal
+            # window, so no comment follows the terminal write — which also
+            # preserves the audit-freshness ordering rule
+            # (SA-0MTHC710X003ORZM: a post-audit comment can invalidate a
+            # passed audit's freshness window). Verdict provenance is included
+            # so the accepted green is attributable from the work item alone
+            # (SA-0MVQHVJEX0071R7G).
+            verdict_lines = "\n".join(_verdict_provenance_lines(report))
+            completion_comment = (
+                f"Implementation complete.\n- Commit: {commit_hash}\n"
+                f"- Branch: {branch}\n- Worktree: {worktree_path}\n"
+                f"{verdict_lines}"
+            )
+            verification_step = report["steps"].get(
+                "post_push_verification") or {}
+            verification_verdict = verification_step.get("verdict")
+            if verification_verdict:
+                # Never a silent green: name the read-only post-push verdict
+                # (and why, when it is not applicable) in the comment.
+                completion_comment += (
+                    f"\n- Post-push verification: {verification_verdict}"
+                )
+                if verification_step.get("reason"):
+                    completion_comment += (
+                        f" ({verification_step['reason']})"
+                    )
+            removal_step = report["steps"].get("worktree_removal") or {}
+            if removal_step.get("deferred"):
+                # Never let a deferred cleanup disappear: name the retained
+                # tree, the reason and the exact remedy on the work item
+                # itself (SA-0MVTE8XAJ002IUDR AC2). Ownership of this cleanup
+                # has passed to the driver/caller, so it is not a remaining
+                # lifecycle step of this run (SA-0MVXUSJ2P009T97H AC1).
+                completion_comment += (
+                    f"\n- Worktree retained (deferred removal: "
+                    f"{removal_step.get('reason', 'unknown')}).\n"
+                    f"  A driven child session's worktree is removed by "
+                    f"`implement.py drive` once the session exits. Otherwise "
+                    f"remove it as the LAST command, once this session no "
+                    f"longer needs its cwd:\n"
+                    f"  {_worktree_cleanup_command(work_item_id)}\n"
+                    f"  manual fallback: git worktree remove {worktree_path} "
+                    f"&& git worktree prune"
+                )
+            wl_add_comment(work_item_id, completion_comment)
+
             # StatusLifecycle.__exit__ sets status=completed, stage=in_review
+            # — the run's LAST lifecycle action (assignee released with it).
 
         # ── Step 8b: Terminal-status read-back assertion ──────────────
         # (OSL-0MVME1PI5005WU58) The terminal write above must have stuck
@@ -10037,33 +10488,11 @@ def phase_finish(
         # the flock if this process dies.
         _release_main_checkout_lock(lock_fd)
 
-    # ── Step 9: Add completion comment ─────────────────────────────
-    # The comment carries the gate's verdict provenance (tree path, tree
-    # fingerprint, cache flag and, for a cache-served verdict, the entry
-    # metadata) so the accepted green is attributable from the work item alone
-    # (SA-0MVQHVJEX0071R7G).
-    verdict_lines = "\n".join(_verdict_provenance_lines(report))
-    completion_comment = (
-        f"Implementation complete.\n- Commit: {commit_hash}\n"
-        f"- Branch: {branch}\n- Worktree: {worktree_path}\n{verdict_lines}"
-    )
+    # ── Step 10: Success reporting ───────────────────────────────
+    # The completion comment already ran inside the lifecycle window
+    # (Step 9, before the terminal write) — nothing lifecycle-relevant is
+    # left here, so the item is already audit-ready.
     removal_step = report["steps"].get("worktree_removal") or {}
-    if removal_step.get("deferred"):
-        # Never let a deferred cleanup disappear: name the retained tree, the
-        # reason and the exact remedy on the work item itself
-        # (SA-0MVTE8XAJ002IUDR AC2).
-        completion_comment += (
-            f"\n- Worktree retained (deferred removal: "
-            f"{removal_step.get('reason', 'unknown')}).\n"
-            f"  A driven child session's worktree is removed by "
-            f"`implement.py drive` once the session exits. Otherwise remove "
-            f"it as the LAST command, once this session no longer needs its "
-            f"cwd:\n"
-            f"  {_worktree_cleanup_command(work_item_id)}\n"
-            f"  manual fallback: git worktree remove {worktree_path} && "
-            f"git worktree prune"
-        )
-    wl_add_comment(work_item_id, completion_comment)
 
     report["success"] = True
     report["hash"] = commit_hash
@@ -11170,7 +11599,30 @@ def phase_parent(
 
     parent_status = str(parent.get("status", ""))
     already_terminal = _is_terminal_status(parent_status)
+    summary = "\n".join(
+        f"- {c['id']} ({c['status']})" for c in classifications
+    )
+    child_summary = "\n".join(
+        f"- {r.get('id', '?')}: {r.get('action', '?')} "
+        f"({r.get('status', '')})"
+        for r in child_results
+    )
+    # ── Comment BEFORE the terminal write ─────────────────────────
+    # Design A (SA-0MVXUSED6008J04R §3): in **every** implement path the
+    # terminal ``completed``/``in_review`` write is the last lifecycle action,
+    # so the per-child summary is posted first. A comment bumps
+    # ``updatedAt``, so posting it after the transition would make the newly
+    # audit-ready parent churn once more (and can invalidate a fresh audit's
+    # window, SA-0MTHC710X003ORZM). No persisted audit can exist on a
+    # non-terminal parent, so this reordering is behaviour-neutral.
     if not already_terminal:
+        wl_add_comment(
+            work_item_id,
+            f"All children of {work_item_id} are in a terminal stage. "
+            f"Advancing the parent to in_review.\n\n"
+            f"Children processed:\n{child_summary}\n\n"
+            f"Per-child summary:\n{summary}",
+        )
         try:
             # Direct terminal durable write (phase_parent is not wrapped in a
             # StatusLifecycle context manager): the release must stay explicit
@@ -11181,6 +11633,14 @@ def phase_parent(
             )
         except RuntimeError:
             msg = f"Failed to advance parent {work_item_id}"
+            # The summary above promised an advance this write could not
+            # deliver: correct the record rather than leave a false claim.
+            wl_add_comment(
+                work_item_id,
+                f"Parent advancement failed: the terminal status write did "
+                f"not stick. {work_item_id} was left non-terminal — re-run "
+                f"`implement.py parent {work_item_id}`.",
+            )
             report["success"] = False
             report["message"] = msg
             if json_output:
@@ -11188,21 +11648,16 @@ def phase_parent(
             else:
                 LOG.error(msg)
             return report
-    summary = "\n".join(
-        f"- {c['id']} ({c['status']})" for c in classifications
-    )
-    child_summary = "\n".join(
-        f"- {r.get('id', '?')}: {r.get('action', '?')} "
-        f"({r.get('status', '')})"
-        for r in child_results
-    )
-    wl_add_comment(
-        work_item_id,
-        f"All children of {work_item_id} are in a terminal stage. "
-        f"Parent advanced to in_review.\n\n"
-        f"Children processed:\n{child_summary}\n\n"
-        f"Per-child summary:\n{summary}",
-    )
+    else:
+        # Already terminal: no lifecycle write follows, so the summary is
+        # posted here without promising another transition.
+        wl_add_comment(
+            work_item_id,
+            f"All children of {work_item_id} are in a terminal stage. "
+            f"Parent is already in a terminal state ({parent_status}).\n\n"
+            f"Children processed:\n{child_summary}\n\n"
+            f"Per-child summary:\n{summary}",
+        )
     report["parent_advanced"] = True
     report["message"] = (
         f"All children of {work_item_id} are terminal; parent advanced "
@@ -13462,19 +13917,6 @@ def _finalise_stranded_child(
         }
 
     commit = str(evidence.get("commit", ""))
-    try:
-        # Direct terminal durable write — the finaliser is not a StatusLifecycle
-        # exit, so the stranded child's hold is released explicitly.
-        StatusLifecycle.update_status(
-            child_id, "completed", stage="in_review", assignee=""
-        )
-    except RuntimeError as exc:
-        return {
-            "finalised": False,
-            "commit": commit,
-            "reason": f"status update failed: {exc}",
-        }
-
     reason = (
         f"Automatically finalised by `implement.py drive --finalise-stranded`: "
         f"the child session failed after its work was pushed "
@@ -13482,7 +13924,31 @@ def _finalise_stranded_child(
         f"in-progress, and its worktree held no uncommitted work. "
         f"Status set to completed / stage in_review."
     )
+    # The finalisation comment is posted BEFORE the terminal write, so the
+    # write is this path's last lifecycle action (design A,
+    # SA-0MVXUSED6008J04R §3: comment before the transition in every implement
+    # path). No persisted audit can exist on a non-terminal item, so this
+    # reordering is behaviour-neutral.
     wl_add_comment(child_id, reason)
+    try:
+        # Direct terminal durable write — the finaliser is not a StatusLifecycle
+        # exit, so the stranded child's hold is released explicitly.
+        StatusLifecycle.update_status(
+            child_id, "completed", stage="in_review", assignee=""
+        )
+    except RuntimeError as exc:
+        # The comment above claimed the finalisation; correct the record when
+        # the terminal write does not stick rather than leave a false claim.
+        wl_add_comment(
+            child_id,
+            f"Stranded-child finalisation failed: the terminal status write "
+            f"did not stick ({exc}). The item was left non-terminal.",
+        )
+        return {
+            "finalised": False,
+            "commit": commit,
+            "reason": f"status update failed: {exc}",
+        }
     LOG.info("Finalised stranded child %s (%s)", child_id, evidence.get(
         "evidence", commit,
     ))
