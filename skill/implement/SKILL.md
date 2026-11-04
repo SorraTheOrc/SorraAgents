@@ -1141,7 +1141,12 @@ See ``../refactor/SKILL.md``.
   > line is emitted (also in `report["steps"]["push"]["gate_evidence"]`); the
   > hook's `mirror_suite_cache` copies the worktree's cache entries into the
   > main checkout's `.worklog/cache` so the pushed commit's green full-suite
-  > entry stays visible to post-push verification and the audit.
+  > entry stays visible to post-push verification and the audit. The mirroring
+  > is behaviour of the **canonical pre-push hook template** shipped by the
+  > `worklog` package (`PRE_PUSH_HOOK_CONTENT`, emitted by `wl init` and kept
+  > current by `wl doctor upgrade`) — not a repository-local patch, so
+  > `wl doctor upgrade --dry-run` reports `pending: []` and `--confirm` never
+  > replaces the capability.
 
   > **The gate's subject is the pushed commit (SA-0MVTRBT50005DUEH).**
   > `.githooks/pre-push` forwards git's `<local_sha>` as
