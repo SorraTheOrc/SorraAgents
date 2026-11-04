@@ -2269,6 +2269,21 @@ def _main_checkout_guard_message(
     )
 
 
+#: Every stage label the finish main-checkout guard can record in
+#: ``report["steps"]["main_checkout_guard"]["verifies"]``
+#: (SA-0MVXVBYXI000QMXM). ``pre_push`` and ``pre_worktree_removal`` are the
+#: push-path verifies; the failure-path stages are recorded when finish aborts
+#: before the push; ``refactor`` is advisory/report-only (it never aborts).
+VERIFY_STAGES: tuple[str, ...] = (
+    "refactor",
+    "build_failure",
+    "gate_failure",
+    "user_abort",
+    "pre_push",
+    "pre_worktree_removal",
+)
+
+
 def _verify_main_checkout(
     guard: dict[str, Any],
     baseline: dict[str, Any],
@@ -2293,7 +2308,7 @@ def _verify_main_checkout(
         worktree_path: This finish run's own worktree.
         own_churn: Paths changed by finish's own fast-forward.
         expected_dirty: Project-declared dirty path prefixes to exclude.
-        stage: Verify stage label (``pre_push`` / ``pre_worktree_removal``).
+        stage: Verify stage label — one of :data:`VERIFY_STAGES`.
 
     Returns:
         The offending paths (empty list on pass).
@@ -9180,13 +9195,68 @@ def phase_finish(
         wl_add_comment(work_item_id, msg)
         raise RuntimeError(msg)
 
+    def _record_main_checkout_verify(
+        stage: str, *, aborting: bool
+    ) -> list[str]:
+        """Record a guard verify on a pre-push abort or advisory path.
+
+        ``finish`` snapshots the main checkout at Step 0.75 but originally
+        verified only at ``pre_push`` and ``pre_worktree_removal``. Every
+        pre-push abort (build failure, gate failure in JSON mode, retries
+        exhausted, interactive user abort) returned before either point, so
+        ``verifies`` stayed ``[]`` and foreign deletions in the main checkout
+        went unreported (2026-10-31: 37 deletions, ``verifies: []``). This
+        runs the verify at *stage* (one of :data:`VERIFY_STAGES`) and, on a
+        violation, posts the loud guard message — naming every offending path,
+        the actor evidence and the recovery command — **in addition to** any
+        pre-existing failure comment, never instead of it (fail loud, never
+        silent).
+
+        ``aborting=False`` is the report-only refactor path: ``run_refactor``
+        failure is advisory today (``LOG.warning`` + continue), so a violation
+        is surfaced in the report and a wl comment but the run is **not**
+        aborted. Turning a pre-existing advisory step into a new abort source
+        would risk the SA-0MUIJAHXS003M7BG false-positive class.
+
+        Returns:
+            The offending paths (empty list on pass).
+        """
+        violations = _verify_main_checkout(
+            main_checkout_guard,
+            main_checkout_baseline,
+            repo_root=repo_root,
+            worktree_path=worktree_path,
+            own_churn=main_checkout_guard["own_churn"],
+            expected_dirty=expected_dirty_paths(repo_root),
+            stage=stage,
+        )
+        if not violations:
+            return violations
+        actor = main_checkout_guard["verifies"][-1].get(
+            "actor_evidence", "unknown"
+        )
+        msg = _main_checkout_guard_message(repo_root, violations, actor, stage)
+        if not aborting:
+            msg = (
+                "Advisory only — this guard verify does not abort the run "
+                "(refactor step):\n\n" + msg
+            )
+        wl_add_comment(work_item_id, msg)
+        return violations
+
     # ── Step 1: Refactor step ──────────────────────────────────────
     if not no_refactor:
         LOG.info("Running refactor step...")
         refactor_result = run_refactor(work_item_id, worktree_path)
         report["steps"]["refactor"] = refactor_result
         if not refactor_result["success"]:
+            # Report-only guard verify (SA-0MVXVBYXI000QMXM): refactor
+            # failure is advisory (warning + continue), so the guard observes
+            # the main checkout here but never aborts on it. Keeps the guard
+            # honest without making a pre-existing advisory step a new abort
+            # source (false-positive risk under parent AC5).
             LOG.warning("Refactor step reported issues; continuing workflow")
+            _record_main_checkout_verify("refactor", aborting=False)
     else:
         report["steps"]["refactor"] = {"skipped": True, "reason": "no_refactor_flag"}
         LOG.info("Refactor step skipped (--no-refactor)")
@@ -9225,6 +9295,10 @@ def phase_finish(
             work_item_id,
             _build_failure_message(build_result, build_result["engine_lag"]),
         )
+        # The failure comment is posted above; this appends the failure-path
+        # guard verify (and, on foreign churn, its own loud comment) so a
+        # pre-push abort never leaves ``verifies`` empty (SA-0MVXVBYXI000QMXM).
+        _record_main_checkout_verify("build_failure", aborting=True)
         try:
             StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
@@ -9342,6 +9416,12 @@ def phase_finish(
                 "reason": failure_reason,
                 **_gate_facts(test_result, _gate_exit_code(test_result)),
             }
+            # Failure-path guard verify: the JSON-mode early return aborts
+            # before the push, so record the verify (and, on foreign churn,
+            # post the loud guard comment) before reporting
+            # (SA-0MVXVBYXI000QMXM). The gate failure itself stays in the
+            # report — the guard comment never replaces it.
+            _record_main_checkout_verify("gate_failure", aborting=True)
             print(format_json_output(report))
             return report
 
@@ -9365,6 +9445,9 @@ def phase_finish(
             report["success"] = False
             report["message"] = msg
             wl_add_comment(work_item_id, msg)
+            # Failure-path guard verify after the pre-existing abort comment
+            # (both comments, in order) — SA-0MVXVBYXI000QMXM.
+            _record_main_checkout_verify("user_abort", aborting=True)
             try:
                 StatusLifecycle.update_status(work_item_id, "open", assignee="")
             except RuntimeError:
@@ -9399,6 +9482,9 @@ def phase_finish(
         report["success"] = False
         report["message"] = msg
         wl_add_comment(work_item_id, msg)
+        # Failure-path guard verify after the pre-existing retries-exhausted
+        # comment (both comments, in order) — SA-0MVXVBYXI000QMXM.
+        _record_main_checkout_verify("gate_failure", aborting=True)
         try:
             StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:

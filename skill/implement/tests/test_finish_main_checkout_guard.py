@@ -22,10 +22,10 @@ Covered here:
   instead of leaving ``verifies: []`` — the 2026-10-31 shape, where 37 foreign
   deletions in the main checkout were never evaluated. This is the **test-first
   slice**: the verify points are wired by the sibling item
-  SA-0MVXVBYXI000QMXM, so the five guard assertions below are
-  ``xfail(strict=True)`` until that wiring lands. The unmarked companion
+  SA-0MVXVBYXI000QMXM, so the five guard assertions below pin that contract.
+  The unmarked companion
   ``test_each_pre_push_abort_path_returns_a_failure_report`` proves the harness
-  really reaches each abort path, so a failure of the marked tests means
+  really reaches each abort path, so a failure of the guard tests means
   "verify point absent", never "harness broken".
 """
 
@@ -490,12 +490,6 @@ _TERMINAL_STATUSES = {"completed", "in_review", "done"}
 #: A foreign deletion in the main checkout — the 2026-10-31 defect class.
 _FOREIGN_DELETION = "packages/shared/src/database.ts"
 
-_FAILURE_PATH_XFAIL = (
-    "Pre-fix tree: the pre-push abort path returns before any guard verify, so "
-    "verifies is empty and the foreign deletion is never reported. Unmark when "
-    "SA-0MVXVBYXI000QMXM wires the failure-path verify points."
-)
-
 
 def _failing_gate_result() -> dict:
     """A parsed gate failure (a genuine test failure, not infrastructure)."""
@@ -649,7 +643,6 @@ def test_each_pre_push_abort_path_returns_a_failure_report(tmp_path):
     _assert_released_to_open(mocks, expect_status_write=False)
 
 
-@pytest.mark.xfail(strict=True, reason=_FAILURE_PATH_XFAIL)
 def test_gate_json_abort_verifies_main_checkout(tmp_path):
     """Gate failure in JSON mode still verifies and reports a foreign deletion."""
     report, mocks = _run_failure_path(
@@ -677,7 +670,6 @@ def test_gate_json_abort_verifies_main_checkout(tmp_path):
     _assert_released_to_open(mocks, expect_status_write=False)
 
 
-@pytest.mark.xfail(strict=True, reason=_FAILURE_PATH_XFAIL)
 def test_gate_retries_exhausted_verifies_main_checkout(tmp_path):
     """The "Tests failed after N retries" exit still verifies the main checkout."""
     report, mocks = _run_failure_path(
@@ -705,7 +697,6 @@ def test_gate_retries_exhausted_verifies_main_checkout(tmp_path):
     _assert_released_to_open(mocks)
 
 
-@pytest.mark.xfail(strict=True, reason=_FAILURE_PATH_XFAIL)
 def test_build_failure_verifies_main_checkout(tmp_path):
     """A Step-2 build failure still verifies the main checkout."""
     report, mocks = _run_failure_path(
@@ -733,7 +724,6 @@ def test_build_failure_verifies_main_checkout(tmp_path):
     _assert_released_to_open(mocks)
 
 
-@pytest.mark.xfail(strict=True, reason=_FAILURE_PATH_XFAIL)
 def test_user_abort_verifies_main_checkout(tmp_path):
     """The interactive fix-loop ``abort`` still verifies the main checkout."""
     report, mocks = _run_failure_path(
@@ -762,7 +752,6 @@ def test_user_abort_verifies_main_checkout(tmp_path):
     _assert_released_to_open(mocks)
 
 
-@pytest.mark.xfail(strict=True, reason=_FAILURE_PATH_XFAIL)
 def test_clean_gate_abort_records_passing_failure_verify(tmp_path):
     """A clean abort records a *passing* failure-path verify and no abort.
 
