@@ -1,10 +1,10 @@
 """Regression tests: finish never attributes, or acts on, another checkout.
 
-**Test-first slice** for SA-0MVXVC03O0034A7V (parent SA-0MVWMUBP10041CSM
-AC2/AC3). The pinning assertions are ``xfail(strict=True)`` until that
-hardening lands; unmark them there. The unmarked companions pin invariants the
-hardening must not relax (a deletion is never allow-listed, a refused
-fast-forward records no churn, a foreign spelling of a dirty path never
+**Regression slice** for SA-0MVXVC03O0034A7V (parent SA-0MVWMUBP10041CSM
+AC2/AC3). The pinning assertions were ``xfail(strict=True)`` on the pre-fix
+tree and are unmarked now that the hardening landed. The companions pin
+invariants the hardening must not relax (a deletion is never allow-listed, a
+refused fast-forward records no churn, a foreign spelling of a dirty path never
 satisfies the own-churn allow-list), so a companion failure means "the fix
 weakened the guard", never "the harness broke".
 
@@ -72,15 +72,6 @@ LOG_NAME = "implement.scripts.implement"
 
 WORK_ITEM = "SA-TESTXCHECK01"
 
-#: Pre-fix reason shared by the pinning assertions: the attribution hardening
-#: (SA-0MVXVC03O0034A7V) is what makes them pass.
-_PRE_FIX = (
-    "Pre-fix tree: attribution is unconstrained — `_record_finish_own_churn` "
-    "returns the raw `git diff --name-only` list and `_resolve_main_repo_root` "
-    "trusts a stated repo_root outside the worktree. Unmark when "
-    "SA-0MVXVC03O0034A7V lands."
-)
-
 #: The seven paths the 2026-10-31 AI_Hell finish mis-attributed (abbreviated to
 #: the two shapes that matter: a docs path and a powerups source path).
 _FOREIGN_PATHS = (
@@ -133,7 +124,6 @@ def _advance(repo: Path) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=_PRE_FIX)
 def test_own_churn_excludes_paths_not_observed_dirty(main_repo: Path):
     """A commit range is not churn: only paths observed dirty are own churn.
 
@@ -147,7 +137,6 @@ def test_own_churn_excludes_paths_not_observed_dirty(main_repo: Path):
     assert implement._record_finish_own_churn(str(main_repo), before, after) == []
 
 
-@pytest.mark.xfail(strict=True, reason=_PRE_FIX)
 def test_fast_forward_surfaces_not_observed_churn_as_diagnostic(tmp_path: Path):
     """The production fast-forward drops unobserved paths and reports them.
 
@@ -184,7 +173,6 @@ def test_fast_forward_surfaces_not_observed_churn_as_diagnostic(tmp_path: Path):
     assert any("docs/added.md" in entry for entry in not_observed), result
 
 
-@pytest.mark.xfail(strict=True, reason=_PRE_FIX)
 def test_own_churn_refuses_a_root_that_is_not_the_repository(
     main_repo: Path, caplog
 ):
@@ -462,7 +450,6 @@ def _finish_harness(worktree: Path):
         yield
 
 
-@pytest.mark.xfail(strict=True, reason=_PRE_FIX)
 def test_finish_never_acts_on_a_sibling_checkout(tmp_path, caplog, monkeypatch):
     """A stated ``repo_root`` in another repository is rejected, loudly.
 

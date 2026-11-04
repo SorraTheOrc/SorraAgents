@@ -2372,10 +2372,17 @@ def _main_checkout_guard_violations(
 
     *own_churn* is the file list of finish's own Step-5 fast-forward of the
     main checkout's ``dev`` branch: those working-tree changes are attributed
-    to finish and never abort. A deletion (``D`` in the code) is **never**
-    allow-listed, even when the path appears in *own_churn* — a fast-forward
-    cannot delete a file relative to the tracked tree, so a ``D`` entry is
-    foreign by construction (WL-0MVPADZ1Z000FOSG AC3).
+    to finish and never abort. It is deliberately narrow
+    (SA-0MVXVC03O0034A7V): :func:`_record_finish_own_churn` only ever returns
+    checkout-relative paths that were *observed dirty in this checkout* after
+    the advance, so a path belonging to another checkout or repository can
+    never be allow-listed here. A foreign spelling of a dirty path (absolute,
+    or a ``..`` escape) simply does not compare equal to the normalised
+    checkout-relative status path, so it never satisfies the allow-list and
+    the real path stays offending. A deletion (``D`` in the code) is **never**
+    allow-listed either, even when the path appears in *own_churn* — a
+    fast-forward cannot delete a file relative to the tracked tree, so a ``D``
+    entry is foreign by construction (WL-0MVPADZ1Z000FOSG AC3).
 
     Args:
         baseline: The :func:`_snapshot_main_checkout` taken at run start.
@@ -2402,26 +2409,127 @@ def _main_checkout_guard_violations(
     return offending
 
 
-def _record_finish_own_churn(
-    repo_root: str, before_head: str, after_head: str
-) -> list[str]:
-    """File list of finish's own fast-forward of the main checkout.
+def _repository_root_mismatch(repo_root: str) -> str:
+    """Explain why *repo_root* is not a main working-tree root ("" when it is).
 
-    The diff between the main checkout's HEAD before the Step-5 fast-forward
-    and after covers every working-tree change the fast-forward itself
-    caused (branch checkout + commit merge), so those paths are attributable
-    to finish and excluded from the main-checkout guard's offending set.
+    Attribution helpers must never treat a path that merely *contains* a
+    repository as that repository: a subdirectory or a linked worktree's root
+    still answers ``git diff --name-only`` (relative to the repository), yet
+    the finish run does not own the files it names. The check therefore
+    requires
+
+    * ``git rev-parse --show-toplevel`` for *repo_root* to be *repo_root*
+      itself, and
+    * ``git rev-parse --git-common-dir`` (whose parent is the main working
+      tree root) to be inside *repo_root* — i.e. *repo_root* is the main
+      checkout, not a linked worktree of one.
 
     Args:
-        repo_root: Absolute path to the main checkout.
-        before_head: ``git rev-parse HEAD`` before the fast-forward.
-        after_head: The fast-forwarded HEAD (commit hash just merged).
+        repo_root: Candidate main-checkout root.
 
     Returns:
-        Sorted file list, or ``[]`` when either side is unavailable.
+        A human-readable reason, or ``""`` when *repo_root* is the root of a
+        non-linked working tree.
+    """
+    try:
+        root = Path(repo_root).resolve()
+    except OSError:
+        return f"{repo_root} cannot be resolved"
+    if not root.is_dir():
+        return f"{repo_root} is not a directory"
+    toplevel_result = run_cmd(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=repo_root,
+        check=False,
+    )
+    if toplevel_result.returncode != 0 or not toplevel_result.stdout.strip():
+        return f"{repo_root} is not inside a git working tree"
+    toplevel = Path(toplevel_result.stdout.strip()).resolve()
+    if toplevel != root:
+        return (
+            f"{repo_root} is not the repository root "
+            f"(git --show-toplevel is {toplevel})"
+        )
+    common_result = run_cmd(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=repo_root,
+        check=False,
+    )
+    if common_result.returncode != 0 or not common_result.stdout.strip():
+        return f"git --git-common-dir failed in {repo_root}"
+    common_dir = Path(common_result.stdout.strip())
+    if not common_dir.is_absolute():
+        common_dir = toplevel / common_dir
+    common_dir = common_dir.resolve()
+    main_root = common_dir.parent
+    if main_root != root:
+        return (
+            f"{repo_root} is a linked worktree, not its main checkout "
+            f"(git --git-common-dir is {common_dir}, whose parent is "
+            f"{main_root})"
+        )
+    return ""
+
+
+def _record_finish_own_churn(
+    repo_root: str,
+    before_head: str,
+    after_head: str,
+    *,
+    observed: dict[str, str] | None = None,
+    not_observed: list[str] | None = None,
+) -> list[str]:
+    """Paths of finish's own fast-forward that were *observed* dirty here.
+
+    The diff between the main checkout's HEAD before the Step-5 fast-forward
+    and after is **not** by itself churn: on 2026-10-31 a finish reported seven
+    paths (``docs/Game Design Document.md``, five ``src/powerups/*``, …) whose
+    ``baseline_paths`` was 0 — that was the file list of the commit local
+    ``dev`` was advanced to, i.e. other work items' work, not anything this
+    run touched in this checkout (SA-0MVXVC03O0034A7V).
+
+    So attribution is constrained three ways:
+
+    1. *repo_root* must be the root of the finished working tree **and** its
+       main checkout — a subdirectory or a linked worktree is refused loudly
+       (:func:`_repository_root_mismatch`), because the diff would then name
+       paths this run does not own;
+    2. every diff path must be checkout-relative (absolute and ``..``-escaping
+       entries are dropped) **and** resolve inside *repo_root*;
+    3. every surviving path must be *observed dirty in the finished checkout*
+       after the advance — the post-fast-forward status map, re-snapshotted
+       here unless supplied via *observed*.
+
+    Dropped paths are reported through *not_observed* so an operator sees what
+    the diff claimed and could not be attributed; they are a diagnostic only
+    and are **never** allow-listed by the main-checkout guard. A deletion is
+    likewise never allow-listed (the guard keeps that exclusion).
+
+    Args:
+        repo_root: Absolute path to the main checkout being finished.
+        before_head: ``git rev-parse HEAD`` before the fast-forward.
+        after_head: The fast-forwarded HEAD (commit hash just merged).
+        observed: Optional status map to intersect against; re-snapshotted from
+            *repo_root* when omitted.
+        not_observed: Optional list extended with a ``"<path> [<reason>]"``
+            entry for every dropped path.
+
+    Returns:
+        Sorted file list of attributable paths, or ``[]`` when the roots or
+        refs are unavailable or nothing was observed dirty.
     """
     if not before_head or not after_head:
         return []
+
+    mismatch = _repository_root_mismatch(repo_root)
+    if mismatch:
+        LOG.warning(
+            "Refusing to attribute finish's own fast-forward churn: %s. No "
+            "path is allow-listed; the main-checkout guard stays strict.",
+            mismatch,
+        )
+        return []
+
     result = run_cmd(
         ["git", "diff", "--name-only", before_head, after_head],
         cwd=repo_root,
@@ -2430,7 +2538,36 @@ def _record_finish_own_churn(
     )
     if result.returncode != 0:
         return []
-    return sorted(p for p in result.stdout.splitlines() if p.strip())
+
+    root = Path(repo_root).resolve()
+    if observed is None:
+        observed = _main_checkout_status_map(repo_root)
+    own: list[str] = []
+    dropped: list[str] = []
+    for raw in result.stdout.splitlines():
+        path = raw.strip()
+        if not path:
+            continue
+        candidate = Path(path)
+        reason = ""
+        if candidate.is_absolute():
+            reason = "absolute path"
+        elif ".." in candidate.parts:
+            reason = "path contains '..'"
+        else:
+            resolved = (root / candidate).resolve()
+            if resolved != root and root not in resolved.parents:
+                reason = f"resolves outside {root}"
+        if not reason and path not in observed:
+            reason = "not observed dirty in the finished checkout"
+        if reason:
+            dropped.append(f"{path} [{reason}]")
+            continue
+        own.append(path)
+
+    if not_observed is not None:
+        not_observed.extend(dropped)
+    return sorted(set(own))
 
 
 def _main_checkout_actor_evidence(
@@ -4726,58 +4863,136 @@ def _get_repo_root(cwd: str | None = None) -> str | None:
     return toplevel.as_posix()
 
 
+def _is_working_tree_root(root: str | None) -> bool:
+    """True when *root* is an existing directory holding a ``.git`` marker.
+
+    Used to validate a **derived** main checkout root before it is trusted:
+    every legitimate answer (:func:`_get_repo_root`) is a working-tree root,
+    so a value without the marker means derivation effectively failed and the
+    documented fallback must apply instead. Returning such a path would make
+    finish snapshot, fast-forward and lock a directory that is not a checkout
+    at all (SA-0MVXVC03O0034A7V).
+
+    Args:
+        root: Candidate root path (``None``/empty means "not derivable").
+    """
+    if not root:
+        return False
+    try:
+        candidate = Path(root)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
+    marker = candidate / ".git"
+    return candidate.is_dir() and (marker.is_dir() or marker.is_file())
+
+
 def _resolve_main_repo_root(
     worktree_path: str | None = None,
     state: ImplementState | None = None,
 ) -> str:
     """Resolve the MAIN checkout root for a worktree-scoped phase.
 
-    The implement state file's ``repo_root`` is authoritative **except** when
-    it points at the worktree itself or somewhere inside it: that is stale
-    state written by ``phase_start`` when it resumed from inside a linked
-    worktree, and trusting it makes ``phase_finish`` refuse to remove "the
-    repository root" and ``phase_abort`` restore the wrong checkout
-    (MS-0MVM7NJF70037YU4).
+    The main root is **derived**, never trusted from state alone. A state
+    file's ``repo_root`` is accepted only when it resolves to the same main
+    checkout that :func:`_get_repo_root` derives from *worktree_path* (via
+    ``git rev-parse --git-common-dir``, whose parent is the main working-tree
+    root). Two defects are closed by that requirement
+    (SA-0MVXVC03O0034A7V):
 
-    A stale value is rejected with a WARNING naming both the rejected and the
-    derived value, then the main root is derived from *worktree_path* via
-    :func:`_get_repo_root` (which resolves ``--git-common-dir``'s parent),
-    falling back to discovery from the current directory.
+    * a **stale** value written by ``phase_start`` when it resumed from inside
+      a linked worktree — the worktree itself, or a path inside it — which
+      made ``phase_finish`` refuse to remove "the repository root" and
+      ``phase_abort`` restore the wrong checkout (MS-0MVM7NJF70037YU4);
+    * a value naming a **sibling checkout** (another repository), which made
+      finish snapshot, fast-forward and push that foreign repository — the
+      2026-10-31 AI_Hell cross-checkout attribution incident.
+
+    Both are rejected with a WARNING naming the rejected and the derived root,
+    and the **derived** root is used. Derivation counts as impossible either
+    when ``git`` cannot answer for the worktree **or** when the answer is not a
+    real working-tree root (:func:`_is_working_tree_root`); then the documented
+    fallback applies — the stated root, else discovery from the current
+    directory, which is the last resort only (a finish run's cwd may be an
+    unrelated checkout) — and it is logged too, so a silently trusted value
+    cannot exist.
 
     Args:
         worktree_path: Absolute path to the phase's worktree, if known.
         state: The implement state read for this worktree, if available.
 
     Returns:
-        Absolute main checkout root — never the worktree or a path inside it
-        (unless the worktree *is* the main checkout, which the callers'
-        removal safety gates then refuse on their own terms).
+        Absolute main checkout root. Whenever the repository owning
+        *worktree_path* is derivable this is never a path outside it (the
+        worktree itself and paths inside it are rejected too, unless the
+        worktree *is* the main checkout — the callers' removal safety gates
+        then refuse on their own terms).
     """
     worktree = Path(worktree_path).resolve() if worktree_path else None
-
-    def _inside_worktree(candidate: str) -> bool:
-        if worktree is None:
-            return False
-        resolved = Path(candidate).resolve()
-        return resolved == worktree or worktree in resolved.parents
-
     stated = (state.repo_root if state else "") or ""
-    if stated and not _inside_worktree(stated):
-        return str(Path(stated).resolve())
 
-    derived = (
-        (_get_repo_root(str(worktree)) if worktree else None)
-        or _get_repo_root()
-        or str(Path.cwd().resolve())
+    # Derive from the worktree only while it exists: an already-removed
+    # worktree makes derivation impossible (``git`` cannot run in it) rather
+    # than an error, which keeps ``cleanup``/``abort`` idempotent.
+    derived: str | None = None
+    if worktree is not None and worktree.is_dir():
+        derived = _get_repo_root(str(worktree))
+        if derived and not _is_working_tree_root(derived):
+            LOG.warning(
+                "Ignoring derived main checkout root %s for worktree %s: it "
+                "is not a git working tree, so the derivation is treated as "
+                "impossible.",
+                derived,
+                worktree,
+            )
+            derived = None
+
+    if derived:
+        if stated:
+            resolved_stated = Path(stated).resolve()
+            if resolved_stated != Path(derived).resolve():
+                inside_worktree = bool(
+                    worktree is not None
+                    and (
+                        resolved_stated == worktree
+                        or worktree in resolved_stated.parents
+                    )
+                )
+                if inside_worktree:
+                    LOG.warning(
+                        "Ignoring stale state repo_root=%s (it is the "
+                        "worktree or inside it); using the main checkout "
+                        "root %s instead.",
+                        stated,
+                        derived,
+                    )
+                else:
+                    LOG.warning(
+                        "Rejecting state repo_root=%s: it is not the main "
+                        "checkout that owns worktree %s (derived main "
+                        "checkout root %s). Using the derived root — finish "
+                        "never acts on another checkout.",
+                        stated,
+                        worktree_path,
+                        derived,
+                    )
+        return derived
+
+    # Derivation impossible: the documented fallback is the only answer left,
+    # and it is surfaced rather than trusted. Discovery from the current
+    # directory is the last resort — never preferred over a stated root, since
+    # the cwd of a finish run may be an unrelated checkout entirely.
+    fallback = (
+        str(Path(stated).resolve())
+        if stated
+        else (_get_repo_root() or str(Path.cwd().resolve()))
     )
-    if stated:
-        LOG.warning(
-            "Ignoring stale state repo_root=%s (it is the worktree or inside "
-            "it); using the main checkout root %s instead.",
-            stated,
-            derived,
-        )
-    return derived
+    LOG.warning(
+        "Cannot derive the main checkout root for worktree %s from git; "
+        "falling back to %s.",
+        worktree_path or Path.cwd(),
+        fallback,
+    )
+    return fallback
 
 
 #: Workspace package consumed by path whose resolution a worktree must own
@@ -6312,6 +6527,13 @@ def _fast_forward_local_dev_for_push(
       recovery) and the post-push ancestry assertion
       (:func:`_assert_commit_on_origin_dev`) remain authoritative.
 
+    ``own_churn`` is recorded **only** when the advance happened
+    (``method == "advanced"``): a refused or no-op fast-forward mutated nothing,
+    so it contributes no attributable churn. Paths the commit diff claims but
+    that were not observed dirty in this checkout are surfaced as
+    ``not_observed`` — visible to the operator, never allow-listed
+    (SA-0MVXVC03O0034A7V).
+
     Args:
         repo_root: Absolute path to the main checkout.
         commit_hash: The commit finish is about to push.
@@ -6454,11 +6676,19 @@ def _fast_forward_local_dev_for_push(
     result["advanced"] = True
     result["pre_advance_tip"] = local_tip
     result["advanced_to"] = _resolve_full_commit(repo_root, commit_hash)
-    # The fast-forward's own file churn is expected — record it so the
-    # main-checkout guard never aborts on it (WL-0MVPADZ1Z000FOSG AC3/AC4).
+    # The advance's own churn is expected and never aborts — but only paths
+    # *observed dirty* in this checkout after the advance are attributable
+    # (WL-0MVPADZ1Z000FOSG AC3/AC4, SA-0MVXVC03O0034A7V).
+    not_observed: list[str] = []
     result["own_churn"] = _record_finish_own_churn(
-        repo_root, before_head, commit_hash
+        repo_root,
+        before_head,
+        commit_hash,
+        not_observed=not_observed,
     )
+    # Diagnostic surface: every path the diff named that could not be
+    # attributed to this checkout. Visible, never allow-listed.
+    result["not_observed"] = not_observed
     LOG.info(
         "Fast-forwarded local %s to %s (was %s)",
         parent_branch,

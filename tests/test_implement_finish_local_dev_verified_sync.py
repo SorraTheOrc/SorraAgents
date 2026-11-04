@@ -151,8 +151,14 @@ class TestFastForwardLocalDev:
         # The main checkout really carries the new files: that is what the
         # pre-push context-budget gate measures.
         assert (sandbox["work"] / "feature.txt").read_text() == "feature\n"
-        # The advance's own churn is attributable to finish.
-        assert "feature.txt" in result["own_churn"]
+        # The advance's own churn is attributable to finish — but only churn
+        # actually observed dirty in THIS checkout. A clean ``--ff-only``
+        # advance leaves the working tree clean, so no path is allow-listed;
+        # the paths the commit diff names are surfaced as a diagnostic instead
+        # (SA-0MVXVC03O0034A7V: an attribution list built from a commit range
+        # once allow-listed other work items' files).
+        assert result["own_churn"] == []
+        assert any("feature.txt" in entry for entry in result["not_observed"])
 
     def test_refuses_loudly_when_local_dev_has_moved(
         self, implement_mod, sandbox

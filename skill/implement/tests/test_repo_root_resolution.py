@@ -500,15 +500,9 @@ def test_abort_from_main_checkout_restores_main_checkout(
 # (the 2026-10-31 cross-checkout attribution defect). The hardening requires the
 # derived main root (``git --git-common-dir``'s parent for the worktree) and
 # only falls back to the stated value when derivation is impossible — always
-# loudly. The pinning assertions are ``xfail(strict=True)`` until
-# SA-0MVXVC03O0034A7V lands; unmark them there. The stale-state cases above
-# (the worktree, or a path inside it) stay covered unchanged.
-
-_FAIL_CLOSED_XFAIL = (
-    "Pre-fix tree: _resolve_main_repo_root returns any stated repo_root that is "
-    "not the worktree without deriving the main root, so a sibling checkout is "
-    "trusted silently. Unmark when SA-0MVXVC03O0034A7V lands."
-)
+# loudly. The pinning assertions were ``xfail(strict=True)`` on the pre-fix tree
+# and are unmarked now that SA-0MVXVC03O0034A7V landed. The stale-state cases
+# above (the worktree, or a path inside it) stay covered unchanged.
 
 
 def _sibling_repo(path: Path) -> Path:
@@ -522,7 +516,6 @@ def _sibling_repo(path: Path) -> Path:
     return path
 
 
-@pytest.mark.xfail(strict=True, reason=_FAIL_CLOSED_XFAIL)
 def test_resolve_main_repo_root_rejects_stated_sibling_checkout(
     repo_with_worktree, tmp_path, caplog
 ):
@@ -550,7 +543,6 @@ def test_resolve_main_repo_root_rejects_stated_sibling_checkout(
     assert str(main) in caplog.text
 
 
-@pytest.mark.xfail(strict=True, reason=_FAIL_CLOSED_XFAIL)
 def test_resolve_main_repo_root_falls_back_loudly_when_underivable(
     tmp_path, monkeypatch, caplog
 ):
