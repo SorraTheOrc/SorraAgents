@@ -2407,6 +2407,10 @@ def _main_checkout_guard_violations(
     fast-forward cannot delete a file relative to the tracked tree, so a ``D``
     entry is foreign by construction (WL-0MVPADZ1Z000FOSG AC3).
 
+    The operator-facing contract lives in
+    ``docs/dev/implement-skill-reference.md`` (§ Finish main-checkout guard →
+    Attribution contract (`own_churn`)).
+
     Args:
         baseline: The :func:`_snapshot_main_checkout` taken at run start.
         current: The :func:`_snapshot_main_checkout` taken at a verify point.
@@ -2526,7 +2530,10 @@ def _record_finish_own_churn(
     Dropped paths are reported through *not_observed* so an operator sees what
     the diff claimed and could not be attributed; they are a diagnostic only
     and are **never** allow-listed by the main-checkout guard. A deletion is
-    likewise never allow-listed (the guard keeps that exclusion).
+    likewise never allow-listed (the guard keeps that exclusion). The
+    operator-facing contract is
+    ``docs/dev/implement-skill-reference.md`` § Finish main-checkout guard →
+    Attribution contract (`own_churn`).
 
     Args:
         repo_root: Absolute path to the main checkout being finished.
@@ -2685,6 +2692,10 @@ def _main_checkout_guard_message(
 #: (SA-0MVXVBYXI000QMXM). ``pre_push`` and ``pre_worktree_removal`` are the
 #: push-path verifies; the failure-path stages are recorded when finish aborts
 #: before the push; ``refactor`` is advisory/report-only (it never aborts).
+#: Documented for operators in ``docs/dev/implement-skill-reference.md``
+#: (§ Finish main-checkout guard → Verify stages);
+#: ``skill/implement/tests/test_guard_docs.py`` fails when this tuple and the
+#: documented table drift apart, so add a stage in both places.
 VERIFY_STAGES: tuple[str, ...] = (
     "refactor",
     "build_failure",
@@ -5119,7 +5130,9 @@ def _resolve_main_repo_root(
     fallback applies — the stated root, else discovery from the current
     directory, which is the last resort only (a finish run's cwd may be an
     unrelated checkout) — and it is logged too, so a silently trusted value
-    cannot exist.
+    cannot exist. The rule is documented for operators in
+    ``docs/dev/implement-skill-reference.md`` § Finish main-checkout guard →
+    Fail-closed `repo_root` resolution.
 
     Args:
         worktree_path: Absolute path to the phase's worktree, if known.
@@ -10379,6 +10392,12 @@ def phase_finish(
         is surfaced in the report and a wl comment but the run is **not**
         aborted. Turning a pre-existing advisory step into a new abort source
         would risk the SA-0MUIJAHXS003M7BG false-positive class.
+
+        The operator-facing contract — stage table, report fields, the
+        both-comments ordering and the advisory refactor status — is
+        documented in ``docs/dev/implement-skill-reference.md``
+        (§ Finish main-checkout guard), and
+        ``skill/implement/tests/test_guard_docs.py`` keeps the two in sync.
 
         Returns:
             The offending paths (empty list on pass).

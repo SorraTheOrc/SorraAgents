@@ -1656,12 +1656,27 @@ the worktree that holds the pushed commit, SA-0MVTFMB7K002Y1F3) — so a foreign
 actor mutating the main checkout mid-finish (the 2026-10-26 `packages/shared`
 wipe) could still be silently carried into the main checkout's bookkeeping or
 a subsequent `git commit -a`. The finish main-checkout guard closes that
-window:
+window on the success path **and** on every pre-push abort path
+(SA-0MVXVBYXI000QMXM):
 
 - **Snapshot at run start** (`_snapshot_main_checkout`): the main
   checkout's working-tree status surface (`git status --porcelain=v1`,
   `{path: code}`, `.worklog/` filtered out) is captured right after the
   placement gate — before build/test/commit.
+- **Verify on every pre-push abort**: build failure, gate failure (JSON mode
+  and retries exhausted) and the interactive user abort each record a verify
+  before `finish` returns, so `verifies` is **never empty** on a failure
+  report produced by those paths (the 2026-10-31 shape — `verifies: []` on a
+  gate abort while 37 foreign deletions sat in the main checkout — can no
+  longer happen). The refactor check records an **advisory** verify (see
+  below).
+- **Scope of the guarantee**: the guard's verify points are the stages in its
+  table. Two refusals are raised *before* either verify point — the build-churn
+  exclusion refusal (Step 2b) and the stale shared-package resolution refusal
+  (Step 2c) — and return with their own loud messages without recording a
+  verify. They are worktree-local refusals outside the guard's failure-path
+  set; an operator reading a report from one of them sees the refusal message
+  itself, never `verifies`.
 - **Verify before the push** (Step 5b, `pre_push`): after the fast-forward,
   `own_churn` (the fast-forward's own file list, `git diff --name-only` of
   the pre-fast-forward HEAD → the merged commit) is attributed to finish and
@@ -1670,23 +1685,142 @@ window:
   mutation that appeared while the push ran (e.g. a concurrent actor) must
   still abort loudly.
 
-On failure `phase_finish` raises inside the `StatusLifecycle` context; the
-work item is left `open` (never `completed`/`in_review`), the abort message
-names **every** offending path, the concurrent-actor evidence available at
-runtime (other worktree `.implement_state.json` entries, live processes with
-cwd in the main checkout, or `unknown`) and the recovery command
-(`git checkout -- <path>`). Pre-existing dirty files present in the baseline
-snapshot and project-declared expected-dirty paths are never a failure;
-a deletion (`D`) is never allow-listed, even when the path appears in
-`own_churn` — a fast-forward cannot delete a file relative to the tree, so
-`D` entries are foreign by construction.
+### Verify stages
 
-The guard's work is observable in the finish report under
-`report["steps"]["main_checkout_guard"]` (snapshot time, verify times and
-verdicts per stage, own-churn list, final verdict). Regression pins:
-`skill/implement/tests/test_finish_main_checkout_guard.py` and the existing
-`skill/implement/tests/test_finish_no_diff_status.py` (must stay green — a
-clean finish is unaffected).
+Every verify calls `_verify_main_checkout`, which appends
+`{stage, at, verdict, offending?, actor_evidence?}` to `guard["verifies"]`
+and updates `guard["verdict"]`. `VERIFY_STAGES` (in
+`skill/implement/scripts/implement.py`) is the complete vocabulary; a
+docs-consistency test (`skill/implement/tests/test_guard_docs.py`) fails when
+this table and the constant drift apart.
+
+| Stage | When it runs | Aborts the run? |
+|---|---|---|
+| `refactor` | the Step-1 refactor check reports issues | **no** — advisory: report entry plus a wl comment, then finish continues |
+| `build_failure` | the Step-2 build fails | yes (the run is already failing) |
+| `gate_failure` | the Step-3 gate fails in `--json` mode, or every fix-and-re-run retry is exhausted | yes (already failing) |
+| `user_abort` | the interactive fix loop's `abort` choice (or EOF/`KeyboardInterrupt`) | yes (already failing) |
+| `pre_push` | after the Step-5 fast-forward, immediately before the push | yes — `_abort_on_main_checkout_violation` |
+| `pre_worktree_removal` | after the push, before the worktree is removed | yes — `_abort_on_main_checkout_violation` |
+
+A verify that passes still records a `pass` entry, so a green main checkout is
+observable on every path (e.g.
+`test_finish_main_checkout_guard.py::test_clean_gate_abort_records_passing_failure_verify`).
+The failure paths record their verify **after** the path's own failure action:
+a build failure has already posted its build-failure comment, the
+test-retries-exhausted path its gate-failure comment, the user abort its abort
+comment; the
+JSON-mode gate failure posts no failure comment (the report carries
+`message`/`test_phase` instead) and the interactive `input()` prompt never runs
+in that mode.
+
+### Loud-comment contract (both comments, never one instead of the other)
+
+On a violation the guard posts the same message via `wl_add_comment` on every
+stage, aborting or advisory:
+
+- **Two comments, in order, on the failure paths.** The path's pre-existing
+  failure comment is posted first, then the guard's main-checkout comment — a
+  guard comment never *replaces* the failure explanation (fail loud, never
+  silent).
+- **Advisory refactor comment.** The refactor verify is evaluated for its own
+  sake — `run_refactor` failure is a non-gating warning today — so its comment
+  is prefixed `Advisory only — this guard verify does not abort the run
+  (refactor step):`. Treating it as an abort source would create a new
+  false-positive class from a pre-existing advisory step
+  (SA-0MUIJAHXS003M7BG).
+- **Aborting stages raise after commenting.** `_abort_on_main_checkout_violation`
+  (push-path stages) and `_record_main_checkout_verify(..., aborting=True)`
+  (failure-path stages) post the comment and then abort; `phase_finish` raises
+  inside the `StatusLifecycle` context, so the work item stays `open` (never
+  `completed`/`in_review`) and the audit trail survives the status reset.
+- **Message content.** The abort message names the stage, **every** offending
+  path (`<path> [<code>]`, capped at 20 lines plus `… and N more`), the
+  concurrent-actor evidence available at runtime (other worktree
+  `.implement_state.json` entries, live processes whose cwd is the main
+  checkout, or `unknown`) and the recovery command (`git checkout -- <path>`
+  / `git restore <path>`), so an agent hitting the abort can act without
+  spelunking.
+
+Pre-existing dirty files present in the baseline snapshot and project-declared
+expected-dirty paths are never a failure.
+
+### Report fields
+
+| Field | Meaning |
+|---|---|
+| `guard["repo_root"]` | The main checkout the guard snapshots and verifies (`_resolve_main_repo_root`, below) |
+| `guard["snapshot_at"]` | ISO timestamp of the baseline snapshot |
+| `guard["baseline_paths"]` | Number of dirty/untracked entries in the baseline snapshot |
+| `guard["own_churn"]` | The attribution allow-list: checkout-relative paths from finish's own fast-forward that were observed dirty in this checkout (never a deletion) |
+| `guard["verifies"]` | Ordered list of verify entries, one per verify point reached |
+| `guard["verdict"]` | Verdict of the most recent verify (`pass` or `fail`) |
+| `verifies[].stage` | The stage label from the table above (`VERIFY_STAGES`) |
+| `verifies[].at` | ISO timestamp of that verify |
+| `verifies[].verdict` | `pass` or `fail` |
+| `verifies[].offending` | One `"<path> [<code>]"` entry per offending path — present only on `fail` |
+| `verifies[].actor_evidence` | Concurrent-actor evidence string, or `unknown` — present only on `fail` |
+
+### Attribution contract (`own_churn`)
+
+`own_churn` is the only thing the guard allow-lists beyond `.worklog/` and
+project expected-dirty paths, so it may name **nothing this run did not do in
+this checkout** (SA-0MVXVC03O0034A7V). `_record_finish_own_churn` constrains it
+three ways and `_main_checkout_guard_violations` enforces the rest:
+
+- **The finished repo only.** `repo_root` must be the root of the finished
+  working tree *and* its main checkout. `_repository_root_mismatch` refuses a
+  subdirectory, a linked worktree or a sibling checkout loudly
+  (`git rev-parse --show-toplevel` must be `repo_root` itself; the parent of
+  `git rev-parse --git-common-dir` must be `repo_root`), and a refusal
+  allow-lists nothing.
+- **Observed churn only.** Every `git diff --name-only` path must be
+  checkout-relative (absolute and `..`-escaping spellings are dropped), must
+  resolve inside `repo_root`, and must have been **observed dirty in this
+  checkout** after the advance (the post-fast-forward status map). Dropped
+  paths are reported as a diagnostic in
+  `report["steps"]["local_dev_fast_forward"]` (`not_observed`) and are never
+  allow-listed — the 2026-10-31 cross-checkout attribution incident was a
+  finish reporting seven paths that were merely *in the commit* local `dev`
+  advanced to.
+- **Deletions are never allow-listed.** A `D` entry is foreign by
+  construction (a fast-forward cannot delete a file relative to the tracked
+  tree), even when the path also appears in `own_churn`. A foreign spelling
+  of a dirty path simply does not compare equal to the normalised
+  checkout-relative status path, so the real path stays offending.
+
+Proven by `skill/implement/tests/test_finish_cross_checkout_attribution.py`
+(`test_own_churn_excludes_paths_not_observed_dirty`,
+`test_own_churn_refuses_a_root_that_is_not_the_repository`,
+`test_guard_never_allow_lists_a_foreign_spelling_of_a_dirty_path`,
+`test_guard_still_never_allow_lists_a_deletion`,
+`test_finish_never_acts_on_a_sibling_checkout`) and
+`skill/implement/tests/test_finish_main_checkout_guard.py`
+(`test_violations_own_churn_allow_list_never_hides_deletion`,
+`test_violations_own_churn_list_only_matches_listed_paths`).
+
+### Fail-closed `repo_root` resolution
+
+`_resolve_main_repo_root` **derives** the main checkout instead of trusting
+`state.repo_root`. The stored value is accepted only when it resolves to the
+same main checkout `_get_repo_root` derives from the worktree; a stale value
+(the worktree itself or a path inside it — MS-0MVM7NJF70037YU4) or a value
+naming a sibling checkout is **rejected, logged and replaced by the derived
+root**, because a trusted foreign root made `finish` snapshot, fast-forward
+and push another repository. When derivation is impossible the documented
+fallback (stated root, else discovery from the current directory) is logged
+too, so a silently trusted value cannot exist. The removal safety gates stay
+untouched — the fix supplies the correct root rather than relaxing a check.
+Pinned by `skill/implement/tests/test_repo_root_resolution.py`
+(`test_resolve_main_repo_root_rejects_stated_sibling_checkout`,
+`test_finish_rejects_stale_state_repo_root_and_removes_worktree`,
+`test_resolve_main_repo_root_falls_back_loudly_when_underivable`,
+`test_remove_worktree_still_refuses_the_main_checkout`).
+
+Regression pins overall: `skill/implement/tests/test_finish_main_checkout_guard.py`
+(failure-path verifies, the loud-abort message, clean-run behaviour) and the
+existing `skill/implement/tests/test_finish_no_diff_status.py` (must stay
+green — a clean finish is unaffected).
 
 ## Write-surface confinement audit (SA-0MVXVC0KB004XDH0)
 
@@ -1925,9 +2059,13 @@ the per-repository lock above:
     survives; an overlapping local modification is reported as
     `reset_conflict` and never clobbered — `reset --hard` is never used);
   - not checked out → atomic compare-and-swap `git update-ref`.
-- **Own churn is still attributed.** The fast-forward's file churn is recorded
-  as `own_churn` so the main-checkout guard never aborts on it
-  (WL-0MVPADZ1Z000FOSG AC3/AC4).
+- **Own churn is still attributed — narrowly.** The fast-forward's file churn
+  is recorded as `own_churn` so the main-checkout guard never aborts on it
+  (WL-0MVPADZ1Z000FOSG AC3/AC4), but only paths *observed dirty in this
+  checkout* qualify: unobserved diff paths are reported as `not_observed`
+  diagnostics, a non-main-checkout root allow-lists nothing, and a deletion is
+  never allow-listed (see
+  [the attribution contract](#attribution-contract-own_churn)).
 
 ### The post-push ancestry assertion fails closed
 
@@ -1985,7 +2123,7 @@ keys added for it are:
 
 | Report key | Meaning |
 |---|---|
-| `report["steps"]["main_checkout_guard"]` | Snapshot time, per-stage verify times/verdicts (`pre_push`, `pre_worktree_removal`), the own-fast-forward churn allow-list and the final verdict |
+| `report["steps"]["main_checkout_guard"]` | The main checkout (`repo_root`), snapshot time and baseline size, one verify entry per stage reached (`refactor`, `build_failure`, `gate_failure`, `user_abort`, `pre_push`, `pre_worktree_removal`) with its time, verdict, offending paths and actor evidence, the own-fast-forward churn allow-list and the final verdict |
 | `report["steps"]["main_checkout_lock"]` | Lock path, whether it was acquired, when, and the holder description when the finish was refused |
 | `report["steps"]["local_dev_fast_forward"]` | Whether the pre-push advance ran (`advanced`), why it refused (`reason`), the pre-advance and remote tips, and the `own_churn` allow-list |
 | `report["steps"]["local_dev_restore"]` | Whether a failed push restored local `dev` to `origin/dev`, and why not when it was skipped |
