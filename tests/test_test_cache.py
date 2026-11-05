@@ -1228,14 +1228,6 @@ def test_tree_bound_entry_never_satisfies_a_loose_request(git_repo: Path) -> Non
 # unexpectedly-passing test into a failure, so an implementation must remove
 # this marker (and the marker can never be forgotten).
 
-CONTRACT_PENDING = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "contract not implemented yet: run_cached() does not flag or quarantine a "
-        "mid-run checkout move (implementation: SA-0MW3GCOLJ0031YA8, state helper: "
-        "SA-0MW3GCKJF006SQIE). Delete this xfail marker when those land."
-    ),
-)
 
 
 def _head(repo: Path) -> str:
@@ -1267,7 +1259,6 @@ def movable_checkout(tmp_path: Path) -> Path:
     return repo
 
 
-@CONTRACT_PENDING
 class TestStateChangedDuringRun:
     """A checkout that moves mid-run is reported and its evidence quarantined."""
 
