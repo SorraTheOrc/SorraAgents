@@ -33,6 +33,7 @@ import pytest
 from audit.scripts import audit_runner
 from audit.scripts.checkpoint_store import (
     PHASE_CHILDREN,
+    PHASE_PHASE2,
     CheckpointStore,
 )
 from audit.tests.test_audit_runner_checkpoint import (
@@ -933,18 +934,40 @@ def _stored_child_audit_report(fingerprint: str) -> str:
     )
 
 
+def _stored_child_audit_not_ready_report(fingerprint: str) -> str:
+    """A stored, v2-fingerprinted child audit saying ``Ready to close: No``.
+
+    Models a serviced in-main-slot child whose own audit judged its criteria
+    and found them unmet (parent AC3).
+    """
+    return (
+        "Ready to close: No\n\n"
+        "Audit report for work item CHILD-1\n\n"
+        f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fingerprint}\n\n"
+        "## Acceptance Criteria Status\n\n"
+        "| # | Criterion | Verdict | Evidence |\n"
+        "|---|-----------|---------|----------|\n"
+        "| 1 | CAC1: child criterion 1 | unmet | child.py:4 — blocking |"
+    )
+
+
 def _proc(stdout: str):
     """A canned successful ``wl`` result (the runner's return shape)."""
     return mock.Mock(returncode=0, stdout=stdout, stderr="")
 
 
-def _resume_child_runner(stored_report: str):
-    """Mock ``wl`` runner serving CHILD-1's item + its fresh stored audit."""
+def _resume_child_runner(stored_report: str | None):
+    """Mock ``wl`` runner serving CHILD-1's item + its stored audit.
+
+    ``stored_report=None`` models a child with NO stored audit (AC4).
+    """
     runner = mock.MagicMock()
 
     def _side_effect(cmd):
         cmd_str = " ".join(str(c) for c in cmd)
         if "audit-show" in cmd_str:
+            if stored_report is None:
+                return _proc(json.dumps({"success": True, "audit": None}))
             return _proc(json.dumps({
                 "success": True,
                 "audit": {
@@ -986,14 +1009,20 @@ class TestCheckpointResumeReResolvesPendingChildren:
     ``Child screens pending`` gate could never clear and the pending-screens
     signal was rewritten run after run.
 
-    RED before the D2 fix: the checkpoint restore short-circuits the
-    orchestration block, so the pending list is still ``['CHILD-1']``.
+    RED before the D2 fix: the checkpoint restore short-circuited the
+    orchestration block, so the pending list stayed ``['CHILD-1']``.
+    GREEN after the D2 fix: the restored pending children are re-resolved
+    through the child-verdict reuse path before the pending gate is computed.
     """
 
-    def _seed_resume_store(self, tmp_path) -> CheckpointStore:
+    def _seed_resume_store(self, tmp_path, phase2=False) -> CheckpointStore:
         """Seed a ``phase1_children``-completed checkpoint whose child still
         carries the unserviced in-main-slot placeholder, then reopen it as a
-        resuming store (production ``CheckpointStore``, not a fake)."""
+        resuming store (production ``CheckpointStore``, not a fake).
+
+        ``phase2=True`` additionally marks Phase 2 completed (the early-return
+        resume path).
+        """
         store = CheckpointStore("TEST-1", HEAD_BASE, tmp_path)
         store.mark_completed(PHASE_CHILDREN, {
             "ac_results": [
@@ -1015,19 +1044,60 @@ class TestCheckpointResumeReResolvesPendingChildren:
             "phase2_completed": False,
             "phase2_skip_note": None,
         })
+        if phase2:
+            store.mark_completed(PHASE_PHASE2, {})
         reopened = CheckpointStore("TEST-1", HEAD_BASE, tmp_path)
         assert reopened.is_resuming is True
         return reopened
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "D2 (SA-0MVSTZ71J001P67S): a phase1_children checkpoint resume "
-            "replays the MAIN_SLOT_PENDING_EVIDENCE placeholders instead of "
-            "re-resolving the serviced child audits (production: "
-            "LP-0MVLNBCTN0084MT0). Remove this marker when the D2 fix lands."
-        ),
-    )
+    def _resume_ctx(self, tmp_path, runner):
+        """A resuming ctx whose restored child still holds the placeholder."""
+        ctx = _make_ctx(checkpoint=self._seed_resume_store(tmp_path))
+        ctx.runner = runner
+        ctx.checkpoint_dir = str(tmp_path)
+        ctx.owning_root = tmp_path
+        ctx.audit_children = True
+        ctx.children = [{
+            "id": "CHILD-1",
+            "title": _RESUME_CHILD_TITLE,
+            "description": _RESUME_CHILD_DESC,
+            "status": "in_progress",
+            "stage": "in_review",
+        }]
+        return ctx
+
+    def _write_signal(self, tmp_path):
+        signal = tmp_path / f"TEST-1{audit_runner.PENDING_SCREENS_SIGNAL_SUFFIX}"
+        audit_runner._write_pending_screens_signal(
+            ["CHILD-1"], "TEST-1", tmp_path, str(tmp_path),
+        )
+        assert signal.is_file()
+        return signal
+
+    def _fingerprint(self) -> str:
+        fingerprint = audit_runner._compute_content_fingerprint(
+            None, "CHILD-1",
+            work_item={
+                "title": _RESUME_CHILD_TITLE,
+                "description": _RESUME_CHILD_DESC,
+            },
+        )
+        assert fingerprint is not None
+        return fingerprint
+
+    def _run_resume(self, ctx):
+        """Run the resume pipeline with every pi entry point mocked."""
+        with mock.patch.object(
+            audit_runner, "_phase1_review_child_acs"
+        ) as child_screen, mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log"
+        ) as pi_call, mock.patch.object(
+            audit_runner, "_run_phase2_deep_analysis",
+            side_effect=lambda issue, ac, cr, **kw: (ac, cr, True),
+        ):
+            rc = audit_runner._phase_children(ctx)
+        return rc, child_screen, pi_call
+
     def test_resume_reuses_serviced_child_audit_and_clears_pending(
         self, tmp_path,
     ):
@@ -1084,3 +1154,148 @@ class TestCheckpointResumeReResolvesPendingChildren:
         # D2 core assertion: the replay of the pending placeholders is gone.
         pending = audit_runner._pending_main_slot_child_ids(ctx.child_results)
         assert pending == [], f"D2: checkpoint resume replays pending {pending}"
+
+    def test_resume_then_report_clears_gate_and_signal(
+        self, tmp_path, capsys,
+    ):
+        """AC2: after a serviced child audit is reused, the report carries no
+        ``Child screens pending`` gate, the JSON payload's
+        ``pending_child_screens`` is empty and the pending-screens signal file
+        is removed."""
+        runner = _resume_child_runner(
+            _stored_child_audit_report(self._fingerprint()),
+        )
+        signal = self._write_signal(tmp_path)
+        ctx = self._resume_ctx(tmp_path, runner)
+        ctx.json_mode = True
+
+        rc, child_screen, pi_call = self._run_resume(ctx)
+        assert rc is None
+        child_screen.assert_not_called()
+        pi_call.assert_not_called()
+
+        assert audit_runner._phase_report(ctx) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["pending_child_screens"] == []
+        assert not signal.exists(), "pending-screens signal not cleared"
+
+    def test_phase2_checkpoint_resume_also_re_resolves_pending(self, tmp_path):
+        """AC1: the ``phase2``-completed early return must not replay the
+        pending child placeholders either — the serviced child audit is
+        collected there too (zero pi calls)."""
+        runner = _resume_child_runner(
+            _stored_child_audit_report(self._fingerprint()),
+        )
+        ctx = _make_ctx(
+            checkpoint=self._seed_resume_store(tmp_path, phase2=True),
+        )
+        ctx.runner = runner
+        ctx.checkpoint_dir = str(tmp_path)
+        ctx.owning_root = tmp_path
+        ctx.audit_children = True
+        ctx.children = [{
+            "id": "CHILD-1",
+            "title": _RESUME_CHILD_TITLE,
+            "description": _RESUME_CHILD_DESC,
+            "status": "in_progress",
+            "stage": "in_review",
+        }]
+
+        rc, child_screen, pi_call = self._run_resume(ctx)
+        assert rc is None
+        child_screen.assert_not_called()
+        pi_call.assert_not_called()
+        assert ctx.child_results[0].get("reused_from")
+        assert (
+            audit_runner._pending_main_slot_child_ids(ctx.child_results) == []
+        )
+
+    def test_resume_serviced_not_ready_child_is_assessed_and_blocks(
+        self, tmp_path, capsys,
+    ):
+        """AC3: a serviced child whose own audit says ``Ready to close: No``
+        is reported as assessed (``child_audit_not_ready``, never
+        ``not_assessed``) and still blocks the parent's readiness."""
+        runner = _resume_child_runner(
+            _stored_child_audit_not_ready_report(self._fingerprint()),
+        )
+        signal = self._write_signal(tmp_path)
+        ctx = self._resume_ctx(tmp_path, runner)
+        ctx.json_mode = True
+
+        rc, _, pi_call = self._run_resume(ctx)
+        assert rc is None
+        pi_call.assert_not_called()
+        child = ctx.child_results[0]
+        assert child.get("child_audit_not_ready") is True
+        assert child.get("reused_from")
+        # Screens were serviced: no child remains pending.
+        assert audit_runner._pending_main_slot_child_ids(ctx.child_results) == []
+
+        assert audit_runner._phase_report(ctx) == 0
+        # The pending-screens signal is cleared by the report phase once the
+        # pending list is empty.
+        assert not signal.exists()
+        payload = json.loads(capsys.readouterr().out)
+        assert "CHILD-1" not in payload["child_reasons"]
+        assert payload["not_assessed_children"] == []
+        # Assessed is not ready: the child's blocking verdicts still block.
+        assert payload["ready_to_close"] is False
+
+    def test_resume_no_stored_audit_keeps_child_pending(self, tmp_path):
+        """AC4: a child with NO stored audit stays pending — the fast path
+        never fabricates a serviced state (and makes no pi call)."""
+        runner = _resume_child_runner(None)
+        signal = self._write_signal(tmp_path)
+        ctx = self._resume_ctx(tmp_path, runner)
+
+        rc, child_screen, pi_call = self._run_resume(ctx)
+        assert rc is None
+        child_screen.assert_not_called()
+        pi_call.assert_not_called()
+        assert ctx.child_results[0].get("reused_from") is None
+        assert ctx.child_results[0].get("child_audit_ready") is False
+        assert audit_runner._pending_main_slot_child_ids(
+            ctx.child_results
+        ) == ["CHILD-1"]
+        assert signal.is_file()
+
+    def test_resume_stale_child_audit_keeps_child_pending(self, tmp_path):
+        """AC4: a stored audit whose content fingerprint no longer matches the
+        child (title/description changed) is stale — the child stays
+        pending."""
+        runner = _resume_child_runner(
+            _stored_child_audit_report("stale-fingerprint-mismatch"),
+        )
+        signal = self._write_signal(tmp_path)
+        ctx = self._resume_ctx(tmp_path, runner)
+
+        rc, _, pi_call = self._run_resume(ctx)
+        assert rc is None
+        pi_call.assert_not_called()
+        assert ctx.child_results[0].get("reused_from") is None
+        assert audit_runner._pending_main_slot_child_ids(
+            ctx.child_results
+        ) == ["CHILD-1"]
+        assert signal.is_file()
+
+    def test_resume_writes_resolved_child_results_back_to_checkpoint(
+        self, tmp_path,
+    ):
+        """AC6: the refreshed ``child_results`` are persisted into the
+        checkpoint before Phase 2, so a later resume sees resolved children
+        instead of replaying the placeholders."""
+        runner = _resume_child_runner(
+            _stored_child_audit_report(self._fingerprint()),
+        )
+        ctx = self._resume_ctx(tmp_path, runner)
+
+        rc, _, _ = self._run_resume(ctx)
+        assert rc is None
+
+        stored = CheckpointStore(
+            "TEST-1", HEAD_BASE, tmp_path,
+        ).accumulated_state()["child_results"]
+        assert audit_runner._pending_main_slot_child_ids(stored) == []
+        assert stored[0].get("reused_from")
+        assert stored[0].get("child_audit_ready") is True

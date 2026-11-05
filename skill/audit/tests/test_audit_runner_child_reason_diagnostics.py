@@ -11,8 +11,6 @@ Tests assert on:
 - the greppable ``Child assessment reasons:`` line in the markdown report,
 - both the stored-verdict-inherited case and the no-stored-verdict case.
 """
-import pytest
-
 from skill.audit.scripts import audit_runner as ar
 
 #: Parent ACs (all met) shared across diagnostic tests.
@@ -364,19 +362,6 @@ def serviced_child_audit_not_ready(child_id="CHILD-NR"):
     }
 
 
-#: Strict-xfail marker shared by the D2 classification-gap reproductions.
-#: Strict means an XPASS fails, so the fixing child MUST remove the marker.
-_D2_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "D2 (SA-0MVSTZ71J001P67S): a serviced child whose stored audit says "
-        "'Ready to close: No' is classified not_assessed instead of "
-        "assessed/child_audit_not_ready (production: LP-0MVLNBCTN0084MT0). "
-        "Remove this marker when the D2 fix lands."
-    ),
-)
-
-
 class TestServicedChildAuditNotReadyClassification:
     """D2 reproduction (parent AC3): a serviced child whose stored audit
     verdict is ``Ready to close: No`` is ASSESSED with
@@ -391,20 +376,18 @@ class TestServicedChildAuditNotReadyClassification:
     reason codes cannot tell a serviced-but-blocking child from an unserviced
     one.
 
-    RED before the D2 fix: ``_classify_child_assessment_reason`` keys only on
+    RED before the D2 fix: ``_classify_child_assessment_reason`` keyed only on
     ``child_audit_ready is False`` + non-acceptable ``ac_results``, so the
-    ``child_audit_not_ready``/``reused_from`` markers of the reuse path are
-    ignored and the child is classified ``not_assessed``.
+    ``child_audit_not_ready``/``reused_from`` markers of the reuse path were
+    ignored and the child was classified ``not_assessed``.
     """
 
-    @_D2_XFAIL
     def test_serviced_not_ready_child_is_not_classified_not_assessed(self):
         """The stored-verdict (not-ready) child is assessed — no reason code."""
         child = serviced_child_audit_not_ready()
         reason = ar._classify_child_assessment_reason(child, None)
         assert reason is None, f"D2: serviced not-ready child classified {reason}"
 
-    @_D2_XFAIL
     def test_json_payload_omits_not_assessed_for_serviced_not_ready_child(self):
         """JSON: no reason code, not in ``not_assessed_children``, still No."""
         child = serviced_child_audit_not_ready()
@@ -418,7 +401,6 @@ class TestServicedChildAuditNotReadyClassification:
         # Assessed is not ready: the child's blocking verdicts still block.
         assert payload["ready_to_close"] is False
 
-    @_D2_XFAIL
     def test_report_has_no_not_assessed_line_and_still_blocks(self):
         child = serviced_child_audit_not_ready()
         report = ar._assemble_issue_report(

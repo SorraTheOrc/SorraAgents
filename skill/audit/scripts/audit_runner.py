@@ -6425,6 +6425,27 @@ def _child_has_stored_verdict(child: dict) -> bool:
     return bool(child.get("reused_from")) or child.get("child_audit_ready") is not None
 
 
+def _child_audit_verdict_blocks(child: dict) -> bool:
+    """True when *child*'s own audit verdict must block the parent's readiness.
+
+    A serviced child whose OWN persisted audit says ``Ready to close: No``
+    carries ``child_audit_not_ready`` together with ``reused_from`` (both
+    recorded by the child-verdict reuse path) and the blocking
+    ``ac_results`` copied from that audit. Being assessed is not the same as
+    being ready, so its blocking verdicts keep blocking the parent even when
+    its stage (``in_review``) would otherwise exempt it from the AC
+    aggregation (SA-0MVSTZ71J001P67S D2 / parent AC3).
+
+    The ``reused_from`` marker is required: it distinguishes a child whose
+    own audit judged it (the reuse path) from a child whose verdict was
+    tainted by a parent-triggered re-screen, which stays exempt for
+    snapshot-exempt children (SA-0MVI35BIU002MTZQ F3a).
+    """
+    return bool(child.get("child_audit_not_ready")) and bool(
+        child.get("reused_from")
+    )
+
+
 def _child_acs_assessed_in_run(child: dict) -> bool:
     """True when *child* carries real (non-pending) acceptable verdicts.
 
@@ -6505,6 +6526,14 @@ def _classify_child_assessment_reason(
     # because it was set before screening) HAS been assessed — the flag means
     # "no stored verdict at pre-pass time", not "never judged"
     # (MS-0MVQO6N34007DHP8).
+    # A child whose OWN persisted audit judged it NOT ready HAS been
+    # assessed: the child-verdict reuse path records ``child_audit_not_ready``
+    # (plus ``reused_from``) and fills ``ac_results`` from that audit. Its
+    # blocking verdicts still block the parent's readiness — being assessed is
+    # not being ready — but reporting it ``not_assessed`` ("never judged")
+    # misstates the child's state (SA-0MVSTZ71J001P67S D2 / parent AC3).
+    if child.get("child_audit_not_ready") and child.get("reused_from"):
+        return None
     if (
         child.get("child_audit_ready") is False
         and not _child_acs_assessed_in_run(child)
@@ -6690,8 +6719,14 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         # children without one are NOT-ASSESSED and still count.
         if cid in unserviced_ids and _child_has_stored_verdict(c):
             continue
-        # Assessed exempt children do not block through their AC verdicts.
-        if _child_is_exempt(c, snapshot_exempt) and _child_has_stored_verdict(c):
+        # Assessed exempt children do not block through their AC verdicts —
+        # EXCEPT a child whose own audit said not-ready: that verdict is a
+        # real judgement and must keep blocking (parent AC3).
+        if (
+            _child_is_exempt(c, snapshot_exempt)
+            and _child_has_stored_verdict(c)
+            and not _child_audit_verdict_blocks(c)
+        ):
             continue
         for a in c.get("ac_results", []):
             child_acs.append(a)
@@ -8712,9 +8747,13 @@ def _build_issue_json(
         # parent-triggered re-screen must not block the parent through a
         # tainted/incorrect child verdict (SA-0MVI35BIU002MTZQ AC5, mirrored
         # in the markdown report path). A child with NO stored verdict is NOT
-        # assessed and still counts.
-        and not (_child_is_exempt(c, snapshot_exempt)
-                 and _child_has_stored_verdict(c))
+        # assessed and still counts. A child whose own audit said not-ready
+        # always counts: its verdict is a real judgement (parent AC3).
+        and not (
+            _child_is_exempt(c, snapshot_exempt)
+            and _child_has_stored_verdict(c)
+            and not _child_audit_verdict_blocks(c)
+        )
         for a in c.get("ac_results", [])
     ]
     all_ac_acceptable = all(
@@ -12682,6 +12721,70 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     })
 
 
+def _re_resolve_pending_main_slot_children(
+    ctx: _AuditContext,
+    child_results: list[dict],
+    active_children: list[dict],
+) -> bool:
+    """Re-resolve checkpoint-restored children still pending in-main-slot.
+
+    A ``phase1_children`` checkpoint whose restored ``child_results`` carry
+    :data:`MAIN_SLOT_PENDING_EVIDENCE` is NOT a completed phase for those
+    children (SA-0MVSTZ71J001P67S D2). The invoking session may have serviced
+    the outstanding ``[AUDIT_IN_MAIN_SLOT_WORK]`` screens and persisted each
+    child audit since the checkpoint was written, so the children are
+    resolved again through the SAME child-verdict reuse path the Phase 1
+    pre-pass uses (:func:`_get_child_audit_verdict` →
+    :func:`_child_acs_from_own_audit`). A child with a fresh stored audit is
+    therefore collected with **zero** child pi calls, its ``reused_from`` /
+    ``child_audit_ready`` / ``child_audit_not_ready`` / ``ac_results`` shape
+    matching a non-resumed run, which lets
+    :func:`_pending_main_slot_child_ids` empty out and the pending-screens
+    signal clear.
+
+    Conservative by construction (never fabricates a serviced state): a
+    child with no stored audit, a stale stored audit, or under ``--force``
+    is left exactly as restored — still carrying its pending placeholder —
+    so it remains pending and keeps blocking the parent's readiness.
+
+    Mutates *child_results* in place; returns ``True`` when at least one
+    child was re-resolved (so the caller persists the refreshed results).
+    """
+    pending_ids = set(_pending_main_slot_child_ids(child_results))
+    if not pending_ids:
+        return False
+    by_id = {
+        str(child.get("id", "") or ""): child
+        for child in active_children or []
+    }
+    for cr in child_results or []:
+        cid = str(cr.get("id", "") or "")
+        if cid not in pending_ids:
+            continue
+        child = by_id.get(cid) or {
+            key: cr.get(key, "")
+            for key in ("id", "title", "status", "stage")
+        }
+        verdict, _reason, audited_at = _get_child_audit_verdict(
+            ctx.runner, cid, worklog_dir=ctx.worklog_dir,
+            force=ctx.force, child=child,
+        )
+        if verdict is not None:
+            cr["child_audit_ready"] = verdict is True
+            cr["child_audit_not_ready"] = verdict is False
+            cr["reused_from"] = audited_at
+            cr["ac_results"] = _child_acs_from_own_audit(
+                child, ctx.runner, worklog_dir=ctx.worklog_dir,
+            )
+        else:
+            # Not resolvable: keep the restored placeholder ACs untouched so
+            # the child stays pending (AC4) — never an empty, fabricated
+            # "assessed" result.
+            cr["child_audit_ready"] = False
+            cr["child_audit_not_ready"] = verdict is False
+    return True
+
+
 def _phase_children(ctx: _AuditContext) -> int | None:
     """Phase 4 — child orchestration + Phase 2 gate.
 
@@ -12812,6 +12915,20 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             )
             phase2_completed = st.get("phase2_completed", phase2_completed)
             phase2_skip_note = st.get("phase2_skip_note", phase2_skip_note)
+            # Restored children still carrying the in-main-slot placeholder
+            # are not resolved yet: collect any child audit persisted since
+            # the checkpoint was written so this run's report/pending-screens
+            # signal reflects the serviced state (SA-0MVSTZ71J001P67S D2).
+            if _re_resolve_pending_main_slot_children(
+                ctx, child_results, active_children,
+            ):
+                _checkpoint_phase_done(checkpoint, PHASE_CHILDREN, {
+                    "ac_results": ac_results,
+                    "child_results": child_results,
+                    "child_persist_results": child_persist_results,
+                    "phase2_completed": phase2_completed,
+                    "phase2_skip_note": phase2_skip_note,
+                })
             print(
                 f"[checkpoint] Skipping completed phase: "
                 f"{PHASE_LABELS[PHASE_PHASE2]}",
@@ -12828,6 +12945,26 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             )
             phase2_completed = st.get("phase2_completed", phase2_completed)
             phase2_skip_note = st.get("phase2_skip_note", phase2_skip_note)
+            # A restored child still carrying the in-main-slot placeholder
+            # means the phase is NOT complete for it: re-resolve exactly
+            # those children through the child-verdict reuse path so a child
+            # audit serviced + persisted since the checkpoint is collected
+            # (zero pi calls) and the pending list can empty
+            # (SA-0MVSTZ71J001P67S D2 / AC1). Children that cannot be
+            # resolved stay pending (AC4).
+            if _re_resolve_pending_main_slot_children(
+                ctx, child_results, active_children,
+            ):
+                # Write the refreshed child_results back BEFORE Phase 2 so a
+                # later resume sees resolved children instead of replaying
+                # the placeholders (AC6).
+                _checkpoint_phase_done(checkpoint, PHASE_CHILDREN, {
+                    "ac_results": ac_results,
+                    "child_results": child_results,
+                    "child_persist_results": child_persist_results,
+                    "phase2_completed": phase2_completed,
+                    "phase2_skip_note": phase2_skip_note,
+                })
             print(
                 f"[checkpoint] Skipping completed phase: "
                 f"{PHASE_LABELS[PHASE_CHILDREN]}",
