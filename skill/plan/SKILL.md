@@ -356,6 +356,16 @@ Then output a summary of what each stage checked/found.
 - Preserve author intent; when uncertain, create an Open Question entry rather than assuming.
 - Keep changes minimal and conservative. Respect `.gitignore`.
 - **Worklog validation**: `feature` or `task` work items must include a `## Acceptance Criteria` section.
+- **AC list formats** (AC coverage review): the shared
+  `../shared/tree_coverage.py::extract_acceptance_criteria` function recognises these list
+  markers inside an `## Acceptance Criteria` section: `- ` (dash bullet), `+ ` (plus bullet),
+  `1. ` (period-numbered) and `1) ` (paren-numbered). (`*` star bullets are **not**
+  recognised.) Bullets and numbers may interleave (collected in document order); a marker
+  indented deeper than the first AC marker is nested detail rather than an AC; wrapped
+  continuation lines join their preceding AC. An `## Acceptance Criteria` section that parses
+  to zero ACs fails the coverage review closed (`recommendation: "stop"`) instead of passing
+  vacuously. See `../shared/tests/test_tree_coverage.py` and the AC coverage review step in
+  [Process](#process-must-follow) for the behavioural contract.
 - **JSON parsing**: `wl ... --json` output may be an object or an array; handle both shapes.
 - If any automated step fails or is ambiguous, surface an Open Question and pause for guidance.
 
