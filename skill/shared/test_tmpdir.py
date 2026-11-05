@@ -49,6 +49,10 @@ Neither helper ever raises. Every error path is caught, logged and reported in
 the returned reason string, so a TMPDIR or prune problem can never change a
 test run's exit status, cache entry or scope resolution. Callers log the reason
 and continue.
+
+Operator guidance (precedence, prune rules, failure signature, remedy):
+``docs/dev/test-skill-reference.md`` §3 “Disk-backed test temporary storage
+and the inode-exhaustion signature” (SA-0MW3ENVLU0097JRD).
 """
 
 from __future__ import annotations

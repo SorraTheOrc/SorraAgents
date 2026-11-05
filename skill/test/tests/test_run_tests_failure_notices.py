@@ -82,6 +82,30 @@ class TestRunSuiteDiagnostics:
         assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
         assert "no parsable failures" in result["notice"]
 
+    def test_inode_exhaustion_signature_is_unparsed_failure(self, tmp_path) -> None:
+        """The captured inode-exhaustion output (SA-0MW2QED9M005FWOK) is
+        classified ``unparsed_failure`` by the runner — an infrastructure
+        condition, never a code failure.
+
+        The incident surfaced as ``ENOSPC`` inside
+        ``PlaywrightBrowserProvider.createContext`` while the ``/tmp`` tmpfs
+        inode budget was at 100 %. The output contains no ``FAILED`` line, so
+        ``run_suite`` must report ``unparsed_failure`` and the gate then maps
+        it to ``reason: unparsed``.
+        """
+        proc = fx.enospc_in_playwright(exit_code=1)
+        with mock.patch.object(run_tests, "_run_cmd", return_value=proc), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite("all", cwd=_repo(tmp_path), use_cache=False)
+
+        assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
+        assert result["failures"] == []
+        assert result["success"] is False
+        assert result["exit_code"] == 1
+        assert "ENOSPC" in result["stderr"]
+        assert "PlaywrightBrowserProvider.createContext" in result["stderr"]
+        assert "no parsable failures" in result["notice"]
+
     def test_command_not_found_is_classified(self, tmp_path) -> None:
         def raise_not_found(*args, **kwargs):
             # errno + filename form so ``exc.filename == "vitest"``.

@@ -1043,3 +1043,111 @@ full-suite cache entry — the audit's read-only full-suite query
 full-suite verification always requires a genuine `full` run at the same
 git state.
 
+## 3. Disk-backed test temporary storage and the inode-exhaustion signature (SA-0MW2QED9M005FWOK)
+
+### Why this exists
+
+`/tmp` is frequently a small tmpfs whose **inode** budget — not its byte
+budget — is exhausted first under multi-agent load. Stale
+`pytest-of-<user>/pytest-*` roots (tens of thousands of tiny files each),
+Playwright/Chromium browser profiles and node compile caches pushed `df -i
+/tmp` to `IUse% 100` / `IFree 0` (~100 % of 1,048,576 inodes) while the byte
+budget was only ~24 % used, and every suite/build subprocess silently defaulted
+to that tmpfs because nothing set `TMPDIR`. The failure surfaced inside the
+Playwright browser provider — `ENOSPC no space left on device` in
+`PlaywrightBrowserProvider.createContext` — as a non-zero exit with no
+parsable test failure, so the gate reported it as `unparsed`
+(infrastructure-class). That classification was correct (the condition is host
+infrastructure, never a code failure) but it blocked green work that a host
+remedy, not a code fix, unblocks.
+
+Two framework-side mitigations close the gap (feature epic
+SA-0MW2QED9M005FWOK: F1 shared helper `skill/shared/test_tmpdir.py`, F2
+runner wiring, F3 `implement.py` parity). Both are **fail-open**: an error is
+logged with a reason string and the run proceeds unchanged.
+
+### TMPDIR resolution (precedence)
+
+`run_tests.py` resolves the test `TMPDIR` once per process
+(`_suite_command_env()` → `shared.test_tmpdir.resolve_test_tmpdir()`) and every
+suite command it spawns inherits it via the child environment. All suite
+command strings, cache keys and scope resolutions are byte-identical — the
+change is env-only.
+
+`implement.py finish` resolves the same helper and exports the result into its
+build, test and `git push` children, so the pre-push full-suite hook runs its
+`run_tests.py` child on the same disk-backed storage. The explicit
+`PI_TEST_TMPDIR` override therefore also steers the pre-push gate.
+
+Precedence (first usable candidate wins):
+
+1. **`PI_TEST_TMPDIR`** — explicit operator override. The directory is created
+   when absent and must be writable; an unusable override is noted and the
+   resolution falls through.
+2. **`PI_TEST_TMPDIR_DISK_ROOT`** (default `/var/tmp`) — the configured
+   disk-backed root; the candidate directory
+   **`<root>/pi-test-<uid>`** is created when absent. Skipped when the root
+   is missing, not a directory, or itself mounted tmpfs.
+3. **`tempfile.gettempdir()`** — the portable final fallback for macOS,
+   Windows and CI hosts without a usable disk-backed root.
+
+The chosen directory is logged at INFO — `Test TMPDIR=<path> (<reason>)` from
+the runner, `Finish TMPDIR=<path> …` from `implement.py` — so an operator can
+verify which storage is active (`ls <root>/pi-test-<uid>` or `df -i <path>`).
+Resolution failure is fail-open: the helper returns a last-resort path and
+logs a warning; it never raises and never changes a run's exit status, cache
+entry or scope resolution.
+
+### Stale pytest-root pruning
+
+Before a full-scope run, the runner calls
+`shared.test_tmpdir.prune_stale_test_roots()` and removes stale
+`pytest-of-<user>/pytest-*` roots under the resolved test TMPDIR *and* under
+`tempfile.gettempdir()`. Rules:
+
+- **user scope** — only the current user's `pytest-of-<user>` base is
+  considered; another user's roots are never touched;
+- **age threshold** — a root younger than `PI_TEST_TMPDIR_MAX_AGE_SECONDS`
+  (default `3600` seconds = 60 minutes) is kept;
+- **keep-current** — the `pytest-current` symlink target is always kept;
+- **keep-newest-N** — the newest `PI_TEST_TMPDIR_KEEP_RECENT` roots (default
+  `2`) are always kept, even when older than the threshold;
+- **in-use skip** — a root referenced by a live `pytest` process is skipped
+  (best-effort Linux `/proc` scan; a no-op elsewhere);
+- **absent base** — no `pytest-of-<user>` base directory is a no-op.
+
+The removed count and per-base outcome counts are logged at INFO; every error
+path is caught and reported in the returned reason string (fail-open — a
+prune problem never changes exit status, cache entry or scope resolution).
+
+### Failure signature — recognise inode exhaustion for what it is
+
+| Signal | Meaning |
+| --- | --- |
+| `ENOSPC: no space left on device` raised inside `PlaywrightBrowserProvider.createContext` (or another file-creation site) | The suite child hit the tmpfs inode (or byte) limit — host infrastructure, not a test failure. |
+| `df -i /tmp` → `IUse% 100`, `IFree 0` while the byte budget looks fine | The `/tmp` tmpfs inode budget is exhausted; stale pytest roots and browser/node caches are usually the cause. |
+| Gate `reason: unparsed` (runner notice code `unparsed_failure`) with no `failures` list | The gate correctly classifies the non-zero exit as infrastructure — never a code `test_failure`. |
+
+A regression pin asserts the captured signature keeps this classification:
+`skill/test/tests/test_gate_reason.py` (classifier) and
+`skill/test/tests/test_run_tests_failure_notices.py` (runner), driven by the
+shared fixtures in `skill/shared/tests/gate_failure_fixtures.py`.
+
+### Operator remedy
+
+1. **Prune stale pytest roots** — remove roots older than the threshold
+   (`/tmp/pytest-of-<user>/pytest-*`), keeping the `pytest-current` target and
+   the newest roots. The runner does this automatically before full-scope
+   runs; a manual prune (roots with `mtime` older than ~20 minutes in the
+   original incident) is the fastest intervention while a gate is blocked —
+   the incident freed ~679k inodes this way.
+2. **Free inodes** — inspect `df -i /tmp`; if pytest roots are not the cause,
+   delete other churn (Playwright/Chromium profiles, node compile caches).
+3. **Verify the disk-backed TMPDIR is active** — look for the runner's
+   `Test TMPDIR=<path> …` INFO log (or `implement.py finish`'s
+   `Finish TMPDIR=<path> …`) and confirm `df -i` on that path has inode
+   headroom. Set `PI_TEST_TMPDIR` explicitly when a host needs a specific
+   disk-backed location.
+
+Related: `docs/dev/test-isolation.md` §H2 discusses `TMPDIR`/`--basetemp` in
+the context of the live-repo-leak incident.

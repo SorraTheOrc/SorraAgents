@@ -88,6 +88,22 @@ FACT_FIELDS = (
 #: or a supervisor kill delivers.
 FIXTURE_SIGNAL = 9
 
+#: Captured inode-exhaustion signature (SA-0MW2QED9M005FWOK): the suite child
+#: raised ``ENOSPC`` inside ``PlaywrightBrowserProvider.createContext`` while
+#: the ``/tmp`` tmpfs inode budget was exhausted, exited non-zero and produced
+#: no parsable test failure — so the gate reported ``unparsed_failure`` →
+#: ``unparsed`` (infrastructure-class), never a code ``test_failure``. The
+#: operator diagnosis was ``df -i /tmp`` → ``1048576 1048576 0 100%``
+#: (``IUse% 100`` / ``IFree 0``) while the byte budget was only ~24 % used.
+ENOSPC_IN_PLAYWRIGHT_STDERR = (
+    "Error: ENOSPC: no space left on device, mkdir "
+    "'/tmp/pytest-of-rgardler/pytest-0/browser-profile-0' at\n"
+    "    at Object.mkdir (node:internal/fs/promises:1122:9)\n"
+    "    at PlaywrightBrowserProvider.createContext "
+    "(/ws/node_modules/@vitest/browser/dist/index.js:2031:7)\n"
+    "    at async BrowserServer.start (/ws/node_modules/@vitest/browser/dist/index.js:2204:11)\n"
+)
+
 
 def completed(
     *, stdout: str = "", stderr: str = "", returncode: int = 0
@@ -140,6 +156,39 @@ def unparsed(
 ) -> subprocess.CompletedProcess:
     """A non-zero exit with no parsable test failure (e.g. bad config)."""
     return completed(stdout=stdout, stderr=stderr, returncode=exit_code)
+
+
+def enospc_in_playwright(
+    *, exit_code: int = 1, stdout: str = ""
+) -> subprocess.CompletedProcess:
+    """The captured inode-exhaustion signature (SA-0MW2QED9M005FWOK).
+
+    ``ENOSPC`` raised inside ``PlaywrightBrowserProvider.createContext`` — a
+    host-infrastructure condition (the ``/tmp`` tmpfs inode budget exhausted),
+    not a code failure. The output carries no parsable ``FAILED`` line, so the
+    runner classifies it ``unparsed_failure`` and the gate ``unparsed``.
+    """
+    return completed(
+        stdout=stdout, stderr=ENOSPC_IN_PLAYWRIGHT_STDERR, returncode=exit_code
+    )
+
+
+def inode_exhaustion_gate_result() -> dict:
+    """The runner-aggregate shape the gate classified in the incident.
+
+    ``notice_codes: ["unparsed_failure"]``, no structured ``failures``, and a
+    non-zero per-suite exit code — the exact shape an operator sees in a gate
+    report for an inode-starved suite (SA-0MW2QED9M005FWOK). A regression pin
+    feeds this to ``gate_reason.classify_gate_result`` and asserts the result
+    is infrastructure-class (``unparsed``), never ``test_failure``.
+    """
+    return {
+        "success": False,
+        "failures": [],
+        "notices": ["suite exited 1 with no parsable failures: all"],
+        "notice_codes": [NOTICE_UNPARSED_FAILURE],
+        "suites": {"all": {"returncode": 1}},
+    }
 
 
 def timeout_expired(timeout: int = FIXTURE_TIMEOUT) -> subprocess.TimeoutExpired:

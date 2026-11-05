@@ -58,6 +58,14 @@ create their repos in a **subdirectory** of `tmp_path`, so `git init` creates a
 refs or rewrite its config. The previous guard's docstring attributed the
 incident to this hypothesis; that attribution is insufficient.
 
+The framework's own test plumbing does not rely on that misresolution
+hypothesis either: it now *sets* a disk-backed `TMPDIR` for every suite
+subprocess and prunes stale `pytest-of-<user>/pytest-*` roots ahead of
+full-scope runs. See
+[`test-skill-reference.md` §3 “Disk-backed test temporary storage and the
+inode-exhaustion signature”](test-skill-reference.md#3-disk-backed-test-temporary-storage-and-the-inode-exhaustion-signature-sa-0mw2qed9m005fwok)
+for the precedence order, the prune rules and the operator remedy.
+
 ## 3. Deterministic reproduction (H1)
 
 The reproduction is **hermetic**: it creates a throwaway *victim* repository in

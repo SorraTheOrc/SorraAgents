@@ -278,3 +278,72 @@ def test_prune_failure_is_reported_and_never_raised(tmp_path, monkeypatch):
 
     assert removed == 0
     assert "prune error" in reason
+
+
+class TestDocumentedContractPinsTheHelpers:
+    """Docs-vs-source pin (SA-0MW3ENVLU0097JRD): the operator guidance in
+    ``docs/dev/test-skill-reference.md`` §3 names exactly the env vars,
+    defaults and failure signature the helpers honour (same style as
+    ``skill/implement/tests/test_gate_classification_docs.py``).
+
+    The behavioural rules themselves are covered above; this class pins the
+    *documented contract* so a renamed constant, a changed default or a
+    signature drift fails here without the operator guidance being updated.
+    """
+
+    _DOC = REPO_ROOT / "docs" / "dev" / "test-skill-reference.md"
+
+    def test_documented_env_var_names_match_production(self) -> None:
+        doc = self._DOC.read_text(encoding="utf-8")
+        for name in _ENV_VARS:
+            assert f"`{name}`" in doc, (
+                f"env var {name!r} is not documented in "
+                "docs/dev/test-skill-reference.md — the TMPDIR/precedence "
+                "guidance must name the exact variable the helper reads"
+            )
+
+    def test_documented_defaults_match_production(self) -> None:
+        doc = self._DOC.read_text(encoding="utf-8")
+        for token in (
+            str(int(test_tmpdir.TEST_ROOT_MAX_AGE_DEFAULT)),  # 3600 seconds
+            str(test_tmpdir.TEST_ROOT_KEEP_DEFAULT),  # 2 newest roots
+            test_tmpdir.TEST_TMPDIR_DISK_ROOT_DEFAULT,  # /var/tmp
+        ):
+            assert token in doc, (
+                f"default value {token!r} is not documented in "
+                "docs/dev/test-skill-reference.md — a changed default must "
+                "update the prune/TMPDIR guidance"
+            )
+
+    def test_failure_signature_tokens_are_documented(self) -> None:
+        """The incident's recognisable output and diagnosis are documented so
+        a future ENOSPC-in-Playwright failure is identified on sight."""
+        doc = self._DOC.read_text(encoding="utf-8")
+        for token in (
+            "PlaywrightBrowserProvider.createContext",
+            "IUse% 100",
+            "unparsed",
+        ):
+            assert token in doc, (
+                f"failure-signature token {token!r} is not documented in "
+                "docs/dev/test-skill-reference.md"
+            )
+
+    def test_resolver_honours_the_documented_precedence(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Smoke pin of the documented precedence order: the explicit override
+        wins over the disk-backed candidate and the tempfile fallback.
+        (Behaviour is covered exhaustively above; this pins the contract as
+        documented.)
+        """
+        override = tmp_path / "override"
+        monkeypatch.setattr(
+            test_tmpdir, "_is_tmpfs", lambda _path: False
+        )
+        monkeypatch.setenv(test_tmpdir.TEST_TMPDIR_ENV, str(override))
+
+        path, reason = test_tmpdir.resolve_test_tmpdir()
+
+        assert path == override
+        assert "override" in reason

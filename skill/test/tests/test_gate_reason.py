@@ -26,6 +26,7 @@ if str(_SKILL_ROOT) not in sys.path:
 import pytest
 
 from skill.implement.scripts import implement
+from skill.shared.tests import gate_failure_fixtures as fx
 from skill.test.scripts import gate_reason, run_tests
 
 
@@ -153,6 +154,53 @@ class TestClassification:
         assert gate_reason.classify_gate_result(None) == (
             gate_reason.GATE_REASON_UNKNOWN
         )
+
+
+class TestInodeExhaustionSignature:
+    """Regression pin (SA-0MW3ENVLU0097JRD): the captured inode-exhaustion
+    signature must classify as infrastructure (``unparsed``), never a code
+    ``test_failure``.
+
+    The incident (``/tmp`` tmpfs at 100 % of its inode budget) surfaced as
+    ``ENOSPC`` inside ``PlaywrightBrowserProvider.createContext`` — a
+    non-zero exit with no parsable failure — and the gate correctly reported
+    ``reason: unparsed`` (SA-0MW2QED9M005FWOK). A future classification
+    change that starts treating that output as a code failure would make a
+    green change un-pushable on a sick host.
+    """
+
+    def test_captured_signature_is_unparsed_never_test_failure(self) -> None:
+        result = fx.inode_exhaustion_gate_result()
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_UNPARSED
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            != gate_reason.GATE_REASON_TEST_FAILURE
+        )
+
+    def test_signature_without_a_notice_still_is_unparsed(self) -> None:
+        """Even without the runner's notice code (e.g. a cache-served result
+        from an older runner shape), the non-zero exit with no parsable
+        failure must classify as ``unparsed``, never ``test_failure``."""
+        result = fx.inode_exhaustion_gate_result()
+        result["notice_codes"] = []
+        result["notices"] = []
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_UNPARSED
+        )
+
+    def test_the_enospc_output_itself_contains_no_failed_line(self) -> None:
+        """The captured text carries no parsable ``FAILED`` marker — the
+        pre-condition that keeps the runner's ``unparsed_failure``
+        classification correct. If the fixture ever gains a ``FAILED`` line,
+        the signature no longer represents the incident."""
+        output = fx.ENOSPC_IN_PLAYWRIGHT_STDERR
+        assert "ENOSPC" in output
+        assert "PlaywrightBrowserProvider.createContext" in output
+        assert "FAILED" not in output
 
 
 class TestDiagnostics:

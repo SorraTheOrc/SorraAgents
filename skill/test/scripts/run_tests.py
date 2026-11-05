@@ -2281,6 +2281,9 @@ def _resolved_test_tmpdir() -> str:
     ambient ``TMPDIR`` (or the portable fallback) is used instead, so a
     TMPDIR problem can never change the run's exit status, cache entry or
     scope resolution.
+
+    Operator guidance (precedence, prune rules, failure signature, remedy):
+    ``docs/dev/test-skill-reference.md`` §3 (SA-0MW3ENVLU0097JRD).
     """
     global _TEST_TMPDIR_CACHE
     if _TEST_TMPDIR_CACHE is None:

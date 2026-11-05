@@ -275,6 +275,9 @@ def _resolved_finish_tmpdir() -> str | None:
     the push/build proceed with the ambient environment and an unchanged
     exit status. Callers only add ``TMPDIR`` when this returns a value.
 
+    Operator guidance (precedence, prune rules, failure signature, remedy):
+    ``docs/dev/test-skill-reference.md`` §3 (SA-0MW3ENVLU0097JRD).
+
     Returns:
         The resolved TMPDIR string, or ``None`` when the resolver is
         unavailable or failed (use the ambient environment, unchanged).
