@@ -177,6 +177,24 @@ supplied to them, the gates are never relaxed.
 Regression coverage (real temp git repo plus linked worktree, no
 `_get_repo_root` mocking): `skill/implement/tests/test_repo_root_resolution.py`.
 
+**Worktree-path resolution rule.** The default worktree path returned by
+`worktree_path_for()` is **relative to the main checkout**
+(`.worklog/worktrees/wl-<id>-<slug>`), not to `cwd`. `phase_start` resolves it
+by joining it onto the main checkout root (`_get_repo_root()`, preserving the
+historical `cwd` fallback when that returns `None`) — never with
+`Path(wt_path).resolve()`. Resolving a relative path against `cwd` when `cwd`
+is the item's own linked worktree nests it as
+`<worktree>/.worklog/worktrees/wl-<id>-<slug>`: `_is_worktree()` then misses the
+registered tree and `git worktree add` attempts a nested creation that fails,
+breaking the driven-child / post-crash resume (SA-0MVXUGXS5006M3HF).
+`--worktree-path` keeps its historical semantics: an absolute override is used
+as given, a relative override resolves against `cwd`.
+
+Regression coverage (real temp git repo plus linked worktree, no
+`_get_repo_root` mocking):
+`skill/implement/tests/test_phase_start_resume_from_worktree.py`
+(SA-0MVXUGXS5006M3HF).
+
 ## Worktree removal ownership
 
 A worktree must never be deleted out from under the session that owns it as

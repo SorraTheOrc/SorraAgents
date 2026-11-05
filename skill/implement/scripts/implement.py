@@ -699,6 +699,13 @@ def slug_from_title(title: str) -> str:
 def worktree_path_for(work_item_id: str, slug: str) -> str:
     """Compute the canonical worktree path.
 
+    The returned path is **relative to the main checkout root**, not to the
+    current working directory. Callers that need an absolute path must join
+    it onto the main checkout root (``_get_repo_root()``) rather than calling
+    ``Path(wt_path).resolve()`` while ``cwd`` may be inside a linked worktree
+    — otherwise the path nests under the worktree and the registered tree is
+    missed (SA-0MVXUGXS5006M3HF).
+
     Args:
         work_item_id: The work item ID.
         slug: Short slug for the branch name.
@@ -9828,9 +9835,27 @@ def _phase_start_locked(
         LOG.info("Parent-branch refresh: %s", refresh_result["warning"])
 
     # ── Step 7: Create (or resume) worktree ────────────────────────
-    wt_path = worktree_path_override or worktree_path_for(work_item_id, slug)
+    # The default worktree path is repository-root-relative
+    # (``worktree_path_for`` returns ``.worklog/worktrees/wl-<id>-<slug>``).
+    # Resolve it against the **main checkout root** (``repo_root``, which
+    # already falls back to cwd when ``_get_repo_root()`` returns ``None``),
+    # never against cwd: when ``start`` is invoked from inside the item's own
+    # linked worktree (a driven child resuming its pre-created tree, or a
+    # human resuming after a crash) ``Path(wt_path).resolve()`` would
+    # otherwise nest the path under the worktree root, ``_is_worktree()``
+    # would miss the registered tree, and ``git worktree add`` would attempt
+    # a nested creation that fails (SA-0MVXUGXS5006M3HF).
+    #
+    # ``--worktree-path`` stays authoritative with unchanged semantics: an
+    # absolute override is used as given and a relative override resolves
+    # against cwd (the historical behaviour, documented in SKILL.md).
+    if worktree_path_override:
+        wt_path = worktree_path_override
+        abs_wt_path = str(Path(worktree_path_override).resolve())
+    else:
+        wt_path = worktree_path_for(work_item_id, slug)
+        abs_wt_path = str((Path(repo_root) / wt_path).resolve())
     branch = branch_name_for(work_item_id, slug)
-    abs_wt_path = str(Path(wt_path).resolve())
     # Idempotent start (SA-0MUWNHKQH0034DW9): when the worktree already
     # exists — e.g. the parent phase created it, or a driven session is
     # resuming — reuse it instead of failing on `git worktree add`. This lets
@@ -9843,7 +9868,7 @@ def _phase_start_locked(
             abs_wt_path,
         )
     else:
-        LOG.info("Creating worktree at %s from branch %s...", wt_path, parent_branch)
+        LOG.info("Creating worktree at %s from branch %s...", abs_wt_path, parent_branch)
         # Snapshot the parent's tracking config BEFORE the registration so the
         # post-add guard can distinguish "this registration poisoned the
         # parent" (a hard failure) from a pre-existing defect (detection's
@@ -9853,8 +9878,8 @@ def _phase_start_locked(
             _git_config_get(repo_root, f"branch.{parent_branch}.remote"),
             _git_config_get(repo_root, f"branch.{parent_branch}.merge"),
         )
-        if not git_worktree_add(branch, wt_path, parent_branch):
-            msg = f"Failed to create worktree at {wt_path} from {parent_branch}"
+        if not git_worktree_add(branch, abs_wt_path, parent_branch):
+            msg = f"Failed to create worktree at {abs_wt_path} from {parent_branch}"
             LOG.error(msg)
             report["success"] = False
             report["message"] = msg

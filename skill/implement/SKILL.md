@@ -657,6 +657,17 @@ git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-
 cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 ```
 
+> **Resume is `cwd`-independent.** The default worktree path is relative to
+> the **main checkout** (`.worklog/worktrees/wl-<id>-<slug>`) and
+> `implement.py start` resolves it against the main checkout root, never
+> against `cwd`. Running `start <id>` from inside the item's own worktree
+> (the driven-child / post-crash resume) therefore resumes the registered
+> tree instead of resolving a doubly-nested
+> `<worktree>/.worklog/worktrees/…` path and failing in `git worktree add`
+> (SA-0MVXUGXS5006M3HF). `--worktree-path` keeps its historical semantics:
+> an absolute override is used as given, a relative one resolves against
+> `cwd`.
+
 > **`node_modules` is a worktree-local link farm:** `implement.py start`
 > materialises `<worktree>/node_modules` as a **real directory** (not a
 > whole-directory symlink) holding one symlink per entry of the main
@@ -989,7 +1000,9 @@ the parent reports all children terminal. Each child is implemented in its
 own worktree (never the main checkout); sequential children reuse/rotate the
 `.worklog/worktrees` machinery. (With `drive` this loop is performed for you;
 the driven child session may call `finish` for its own item — `start` resumes
-the pre-created worktree idempotently.)
+the pre-created worktree idempotently from **either** `cwd` — the main
+checkout or inside the worktree — because the default worktree path is
+resolved against the main checkout root, not `cwd`.)
 
 **Single-pass, subprocess-isolated orchestration.** Every child's start and
 finish runs through `_invoke_implement` — a **separate `implement.py`
