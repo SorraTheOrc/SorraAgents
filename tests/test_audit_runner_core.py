@@ -2817,3 +2817,72 @@ class TestRC2RCFallbackVerdict:
             f"Debug log should contain raw output, got: {content[:200]}"
         )
 
+
+# ---------------------------------------------------------------------------
+# C1 (WL-0MW32Y8E90092TIM): transient classification in report assembly
+# ---------------------------------------------------------------------------
+# Regression tests for the test-first pair with C2 (WL-0MW32YQ29001ZN66):
+# when an AC verdict came from an infrastructure fallback (Phase-2 timeout,
+# provider error, unparseable output, concurrency cap) the assembled report
+# must carry `Audit classification: transient (verdict_assembly_failure:
+# <cause>)` instead of an unmarked verdict; a clean run emits no
+# classification line. Red against current HEAD; green after C2.
+
+class TestTransientClassificationAssembly:
+    """Report assembly distinguishes infra-fallback verdicts as transient."""
+
+    from typing import ClassVar
+
+    ISSUE: ClassVar[dict] = {"id": "SA-TRANSIENT", "title": "Transient assembly test"}
+
+    # Marker (from audit_runner._INFRA_FALLBACK_MARKERS) → cause token the
+    # classification line must carry. This is the contract C2 implements.
+    MARKER_TO_CAUSE: ClassVar[list[tuple[str, str]]] = [
+        ("Pi model output could not be parsed", "unparseable_output"),
+        ("Pi provider error: upstream unavailable", "provider_error"),
+        ("Audit concurrency limit reached", "concurrency_cap"),
+        ("timed out — manual review required", "timeout"),
+    ]
+
+    def test_infra_fallback_verdicts_emit_transient_classification(self):
+        """For each infrastructure-fallback marker the assembled report
+        starts with `Ready to close:` and carries
+        `Audit classification: transient (verdict_assembly_failure: <cause>)`
+        (AC2)."""
+        from audit.scripts.audit_runner import _assemble_issue_report
+
+        for marker, cause in self.MARKER_TO_CAUSE:
+            ac_results = [
+                {
+                    "text": "The system must do the thing.",
+                    "verdict": "partial",
+                    "evidence": f"criterion not assessed — {marker}",
+                },
+            ]
+            report = _assemble_issue_report(self.ISSUE, ac_results, [])
+
+            assert report.startswith("Ready to close:"), report.splitlines()[0]
+            assert (
+                f"Audit classification: transient "
+                f"(verdict_assembly_failure: {cause})" in report
+            ), (
+                f"marker {marker!r} should map to cause {cause!r}; "
+                f"report excerpt: {report[:400]!r}"
+            )
+
+    def test_clean_report_has_no_classification_line(self):
+        """A run whose verdicts are genuine model assessments emits no
+        classification line (AC2)."""
+        from audit.scripts.audit_runner import _assemble_issue_report
+
+        ac_results = [
+            {
+                "text": "Feature works as specified.",
+                "verdict": "met",
+                "evidence": "tests/test_feature.py:12 — verified",
+            },
+        ]
+        report = _assemble_issue_report(self.ISSUE, ac_results, [])
+
+        assert "Audit classification:" not in report, report[:400]
+
