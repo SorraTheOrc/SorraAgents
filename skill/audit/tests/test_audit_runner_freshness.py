@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import pytest
 from audit.scripts import audit_runner
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 def _proc(returncode: int, stdout: str = ""):
@@ -1350,3 +1351,217 @@ class TestContentFreshnessGate:
             )
         assert rc == 0
         assert pi_calls, "--force must bypass the fresh-audit short-circuit"
+
+
+class TestPendingScreensFreshnessGate:
+    """D1 reproduction (parent AC1): the item-level freshness gate must not
+    treat a stored report with OUTSTANDING in-main-slot child screens as a
+    fresh final verdict.
+
+    Observed production symptom (LP-0MVLNBCTN0084MT0, 2026-10-29): the first
+    in-main-slot run finished ``Ready to close: No`` with the header line
+    ``Child screens pending: 2 (main-slot)`` and wrote
+    ``.worklog/audit-checkpoints/LP-0MVLNBCTN0084MT0.pending-screens.json``.
+    The invoking session then serviced both screens and persisted both child
+    audits (v2 fingerprints). The documented re-run printed::
+
+        Skipping: audit still fresh — Ready to close: No (audited ...)
+
+    because the parent's title/description were unchanged, so the v2 content
+    fingerprint matched and the pipeline never resumed: the persisted child
+    audits were never consulted and the signal file stayed on disk.
+
+    RED before the D1 fix: nothing reads the pending-screens signal before
+    the freshness short-circuit, so ``cmd_issue`` still prints
+    ``Skipping: audit still fresh``.
+    """
+
+    _TITLE = "In-main-slot resume"
+    _DESC = (
+        "## Acceptance Criteria\n- AC1: collect the serviced child audits"
+    )
+    _PENDING_HEADER = "Child screens pending: 1 (main-slot) — CHILD-1"
+
+    def _stored_report(self, fingerprint: str) -> str:
+        """The stored parent report: fingerprint-fresh, screens outstanding."""
+        return (
+            "Ready to close: No\n\n"
+            "Audit report for work item TEST-1\n\n"
+            f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fingerprint}\n\n"
+            f"{self._PENDING_HEADER}"
+        )
+
+    def _item(self) -> dict:
+        return {
+            "id": "TEST-1",
+            "title": self._TITLE,
+            "description": self._DESC,
+            "status": "open",
+            "stage": "in_progress",
+            "updatedAt": "2026-10-29T00:01:00.000Z",
+        }
+
+    def _make_runner(self, stored_report: str):
+        """Mock ``wl`` for a real ``cmd_issue`` run (single-fetch friendly)."""
+        mock_runner = mock.MagicMock()
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "rev-parse" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0, stdout="a" * 40, stderr="",
+                )
+            if "audit-show" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "audit": {
+                            "auditedAt": "2026-10-29T00:01:32.443Z",
+                            "rawOutput": stored_report,
+                        },
+                    }),
+                    stderr="",
+                )
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": self._item(),
+                        "children": [{
+                            "id": "CHILD-1",
+                            "title": "Child CHILD-1",
+                            "status": "in_progress",
+                            "stage": "in_review",
+                            "description": "## Acceptance Criteria\n- CAC1",
+                        }],
+                    }),
+                    stderr="",
+                )
+            if "show" in cmd_str and "--json" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": self._item(),
+                        "comments": [],
+                    }),
+                    stderr="",
+                )
+            return SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"success": True}),
+                stderr="",
+            )
+
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
+        return mock_runner
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "D1 (SA-0MVSTZ71J001P67S): the item-level freshness gate ignores "
+            "the pending-screens signal — a stored report with outstanding "
+            "child screens is treated as a fresh final verdict and 'Skipping: "
+            "audit still fresh' is printed (production: "
+            "LP-0MVLNBCTN0084MT0). Remove this marker when the D1 fix lands."
+        ),
+    )
+    def test_pending_screens_signal_suppresses_fresh_skip(self, tmp_path):
+        """A fresh-by-fingerprint parent report whose signal names an
+        outstanding child screen must NOT short-circuit: no
+        ``Skipping: audit still fresh`` and the pipeline runs."""
+        fingerprint = audit_runner._compute_content_fingerprint(
+            _FakeGitRepo(), "TEST-1",
+            work_item={"title": self._TITLE, "description": self._DESC},
+        )
+        assert fingerprint is not None
+        stored_report = self._stored_report(fingerprint)
+
+        # The previous run's resumable signal, written via the production
+        # writer so the run exercises the real reader/writer pair.
+        signal = tmp_path / f"TEST-1{audit_runner.PENDING_SCREENS_SIGNAL_SUFFIX}"
+        audit_runner._write_pending_screens_signal(
+            ["CHILD-1"], "TEST-1", tmp_path, str(tmp_path),
+        )
+        assert signal.is_file()
+
+        captured: list[str] = []
+        pi_calls: list[str] = []
+
+        def _capture_pi(issue_id, context, prompt, **kwargs):
+            pi_calls.append(context)
+            return {"extracted_text": "[]"}
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_capture_pi,
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head", return_value="a" * 40,
+            ),
+            mock.patch(
+                "builtins.print",
+                side_effect=lambda *a, **k: captured.append(
+                    " ".join(str(x) for x in a)
+                ),
+            ),
+        ):
+            audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=False,
+                runner=self._make_runner(stored_report),
+                checkpoint_dir=str(tmp_path),
+            )
+
+        stdout = "\n".join(captured)
+        printed_skip = "Skipping: audit still fresh" in stdout
+        assert not printed_skip, (
+            "D1: pending-screens signal ignored — the fresh skip was printed"
+        )
+        assert pi_calls, (
+            "D1: the run must proceed to the audit pipeline (the parent "
+            "screening call) when child screens are outstanding"
+        )
+
+    def test_no_signal_still_short_circuits(self):
+        """Control (unchanged behaviour): with NO pending-screens signal the
+        freshness short-circuit is byte-identical — skip notice printed, no
+        model call."""
+        fingerprint = audit_runner._compute_content_fingerprint(
+            _FakeGitRepo(), "TEST-1",
+            work_item={"title": self._TITLE, "description": self._DESC},
+        )
+        assert fingerprint is not None
+        stored_report = self._stored_report(fingerprint)
+        captured: list[str] = []
+        pi_calls: list[str] = []
+
+        def _capture_pi(issue_id, context, prompt, **kwargs):
+            pi_calls.append(context)
+            return {"extracted_text": "[]"}
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_capture_pi,
+            ),
+            mock.patch(
+                "builtins.print",
+                side_effect=lambda *a, **k: captured.append(
+                    " ".join(str(x) for x in a)
+                ),
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=False,
+                runner=self._make_runner(stored_report),
+            )
+
+        assert rc == 0
+        assert "Skipping: audit still fresh" in "\n".join(captured)
+        assert pi_calls == []
