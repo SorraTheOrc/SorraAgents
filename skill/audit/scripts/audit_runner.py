@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# <!-- REFACTOR-SA-0MW2SWB2A005CS2B
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 
 # <!-- REFACTOR-SA-0MUQ2OMWJ009QW4O
 # smell: formatting
@@ -14127,6 +14132,9 @@ def _cascade_descendants_terminal(
     - Dry-run safe: ``persist=False`` suppresses the cascade entirely.
     - Non-fatal: a per-child ``wl`` failure is logged loudly and does not
       abort the audit; the next passing audit completes the cascade.
+    - Releases the descendant's scheduling hold: the terminalise write also
+      clears a non-producer ``assignee`` (SA-0MW0F91KN004J06U), so a cascaded
+      child is never left on a lingering agent claim.
 
     Args:
         parent_id: The audited parent whose subtree is being terminalised.
@@ -14153,10 +14161,13 @@ def _cascade_descendants_terminal(
         if _is_terminal_lifecycle(status, stage):
             continue
         try:
+            # Terminal outcome for the descendant: release its scheduling hold in
+            # the same write (assignee-hold convention, shared with the
+            # executor's other terminal writes).
             _run_wl(
                 runner,
                 ["wl", "update", child_id, "--status", "completed",
-                 "--stage", "done", "--json"],
+                 "--stage", "done", "--assignee", "", "--json"],
                 worklog_dir=worklog_dir,
             )
         except RuntimeError as exc:

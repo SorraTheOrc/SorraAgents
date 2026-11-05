@@ -217,12 +217,15 @@ class TestStatusLifecycleUnit:
 
     def test_update_status_accepts_valid_stage(self, mock_run):
         """A valid stage is forwarded to ``wl update`` unchanged."""
-        mock_run.side_effect = [_make_wl_update_proc()]
+        mock_run.side_effect = [
+            _make_wl_show_proc(assignee=""),  # claim read (nothing to release)
+            _make_wl_update_proc(),            # the transition itself
+        ]
 
         StatusLifecycle.update_status("TEST-123", "completed", stage="in_review")
 
         calls = [c.args[0] for c in mock_run.call_args_list]
-        assert calls[0] == [
+        assert calls[1] == [
             "wl", "update", "TEST-123", "--status", "completed",
             "--json", "--stage", "in_review",
         ]
@@ -242,6 +245,138 @@ class TestStatusLifecycleUnit:
         if "--assignee" not in call:
             return None
         return call[call.index("--assignee") + 1]
+
+    # ------------------------------------------------------------------
+    # Direct durable writes release too (SA-0MW0F91KN004J06U)
+    # ------------------------------------------------------------------
+
+    def test_update_status_releases_external_claim_on_terminal_write(self, mock_run):
+        """A direct ``update_status`` terminal write releases a pre-claim.
+
+        Prose-only skills (``plan``) and direct durable writes
+        (``tree_coverage._advance_stage``, ``effort-and-risk``'s status
+        restore) never enter the context manager, so the choke point itself
+        must release the workflow pre-claim — the exact gap the producer
+        review rejected (the plan skill left the item on its agent's hold).
+        """
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="in-progress", assignee="plan-agent"),
+            _make_wl_update_proc(),
+        ]
+
+        StatusLifecycle.update_status(
+            "TEST-123", "open", stage="plan_complete"
+        )
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[0] == ["wl", "show", "TEST-123", "--json"]
+        assert self._release_value(calls[1]) == ""
+        assert "--stage" in calls[1] and "plan_complete" in calls[1]
+
+    def test_update_status_stage_advance_releases_external_claim(self, mock_run):
+        """The AC-coverage stage advance (status ``open``) releases a pre-claim."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="in-progress", assignee="intake-agent"),
+            _make_wl_update_proc(),
+        ]
+
+        StatusLifecycle.update_status("TEST-123", "open", stage="intake_complete")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert self._release_value(calls[-1]) == ""
+
+    def test_update_status_claim_never_releases(self, mock_run):
+        """A transition *to* in-progress is a claim, never a release."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="open", assignee="current-agent"),
+            _make_wl_update_proc(),
+        ]
+
+        StatusLifecycle.update_status("TEST-123", "in-progress")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert self._release_value(calls[-1]) is None
+
+    def test_update_status_preserves_producer_hold(self, mock_run):
+        """The producer ``Map`` hold survives every direct terminal write."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="in-progress", assignee="Map"),
+            _make_wl_update_proc(),
+        ]
+
+        StatusLifecycle.update_status("TEST-123", "open", stage="plan_complete")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert self._release_value(calls[-1]) is None
+
+    def test_update_status_preserves_needs_producer_review_hold(self, mock_run):
+        """A ``needsProducerReview`` item keeps its assignee."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(
+                status="in-progress",
+                assignee="audit-agent",
+                needs_producer_review=True,
+            ),
+            _make_wl_update_proc(),
+        ]
+
+        StatusLifecycle.update_status("TEST-123", "blocked")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert self._release_value(calls[-1]) is None
+
+    def test_update_status_handoff_keeps_hold_when_flagging_review(self, mock_run):
+        """Flagging producer review in the same write makes it a persistent hold."""
+        mock_run.side_effect = [
+            _make_wl_show_proc(status="in-progress", assignee="plan-agent"),
+            _make_wl_update_proc(),
+        ]
+
+        StatusLifecycle.update_status(
+            "TEST-123", "open", needs_producer_review=True
+        )
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert self._release_value(calls[-1]) is None
+        # The review flag itself is still written, so the hold is sanctioned.
+        assert "--needs-producer-review" in calls[-1]
+
+    def test_update_status_explicit_assignee_is_written_verbatim(self, mock_run):
+        """An explicit assignee disables the automatic release (no claim read)."""
+        mock_run.side_effect = [_make_wl_update_proc()]
+
+        StatusLifecycle.update_status("TEST-123", "completed", assignee="")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        # Only the update ran — an explicit value needs no inspection.
+        assert len(calls) == 1
+        assert self._release_value(calls[0]) == ""
+
+    def test_update_status_release_opt_out_never_releases(self, mock_run):
+        """``release_assignee=False`` keeps the hold even on a terminal write."""
+        mock_run.side_effect = [_make_wl_update_proc()]
+
+        StatusLifecycle.update_status(
+            "TEST-123", "completed", release_assignee=False
+        )
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert self._release_value(calls[0]) is None
+
+    def test_update_status_tolerates_unreadable_item(self, mock_run):
+        """An unreadable item never blocks the transition (release is a backstop)."""
+        mock_run.side_effect = [
+            _make_wl_failure_proc(stdout=json.dumps({
+                "success": False, "error": "work item not found",
+            })),
+            _make_wl_update_proc(),
+        ]
+
+        StatusLifecycle.update_status("TEST-123", "open", stage="plan_complete")
+
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        assert calls[-1][:4] == ["wl", "update", "TEST-123", "--status"]
+        assert self._release_value(calls[-1]) is None
 
     def test_assignee_held_on_entry_released_on_success(self, mock_run):
         """A claim the context manager holds is released on the success exit.

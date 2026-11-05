@@ -270,6 +270,17 @@ dispatch. The shared `StatusLifecycle` releases the assignee on every exit
 path it controls, but three outcomes never reach a normal exit and need an
 explicit durable write:
 
+**Direct terminal writes release too.** `StatusLifecycle.update_status` — the
+shared choke point every skill status write uses — releases an observed
+non-producer claim whenever the transition leaves the active-work status
+(`in-progress`). A prose-only skill (`plan`), the AC-coverage stage advance
+(`tree_coverage._advance_stage`) and a captured-status restore
+(`effort-and-risk`) therefore cannot reintroduce the hold by omitting an
+explicit `assignee=""`. Producer `Map` and `needsProducerReview` holds are
+preserved, and an explicit `assignee=` / `release_assignee=` overrides the
+automatic decision. Full contract:
+[assignee-release.md](assignee-release.md#direct-durable-writes-statuslifecycleupdate_status).
+
 | Outcome | Who does not get to write | Who persists the release |
 |---|---|---|
 | SIGTERM / SIGINT | the interrupted phase | `_signal_handler` → `_handle_signal_cleanup` → `_safety_reset_if_in_progress` (status `open` **and** `assignee=""`) |

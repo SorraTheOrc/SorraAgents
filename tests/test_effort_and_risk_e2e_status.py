@@ -232,6 +232,57 @@ class TestEffortRiskE2EStatus:
         log_slice = [json.loads(line) for line in log_lines]
         self._assert_status_preserved(worklog_dir, item_id, stage, env, log_slice)
 
+    def test_run_skill_releases_an_external_pre_claim(self, e2e_worklog, tmp_path):
+        """The skill's terminal status restore releases the workflow pre-claim.
+
+        ``AGENTS_GLOBAL.md`` step 1 claims an item *with an assignee* before a
+        skill runs. ``effort-and-risk`` never enters a ``StatusLifecycle``: it
+        restores the captured status through the direct
+        ``update_status`` choke point, which must still release the pre-claim
+        (SA-0MW0F91KN004J06U). Read back against a **real** ``wl`` store.
+        """
+        tmp_root, worklog_dir = e2e_worklog
+        item_id = _create_item(tmp_root, worklog_dir, "plan_complete")
+
+        rc, out, err = _run(
+            [
+                "wl", "update", item_id,
+                "--assignee", "effort-risk-agent",
+                "--worklog-dir", str(worklog_dir),
+                "--json",
+            ],
+            cwd=tmp_root,
+        )
+        assert rc == 0, f"wl update (pre-claim) failed: {out} {err}"
+        assert _wl_show(tmp_root, item_id, worklog_dir)["assignee"] == (
+            "effort-risk-agent"
+        )
+
+        nested_cwd = tmp_root / "nested" / "work"
+        nested_cwd.mkdir(parents=True)
+
+        rc, out, err = _run(
+            [
+                sys.executable, str(RUN_SKILL),
+                "--issue", item_id,
+                "--o", "1", "--m", "2", "--p", "3",
+                "--coord", "1", "--review", "1",
+                "--testing", "1", "--risk_buffer", "1",
+                "--certainty", "85",
+            ],
+            cwd=nested_cwd,
+        )
+        assert rc == 0, f"run_skill.py failed (rc={rc}): {out} {err}"
+
+        persisted = _wl_show(tmp_root, item_id, worklog_dir)
+        assert persisted["assignee"] == "", (
+            "the workflow pre-claim survived the run: got "
+            f"{persisted['assignee']!r}"
+        )
+        # The claim release must not advance the item: status/stage stay put.
+        assert persisted["status"] == "open"
+        assert persisted["stage"] == "plan_complete"
+
     def test_orchestrator_direct_preserves_status(self, e2e_worklog, tmp_path):
         """The orchestrator itself never changes status.
 

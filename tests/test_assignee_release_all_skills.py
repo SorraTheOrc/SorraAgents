@@ -412,6 +412,12 @@ class ReleaseExercise:
     exercise: Callable[[FakeWorklogStore], None] = field(compare=False)
     classification: str = "must-release-on-terminal"
     target_id: str = "SA-MATRIXAUDIT"
+    #: Optional assertion replacing the default "target assignee is empty".
+    #: Used by a helper that releases a *different* item (the cascade releases
+    #: the descendants, not the audited parent).
+    verify: Callable[[FakeWorklogStore], None] | None = field(
+        default=None, compare=False
+    )
 
 
 @dataclass(frozen=True)
@@ -1057,15 +1063,16 @@ RELEASE_ROWS: tuple[ReleaseRow, ...] = (
             label="plan-complete",
             target_id="SA-MATRIXPLAN",
             run=_run_plan_complete,
-            # Plan's documented claim carries no assignee, so the row pins
-            # that the claim never introduces a hold in the first place.
-            seed_assignee="",
+            # Plan's documented claim carries no assignee, so the exercise
+            # seeds the workflow pre-claim an agent makes *before* the skill
+            # runs — the hold the skip must release (SA-0MW0F91KN004J06U).
+            seed_assignee=_AGENT,
         ),
         failure=Invocation(
             label="plan-error-reset",
             target_id="SA-MATRIXPLAN",
             run=_run_plan_abort,
-            seed_assignee="",
+            seed_assignee=_AGENT,
         ),
     ),
 )
@@ -1322,8 +1329,10 @@ def test_read_only_callers_never_touch_an_assignee(
 # ---------------------------------------------------------------------------
 
 #: The read-only callers whose lifecycle can *release* a pre-existing claim.
-#: ``effort-and-risk`` and ``tree-coverage`` never enter a StatusLifecycle, so
-#: they have no terminal transition to release on.
+#: All four run a terminal status transition: the two ``restore_on_exit``
+#: lifecycles through the context manager, and ``effort-and-risk`` /
+#: ``tree-coverage`` through the direct ``update_status`` choke point
+#: (SA-0MW0F91KN004J06U).
 EXTERNALLY_PRE_CLAIMED_ROWS: tuple[ReadOnlyCaller, ...] = (
     ReadOnlyCaller(
         name="find-related read-only analysis (externally pre-claimed)",
@@ -1334,6 +1343,16 @@ EXTERNALLY_PRE_CLAIMED_ROWS: tuple[ReadOnlyCaller, ...] = (
         name="refactor read-only analysis (externally pre-claimed)",
         source="refactor/scripts/refactor.py",
         exercise=_exercise_refactor,
+    ),
+    ReadOnlyCaller(
+        name="effort-and-risk estimate wrapper (externally pre-claimed)",
+        source="effort-and-risk/scripts/run_skill.py",
+        exercise=_exercise_effort_and_risk,
+    ),
+    ReadOnlyCaller(
+        name="tree-coverage stage advance (externally pre-claimed)",
+        source="shared/tree_coverage.py",
+        exercise=_exercise_tree_coverage,
     ),
 )
 
@@ -1382,6 +1401,34 @@ def _exercise_audit_pre_audit_restore(store: FakeWorklogStore) -> None:
     audit_runner._restore_pre_audit_state_on_failure(ctx)
 
 
+def _exercise_audit_cascade_release(store: FakeWorklogStore) -> None:
+    """The descendant cascade terminalises a held child and releases it."""
+    store.add_item(
+        {
+            "id": "SA-MATRIXCASCADE",
+            "title": "cascaded child",
+            "status": "in-progress",
+            "stage": "plan_complete",
+            "assignee": _AGENT,
+            "parentId": "SA-MATRIXAUDIT",
+        }
+    )
+    cascaded = audit_runner._cascade_descendants_terminal(
+        "SA-MATRIXAUDIT", "2026-11-05T00:00:00Z", store.runner
+    )
+    assert cascaded == 1, "the cascade did not terminalise the child"
+
+
+def _verify_audit_cascade_release(store: FakeWorklogStore) -> None:
+    """A cascaded child is ``completed``/``done`` and off its agent hold."""
+    persisted = store.show("SA-MATRIXCASCADE")
+    assert persisted["status"] == "completed"
+    assert persisted["stage"] == "done"
+    assert persisted["assignee"] == "", (
+        "the cascaded child kept a lingering agent claim"
+    )
+
+
 def _exercise_implement_orphaned_claim_release(store: FakeWorklogStore) -> None:
     """The timeout-kill release persists a cleared assignee (SA-0MVVF75ZA007XNKB).
 
@@ -1414,6 +1461,13 @@ RELEASE_EXERCISES: tuple[ReleaseExercise, ...] = (
         exercise=_exercise_audit_pre_audit_restore,
     ),
     ReleaseExercise(
+        name="audit descendant cascade (terminalised children)",
+        source="audit/scripts/audit_runner.py",
+        entry_points=("_cascade_descendants_terminal",),
+        exercise=_exercise_audit_cascade_release,
+        verify=_verify_audit_cascade_release,
+    ),
+    ReleaseExercise(
         name="implement orphaned-claim release (timeout/signal kill)",
         source="implement/scripts/implement.py",
         entry_points=("_release_orphaned_child_claim",),
@@ -1433,6 +1487,10 @@ def test_release_only_entry_point_clears_the_assignee(case: ReleaseExercise) -> 
     assert store.assignee(case.target_id) == _AGENT
 
     case.exercise(store)
+
+    if case.verify is not None:
+        case.verify(store)
+        return
 
     assert store.assignee(case.target_id) == ""
     assert any(

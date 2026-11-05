@@ -51,10 +51,12 @@ See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#workflow-for-ai-agents) for the claim
 **Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`; release to `open` only at true handoff.** No agent process may perform work-item mutations (create children, update description, wire deps, add completion comments) while `status: open`. Use `StatusLifecycle.require_claimed(<id>)` as a guard before any mutation, and `StatusLifecycle.ensure_claimed(<id>)` to re-claim on in-session resume.
 
 Claim with `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
-— plan claims **with no `assignee`**, so it establishes no scheduling hold
-and nothing needs releasing on exit (asserted against the
-[assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant),
-cross-referenced rather than restated) — before starting, and always leave
+— plan claims **with no `assignee`**, so it never *sets* a scheduling hold;
+the terminal transitions below release any claim the item already carried
+(the agent's step-1 pre-claim), because `update_status` enforces the
+[assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)
+for direct durable writes as well as for the context manager
+(cross-referenced rather than restated) — before starting, and always leave
 the item in a **valid terminal status** (`open`, `blocked`, or `completed`)
 when the skill ends — including on error:
 

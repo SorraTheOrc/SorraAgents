@@ -53,7 +53,7 @@ Before any branch operations, determine whether the current branch is associated
 3. **Apply the decision rule.** Read the audit report's `Ready to close:` verdict and its `## Acceptance Criteria Status` table (or `No acceptance criteria defined.` when none exist):
 
    - **`Ready to close: Yes`** (every criterion `met` or `adjusted`) → the work is verified complete:
-     1. Transition the work item: `wl update <work-item-id> --status completed --stage in_review --json`
+     1. Transition the work item: `wl update <work-item-id> --status completed --stage in_review --assignee "" --json` (the `--assignee ""` releases the item's scheduling hold — see the [assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant))
      2. Add a comment: `wl comment add <work-item-id> --comment "Cleanup audit passed on branch <branch-name>. Work item transitioned to in_review." --author <agent-name> --json`
      3. Proceed to Step 1.
    - **Any criterion `unmet` or `partial`** → **abort cleanup**. Output a clear message listing which criteria failed and their verdicts, referencing the audit report. Do not perform any branch operations — skip Steps 1-8 entirely. Suggest next steps (e.g. "Fix the unmet criteria and re-run cleanup").

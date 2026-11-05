@@ -43,6 +43,37 @@ scheduling hold or a caller that restores a pre-existing assignee itself (the
 `verify_context_reduction` restore). A call site that passes it must say why in
 an inline comment.
 
+### Direct durable writes: `StatusLifecycle.update_status`
+
+Not every skill terminal transition goes through the context manager: a
+prose-only skill (`plan`) calls `update_status` directly, `tree_coverage`
+advances the AC-coverage stage that way, and `effort-and-risk` restores the
+captured status in a `finally` block. Relying on an explicit `assignee=""` at
+each of those call sites meant one omission reintroduced the hold — the exact
+failure the producer review caught on the `plan` skill
+(SA-0MW0F91KN004J06U).
+
+`update_status` is therefore the **single release choke point** as well:
+
+- a transition to any status other than the active-work status
+  (`in-progress`) is a terminal outcome of the run, so the item's current
+  non-producer claim is released in the same `wl update`;
+- the claim is read first (`wl show`); when the item cannot be read the
+  transition still goes ahead — the release is a backstop, never a
+  precondition;
+- `assignee=<value>` writes that value verbatim and disables the automatic
+  release (the caller manages the hold);
+- `needs_producer_review=True` in the same write makes it a sanctioned
+  persistent hold, so the release is suppressed;
+- `release_assignee=True/False` forces or forbids the release (the
+  `StatusLifecycle` context manager passes `False` on its own exit paths,
+  which it has already decided, so `preserve_assignee_on_exit=True` can never
+  be second-guessed there).
+
+`StatusLifecycle.update_status(id, "open", stage="plan_complete")` therefore
+leaves a plan item unheld even though the skill never entered the context
+manager.
+
 ### Ownership rule
 
 A terminal transition may clear **any non-producer** assignee, not only the
@@ -160,11 +191,18 @@ through `wl show` to prove the item was dispatchable again.
 ## Tests
 
 - `tests/test_assignee_release_all_skills.py` — the table-driven matrix for
-  every skill terminal entry point, extended with externally pre-claimed
-  read-only rows.
+  every skill terminal entry point. Every row seeds an **externally
+  pre-claimed** agent assignee (the workflow pre-claim), including the
+  prose-only `plan` row and the read-only callers that release through a
+  direct `update_status` (`effort-and-risk`, `tree_coverage._advance_stage`).
 - `skill/shared/test_status_lifecycle.py` — the widened lifecycle release
   (externally set agent claim, failure/rollback, `restore_on_exit`,
-  `needsProducerReview` preservation, producer `Map` preservation).
+  `needsProducerReview` preservation, producer `Map` preservation) **and** the
+  `update_status` choke point (terminal write, claim status, explicit
+  assignee, `release_assignee` opt-out, unreadable item).
+- `tests/test_effort_and_risk_e2e_status.py` — the direct-write release
+  against a real `wl` store (pre-claim → run → empty assignee, status/stage
+  preserved).
 - `skill/shared/tests/test_claim_release.py` — predicate, session backstop,
   interrupting signal (real store), reaper release/idempotence/preservation.
 - `skill/shared/tests/test_worklog_sync.py` — the post-sync reaper hook.

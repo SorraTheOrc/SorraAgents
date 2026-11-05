@@ -85,14 +85,18 @@ Without `audit_runner.py` (always `--json`; `ORIG_STATUS` = pre-audit status):
 ```bash
 wl update <id> --status in_progress --json
 # Yes (top-level, no parent, never reviewed or content changed):
-#   wl update <id> --status completed --stage in_review --needs-producer-review yes --json
+#   wl update <id> --status completed --stage in_review --assignee "" --needs-producer-review yes --json
 # Yes (top-level, producer already reviewed unchanged content): write NO flag
-#   wl update <id> --status completed --stage in_review --json
-# Yes (child item):            wl update <id> --status completed --stage in_review --json
-# No (independent, top-level): wl update <id> --status open --stage plan_complete --needs-producer-review yes --json
-# No (cascade-suppressed / child): wl update <id> --status open --stage plan_complete --json
+#   wl update <id> --status completed --stage in_review --assignee "" --json
+# Yes (child item):            wl update <id> --status completed --stage in_review --assignee "" --json
+# No (independent, top-level): wl update <id> --status open --stage plan_complete --assignee "" --needs-producer-review yes --json
+# No (cascade-suppressed / child): wl update <id> --status open --stage plan_complete --assignee "" --json
 # Fail: wl update <id> --status "$ORIG_STATUS" --assignee "" --json
 ```
+
+Every terminal write carries `--assignee ""`
+([assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)):
+a non-empty assignee is a scheduling hold, so the transition must release it.
 
 ## Launch Context and Per-Audit Scope
 
