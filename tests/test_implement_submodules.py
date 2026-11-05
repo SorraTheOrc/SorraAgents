@@ -311,7 +311,10 @@ class TestStructural:
     def test_phase_start_calls_submodules_after_worktree_add(self):
         """The submodule helper must run after the worktree is created."""
         assert self.SOURCE, f"implement.py not found at {_IMPLEMENT_PY}"
-        add_idx = self.SOURCE.index("git_worktree_add(branch, wt_path, parent_branch)")
+        # The worktree path variable was renamed to the resolved absolute
+        # path (SA-0MVXUGXS5006M3HF); match the call prefix so the ordering
+        # assertion does not pin the argument name.
+        add_idx = self.SOURCE.index("git_worktree_add(branch,")
         call_idx = self.SOURCE.index("_ensure_submodules(abs_wt_path")
         assert add_idx != -1
         assert call_idx > add_idx, (
