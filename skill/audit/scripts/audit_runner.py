@@ -3885,7 +3885,7 @@ def _run_tests_via_test_skill(
 
     if not notice and state_changed:
         notice = (
-            "checkout moved during the run for "
+            "[state_changed_during_run] checkout moved during the run for "
             f"{len(state_changed)} command(s); their verdicts were discarded "
             "(re-run from a stable checkout): "
             + "; ".join(

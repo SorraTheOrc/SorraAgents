@@ -248,7 +248,7 @@ if result is None:
         reason = "unknown"
 else:
     reason = classify_gate_result(result)
-print(render_gate_diagnostic(reason))
+print(render_gate_diagnostic(reason, result))
 PY
 )"; then
         gate_diag="gate_reason=unknown

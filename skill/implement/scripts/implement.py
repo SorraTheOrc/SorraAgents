@@ -8475,10 +8475,21 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
             for f in state_changed_flags
             if isinstance(f, dict)
         )
-        return (
+        sections: list[str] = [
             "Checkout moved during the run (infrastructure, not a code "
             "failure); the result was discarded:\n" + movement
-        )
+        ]
+        notices = [
+            str(n).strip()
+            for n in (test_result.get("notices") or [])
+            if str(n).strip()
+        ]
+        if notices:
+            # A more specific gate notice (e.g. "gate evidence invalid: the
+            # temporary index changed") stays visible: the movement explains
+            # the symptom, the notice names the mechanism.
+            sections.append("Runner notices:\n" + "\n".join(notices))
+        return "\n\n".join(sections)
 
     sections: list[str] = []
     notices = [

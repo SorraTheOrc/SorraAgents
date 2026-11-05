@@ -249,6 +249,31 @@ def gate_reason_message(reason: str) -> str:
     return f"{headline}\n  {remedy}"
 
 
-def render_gate_diagnostic(reason: str) -> str:
-    """The stable machine-readable line plus the human diagnostic."""
-    return f"gate_reason={reason}\n{gate_reason_message(reason)}"
+def render_gate_diagnostic(
+    reason: str, result: dict[str, Any] | None = None
+) -> str:
+    """The stable machine-readable line plus the human diagnostic.
+
+    *result* (the runner's aggregate) is optional so an existing caller keeps
+    working; when it carries a moved-checkout flag the diagnostic additionally
+    names the checkout, both commits and the required re-run
+    (SA-0MW3FF18I003KGZE AC4) instead of only the generic infrastructure
+    remedy.
+    """
+    diagnostic = f"gate_reason={reason}\n{gate_reason_message(reason)}"
+    flag = (result or {}).get("state_changed_during_run")
+    if flag:
+        if isinstance(flag, dict):
+            flag = [flag]
+        details = [
+            state_changed_detail(f)
+            for f in flag
+            if isinstance(f, dict)
+        ]
+        if details:
+            diagnostic += "\n" + "\n".join("  " + d for d in details)
+            diagnostic += (
+                "\n  Re-run the suite from a stable checkout: "
+                "python3 skill/test/scripts/run_tests.py --scope full"
+            )
+    return diagnostic

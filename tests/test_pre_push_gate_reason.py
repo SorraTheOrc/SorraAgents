@@ -272,9 +272,9 @@ class TestStateChangedDuringRunClassification:
             suite_exit=75,
         )
         assert proc.returncode != 0, "the gate must still block the push"
-        assert "gate_reason=infrastructure" in proc.stdout
+        assert "gate_reason=infrastructure" in proc.stderr
         # The diagnostic names the checkout movement and the re-run.
-        assert "/shared/checkout" in proc.stdout
+        assert "/shared/checkout" in proc.stderr
 
     def test_stable_red_run_still_classifies_as_test_failure(
         self, tmp_path: Path
@@ -291,4 +291,4 @@ class TestStateChangedDuringRunClassification:
             suite_exit=1,
         )
         assert proc.returncode != 0
-        assert "gate_reason=test_failure" in proc.stdout
+        assert "gate_reason=test_failure" in proc.stderr
