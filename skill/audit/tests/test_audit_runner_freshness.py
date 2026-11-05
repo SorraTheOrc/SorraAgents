@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import pytest
 from audit.scripts import audit_runner
+from audit.scripts.checkpoint_store import ENV_CHECKPOINT_DIR
 from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
@@ -1458,16 +1459,6 @@ class TestPendingScreensFreshnessGate:
         mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
         return mock_runner
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "D1 (SA-0MVSTZ71J001P67S): the item-level freshness gate ignores "
-            "the pending-screens signal — a stored report with outstanding "
-            "child screens is treated as a fresh final verdict and 'Skipping: "
-            "audit still fresh' is printed (production: "
-            "LP-0MVLNBCTN0084MT0). Remove this marker when the D1 fix lands."
-        ),
-    )
     def test_pending_screens_signal_suppresses_fresh_skip(self, tmp_path):
         """A fresh-by-fingerprint parent report whose signal names an
         outstanding child screen must NOT short-circuit: no
@@ -1565,3 +1556,164 @@ class TestPendingScreensFreshnessGate:
         assert rc == 0
         assert "Skipping: audit still fresh" in "\n".join(captured)
         assert pi_calls == []
+
+    # ------------------------------------------------------------------
+    # D1 fix coverage (SA-0MW2J7NGP006CIEG AC3-AC6)
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _pipeline(self, captured: list[str], stderr_lines: list[str],
+                  pi_calls: list[str]):
+        """Patch the pipeline's model/quality calls and capture its output."""
+        def _capture_pi(issue_id, context, prompt, **kwargs):
+            pi_calls.append(context)
+            return {"extracted_text": "[]"}
+
+        def _capture_print(*args, **kwargs):
+            text = " ".join(str(a) for a in args)
+            captured.append(text)
+            if kwargs.get("file") is sys.stderr:
+                stderr_lines.append(text)
+
+        with (
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", side_effect=_capture_pi,
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head", return_value="a" * 40,
+            ),
+            mock.patch("builtins.print", side_effect=_capture_print),
+        ):
+            yield
+
+    def _stored_report_fixture(self) -> str:
+        fingerprint = audit_runner._compute_content_fingerprint(
+            _FakeGitRepo(), "TEST-1",
+            work_item={"title": self._TITLE, "description": self._DESC},
+        )
+        assert fingerprint is not None
+        return self._stored_report(fingerprint)
+
+    def _run_issue(self, *, stored_report: str, force: bool = False,
+                   checkpoint_dir: str | None = None,
+                   no_checkpoint: bool = False,
+                   captured: list[str] | None = None,
+                   stderr_lines: list[str] | None = None,
+                   pi_calls: list[str] | None = None) -> int:
+        captured = captured if captured is not None else []
+        stderr_lines = stderr_lines if stderr_lines is not None else []
+        pi_calls = pi_calls if pi_calls is not None else []
+        kwargs: dict = {"no_checkpoint": no_checkpoint}
+        if checkpoint_dir is not None:
+            kwargs["checkpoint_dir"] = checkpoint_dir
+        with self._pipeline(captured, stderr_lines, pi_calls):
+            return audit_runner.cmd_issue(
+                "TEST-1", persist=False, force=force,
+                runner=self._make_runner(stored_report), **kwargs,
+            )
+
+    def test_signal_diagnostic_names_outstanding_children(self):
+        """AC6: the suppressed short-circuit is observable — a one-line
+        stderr diagnostic names the outstanding child count/ids and why."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as cp_dir:
+            audit_runner._write_pending_screens_signal(
+                ["CHILD-1", "CHILD-2"], "TEST-1", cp_dir, cp_dir,
+            )
+            captured: list[str] = []
+            stderr_lines: list[str] = []
+            pi_calls: list[str] = []
+            rc = self._run_issue(
+                stored_report=self._stored_report_fixture(),
+                checkpoint_dir=cp_dir,
+                captured=captured, stderr_lines=stderr_lines,
+                pi_calls=pi_calls,
+            )
+
+        assert rc == 0
+        assert pi_calls, "the pipeline must run while screens are outstanding"
+        diagnostic = "\n".join(stderr_lines)
+        assert "Freshness gate bypassed" in diagnostic
+        assert "2 child screen(s)" in diagnostic
+        assert "CHILD-1" in diagnostic and "CHILD-2" in diagnostic
+        assert "not a final verdict" in diagnostic
+
+    def test_audit_checkpoint_dir_env_supplies_the_signal(self, tmp_path):
+        """AC3: with no explicit --checkpoint-dir the signal resolves through
+        ``AUDIT_CHECKPOINT_DIR`` (the same resolution as the checkpoint store)."""
+        audit_runner._write_pending_screens_signal(
+            ["CHILD-1"], "TEST-1", tmp_path, str(tmp_path),
+        )
+        captured: list[str] = []
+        pi_calls: list[str] = []
+        with mock.patch.dict(
+            audit_runner.os.environ,
+            {ENV_CHECKPOINT_DIR: str(tmp_path)},
+            clear=False,
+        ):
+            rc = self._run_issue(
+                stored_report=self._stored_report_fixture(),
+                captured=captured, pi_calls=pi_calls,
+            )
+
+        assert rc == 0
+        assert "Skipping: audit still fresh" not in "\n".join(captured)
+        assert pi_calls, "the pipeline must run when the env dir holds a signal"
+
+    def test_no_checkpoint_reads_no_signal(self, tmp_path):
+        """AC3: a ``--no-checkpoint`` run reads no signal — the freshness
+        short-circuit is unchanged even when the file exists on disk."""
+        audit_runner._write_pending_screens_signal(
+            ["CHILD-1"], "TEST-1", tmp_path, str(tmp_path),
+        )
+        captured: list[str] = []
+        pi_calls: list[str] = []
+        rc = self._run_issue(
+            stored_report=self._stored_report_fixture(),
+            checkpoint_dir=str(tmp_path), no_checkpoint=True,
+            captured=captured, pi_calls=pi_calls,
+        )
+
+        assert rc == 0
+        assert "Skipping: audit still fresh" in "\n".join(captured)
+        assert pi_calls == []
+
+    def test_force_bypasses_gate_and_clears_checkpoint(self, tmp_path):
+        """AC4: ``--force`` is unchanged — the freshness gate is never
+        consulted and the existing checkpoint is cleared."""
+        checkpoint_file = tmp_path / "TEST-1.checkpoint.json"
+        checkpoint_file.write_text(
+            json.dumps({"issue_id": "TEST-1", "phases": {}}),
+            encoding="utf-8",
+        )
+        audit_runner._write_pending_screens_signal(
+            ["CHILD-1"], "TEST-1", tmp_path, str(tmp_path),
+        )
+        freshness_calls: list[str] = []
+        captured: list[str] = []
+        pi_calls: list[str] = []
+
+        def _spy_freshness(issue_id, *args, **kwargs):
+            freshness_calls.append(issue_id)
+            return "Ready to close: Yes"
+
+        with mock.patch.object(
+            audit_runner, "_check_audit_freshness", side_effect=_spy_freshness,
+        ):
+            rc = self._run_issue(
+                stored_report=self._stored_report_fixture(), force=True,
+                checkpoint_dir=str(tmp_path), captured=captured,
+                pi_calls=pi_calls,
+            )
+
+        assert rc == 0
+        assert freshness_calls == [], "--force must not consult freshness"
+        assert "Skipping: audit still fresh" not in "\n".join(captured)
+        assert not checkpoint_file.exists(), "--force clears the checkpoint"
+        assert pi_calls

@@ -9888,6 +9888,13 @@ class _AuditContext:
     # persist the resumable in-main-slot pending-screens signal
     # (SA-0MU32TE120012T49). None when checkpointing is disabled.
     checkpoint_dir: str | None = None
+    # Explicit checkpoint directory / disable flag threaded from cmd_issue so
+    # the FRESHNESS gate (_phase_gate — which runs before
+    # ``_open_checkpoint_store`` resolves ``checkpoint_dir``) can read the
+    # resumable pending-screens signal with the same directory resolution as
+    # the checkpoint store itself (SA-0MW2J7NGP006CIEG AC3).
+    explicit_checkpoint_dir: str | None = None
+    no_checkpoint: bool = False
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
@@ -10977,25 +10984,54 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
                                               audit_sink=prior_audit_sink)
         prior_audit = prior_audit_sink or None
         if fresh_report is not None:
-            # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt of
-            # the fresh audit so a redundant re-audit is stopped before the
-            # model is invoked (re-audit coordination, SA-0MSQIA84B005NHWC).
-            # The full report still follows so the operator can inspect the
-            # evidence that produced the verdict.
-            audited_at = _fetch_audited_at(
-                runner, issue_id, worklog_dir=worklog_dir,
+            # D1 (SA-0MW2J7NGP006CIEG AC1): a stored report whose own header
+            # says "Child screens pending" is NOT a final verdict. The
+            # content fingerprint only covers the item's title/description,
+            # which an invoking session servicing the emitted child screens
+            # never changes — so honouring the fingerprint alone permanently
+            # clamps such an item (production: LP-0MVLNBCTN0084MT0). The
+            # resumable signal names the screens left outstanding by the
+            # previous run; while it lists any child, fall through to the
+            # pipeline so the checkpoint resume can collect the child
+            # verdicts. ``_check_audit_freshness`` itself is unchanged —
+            # the decision to honour its result lives here.
+            outstanding_screens = (
+                set()
+                if ctx.no_checkpoint
+                else _read_pending_screens_signal(
+                    issue_id, owning_root, ctx.explicit_checkpoint_dir,
+                )
             )
-            verdict = _parse_ready_to_close(fresh_report)
-            verdict_label = "Yes" if verdict == "yes" else "No"
-            notice = (
-                f"Skipping: audit still fresh — Ready to close: "
-                f"{verdict_label}"
-            )
-            if audited_at:
-                notice += f" (audited {audited_at})"
-            print(notice)
-            print(fresh_report)
-            return 0
+            if outstanding_screens:
+                print(
+                    f"Freshness gate bypassed: {len(outstanding_screens)} "
+                    "child screen(s) still pending main-slot review ("
+                    + ", ".join(sorted(outstanding_screens))
+                    + ") — a report with outstanding child screens is not a "
+                    "final verdict; resuming the audit pipeline.",
+                    file=sys.stderr,
+                )
+            else:
+                # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt
+                # of the fresh audit so a redundant re-audit is stopped
+                # before the model is invoked (re-audit coordination,
+                # SA-0MSQIA84B005NHWC). The full report still follows so the
+                # operator can inspect the evidence that produced the
+                # verdict.
+                audited_at = _fetch_audited_at(
+                    runner, issue_id, worklog_dir=worklog_dir,
+                )
+                verdict = _parse_ready_to_close(fresh_report)
+                verdict_label = "Yes" if verdict == "yes" else "No"
+                notice = (
+                    f"Skipping: audit still fresh — Ready to close: "
+                    f"{verdict_label}"
+                )
+                if audited_at:
+                    notice += f" (audited {audited_at})"
+                print(notice)
+                print(fresh_report)
+                return 0
 
     # ------------------------------------------------------------------
     # Never-block guarantee (F4, SA-0MSTN8CWM003AAU9): the audit NEVER
@@ -14540,6 +14576,26 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # re-queuing the item as a stale-audit candidate. A non-Yes verdict never
     # reaches here (fail-closed: a failed dry-run must not clear staleness).
     if dry_run_freshness_refresh:
+        # AC5 (SA-0MW2J7NGP006CIEG): a dry-run must never re-publish "fresh"
+        # for a run with outstanding in-main-slot child screens. The
+        # child-audit execution gate already forces ``Ready to close: No``
+        # while any screen is pending (so this branch should be unreachable);
+        # this guard is defence in depth and keeps the invariant if that gate
+        # ever regresses. Deliberately broader than the report gate: EVERY
+        # child carrying the unserviced in-main-slot marker blocks the
+        # refresh, including ones the report classifies as unserviced.
+        outstanding_screens = _pending_main_slot_child_ids(ctx.child_results)
+        if outstanding_screens:
+            print(
+                f"Error: refusing to refresh audit freshness for "
+                f"{ctx.issue_id}: {len(outstanding_screens)} child screen(s) "
+                "still pending main-slot review ("
+                + ", ".join(outstanding_screens)
+                + "). A report with outstanding child screens is not a "
+                "final verdict, so a dry run may not mark it fresh.",
+                file=sys.stderr,
+            )
+            return 1
         fresh_rc = persist_audit_freshness(
             ctx.issue_id,
             runner=ctx.runner,
@@ -14827,6 +14883,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
         max_child_audits=max_child_audits, run_tests=run_tests,
         no_execute=no_execute,
         max_citations_per_ac=max_citations_per_ac,
+        explicit_checkpoint_dir=checkpoint_dir,
+        no_checkpoint=no_checkpoint,
     )
     rc = _phase_gate(ctx)
     if rc is not None:
