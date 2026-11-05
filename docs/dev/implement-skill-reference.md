@@ -1492,6 +1492,23 @@ changed-scope gate reports (see
 the hook only consumes the runner's published notice codes, never re-defines
 them.
 
+#### Pushed-commit guard refusal (SA-0MW3H07A8004Q54C AC3)
+
+§3a of `.githooks/pre-push` refuses a dev/main push **before** the suite runs
+when the tree it would measure is not the pushed commit (or is dirty at it),
+so it prints no `gate_reason=` line. `git_push_to_dev()` recognises the guard's
+stable diagnostic instead and reports the distinct reason
+`refused_by_pushed_commit_guard`, carrying the values the guard named:
+`evidence_out["pushed_commit_guard"] = {pushed_sha, gate_head, gate_tree}`.
+`phase_finish` records `report["steps"]["push"]["reason"] =
+"refused_by_pushed_commit_guard"` plus
+`report["steps"]["push"]["refused_by_pushed_commit_guard"]` with those three
+values, and its remedy names the worktree push (`git push origin
+HEAD:refs/heads/dev` from the worktree that holds the pushed commit). This is
+the recovery the guard itself documents; finish's normal path already pushes
+from that worktree, so the refusal is a fail-closed safety net, not a routine
+outcome.
+
 ### Process-group kill (AC2)
 
 `_kill_process_group(pid)` calls `os.killpg(os.getpgid(pid), signal.SIGKILL)`;
@@ -2046,6 +2063,16 @@ the per-repository lock above:
   the remote tip) and `commit_not_based_on_remote_tip` (a sibling landed
   first). A refusal never fails the finish: the push (with its rebase-and-retry
   recovery) and the post-push ancestry assertion remain authoritative.
+- **Retried after the recovery rebase (SA-0MW3H07A8004Q54C AC1).** When Step 5
+  refused (`local_dev_diverged` / `commit_not_based_on_remote_tip`) because a
+  sibling moved `dev`, the non-fast-forward recovery rebases the feature branch
+  onto `origin/dev` and then **retries** the fast-forward for the rebased
+  commit, recorded as `report["steps"]["local_dev_fast_forward"]["retry"]`.
+  The main checkout's `dev` (and its `HEAD` when `dev` is checked out)
+  therefore tracks the pushed commit before the retry push. A second refusal is
+  recorded and never fails the finish, and the retry's own file churn is added
+  to the main-checkout guard's `own_churn` so it is never misreported as a
+  foreign mutation.
 - **Reversal on a failed push.** Every push-failure path (`PushTimeoutError`,
   `PushNonFastForwardError`, a plain push failure) calls
   `_restore_local_dev_after_failed_push`, so the shared local `dev` is never

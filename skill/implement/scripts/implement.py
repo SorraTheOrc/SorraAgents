@@ -4720,6 +4720,21 @@ PUSH_RETRY_CAP_SECONDS = 30.0
 
 _GATE_REASON_LINE_RE = re.compile(r"^gate_reason=([a-z_]+)\s*$", re.MULTILINE)
 
+#: Reason reported when the repo-local pre-push **pushed-commit guard** refuses
+#: (§3a, LP-0MVSJUM3O003C0H9). The guard exits *before* the suite runs, so it
+#: emits no ``gate_reason=`` line; the refusal is recognised from its stable
+#: diagnostic instead, which makes it distinguishable from a generic push
+#: failure (SA-0MW3H07A8004Q54C AC3).
+PUSHED_COMMIT_GUARD_REASON = "refused_by_pushed_commit_guard"
+_PUSHED_COMMIT_GUARD_MARKER = "pre-push gate refuses this push"
+_PUSHED_COMMIT_GUARD_PUSHED_RE = re.compile(
+    r"pushed commit[^\n:]*:\s*([0-9a-f]{6,40})"
+)
+_PUSHED_COMMIT_GUARD_HEAD_RE = re.compile(
+    r"checked-out HEAD:\s*([0-9a-f]{6,40})"
+)
+_PUSHED_COMMIT_GUARD_TREE_RE = re.compile(r"gate tree:\s*(\S+)")
+
 
 class PushGateFailureError(RuntimeError):
     """A dev push refused by the pre-push gate, carrying its reason code.
@@ -4784,6 +4799,31 @@ def _parse_gate_reason(stderr: str) -> str | None:
     return matches[-1] if matches else None
 
 
+def _parse_pushed_commit_guard_refusal(stderr: str) -> dict[str, str] | None:
+    """Return the pushed-commit guard's refusal details, or ``None``.
+
+    §3a of ``.githooks/pre-push`` refuses a dev/main push *before* the suite
+    runs, so it prints no ``gate_reason=`` line. Its refusal is recognised from
+    the stable marker and the ``pushed commit`` / ``checked-out HEAD`` /
+    ``gate tree`` values it names — the same three the operator needs to act
+    (SA-0MW3H07A8004Q54C AC3). Missing fields are omitted, never fabricated.
+    """
+    text = stderr or ""
+    if _PUSHED_COMMIT_GUARD_MARKER not in text.lower():
+        return None
+    details: dict[str, str] = {}
+    pushed = _PUSHED_COMMIT_GUARD_PUSHED_RE.search(text)
+    if pushed:
+        details["pushed_sha"] = pushed.group(1)
+    head = _PUSHED_COMMIT_GUARD_HEAD_RE.search(text)
+    if head:
+        details["gate_head"] = head.group(1)
+    tree = _PUSHED_COMMIT_GUARD_TREE_RE.search(text)
+    if tree:
+        details["gate_tree"] = tree.group(1)
+    return details
+
+
 def _stderr_tail(text: str, limit: int = 20) -> str:
     """The last *limit* lines of a push/gate stderr (bounded for comments)."""
     lines = (text or "").strip().splitlines()
@@ -4792,6 +4832,16 @@ def _stderr_tail(text: str, limit: int = 20) -> str:
 
 def _push_gate_remediation(gate_reason: str | None) -> str:
     """The operator remedy for a dev-push gate reason (never empty)."""
+    if gate_reason == PUSHED_COMMIT_GUARD_REASON:
+        # AC3: the recovery is the guard's own documented alternative — push
+        # from a checkout that *is* the pushed commit.
+        return (
+            "The pre-push pushed-commit guard refused: the gate tree was not "
+            "the pushed commit, or was dirty at it. Push from the worktree "
+            "that holds the pushed commit (git push origin "
+            "HEAD:refs/heads/dev from that worktree), or bring the main "
+            "checkout to the pushed commit and re-run finish."
+        )
     if gate_reason and _GATE_REMEDIATION.get(gate_reason):
         return str(_GATE_REMEDIATION[gate_reason])
     return (
@@ -4975,16 +5025,26 @@ def git_push_to_dev(
                 _push_retry_sleep(delay)
                 continue
 
-            gate_reason = _parse_gate_reason(stderr_str)
+            # The pushed-commit guard (§3a) refuses before the suite runs and
+            # prints no ``gate_reason=`` line: recognise its stable diagnostic
+            # so a guard refusal is reported distinctly, with the pushed sha /
+            # gate HEAD / gate tree it names (SA-0MW3H07A8004Q54C AC3).
+            pushed_commit_guard = _parse_pushed_commit_guard_refusal(stderr_str)
+            gate_reason = (
+                PUSHED_COMMIT_GUARD_REASON
+                if pushed_commit_guard is not None
+                else _parse_gate_reason(stderr_str)
+            )
             if evidence_out is not None:
                 evidence_out.clear()
-                evidence_out.update(
-                    {
-                        "success": False,
-                        "gate_reason": gate_reason,
-                        "stderr_tail": _stderr_tail(stderr_str),
-                    }
-                )
+                failure: dict[str, Any] = {
+                    "success": False,
+                    "gate_reason": gate_reason,
+                    "stderr_tail": _stderr_tail(stderr_str),
+                }
+                if pushed_commit_guard is not None:
+                    failure["pushed_commit_guard"] = pushed_commit_guard
+                evidence_out.update(failure)
             LOG.error(
                 "git push to dev failed (attempt %d/%d, gate_reason=%s): %s",
                 attempt,
@@ -10026,6 +10086,8 @@ def _recover_non_fast_forward_push(
     exc: PushNonFastForwardError,
     work_item_id: str,
     evidence_out: dict[str, Any] | None = None,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    ff_retry_out: dict[str, Any] | None = None,
 ) -> str:
     """Recover from a non-fast-forward push by rebasing and retrying.
 
@@ -10050,6 +10112,11 @@ def _recover_non_fast_forward_push(
         work_item_id: Work item to comment on for the recovery audit trail.
         evidence_out: Optional dict populated on a successful retry with the
             gate evidence (passed through to :func:`git_push_to_dev`).
+        parent_branch: Shared parent branch whose local checkout is retried
+            after the rebase (default: ``dev``).
+        ff_retry_out: Optional dict populated with the post-rebase
+            fast-forward retry result, recorded by ``finish``
+            (SA-0MW3H07A8004Q54C AC1).
 
     Returns:
         The (possibly rewritten) commit hash that was pushed.
@@ -10094,6 +10161,25 @@ def _recover_non_fast_forward_push(
     # The rebase rewrote HEAD — capture the new tip so the retry push and
     # the completion comment reference the commit that actually lands.
     new_commit = git_get_commit_hash(worktree_path) or commit_hash
+
+    # AC1 (SA-0MW3H07A8004Q54C): Step 5's fast-forward was refused (or pointed
+    # at the pre-rebase commit) because dev had moved. The rebase now yields a
+    # commit based on origin/dev, so retry the fast-forward *here* — the main
+    # checkout's dev (and its HEAD when dev is checked out) then tracks the
+    # pushed commit. Best-effort by contract: a second refusal is recorded and
+    # never fails the finish, exactly like Step 5.
+    ff_retry = _fast_forward_local_dev_for_push(
+        repo_root, new_commit, parent_branch
+    )
+    if ff_retry_out is not None:
+        ff_retry_out.clear()
+        ff_retry_out.update(ff_retry)
+    LOG.info(
+        "Post-rebase local %s fast-forward retry: method=%s advanced=%s",
+        parent_branch,
+        ff_retry.get("method"),
+        ff_retry.get("advanced"),
+    )
 
     # 2. Retry the push from the worktree that now holds the rebased commit —
     #    never from the main checkout, which still holds the pre-rebase commit
@@ -10971,6 +11057,7 @@ def phase_finish(
                     "Push failed (non-fast-forward); attempting rebase and retry "
                     "...",
                 )
+                ff_retry: dict[str, Any] = {}
                 commit_hash = _recover_non_fast_forward_push(
                     worktree_path=worktree_path,
                     repo_root=repo_root,
@@ -10979,7 +11066,20 @@ def phase_finish(
                     exc=exc,
                     work_item_id=work_item_id,
                     evidence_out=push_evidence,
+                    parent_branch=parent_branch,
+                    ff_retry_out=ff_retry,
                 )
+                # AC1 (SA-0MW3H07A8004Q54C): record the post-rebase
+                # fast-forward retry, and treat its own churn as finish's
+                # (never as a foreign mutation).
+                if ff_retry:
+                    local_dev_fast_forward["retry"] = ff_retry
+                    report["steps"]["local_dev_fast_forward"] = (
+                        local_dev_fast_forward
+                    )
+                    main_checkout_guard["own_churn"] = list(
+                        main_checkout_guard.get("own_churn") or []
+                    ) + list(ff_retry.get("own_churn") or [])
                 # The rebase rewrote HEAD; keep the reported commit in sync.
                 report["steps"]["commit"]["hash"] = commit_hash
                 report["steps"]["push"] = {
@@ -10996,12 +11096,16 @@ def phase_finish(
                 # machine-readable reason in the finish report and post it on
                 # the work item with the matching remediation, instead of the
                 # generic "git push to dev failed".
-                report["steps"]["push"] = {
+                push_step: dict[str, Any] = {
                     "success": False,
                     "reason": exc.gate_reason,
                     "hash": commit_hash,
                     "gate_stderr_tail": exc.stderr_tail,
                 }
+                guard_details = push_evidence.get("pushed_commit_guard")
+                if guard_details:
+                    push_step["refused_by_pushed_commit_guard"] = guard_details
+                report["steps"]["push"] = push_step
                 report["steps"]["local_dev_restore"] = (
                     _restore_local_dev_after_failed_push(
                         repo_root, local_dev_fast_forward, parent_branch

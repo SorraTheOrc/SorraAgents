@@ -284,6 +284,22 @@ so an agent could not tell *fix the code* from *retry later*.
   records `report["steps"]["push"]["reason"]` and posts the reason with its
   remedy on the work item, instead of the generic failure. The red-suite
   `test_failure` message is unchanged in substance.
+- **The pushed-commit guard is distinguishable.** §3a of `.githooks/pre-push`
+  refuses a dev/main push *before* the suite runs when the gate tree is not the
+  pushed commit (or is dirty at it), so it prints no `gate_reason=` line.
+  `finish` recognises the guard's stable diagnostic and reports the distinct
+  reason `refused_by_pushed_commit_guard`, with the pushed sha, gate HEAD and
+  gate tree in `report["steps"]["push"]["refused_by_pushed_commit_guard"]`;
+  the remedy names the worktree push. The normal path already pushes from the
+  worktree that holds the commit, so this is a fail-closed safety net.
+- **The fast-forward is retried after the recovery rebase.** When Step 5's
+  local-dev fast-forward was refused (`local_dev_diverged` /
+  `commit_not_based_on_remote_tip`) because a sibling moved `dev`, the
+  non-fast-forward recovery rebases onto `origin/dev` and then retries the
+  fast-forward for the rebased commit
+  (`report["steps"]["local_dev_fast_forward"]["retry"]`), so the main
+  checkout's `dev` tracks the pushed commit. A second refusal is recorded and
+  never fails the finish.
 - **Transient transport closes retry.** `Connection … closed by remote host`,
   `Connection reset by peer`, `remote end hung up unexpectedly` and
   `kex_exchange_identification` are retried up to 3 attempts with jittered

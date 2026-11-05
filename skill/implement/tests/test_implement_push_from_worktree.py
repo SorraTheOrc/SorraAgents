@@ -696,3 +696,334 @@ def test_push_gate_infrastructure_reason_is_reported_and_commented(sandbox):
         "slot_contention" in comment and "TEST_LOCK_TIMEOUT" in comment
         for comment in comments
     ), f"the work-item comment must name the reason and remedy; got {comments}"
+
+
+# ---------------------------------------------------------------------------
+# SA-0MW3H07A8004Q54C — the pushed-commit guard refusal is distinguishable,
+# and the recovery rebase retries the local-dev fast-forward
+# ---------------------------------------------------------------------------
+
+
+def _hooks_dir(sandbox: dict) -> Path:
+    """The shared hooks directory for the sandbox's main repo and worktree."""
+    common = gs.run_git(
+        sandbox["main"], ["rev-parse", "--git-common-dir"], check=True
+    ).stdout.strip()
+    path = Path(common)
+    if not path.is_absolute():
+        path = sandbox["main"] / path
+    return path / "hooks"
+
+
+def _install_guard_refusal_hook(sandbox: dict, block: str) -> Path:
+    """Install a pre-push hook that prints *block* on stderr and refuses."""
+    hooks = _hooks_dir(sandbox)
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-push"
+    hook.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"sys.stderr.write({block!r})\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    return hook
+
+
+def _install_recording_guard_hook(sandbox: dict, marker: Path) -> Path:
+    """Install a guard-shaped pre-push hook that records what it measured.
+
+    It mirrors the pushed-commit guard's contract: for the gated ref it records
+    ``<local_sha> <gate_head> <gate_tree> <dirty>`` and refuses unless the
+    pushed sha *is* the gate tree's HEAD and the tree is clean.
+    """
+    hooks = _hooks_dir(sandbox)
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-push"
+    hook.write_text(
+        "#!/usr/bin/env python3\n"
+        "import subprocess\n"
+        "import sys\n"
+        f"MARKER = {str(marker)!r}\n"
+        "def _git(*args):\n"
+        "    return subprocess.run(\n"
+        "        ['git', *args], capture_output=True, text=True\n"
+        "    ).stdout.strip()\n"
+        "head = _git('rev-parse', 'HEAD')\n"
+        "root = _git('rev-parse', '--show-toplevel')\n"
+        "dirty = _git('status', '--porcelain')\n"
+        "for line in sys.stdin:\n"
+        "    parts = line.split()\n"
+        "    if len(parts) < 4:\n"
+        "        continue\n"
+        "    local_sha, remote_ref = parts[1], parts[2]\n"
+        "    if remote_ref != 'refs/heads/dev':\n"
+        "        continue\n"
+        "    with open(MARKER, 'w', encoding='utf-8') as fh:\n"
+        "        fh.write('%s %s %s %s\\n' % (local_sha, head, root, dirty))\n"
+        "    if local_sha != head:\n"
+        "        sys.stderr.write(\n"
+        "            'ERROR: pre-push gate refuses this push: the tree it '\n"
+        "            'would measure is not the pushed commit.\\n'\n"
+        "        )\n"
+        "        sys.exit(1)\n"
+        "    if dirty:\n"
+        "        sys.stderr.write(\n"
+        "            'ERROR: pre-push gate refuses this push: the gate tree '\n"
+        "            'is dirty at the pushed commit.\\n'\n"
+        "        )\n"
+        "        sys.exit(1)\n"
+        "sys.exit(0)\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    return hook
+
+
+def test_parser_ignores_non_guard_failures():
+    """Only the guard's own diagnostic is a pushed-commit refusal."""
+    assert implement._parse_pushed_commit_guard_refusal("") is None
+    assert (
+        implement._parse_pushed_commit_guard_refusal(
+            "fatal: Authentication failed for 'origin'"
+        )
+        is None
+    )
+
+
+def test_parser_handles_the_dirty_tree_variant():
+    """The dirty-tree refusal names the pushed sha and the gate tree."""
+    details = implement._parse_pushed_commit_guard_refusal(
+        "ERROR: pre-push gate refuses this push: the gate tree is dirty at "
+        "the pushed commit.\n"
+        "  pushed commit: abc1234\n"
+        "  gate tree:     /tmp/main\n"
+    )
+    assert details == {"pushed_sha": "abc1234", "gate_tree": "/tmp/main"}
+
+
+def test_pushed_commit_guard_refusal_is_classified_with_its_details(sandbox):
+    """A guard refusal is reported distinctly, carrying sha / HEAD / tree.
+
+    Pre-fix: the guard emits no ``gate_reason`` line, so the push was reported
+    as a generic failure and the operator had to read the raw stderr.
+    """
+    block = (
+        "ERROR: pre-push gate refuses this push: the tree it would measure is "
+        "not the pushed commit.\n"
+        "  pushed commit  (refs/heads/dev): 50167e00\n"
+        "  checked-out HEAD:            2016e5236\n"
+        "  gate tree:                   /home/rgardler/projects/llm\n"
+        "  A full-suite run here would verify a different tree.\n"
+    )
+    _install_guard_refusal_hook(sandbox, block)
+
+    evidence: dict = {}
+    assert (
+        implement.git_push_to_dev(
+            str(sandbox["wt"]),
+            BRANCH,
+            sandbox["feature_short"],
+            evidence_out=evidence,
+        )
+        is False
+    )
+    assert evidence["gate_reason"] == "refused_by_pushed_commit_guard", evidence
+    assert evidence["pushed_commit_guard"] == {
+        "pushed_sha": "50167e00",
+        "gate_head": "2016e5236",
+        "gate_tree": "/home/rgardler/projects/llm",
+    }, evidence
+
+
+def test_phase_finish_reports_refused_by_pushed_commit_guard(sandbox):
+    """``phase_finish`` surfaces the guard refusal as a distinct push step."""
+    comments: list[str] = []
+    guard = {
+        "pushed_sha": "50167e00",
+        "gate_head": "2016e5236",
+        "gate_tree": "/home/rgardler/projects/llm",
+    }
+
+    def guard_refusing_push(cwd, branch, commit_hash=None, **kwargs):
+        evidence = kwargs.get("evidence_out")
+        if evidence is not None:
+            evidence.update(
+                {
+                    "success": False,
+                    "gate_reason": "refused_by_pushed_commit_guard",
+                    "stderr_tail": (
+                        "ERROR: pre-push gate refuses this push: the tree it "
+                        "would measure is not the pushed commit."
+                    ),
+                    "pushed_commit_guard": dict(guard),
+                }
+            )
+        return False
+
+    pushes: list[tuple] = []
+    with _stubbed_finish(sandbox, sandbox["feature_short"], pushes):
+        with patch.object(implement, "git_push_to_dev", side_effect=guard_refusing_push):
+            with patch.object(
+                implement,
+                "wl_add_comment",
+                side_effect=lambda *args, **kwargs: comments.append(args[1]) or True,
+            ):
+                report = implement.phase_finish(
+                    "SA-TEST", json_output=True, no_refactor=True
+                )
+
+    assert report["success"] is False, report
+    push = report["steps"]["push"]
+    assert push["reason"] == "refused_by_pushed_commit_guard", push
+    assert push["refused_by_pushed_commit_guard"] == guard, push
+    assert any(
+        "refused_by_pushed_commit_guard" in comment and "worktree" in comment.lower()
+        for comment in comments
+    ), f"the remedy must name the worktree push; got {comments}"
+
+
+def test_recover_retries_the_fast_forward_with_the_rebased_commit(sandbox):
+    """After the recovery rebase, the fast-forward is retried for the new tip."""
+    recorded: list[tuple] = []
+    advanced = {
+        "method": "advanced",
+        "success": True,
+        "advanced": True,
+        "commit": "rebased123",
+        "advanced_to": "rebased123",
+        "own_churn": ["feature.txt"],
+    }
+
+    def fake_ff(repo_root, commit_hash, parent_branch="dev"):
+        recorded.append((repo_root, commit_hash, parent_branch))
+        return dict(advanced)
+
+    ff_retry: dict = {}
+    run_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with patch.object(implement, "run_cmd", return_value=run_ok):
+        with patch.object(implement, "git_get_commit_hash", return_value="rebased123"):
+            with patch.object(
+                implement, "_fast_forward_local_dev_for_push", side_effect=fake_ff
+            ):
+                with patch.object(implement, "_assert_push_subject"):
+                    with patch.object(implement, "git_push_to_dev", return_value=True):
+                        with patch.object(implement, "wl_add_comment", return_value=True):
+                            new_commit = implement._recover_non_fast_forward_push(
+                                worktree_path=str(sandbox["wt"]),
+                                repo_root=str(sandbox["main"]),
+                                branch=BRANCH,
+                                commit_hash=sandbox["feature_short"],
+                                exc=implement.PushNonFastForwardError(
+                                    sandbox["feature_short"],
+                                    BRANCH,
+                                    "non-fast-forward",
+                                    "git rebase origin/dev",
+                                ),
+                                work_item_id="SA-TEST",
+                                parent_branch="dev",
+                                ff_retry_out=ff_retry,
+                            )
+
+    assert new_commit == "rebased123"
+    assert recorded == [(str(sandbox["main"]), "rebased123", "dev")], recorded
+    assert ff_retry == advanced, ff_retry
+
+
+def test_phase_finish_records_the_fast_forward_retry(sandbox):
+    """The recovery retry is recorded in the finish report."""
+    advanced = {
+        "method": "advanced",
+        "success": True,
+        "advanced": True,
+        "commit": sandbox["feature_short"],
+        "advanced_to": sandbox["feature_short"],
+        "own_churn": ["feature.txt"],
+    }
+    calls = {"n": 0}
+
+    def push_raises_once(cwd, branch, commit_hash=None, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise implement.PushNonFastForwardError(
+                commit_hash or "x", branch, "non-fast-forward", "git rebase origin/dev"
+            )
+        return True
+
+    def fake_recover(**kwargs):
+        out = kwargs.get("ff_retry_out")
+        if out is not None:
+            out.update(advanced)
+        return kwargs["commit_hash"]
+
+    pushes: list[tuple] = []
+    with _stubbed_finish(sandbox, sandbox["feature_short"], pushes):
+        with patch.object(implement, "git_push_to_dev", side_effect=push_raises_once):
+            with patch.object(
+                implement, "_recover_non_fast_forward_push", side_effect=fake_recover
+            ):
+                report = implement.phase_finish(
+                    "SA-TEST", json_output=True, no_refactor=True
+                )
+
+    assert report["success"] is True, report["message"]
+    recorded = report["steps"]["local_dev_fast_forward"]
+    assert recorded.get("retry") == advanced, recorded
+
+
+def test_concurrent_move_recovery_pushes_the_clean_worktree_tree(sandbox):
+    """AC1/AC3: origin/dev moves, recovery rebases, retries the ff, and the
+    guard measures the clean worktree at the pushed commit."""
+    main = sandbox["main"]
+    wt = sandbox["wt"]
+    remote = sandbox["remote"]
+
+    # A sibling lands on origin/dev after the feature worktree forked from dev.
+    (main / "sibling.txt").write_text("sibling\n", encoding="utf-8")
+    sibling = gs.commit_all(main, "sibling commit")
+    gs.run_git(main, ["push", "-q", "origin", "dev"], check=True)
+    assert _rev(remote, "dev") == sibling
+
+    marker = Path(sandbox["tmp"]) / "guard-push-observed.txt"
+    _install_recording_guard_hook(sandbox, marker)
+
+    ff_retry: dict = {}
+    with patch.object(implement, "wl_add_comment", return_value=True):
+        new_commit = implement._recover_non_fast_forward_push(
+            worktree_path=str(wt),
+            repo_root=str(main),
+            branch=BRANCH,
+            commit_hash=sandbox["feature_short"],
+            exc=implement.PushNonFastForwardError(
+                sandbox["feature_short"],
+                BRANCH,
+                "non-fast-forward",
+                "git rebase origin/dev",
+            ),
+            work_item_id="SA-TEST",
+            parent_branch="dev",
+            ff_retry_out=ff_retry,
+        )
+
+    # The rebased commit landed on origin/dev and the worktree holds it.
+    assert _names_commit(_rev(remote, "dev"), new_commit), new_commit
+    assert _names_commit(_rev(wt), new_commit), new_commit
+
+    # AC3: at push time the guard measured the pushed commit, on a clean tree.
+    observed = marker.read_text(encoding="utf-8").split()
+    assert len(observed) >= 3, observed
+    assert _names_commit(observed[0], new_commit), observed
+    assert observed[1] == observed[0], (
+        "the gate tree HEAD must be the pushed sha at push time; "
+        f"observed local_sha={observed[0]} gate_head={observed[1]}"
+    )
+    assert gs.run_git(wt, ["status", "--porcelain"]).stdout.strip() == "", (
+        "the gate tree must be clean at push time"
+    )
+    assert Path(observed[2]).resolve() == wt.resolve(), observed
+
+    # AC1: the retried fast-forward advanced the main checkout's dev.
+    assert ff_retry.get("method") == "advanced", ff_retry
+    assert _names_commit(ff_retry.get("advanced_to") or "", new_commit), ff_retry
+    assert _names_commit(_rev(main), new_commit), new_commit
