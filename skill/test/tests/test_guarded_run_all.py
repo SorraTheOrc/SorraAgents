@@ -380,7 +380,7 @@ def test_guarded_run_from_worktree_fails_on_main_checkout_deletion(
     """
     from shared.process_semaphore import nested_semaphore_dir
 
-    gs, main, worktree = _main_with_linked_worktree(tmp_path)
+    _gs, main, worktree = _main_with_linked_worktree(tmp_path)
     victim = main / "keep.txt"
 
     # A nested run must not contend for the host-wide "test" slot this suite
