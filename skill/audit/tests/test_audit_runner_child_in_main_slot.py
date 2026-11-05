@@ -33,6 +33,7 @@ import pytest
 from audit.scripts import audit_runner
 from audit.scripts.checkpoint_store import (
     PHASE_CHILDREN,
+    PHASE_PARENT,
     PHASE_PHASE2,
     CheckpointStore,
 )
@@ -44,6 +45,7 @@ from audit.tests.test_audit_runner_phase1 import (
     _make_phase1_runner,
     _phase1_child,
 )
+from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
 @pytest.fixture(autouse=True)
@@ -755,7 +757,8 @@ class TestInteractiveRegressionGuard:
     )
 
     def _run_interactive(self, capsys, *, stored_child_audit=None,
-                         force=False):
+                         force=False, checkpoint_dir=None,
+                         parent_audit_raw=None, json_mode=False):
         """Run ``cmd_issue`` in in-main-slot mode like an interactive
         session, returning ``(rc, stdout, stderr, child_pi_contexts)``.
 
@@ -763,6 +766,13 @@ class TestInteractiveRegressionGuard:
         CHILD-1 (the serviced case); otherwise the child has no stored audit
         and is freshly screened in the main slot (the pending case).
         *force* exercises the ``--force`` bypass of child-verdict reuse.
+        *checkpoint_dir* enables phase checkpointing (``--checkpoint-dir``)
+        so the composed resume cycle can be exercised end to end, and
+        *parent_audit_raw* seeds the stored parent report the freshness gate
+        sees (a v2-fingerprinted, fresh report leaves the pipeline's
+        pending-screens bypass as the only reason to re-run). *json_mode*
+        makes the run emit the structured JSON payload instead of the
+        markdown report.
         """
         context_log: list[str] = []
 
@@ -776,9 +786,13 @@ class TestInteractiveRegressionGuard:
         child_audit_raw = (
             {"CHILD-1": stored_child_audit} if stored_child_audit else None
         )
-        runner, _ = _make_phase1_runner(
+        runner, _ = _e2e_runner(
             [child], child_audit_raw=child_audit_raw,
+            parent_audit_raw=parent_audit_raw,
         )
+        extra: dict = {}
+        if checkpoint_dir is not None:
+            extra["checkpoint_dir"] = str(checkpoint_dir)
 
         with mock.patch.object(
             audit_runner, "_call_pi_and_maybe_log", side_effect=_capture
@@ -790,6 +804,7 @@ class TestInteractiveRegressionGuard:
             rc = audit_runner.cmd_issue(
                 "TEST-1", persist=False, force=force, runner=runner,
                 audit_children=True, child_in_main_slot=True,
+                json_mode=json_mode, **extra,
             )
 
         captured = capsys.readouterr()
@@ -991,6 +1006,136 @@ def _resume_child_runner(stored_report: str | None):
 
     runner.side_effect = _side_effect
     return runner
+
+
+#: Parent item identity served to the composed end-to-end resume tests. The
+#: stored parent report's v2 fingerprint is computed from exactly these
+#: fields, so the freshness gate sees the report as content-fresh.
+_E2E_TITLE = "In-main-slot resume cycle"
+_E2E_DESC = (
+    "## Acceptance Criteria\n- AC1: collect the serviced child audits"
+)
+_E2E_PARENT_AUDITED_AT = "2026-10-29T00:20:00.000Z"
+
+
+def _e2e_runner(children: list[dict], *, child_audit_raw: dict | None = None,
+                parent_audit_raw: str | None = None,
+                head: str = HEAD_BASE):
+    """Mock ``wl``/``git`` runner for the composed resume-cycle tests.
+
+    Wraps :func:`_make_phase1_runner` (same parent/child ``wl`` surface) and
+    adds the three things the composed cycle needs beyond Phase 1:
+
+    - ``git rev-parse HEAD`` — enables the production ``CheckpointStore``
+      (without a 40-hex HEAD the runner disables checkpointing).
+    - ``wl audit-show TEST-1`` — the stored parent report the freshness gate
+      inspects (``None`` models the pre-service first run).
+    - ``wl show TEST-1 --json`` — the parent item with a real title and
+      description, so the content fingerprint is computed from real data.
+    """
+    base_runner, audit_shows = _make_phase1_runner(
+        children, child_audit_raw=child_audit_raw,
+    )
+    inner = base_runner.side_effect
+
+    def _side_effect(cmd):
+        cmd_list = list(cmd)
+        cmd_str = " ".join(str(c) for c in cmd_list)
+        if cmd_str == "git rev-parse HEAD":
+            return _proc(head)
+        if "audit-show" in cmd_list:
+            target = cmd_list[cmd_list.index("audit-show") + 1]
+            if target == "TEST-1" and parent_audit_raw is not None:
+                return _proc(json.dumps({
+                    "success": True,
+                    "workItemId": "TEST-1",
+                    "audit": {
+                        "workItemId": "TEST-1",
+                        "auditedAt": _E2E_PARENT_AUDITED_AT,
+                        "rawOutput": parent_audit_raw,
+                    },
+                }))
+        if (
+            "show" in cmd_list
+            and "--children" not in cmd_list
+            and "TEST-1" in cmd_list
+        ):
+            return _proc(json.dumps({
+                "success": True,
+                "workItem": {
+                    "id": "TEST-1",
+                    "title": _E2E_TITLE,
+                    "description": _E2E_DESC,
+                    "status": "open",
+                    "stage": "in_progress",
+                },
+                "comments": [],
+            }))
+        return inner(cmd)
+
+    base_runner.side_effect = stateful_wl_side_effect(_side_effect)
+    return base_runner, audit_shows
+
+
+def _stored_parent_report() -> str:
+    """A v2-fingerprinted parent report whose child screens are outstanding.
+
+    Shaped like a real persisted in-main-slot report: ``Ready to close: No``
+    with the ``Child screens pending`` gate header. The fingerprint is
+    computed from :data:`_E2E_TITLE` / :data:`_E2E_DESC` — the item the
+    freshness gate reads — so the report is FRESH by content and only the
+    pending-screens signal can legitimately force the pipeline to re-run.
+    """
+    fingerprint = audit_runner._compute_content_fingerprint(
+        None, "TEST-1",
+        work_item={"title": _E2E_TITLE, "description": _E2E_DESC},
+    )
+    assert fingerprint is not None
+    return (
+        "Ready to close: No\n\n"
+        "Audit report for work item TEST-1\n\n"
+        f"{audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fingerprint}\n\n"
+        "Child screens pending: 1 (main-slot) — CHILD-1"
+    )
+
+
+def _seed_phase1_pending_checkpoint(tmp_path, child: dict,
+                                    head: str = HEAD_BASE) -> CheckpointStore:
+    """Seed a ``phase1_children``-completed checkpoint whose child still
+    carries the unserviced in-main-slot placeholder (the state a previous
+    session leaves behind when it dies after emitting the screens).
+
+    Returns the reopened store so the caller can assert ``is_resuming``.
+    """
+    store = CheckpointStore("TEST-1", head, tmp_path)
+    store.mark_completed(PHASE_PARENT, {
+        "ac_results": [
+            {"text": "AC1: x", "verdict": "met", "evidence": "parent"},
+        ],
+    })
+    store.mark_completed(PHASE_CHILDREN, {
+        "ac_results": [
+            {"text": "AC1: x", "verdict": "met", "evidence": "parent"},
+        ],
+        "child_results": [{
+            "id": "CHILD-1",
+            "title": child.get("title", ""),
+            "status": child.get("status", ""),
+            "stage": child.get("stage", ""),
+            "child_audit_ready": False,
+            "ac_results": [{
+                "text": "CAC1: child criterion 1",
+                "verdict": "partial",
+                "evidence": _MAIN_SLOT_PENDING_SCREEN_EVIDENCE,
+            }],
+        }],
+        "child_persist_results": [],
+        "phase2_completed": False,
+        "phase2_skip_note": None,
+    })
+    reopened = CheckpointStore("TEST-1", head, tmp_path)
+    assert reopened.is_resuming is True
+    return reopened
 
 
 class TestCheckpointResumeReResolvesPendingChildren:
@@ -1299,3 +1444,163 @@ class TestCheckpointResumeReResolvesPendingChildren:
         assert audit_runner._pending_main_slot_child_ids(stored) == []
         assert stored[0].get("reused_from")
         assert stored[0].get("child_audit_ready") is True
+
+
+class TestResumeCycleEndToEnd:
+    """Composed end-to-end coverage of the in-main-slot resume cycle
+    (parent AC2/AC5/AC6; SA-0MW2J7OPP007MAPV AC1/AC2).
+
+    The two mechanism fixes (D1: the freshness gate must not treat a report
+    with outstanding child screens as a fresh final verdict; D2: a
+    ``phase1_children`` checkpoint restore must re-resolve its pending
+    placeholders) compose with the pre-existing child-verdict reuse path into
+    one reachable cycle:
+
+    ``fresh parent audit + <id>.pending-screens.json`` → no freshness
+    short-circuit → collect the serviced child audits → no
+    ``Child screens pending`` gate, empty ``pending_child_screens``, signal
+    removed, zero child-screening pi calls.
+
+    Two service cases are distinguished, mirroring the documented contract:
+
+    - **same session** — the invoking session services the screens and
+      re-runs the parent in the same process. The first run's checkpoint was
+      cleared on its success, so the re-run converges through the ordinary
+      Phase-1 child-verdict pre-pass.
+    - **later session** — a previous session died after completing the child
+      orchestration, leaving a ``phase1_children`` checkpoint with the
+      unserviced placeholders on disk. The next session services the screens
+      and re-runs the parent; the checkpoint resume re-resolves the pending
+      children (D2) instead of replaying the placeholders.
+    """
+
+    def _child(self) -> dict:
+        return _phase1_child(1, stage="in_review")
+
+    def _child_fingerprint(self) -> str:
+        fingerprint = audit_runner._compute_content_fingerprint(
+            None, "CHILD-1", work_item=self._child(),
+        )
+        assert fingerprint is not None
+        return fingerprint
+
+    def _signal(self, tmp_path) -> Path:
+        signal = tmp_path / f"TEST-1{audit_runner.PENDING_SCREENS_SIGNAL_SUFFIX}"
+        return signal
+
+    def _write_signal(self, tmp_path) -> Path:
+        audit_runner._write_pending_screens_signal(
+            ["CHILD-1"], "TEST-1", tmp_path, str(tmp_path),
+        )
+        signal = self._signal(tmp_path)
+        assert signal.is_file()
+        return signal
+
+    # ------------------------------------------------------------------
+    # Case (a) — the invoking session services the screens in the SAME
+    # session as the first run
+    # ------------------------------------------------------------------
+
+    def test_same_session_service_then_rerun_collects_and_clears(
+        self, tmp_path, capsys,
+    ):
+        """Same-session case: the first run emits the screens and persists
+        the resumable signal; the session services them and re-runs the
+        parent. The re-run is not short-circuited by the content-fresh stored
+        parent report, collects the serviced child audit with zero
+        child-screening pi calls, and leaves no gate, no pending child and no
+        signal behind."""
+        signal = self._signal(tmp_path)
+
+        # Run 1 — pre-service: no stored parent audit, no stored child audit.
+        rc1, out1, err1, ctx1 = self._run(capsys, tmp_path)
+        assert rc1 == 0
+        assert ctx1 == []  # in-main-slot: no child pi subprocess
+        assert "Child screens pending: 1 (main-slot) — CHILD-1" in out1
+        assert audit_runner.IN_MAIN_SLOT_WORK_MARKER in err1
+        assert signal.is_file(), "first run did not persist the signal"
+        # The first run succeeded, so its checkpoint was cleared — the
+        # same-session re-run never resumes from it.
+        assert not (tmp_path / "TEST-1.checkpoint.json").exists()
+
+        # The invoking session services the screens: the child now has a
+        # fresh persisted audit and the parent its (content-fresh) report.
+        rc2, out2, err2, ctx2 = self._run(
+            capsys, tmp_path,
+            stored_child_audit=_stored_child_audit_report(
+                self._child_fingerprint(),
+            ),
+            parent_audit_raw=_stored_parent_report(),
+            json_mode=True,
+        )
+
+        assert rc2 == 0
+        assert ctx2 == [], "a serviced child must cost zero child pi calls"
+        # D1: the content-fresh stored report did NOT short-circuit — the
+        # outstanding signal forced the pipeline to resume.
+        assert "Skipping: audit still fresh" not in out2
+        assert "Freshness gate bypassed" in err2
+        assert "CHILD-1" in err2
+
+        payload = json.loads(out2)
+        assert payload["pending_child_screens"] == []
+        assert payload["ready_to_close"] is True
+        assert not signal.exists(), "pending-screens signal not cleared"
+
+    # ------------------------------------------------------------------
+    # Case (b) — a LATER session services the screens and re-runs the parent
+    # ------------------------------------------------------------------
+
+    def test_later_session_resume_collects_without_replaying_placeholders(
+        self, tmp_path, capsys,
+    ):
+        """Later-session case: the previous session died after completing the
+        child orchestration, leaving a ``phase1_children`` checkpoint whose
+        children still carry the in-main-slot placeholders plus the signal.
+        The next session services the screens and re-runs the parent; the
+        checkpoint resume re-resolves the pending children (D2) instead of
+        replaying them, so the report has no gate and no pending child and
+        the signal is removed — with zero child-screening pi calls."""
+        _seed_phase1_pending_checkpoint(tmp_path, self._child())
+        checkpoint_path = tmp_path / "TEST-1.checkpoint.json"
+        assert checkpoint_path.is_file()
+        signal = self._write_signal(tmp_path)
+
+        rc, out, err, child_ctx = self._run(
+            capsys, tmp_path,
+            stored_child_audit=_stored_child_audit_report(
+                self._child_fingerprint(),
+            ),
+            parent_audit_raw=_stored_parent_report(),
+        )
+
+        assert rc == 0
+        assert child_ctx == [], "a serviced child must cost zero child pi calls"
+        # D1: the content-fresh stored report did not short-circuit.
+        assert "Skipping: audit still fresh" not in out
+        assert "Freshness gate bypassed" in err
+        # D2: the checkpoint resume ran and re-resolved the pending child.
+        assert "[checkpoint] Skipping completed phase" in err
+        assert "Child verdict reused from" in out
+        # The composed result: no gate, ready, signal cleared.
+        assert "Child screens pending" not in out
+        assert "Child assessment reasons:" not in out
+        assert "Ready to close: Yes" in out
+        assert not signal.exists(), "pending-screens signal not cleared"
+        assert not checkpoint_path.exists(), "resumed checkpoint not cleared"
+
+    # ------------------------------------------------------------------
+    # Harness
+    # ------------------------------------------------------------------
+
+    def _run(self, capsys, tmp_path, *, stored_child_audit=None,
+             parent_audit_raw=None, json_mode=False):
+        """Drive ``cmd_issue`` through the shared interactive harness with
+        the composed resume-cycle fixtures."""
+        return TestInteractiveRegressionGuard._run_interactive(
+            self, capsys,
+            stored_child_audit=stored_child_audit,
+            checkpoint_dir=tmp_path,
+            parent_audit_raw=parent_audit_raw,
+            json_mode=json_mode,
+        )
