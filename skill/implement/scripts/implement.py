@@ -151,6 +151,16 @@ except Exception:  # pragma: no cover - only partial installs hit this
     _detect_self_referential_upstreams = None
 
 try:
+    # Disk-backed TMPDIR resolution shared with the test runner (F1,
+    # SA-0MW3EN72O005BMIP). Deliberately OUTSIDE the hard-fail shared block:
+    # an older skill install without the module degrades to the ambient
+    # TMPDIR — logged and unchanged — instead of blocking the start
+    # (SA-0MW3ENQY0001RBSW AC4, fail-open).
+    from shared.test_tmpdir import resolve_test_tmpdir as _resolve_test_tmpdir
+except Exception:  # pragma: no cover - only partial installs hit this
+    _resolve_test_tmpdir = None
+
+try:
     # The shared changed-file → test selector (SA-0MT6CENPW004V2JN). Kept
     # optional: partial skill installs (staged layouts without the test
     # skill's scripts) must still start implement.py — changed-scope then
@@ -240,6 +250,91 @@ PYTEST_CMD = canonicalize_quiet_test_command("pytest")  # pytest -q -r a --disab
 NPM_TEST_CMD = canonicalize_quiet_test_command("npm test")  # npm --silent test
 
 LOG = logging.getLogger("implement.scripts.implement")
+
+
+#: Module-level cache for the disk-backed TMPDIR, resolved once per finish
+#: run (SA-0MW3ENQY0001RBSW). ``None`` means "not yet resolved"; the
+#: resolver never returns ``None`` once resolved (a failed resolution is
+#: recorded as ``_FINISH_TMPDIR_RESOLVED = True`` with ``None`` so callers
+#: leave the child env unchanged and no re-resolution/log spam occurs).
+_FINISH_TMPDIR_CACHE: str | None = None
+_FINISH_TMPDIR_RESOLVED = False
+
+
+def _resolved_finish_tmpdir() -> str | None:
+    """Return the disk-backed TMPDIR, resolved once per finish run.
+
+    Delegates to the shared F1 helper
+    (:func:`shared.test_tmpdir.resolve_test_tmpdir`, SA-0MW3EN72O005BMIP) so
+    the finish gate's build/test/push children share the exact same
+    disk-backed directory the test runner uses — closing the inode-exhausted
+    tmpfs failure end-to-end (SA-0MW3ENQY0001RBSW).
+
+    Fail-open (AC4): a resolver outage (partial skill install without the
+    F1 module, or any exception) is logged and ``None`` is returned once, so
+    the push/build proceed with the ambient environment and an unchanged
+    exit status. Callers only add ``TMPDIR`` when this returns a value.
+
+    Returns:
+        The resolved TMPDIR string, or ``None`` when the resolver is
+        unavailable or failed (use the ambient environment, unchanged).
+    """
+    global _FINISH_TMPDIR_CACHE, _FINISH_TMPDIR_RESOLVED
+    if _FINISH_TMPDIR_RESOLVED:
+        return _FINISH_TMPDIR_CACHE
+    _FINISH_TMPDIR_RESOLVED = True
+    if _resolve_test_tmpdir is None:
+        LOG.warning(
+            "Finish TMPDIR resolver unavailable (partial install); "
+            "using the ambient environment",
+        )
+        return None
+    try:
+        path, reason = _resolve_test_tmpdir()
+    except Exception as exc:  # noqa: BLE001 - documented fail-open contract
+        LOG.warning(
+            "Finish TMPDIR resolution failed (%s); using the ambient "
+            "environment",
+            exc,
+        )
+        return None
+    _FINISH_TMPDIR_CACHE = str(path)
+    if "disk-backed candidate" in reason or "explicit" in reason:
+        LOG.info("Finish TMPDIR=%s (%s)", path, reason)
+    else:
+        LOG.warning(
+            "Finish TMPDIR candidate unusable; using %s (%s)", path, reason
+        )
+    return _FINISH_TMPDIR_CACHE
+
+
+@contextlib.contextmanager
+def _scoped_test_tmpdir_export() -> Iterator[None]:
+    """Temporarily export the resolved disk-backed TMPDIR into ``os.environ``.
+
+    The in-process ``guarded_run_all`` test step has no Popen to pass an env
+    to (SA-0MW3ENQY0001RBSW AC2) — exporting around the call lets the test
+    runner's *own* process tempfile usage and any child it spawns without an
+    explicit env land on the disk-backed dir. Save/restore guarantees the
+    export never leaks into the operator's parent shell after the finish run
+    returns (AC3): the pre-existing value (or absence) is restored on exit.
+
+    Fail-open (AC4): when resolution failed the context is a transparent
+    no-op — nothing is exported, nothing is mutated.
+    """
+    tmpdir = _resolved_finish_tmpdir()
+    if tmpdir is None:
+        yield
+        return
+    previous = os.environ.get("TMPDIR")
+    os.environ["TMPDIR"] = tmpdir
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = previous
 
 
 def _emit_timing(timer: Timer) -> None:
@@ -4946,13 +5041,22 @@ def git_push_to_dev(
         # Spawn the push in its own process group so that a timeout kills the
         # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
         try:
+            # Augment the push child env with the resolved disk-backed TMPDIR
+            # so the pre-push hook's ``run_tests.py`` inherits it (fail-open:
+            # a resolution failure leaves the ambient env unchanged). Neither
+            # this export nor the resolution mutates the parent shell env
+            # (SA-0MW3ENQY0001RBSW AC1/AC3).
+            child_env = dict(os.environ)
+            _finish_tmpdir = _resolved_finish_tmpdir()
+            if _finish_tmpdir is not None:
+                child_env["TMPDIR"] = _finish_tmpdir
             proc = subprocess.Popen(
                 ["git", "push", PUSH_REMOTE_NAME, f"{branch}:refs/heads/dev"],
                 cwd=cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,  # new process group
-                env={**os.environ},
+                env=child_env,
             )
             try:
                 _stdout, stderr = proc.communicate(timeout=timeout)
@@ -7628,12 +7732,21 @@ def run_build(cwd: str) -> dict[str, Any]:
             "exit_code": 0,
             "skipped": True,
         }
+    # Inject the resolved disk-backed TMPDIR into the build child env so the
+    # build (and anything it spawns) never lands on the inode-starved tmpfs.
+    # Fail-open: a resolution failure leaves the ambient env unchanged and the
+    # build proceeds (SA-0MW3ENQY0001RBSW AC2/AC4).
+    build_env = None
+    _finish_tmpdir = _resolved_finish_tmpdir()
+    if _finish_tmpdir is not None:
+        build_env = {"TMPDIR": _finish_tmpdir}
     result = run_cmd(
         ["npm", "run", "build"],
         cwd=cwd,
         check=False,
         timeout=300,
         capture=True,
+        env=build_env,
     )
     return {
         "success": result.returncode == 0,
@@ -8531,28 +8644,42 @@ def _run_guarded_suite(
     if _guarded_run_all is None or _full_suite_commands is None:
         # Partial install, or the legacy convention path: only the inner
         # conftest guard is armed, so run directly (no delegation).
-        return _run_commands_direct(
-            commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
-        )
+        with _scoped_test_tmpdir_export():
+            return _run_commands_direct(
+                commands,
+                cwd,
+                tooling=tooling,
+                scope=scope,
+                fingerprint=fingerprint,
+            )
     try:
-        guarded = _guarded_run_all(
-            cwd=Path(cwd),
-            timeout=_resolve_test_timeout(cwd),
-            commands=commands,
-            scope=scope,
-            base_ref=base_ref or "origin/dev",
-            use_cache=True,
-            fingerprint=fingerprint,
-        )
+        # The in-process runner has no env to pass, so the resolved
+        # disk-backed TMPDIR is exported into ``os.environ`` for the duration
+        # of the call (save/restore — never mutates the parent shell). The
+        # suite subprocesses the runner spawns also carry ``TMPDIR`` from
+        # ``test.scripts.run_tests._suite_command_env``; the export here
+        # additionally covers the runner's own tempfile usage and the direct
+        # fallback path (SA-0MW3ENQY0001RBSW AC2/AC3).
+        with _scoped_test_tmpdir_export():
+            guarded = _guarded_run_all(
+                cwd=Path(cwd),
+                timeout=_resolve_test_timeout(cwd),
+                commands=commands,
+                scope=scope,
+                base_ref=base_ref or "origin/dev",
+                use_cache=True,
+                fingerprint=fingerprint,
+            )
     except Exception as exc:  # noqa: BLE001 - degrade to the direct path
         LOG.warning(
             "Implement run_tests: guarded_run_all failed (%s) — falling "
             "back to the direct cached runner (inner guard only).",
             exc,
         )
-        return _run_commands_direct(
-            commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
-        )
+        with _scoped_test_tmpdir_export():
+            return _run_commands_direct(
+                commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
+            )
     return _adapt_guarded_result(guarded, tooling=tooling, scope=scope)
 
 
