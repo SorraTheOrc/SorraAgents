@@ -97,11 +97,13 @@ import argparse
 import configparser
 import contextvars
 import json
+import logging
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -130,6 +132,7 @@ from shared.skill_extensions import (
     SkillExtensionError,
     load_extension,
 )
+from shared.test_tmpdir import prune_stale_test_roots, resolve_test_tmpdir
 from shared.timing import Timer
 from test_cache import (
     DEFAULT_TTL_SECONDS,
@@ -153,6 +156,11 @@ from test_runner import (
 )
 
 REPO_ROOT = _SKILLS_ROOT.parent
+
+#: Runner diagnostics logger (SA-0MW3ENF32006BGN1): TMPDIR choice / prune
+#: outcomes are emitted here so operators can see the disk-backed TMPDIR and
+#: stale-root pruning from one place.
+LOG = logging.getLogger("skill.test.run_tests")
 
 # Cache TTL exposed as a module constant so CLI tests can backdate entries.
 CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS
@@ -2232,13 +2240,70 @@ def _suite_command_env() -> dict[str, str]:
        (SA-0MVE98T1M006A17T). An ambient value wins (it is re-exported
        normalised); otherwise the calibrated default applies. This is the
        only mutation, and it never leaks back into ``os.environ``.
+    3. A disk-backed ``TMPDIR`` resolved by the shared helper
+       (:func:`shared.test_tmpdir.resolve_test_tmpdir`, F1
+       SA-0MW3EN72O005BMIP) so a suite subprocess never exhausts a tiny
+       tmpfs ``/tmp`` inode budget (SA-0MW2QED9M005FWOK). Resolved once per
+       process (module-level cache); fail-open — any resolver error is
+       logged and the run proceeds with the ambient TMPDIR
+       (SA-0MW3ENF32006BGN1 AC3).
 
     ``NODE_OPTIONS`` and every other unrelated variable are preserved, so
-    consumer-provided vitest/NODE_OPTIONS plumbing keeps working.
+    consumer-provided vitest/NODE_OPTIONS plumbing keeps working. The
+    TMPDIR/VITEST changes are env-only — command strings and therefore cache
+    keys are byte-identical (SA-0MW3ENF32006BGN1 AC4).
     """
     env = subprocess_env_with_scrubbed_overrides()
     env[TEST_VITEST_MAX_WORKERS_ENV] = str(_test_vitest_max_workers())
+    env["TMPDIR"] = _resolved_test_tmpdir()
     return env
+
+
+#: Module-level cache for the disk-backed test TMPDIR (resolved once per
+#: process on first use; SA-0MW3ENF32006BGN1). ``None`` means "not yet
+#: resolved".
+_TEST_TMPDIR_CACHE: str | None = None
+
+
+def _resolved_test_tmpdir() -> str:
+    """Return the disk-backed test TMPDIR, resolving it once per process.
+
+    Delegates to the shared F1 helper (:func:`shared.test_tmpdir.resolve_test_tmpdir`)
+    which picks an explicit ``PI_TEST_TMPDIR`` override, else a disk-backed
+    candidate under the configured root, else ``tempfile.gettempdir()`` — and
+    never raises. The result is cached module-wide so every suite command of
+    a run shares one TMPDIR (resolving repeatedly for each spawned command
+    would be wasteful and could pick a different dir mid-run).
+
+    Fail-open (AC3): the F1 helper has a documented never-raise contract, but
+    a defensive guard mirrors the same contract here — if resolution ever
+    does raise (e.g. a patched/test stub), the error is logged and the
+    ambient ``TMPDIR`` (or the portable fallback) is used instead, so a
+    TMPDIR problem can never change the run's exit status, cache entry or
+    scope resolution.
+    """
+    global _TEST_TMPDIR_CACHE
+    if _TEST_TMPDIR_CACHE is None:
+        try:
+            path, reason = resolve_test_tmpdir()
+        except Exception as exc:  # noqa: BLE001 - documented fail-open contract
+            LOG.warning(
+                "Test TMPDIR resolution failed (%s); falling back to ambient TMPDIR",
+                exc,
+            )
+            _TEST_TMPDIR_CACHE = os.environ.get("TMPDIR") or tempfile.gettempdir()
+            return _TEST_TMPDIR_CACHE
+        _TEST_TMPDIR_CACHE = str(path)
+        # AC5: INFO when a disk-backed (or explicit-override) dir is chosen;
+        # WARNING when the resolver had to fall back because every candidate
+        # was unusable.
+        if "disk-backed candidate" in reason or "explicit" in reason:
+            LOG.info("Test TMPDIR=%s (%s)", path, reason)
+        else:
+            LOG.warning(
+                "Test TMPDIR candidate unusable; using %s (%s)", path, reason
+            )
+    return _TEST_TMPDIR_CACHE
 
 
 def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess:
@@ -2810,6 +2875,19 @@ def run_all(
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
+
+    # Full-scope runs are the churn-heavy path behind the /tmp-inode defect
+    # (SA-0MW2QED9M005FWOK): prune stale pytest roots once before executing so
+    # thousands of tiny pytest-of-<user> roots cannot exhaust the inode budget
+    # inside a suite subprocess. Gated on the REQUESTED scope AND the
+    # commands-is-None (canonical full-resolution) branch so an explicit
+    # command override (typed profiles, finish-gate changed scope, the
+    # guarded-run E2E fixtures) is untouched (SA-0MW3ENF32006BGN1 AC2;
+    # mirror of the ``if commands is None`` full-resolution branch).
+    # Fail-open (AC3): any prune error is logged and swallowed; the run's
+    # exit status, cache entry and scope resolution are unchanged.
+    if scope == "full" and commands is None:
+        _prune_stale_roots_before_run()
     notices: list[str] = []
     notice_codes: list[str] = []
     stdout_parts: list[str] = []
@@ -3498,6 +3576,27 @@ def guarded_run_all(
             result = {**result, "live_repo_excluded": excluded}
 
     return result
+
+
+def _prune_stale_roots_before_run() -> None:
+    """Prune stale pytest roots ahead of a full-scope run; never raises.
+
+    Delegates to the shared F1 helper
+    (:func:`shared.test_tmpdir.prune_stale_test_roots`, SA-0MW3EN72O005BMIP)
+    and logs the removed count and freed paths at INFO (SA-0MW3ENF32006BGN1
+    AC5). Fail-open (AC3): any error is caught, logged and swallowed, and the
+    run proceeds unchanged — a prune problem must never change the exit
+    status, cache entry or scope resolution.
+    """
+    try:
+        removed, reason = prune_stale_test_roots()
+    except Exception as exc:  # noqa: BLE001 - documented fail-open contract
+        LOG.warning("Stale pytest-root prune failed (%s); continuing", exc)
+        return
+    if removed:
+        LOG.info("Pruned %d stale pytest root(s): %s", removed, reason)
+    else:
+        LOG.debug("No stale pytest roots to prune (%s)", reason)
 
 
 def main(argv: list[str] | None = None) -> int:
