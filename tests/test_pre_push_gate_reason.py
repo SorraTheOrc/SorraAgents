@@ -238,3 +238,57 @@ class TestUnclassifiable:
         )
         assert result.returncode == 1
         assert "gate_reason=infrastructure" in result.stderr, result.stderr
+
+
+class TestStateChangedDuringRunClassification:
+    """A checkout that moved mid-run is infrastructure, never test_failure."""
+
+    def _flagged_result(self, checkout: str = "/shared/checkout") -> dict:
+        """A runner aggregate carrying the state-changed flag AND stale
+        failure records — the flag must win (SA-0MW3FF18I003KGZE AC4)."""
+        return {
+            "success": False,
+            "failures": [{"test_name": "mixed_tree_fiche.txt"}],
+            "notice_codes": ["state_changed_during_run"],
+            "notices": ["the checkout moved while the suite executed"],
+            "state_changed_during_run": [
+                {
+                    "notice_code": "state_changed_during_run",
+                    "checkout": checkout,
+                    "before_commit": "a" * 40,
+                    "after_commit": "b" * 40,
+                    "message": "checkout moved mid-run",
+                }
+            ],
+        }
+
+    def test_flagged_result_is_infrastructure_and_names_the_movement(
+        self, tmp_path: Path
+    ) -> None:
+        """The moved checkout is infrastructure with a re-run diagnostic."""
+        proc = _run_hook(
+            tmp_path,
+            self._flagged_result(),
+            suite_exit=75,
+        )
+        assert proc.returncode != 0, "the gate must still block the push"
+        assert "gate_reason=infrastructure" in proc.stdout
+        # The diagnostic names the checkout movement and the re-run.
+        assert "/shared/checkout" in proc.stdout
+
+    def test_stable_red_run_still_classifies_as_test_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """Control: a genuine red run without the flag is still a failure."""
+        proc = _run_hook(
+            tmp_path,
+            {
+                "success": False,
+                "failures": [{"test_name": "test_real_failure.py::t"}],
+                "notice_codes": [],
+                "notices": [],
+            },
+            suite_exit=1,
+        )
+        assert proc.returncode != 0
+        assert "gate_reason=test_failure" in proc.stdout

@@ -236,6 +236,9 @@ try:
     from test.scripts.gate_reason import (
         classify_gate_result as _classify_gate_result,
     )
+    from test.scripts.gate_reason import (
+        state_changed_detail as _state_changed_detail,
+    )
 except ImportError:  # pragma: no cover - older test skill
     _classify_gate_result = None  # type: ignore[assignment]
     _GATE_REMEDIATION = {}  # type: ignore[assignment]
@@ -8276,6 +8279,12 @@ def _adapt_guarded_result(
         for c in guarded.get("notice_codes", [])
         if str(c).strip()
     ]
+    state_changed_flags = guarded.get("state_changed_during_run") or []
+    if isinstance(state_changed_flags, dict):
+        state_changed_flags = [state_changed_flags]
+    state_changed_flags = [
+        f for f in state_changed_flags if isinstance(f, dict) and f
+    ]
     exit_code = _guarded_exit_code(guarded)
     result: dict[str, Any] = {
         "success": bool(guarded.get("success")) and exit_code == 0,
@@ -8288,6 +8297,11 @@ def _adapt_guarded_result(
         "failures": failures,
         "notices": notices,
         "notice_codes": notice_codes,
+        # Moved-checkout flags (SA-0MW3FF18I003KGZE AC4): carried through
+        # additively so the gate classification consults the flag before any
+        # failure-based branch, and the operator message can name the checkout
+        # movement and both commits.
+        "state_changed_during_run": state_changed_flags,
         "skipped": False,
         "tooling": tooling,
         "scope": guarded.get("scope", scope),
@@ -8405,6 +8419,8 @@ def _gate_failure_kind(test_result: dict[str, Any]) -> str:
     failure with no structured failure, no notice and no executed command —
     never for a timed-out, killed or non-zero run.
     """
+    if test_result.get("state_changed_during_run"):
+        return GATE_FAILURE_INFRASTRUCTURE
     if test_result.get("failures"):
         return GATE_FAILURE_TESTS
     # Single shared classifier (SA-0MVSJX5HS002DJHI): the pre-push hook and
@@ -8449,6 +8465,20 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
     failures = [str(f) for f in (test_result.get("failures") or [])]
     if failures:
         return "Failures:\n" + "\n".join(failures[:20])
+
+    state_changed_flags = test_result.get("state_changed_during_run") or []
+    if isinstance(state_changed_flags, dict):
+        state_changed_flags = [state_changed_flags]
+    if state_changed_flags:
+        movement = "\n".join(
+            "- " + _state_changed_detail(f)
+            for f in state_changed_flags
+            if isinstance(f, dict)
+        )
+        return (
+            "Checkout moved during the run (infrastructure, not a code "
+            "failure); the result was discarded:\n" + movement
+        )
 
     sections: list[str] = []
     notices = [
@@ -8543,7 +8573,17 @@ def _gate_failure_message(
     kind = _gate_failure_kind(test_result)
     detail = _gate_failure_detail(test_result)
     facts = _gate_facts(test_result, _gate_exit_code(test_result))
-    if kind == GATE_FAILURE_SLOT_CONTENTION:
+    state_changed_flags = test_result.get("state_changed_during_run") or []
+    if isinstance(state_changed_flags, dict):
+        state_changed_flags = [state_changed_flags]
+    if state_changed_flags:
+        headline = (
+            f"Test run {attempt}/{max_retry} was invalidated: the checkout "
+            "moved while the suite executed (infrastructure, not a code "
+            "failure). Nothing ran against one single tree, so the verdict "
+            "is discarded; re-running below executes from a stable checkout."
+        )
+    elif kind == GATE_FAILURE_SLOT_CONTENTION:
         waited = (
             f" after waiting {_render_seconds(facts['slot_wait_seconds'])} "
             "for one"

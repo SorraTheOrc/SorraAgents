@@ -68,6 +68,7 @@ _NOTICE_SUITE_TIMEOUT = "suite_timeout"
 _NOTICE_KILLED = "killed"
 _NOTICE_UNPARSED_FAILURE = "unparsed_failure"
 _NOTICE_COMMAND_NOT_FOUND = "command_not_found"
+_NOTICE_STATE_CHANGED_DURING_RUN = "state_changed_during_run"
 _SLOT_BUSY_NOTICE_PREFIX = "test concurrency slot busy:"
 
 #: Remediation an operator can act on, keyed by reason. Used by the hook's
@@ -148,6 +149,14 @@ def classify_gate_result(result: dict[str, Any] | None) -> str:
     if not isinstance(result, dict):
         return GATE_REASON_UNKNOWN
 
+    # A checkout that moved while the suite executed makes every failure
+    # record a mixed-tree artefact (SA-0MW3FF18I003KGZE AC4): the reason is
+    # infrastructure, and this check runs BEFORE the structured-failure test
+    # so stale/upstream failure records can never reclassify a flagged run as a
+    # code failure.
+    if result.get("state_changed_during_run"):
+        return GATE_REASON_INFRASTRUCTURE
+
     if result.get("failures"):
         return GATE_REASON_TEST_FAILURE
 
@@ -175,6 +184,26 @@ def classify_gate_result(result: dict[str, Any] | None) -> str:
     if notice_codes or result.get("notices"):
         return GATE_REASON_INFRASTRUCTURE
     return GATE_REASON_UNKNOWN
+
+
+def state_changed_detail(flag: dict[str, Any] | None) -> str:
+    """Operator-facing movement detail: checkout, commits, required re-run.
+
+    Rendered for a flagged result (SA-0MW3FF18I003KGZE AC4) so the gate
+    message names the checkout that moved, both commits, and the required
+    re-run instead of an empty ``Failures:`` block.
+    """
+    if not isinstance(flag, dict):
+        flag = {}
+    checkout = flag.get("checkout") or "<unknown checkout>"
+    before = flag.get("before_commit") or "<none>"
+    after = flag.get("after_commit") or "<none>"
+    return (
+        f"checkout {checkout} moved while the suite executed "
+        f"(HEAD {before} -> {after}): the mixed tree exists at no single "
+        f"commit, so the verdict is discarded \u2014 re-run the suite from a "
+        f"stable checkout."
+    )
 
 
 def gate_reason_message(reason: str) -> str:
