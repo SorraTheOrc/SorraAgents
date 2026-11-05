@@ -104,13 +104,20 @@ parent's, so a child-level gap must never spuriously block a release.
 - **Genuine "not ready to close"** verdict — blocks immediately, **no**
   re-audit attempt.
 - **Missing audit** or **transient** audit (timeout, provider error,
-  FailureNotice per `isTimeoutOrTransientAudit`) — **conservative
+  FailureNotice per `isTimeoutOrTransientAudit`, the machine-readable
+  transient classification token `transient (verdict_(assembly|persistence)_failure)`
+  in `rawOutput`/`summary`, or the runner's infra-fallback descriptors
+  `Pi model output could not be parsed` / `Audit concurrency limit reached`
+  — WL-0MW2F2T1I001ZNH7 parity) — **conservative
   auto-remediation**: the gate re-runs the audit via
   `resolveAuditRunner()` (in-repo `skill/audit/scripts/audit_runner.py`
   preferred, global `~/.pi/agent/skills/audit/scripts/audit_runner.py`
   fallback) with `audit_runner.py issue <id>`, then re-checks
   `wl audit-show`. The item blocks **only if it still fails after the
   re-run**; successful remediations are reported in `remediatedItems`.
+  A transient-classified item is reported with a transient/remediable
+  reason (`re-audit recommended`) and is **never** reported with the
+  genuine-verdict reason `Audit verdict: not ready to close`.
 - **Remediation-runner failure/timeout** — treated as blocking for that item
   with the manual remediation command surfaced; never silently passed.
 

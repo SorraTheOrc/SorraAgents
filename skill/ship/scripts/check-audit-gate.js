@@ -253,6 +253,16 @@ const TIMEOUT_TRANSIENT_PATTERNS = [
   /\btime(?:d)?\s*outs?\b/i, // "timed out", "time out", "timeout(s)"
   /provider\s+(?:error|stop\s+reason)/i, // "Pi provider error: ..."
   /script\s+execution\s+failure/i, // FailureNotice banner
+  // WL-0MW2F2T1I001ZNH7 (C2): the machine-readable transient classification
+  // token emitted by report assembly / the persistence fallback
+  // ("Audit classification: transient (verdict_assembly_failure: <cause>)"
+  // and "Audit result persisted; transient (verdict_persistence_failure)").
+  /transient\s*\(\s*verdict_(?:persistence|assembly)_failure/i,
+  // Parity with the audit runner's _INFRA_FALLBACK_MARKERS descriptors so a
+  // degraded run is never reported as a genuine verdict even when the
+  // classification line itself is absent.
+  /Pi model output could not be parsed/i,
+  /Audit concurrency limit reached/i,
 ];
 
 /**

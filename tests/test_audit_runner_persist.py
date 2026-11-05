@@ -689,6 +689,7 @@ class TestTransientPersistenceClassification:
 
     REPORT = (
         "Ready to close: No\n"
+        "Audit classification: transient (verdict_assembly_failure: timeout)\n"
         "\n"
         "# Audit report for work item SA-TEST\n"
         "\n"
@@ -737,7 +738,17 @@ class TestTransientPersistenceClassification:
     def test_audit_set_summary_names_transient_classification(self):
         """On the persistence-rejection path the `wl audit-set --summary`
         argv names the transient classification, so the stored summary is
-        distinguishable from a genuine verdict (AC1)."""
+        distinguishable from a genuine verdict (AC1).
+
+        The summary mirrors the report's machine-readable
+        ``Audit classification:`` line (D1, WL-0MW2F2T1I001ZNH7): a degraded
+        run's assembled report carries ``transient (verdict_assembly_failure:
+        <cause>)`` (here a Phase-2 timeout), which persist_audit copies into
+        the ``--summary`` token. The persistence-rejection dynamics below
+        (first ``wl update --audit-text`` rejected, compact fallback
+        persisted, ``PERSIST_CONTENT_INVALID``) exercise the exact incident
+        of WL-0MW1VINII003IL7R.
+        """
         calls = []
         update_count = {"n": 0}
 

@@ -119,9 +119,15 @@ def _build_fallback_text(issue_id: str, ready: str) -> str:
     Starts with the wl-required ``Ready to close:`` line, names *issue_id*
     (so the identity and readback guards still pass) and carries a clear
     failure notice explaining that the assembled verdict content was rejected.
+
+    A machine-readable ``Audit classification: transient
+    (verdict_persistence_failure)`` line follows the verdict line so a
+    degraded persistence is distinguishable from a genuine ``Ready to
+    close: No`` verdict (WL-0MW2F2T1I001ZNH7 AC1).
     """
     return (
         f"Ready to close: {ready}\n"
+        "Audit classification: transient (verdict_persistence_failure)\n"
         "\n"
         "# Audit persistence notice\n"
         "\n"
@@ -326,6 +332,28 @@ def _extract_ready_to_close(report_text: str) -> bool:
     return False
 
 
+def _extract_transient_classification(report_text: str) -> str | None:
+    """Extract the machine-readable transient classification token, if any.
+
+    Report assembly emits a single ``Audit classification: transient
+    (verdict_assembly_failure: <cause>)`` line when an infrastructure
+    fallback produced the verdicts (and the persistence fallback emits
+    ``transient (verdict_persistence_failure)``). Returns the token after
+    the ``Audit classification: `` prefix (e.g.
+    ``transient (verdict_assembly_failure: timeout)``) or ``None`` when the
+    report carries no classification line (a clean, genuine-verdict run).
+    The token is mirrored into the ``wl audit-set --summary`` so a summary
+    consumer can tell a transient run from a genuine verdict
+    (WL-0MW2F2T1I001ZNH7 D1).
+    """
+    prefix = "Audit classification: "
+    for line in report_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):]
+    return None
+
+
 # Work-item id pattern: 2-5 uppercase letters, dash, then base62-ish suffix
 # (e.g. ``SA-0MSAS108O009DYKT``, ``OSL-0MSABC7SB001NVUN``).
 _WORK_ITEM_ID_RE = r"\b[A-Z]{2,5}-[A-Z0-9]{12,20}\b"
@@ -514,7 +542,16 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
         runner = subprocess.run
 
     ready = "yes" if _extract_ready_to_close(report_text) else "no"
+    # Mirror the report's machine-readable transient classification (emitted
+    # by report assembly for infra-fallback verdicts, D1 of
+    # WL-0MW2F2T1I001ZNH7) into the audit-set summary, so the stored audit
+    # summary distinguishes a transient run from a genuine verdict even when
+    # a later consumer only reads the summary field. A clean report carries
+    # no classification line and keeps the plain summary.
+    classification = _extract_transient_classification(report_text)
     summary = "Audit result persisted via persist_audit.py"
+    if classification:
+        summary = f"Audit result persisted; {classification}"
 
     # Lower critical → high priority before persisting when the audit
     # verdict is 'Ready to close: Yes' (best-effort; AC1-AC5).

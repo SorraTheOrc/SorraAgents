@@ -1402,6 +1402,44 @@ _INFRA_FALLBACK_MARKERS = (
     "timed out \u2014 manual review required",
 )
 
+# Marker → cause-token mapping used to classify an infrastructure-fallback
+# run as transient (WL-0MW2F2T1I001ZNH7 AC2). Order mirrors
+# ``_INFRA_FALLBACK_MARKERS``; the cause tokens are the machine-readable
+# vocabulary the report's ``Audit classification: transient
+# (verdict_assembly_failure: <cause>)`` line and the release audit gate
+# share, kept in parity with the gate's recognition patterns.
+_INFRA_FALLBACK_CAUSES = (
+    ("Pi model output could not be parsed", "unparseable_output"),
+    ("Pi provider error", "provider_error"),
+    ("Audit concurrency limit reached", "concurrency_cap"),
+    ("timed out \u2014 manual review required", "timeout"),
+)
+
+
+def _classify_infra_fallback(ac_results: list[dict],
+                             child_results: list[dict]) -> str | None:
+    """Return the transient cause token for the first infra-fallback marker
+    found across parent/child AC evidence, or ``None`` for a clean run.
+
+    When any AC verdict came from an infrastructure fallback (Phase-2
+    timeout, provider error, unparseable output, concurrency cap), the run's
+    verdicts are not genuine model assessments and the assembled report must
+    carry the machine-readable transient classification
+    (WL-0MW2F2T1I001ZNH7 AC2).
+    """
+    for r in ac_results:
+        evidence = _evidence_text(r.get("evidence"))
+        for marker, cause in _INFRA_FALLBACK_CAUSES:
+            if marker in evidence:
+                return cause
+    for cr in child_results:
+        for r in cr.get("ac_results", []):
+            evidence = _evidence_text(r.get("evidence"))
+            for marker, cause in _INFRA_FALLBACK_CAUSES:
+                if marker in evidence:
+                    return cause
+    return None
+
 
 def _evidence_text(value) -> str:
     """Render an evidence value as text, whatever its type.
@@ -6640,7 +6678,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            content_fingerprint: str | None = None,
                            merge_gate_evidence: str | None = None,
                            snapshot_exempt: set[str] | None = None,
-                           stale_pending_ids: set[str] | None = None) -> str:
+                           stale_pending_ids: set[str] | None = None,
+                           classification: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -6702,6 +6741,16 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       near the header so the persisted report carries the freshness gate data
       (SA-0MSKB6US1009CNHT, SA-0MVIDI8E00063OOP). The line is parsed back by
       ``_extract_content_fingerprint``.
+
+    *classification* is the optional transient cause token (``timeout`` /
+      ``provider_error`` / ``unparseable_output`` / ``concurrency_cap``) for
+      a run whose verdicts came from an infrastructure fallback
+      (WL-0MW2F2T1I001ZNH7 AC2). When ``None`` (the default) the cause is
+      derived from ``_INFRA_FALLBACK_MARKERS`` present in the AC evidence.
+      When set, the report carries ``Audit classification: transient
+      (verdict_assembly_failure: <classification>)`` immediately after the
+      ``Ready to close:`` first line; a clean run emits no classification
+      line.
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
@@ -6814,6 +6863,20 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     else:
         ready = ready_before_cq
 
+    # Transient classification (WL-0MW2F2T1I001ZNH7 AC2): an explicit cause
+    # (passed by callers when the run degraded) wins; otherwise derive it
+    # from infra-fallback markers in AC evidence, so a "No" verdict produced
+    # solely by an infrastructure failure is distinguishable from a genuine
+    # model assessment. A clean run carries no classification line.
+    if classification is None:
+        classification = _classify_infra_fallback(ac_results, child_results)
+    classification_lines: list[str] = []
+    if classification:
+        classification_lines = [
+            ("Audit classification: transient "
+             f"(verdict_assembly_failure: {classification})")
+        ]
+
     # Explicit child-audit execution gate (SA-0MU32TE120012T49): in-main-slot
     # pending child screens are never presented as a normal result. The gate
     # names the child ids and how to complete them, and forces Ready=No.
@@ -6843,6 +6906,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             model_line = f"Model: {effective_model} (no provider)"
         lines = [
             f"Ready to close: {ready}",
+            *classification_lines,
             *gate_lines,
             "",
             f"Audit report for work item {issue_id_label}",
@@ -6877,6 +6941,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     else:
         lines = [
             f"Ready to close: {ready}",
+            *classification_lines,
             *gate_lines,
             "",
             f"Audit report for work item {issue_id_label}",
