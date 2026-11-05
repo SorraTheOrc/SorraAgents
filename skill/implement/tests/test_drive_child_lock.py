@@ -147,6 +147,7 @@ def _run(cmd: list[str], cwd: Path, *, timeout: int = 120) -> subprocess.Complet
     """
     proc = subprocess.run(
         cmd,
+        check=False,
         cwd=str(cwd),
         capture_output=True,
         text=True,
