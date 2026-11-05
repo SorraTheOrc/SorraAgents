@@ -3765,6 +3765,11 @@ def _run_tests_via_test_skill(
     results: list[dict] = []
     failures: list[dict] = []
     triaged: list[dict] = []
+    #: Commands whose guarded checkout moved while they executed
+    #: (SA-0MW3FF18I003KGZE AC4): their output is a mixed-tree verdict, so
+    #: nothing is parsed from it and NOTHING is triaged — a moved checkout must
+    #: never mint a critical ``test-failure`` item. The run still fails.
+    state_changed: list[dict] = []
     notice = ""
     for command in full_suite_commands(project_root):
         try:
@@ -3795,6 +3800,19 @@ def _run_tests_via_test_skill(
             break
         results.append(run)
         output = f"{run.get('stdout', '')}\n{run.get('stderr', '')}"
+        movement = run.get("state_changed_during_run")
+        if movement:
+            # Quarantine: no failure records, no triage, and the run is red.
+            state_changed.append({**movement, "suite_command": command})
+            print(
+                "notice: [state_changed_during_run] "
+                f"checkout {movement.get('checkout')} changed while the suite "
+                f"executed (HEAD {movement.get('before_commit') or '<none>'} -> "
+                f"{movement.get('after_commit') or '<none>'}): the verdict is "
+                "discarded and not triaged — re-run from a stable checkout.",
+                file=sys.stderr,
+            )
+            continue
         if "pytest" in command:
             cmd_failures = parse_pytest_failures(output)
         else:
@@ -3813,7 +3831,12 @@ def _run_tests_via_test_skill(
                 "suite_command": command,
             })
 
-    success = bool(results) and not notice and not failures
+    success = (
+        bool(results)
+        and not notice
+        and not failures
+        and not state_changed
+    )
 
     # Triage failures per the test skill (AC4) — never silently ignored.
     # Deduplicate by test_name and enforce a hard cap to prevent runaway
@@ -3860,9 +3883,22 @@ def _run_tests_via_test_skill(
                     "error": str(exc),
                 })
 
+    if not notice and state_changed:
+        notice = (
+            "checkout moved during the run for "
+            f"{len(state_changed)} command(s); their verdicts were discarded "
+            "(re-run from a stable checkout): "
+            + "; ".join(
+                f"{m.get('checkout')} "
+                f"{m.get('before_commit') or '<none>'}->{m.get('after_commit') or '<none>'}"
+                for m in state_changed
+            )
+        )
+
     print(
         f"Test skill run completed: success={success} commands={len(results)} "
         f"failures={len(failures)} triaged={len(triaged)} "
+        f"state_changed={len(state_changed)} "
         f"notice={notice or 'none'}",
         file=sys.stderr,
     )
@@ -3871,6 +3907,9 @@ def _run_tests_via_test_skill(
         "results": results,
         "failures": failures,
         "triaged": triaged,
+        # The flagged commands (SA-0MW3FF18I003KGZE AC4) so the audit report
+        # can name the checkout movement and the required re-run.
+        "state_changed_during_run": state_changed,
         "notice": notice,
     }
 

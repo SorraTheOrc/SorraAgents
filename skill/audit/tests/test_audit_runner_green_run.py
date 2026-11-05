@@ -2519,3 +2519,80 @@ class TestNestedSuiteRecursionGuard:
         err = capsys.readouterr().err
         assert "F3 auto-execution stand-down" in err
         assert "SA-0MUG47DYG006TV40" in err
+
+
+class TestStateChangedDuringRunAuditTriage:
+    """A moved-checkout command is reported, never triaged (SA-0MW3FF18I003KGZE AC4)."""
+
+    def _flagged_run(self, checkout: str = "/shared/checkout") -> dict:
+        """A ``run_cached`` result whose stdout would parse as failures."""
+        return {
+            "stdout": "FAILED tests/test_x.py::test_x - AssertionError\n"
+            "FAILED tests/test_y.py::test_y - AssertionError\n",
+            "stderr": "",
+            "exit_code": 75,
+            "completed_at": 1.0,
+            "command": "pytest -q",
+            "git_state": "",
+            "fingerprint_kind": "worktree",
+            "scope": "full",
+            "test_type": "full",
+            "interpreter": "",
+            "cached": False,
+            "state_changed_during_run": {
+                "notice_code": "state_changed_during_run",
+                "checkout": checkout,
+                "before_commit": "a" * 40,
+                "after_commit": "b" * 40,
+                "message": "checkout moved while the suite executed",
+            },
+        }
+
+    def test_flagged_command_is_not_triaged_and_fails_the_run(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """No parse, no check_or_create, non-green, notice names movement."""
+        monkeypatch.setattr(
+            audit_runner, "full_suite_commands", lambda root: ["pytest -q"]
+        )
+        monkeypatch.setattr(
+            audit_runner, "run_cached", lambda *a, **k: self._flagged_run()
+        )
+        with mock.patch(
+            "triage.scripts.check_or_create.check_or_create"
+        ) as spied:
+            result = audit_runner._run_tests_via_test_skill(tmp_path)
+
+        spied.assert_not_called()
+        assert result["success"] is False
+        assert result["failures"] == []
+        assert result["state_changed_during_run"] == [
+            {**self._flagged_run()["state_changed_during_run"],
+             "suite_command": "pytest -q"}
+        ]
+        assert "state_changed_during_run" in result["notice"]
+        err = capsys.readouterr().err
+        assert "state_changed_during_run" in err
+        assert "/shared/checkout" in err
+
+    def test_stable_red_run_still_triages_failures(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Control: a stable red run keeps today's parse + triage behaviour."""
+        red = self._flagged_run()
+        red["exit_code"] = 1
+        red["state_changed_during_run"] = None
+        red["stdout"] = "FAILED tests/test_real.py::test_real - AssertionError\n"
+        monkeypatch.setattr(
+            audit_runner, "full_suite_commands", lambda root: ["pytest -q"]
+        )
+        monkeypatch.setattr(audit_runner, "run_cached", lambda *a, **k: red)
+        with mock.patch(
+            "triage.scripts.check_or_create.check_or_create"
+        ) as spied:
+            result = audit_runner._run_tests_via_test_skill(tmp_path)
+
+        assert spied.call_count == 1
+        assert result["failures"], "the real failure must still be parsed"
+        assert result["success"] is False
+        assert result["state_changed_during_run"] == []
