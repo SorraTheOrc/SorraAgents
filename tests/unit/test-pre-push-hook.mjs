@@ -8,12 +8,20 @@
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { execSync } from 'node:child_process';
+// Hermetic git environment: a fixture git command must never stage into an
+// inherited GIT_INDEX_FILE (SA-0MW0V9PEP004EJYV / SA-0MVYS34QF000AWQX).
+import { hermeticGitEnv } from '../helpers/hermeticGitEnv.mjs';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '../..');
 const HOOK_PATH = path.join(REPO_ROOT, '.githooks', 'pre-push');
+
+/** Run git with the repository-override vars (incl. GIT_INDEX_FILE) scrubbed. */
+function execGit(cmd, opts = {}) {
+  return execSync(cmd, { ...opts, env: hermeticGitEnv(opts.env) });
+}
 
 /**
  * Run the pre-push hook script with a simulated git branch context.
@@ -24,7 +32,7 @@ function runPrePushHook(envOverrides = {}) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pre-push-test-'));
   try {
     // Initialize a minimal git repo
-    execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git init', { cwd: tmpDir, stdio: 'pipe' });
 
     // Copy the hook into the temp repo's .git/hooks
     const hooksDir = path.join(tmpDir, '.git', 'hooks');
@@ -34,19 +42,19 @@ function runPrePushHook(envOverrides = {}) {
     fs.writeFileSync(targetHook, hookContent, { mode: 0o755 });
 
     // Configure the repo to use hooks
-    execSync('git config core.hooksPath .git/hooks', { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git config core.hooksPath .git/hooks', { cwd: tmpDir, stdio: 'pipe' });
 
     // Create an initial commit so we have a valid repo state
-    execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
-    execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
     fs.writeFileSync(path.join(tmpDir, 'README.md'), '# test');
-    execSync('git add .', { cwd: tmpDir, stdio: 'pipe' });
-    execSync('git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git add .', { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
 
     // Add a fake remote so push doesn't fail on network
     const fakeRemote = path.join(tmpDir, 'fake-remote.git');
-    execSync(`git init --bare ${fakeRemote}`, { cwd: tmpDir, stdio: 'pipe' });
-    execSync('git remote add origin ' + fakeRemote, { cwd: tmpDir, stdio: 'pipe' });
+    execGit(`git init --bare ${fakeRemote}`, { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git remote add origin ' + fakeRemote, { cwd: tmpDir, stdio: 'pipe' });
 
     // Build the environment
     const baseEnv = {
@@ -59,7 +67,7 @@ function runPrePushHook(envOverrides = {}) {
 
     // Attempt push (the hook runs before the push)
     try {
-      execSync('git push -u origin HEAD 2>&1', { cwd: tmpDir, env, stdio: 'pipe' });
+      execGit('git push -u origin HEAD 2>&1', { cwd: tmpDir, env, stdio: 'pipe' });
       return { exitCode: 0, stdout: '', stderr: '' };
     } catch (err) {
       return {
@@ -93,22 +101,22 @@ describe('pre-push hook: branch policy', () => {
     // by checking the hook logic directly
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pre-push-master-'));
     try {
-      execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git checkout -b master', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git init', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git checkout -b master', { cwd: tmpDir, stdio: 'pipe' });
       const hooksDir = path.join(tmpDir, '.git', 'hooks');
       fs.mkdirSync(hooksDir, { recursive: true });
       const hookContent = fs.readFileSync(HOOK_PATH, 'utf8');
       fs.writeFileSync(path.join(hooksDir, 'pre-push'), hookContent, { mode: 0o755 });
-      execSync('git config core.hooksPath .git/hooks', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git config core.hooksPath .git/hooks', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
       fs.writeFileSync(path.join(tmpDir, 'README.md'), '# test');
-      execSync('git add .', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git add .', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
 
       const fakeRemote = path.join(tmpDir, 'fake-remote.git');
-      execSync(`git init --bare ${fakeRemote}`, { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git remote add origin ' + fakeRemote, { cwd: tmpDir, stdio: 'pipe' });
+      execGit(`git init --bare ${fakeRemote}`, { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git remote add origin ' + fakeRemote, { cwd: tmpDir, stdio: 'pipe' });
 
       const env = {
         ...process.env,
@@ -116,7 +124,7 @@ describe('pre-push hook: branch policy', () => {
         BRANCH_POLICY_SKIP: '',
       };
       try {
-        execSync('git push -u origin HEAD 2>&1', { cwd: tmpDir, env, stdio: 'pipe' });
+        execGit('git push -u origin HEAD 2>&1', { cwd: tmpDir, env, stdio: 'pipe' });
         assert.fail('Push to master should be blocked');
       } catch (err) {
         const output = err.stderr?.toString() || err.stdout?.toString() || '';
@@ -133,29 +141,29 @@ describe('pre-push hook: branch policy', () => {
   test('allows push from a feature branch', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pre-push-feature-'));
     try {
-      execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git checkout -b wl-SA-001-test-feature', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git init', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git checkout -b wl-SA-001-test-feature', { cwd: tmpDir, stdio: 'pipe' });
       const hooksDir = path.join(tmpDir, '.git', 'hooks');
       fs.mkdirSync(hooksDir, { recursive: true });
       const hookContent = fs.readFileSync(HOOK_PATH, 'utf8');
       fs.writeFileSync(path.join(hooksDir, 'pre-push'), hookContent, { mode: 0o755 });
-      execSync('git config core.hooksPath .git/hooks', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git config core.hooksPath .git/hooks', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
       fs.writeFileSync(path.join(tmpDir, 'README.md'), '# test');
-      execSync('git add .', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git add .', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
 
       const fakeRemote = path.join(tmpDir, 'fake-remote.git');
-      execSync(`git init --bare ${fakeRemote}`, { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git remote add origin ' + fakeRemote, { cwd: tmpDir, stdio: 'pipe' });
+      execGit(`git init --bare ${fakeRemote}`, { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git remote add origin ' + fakeRemote, { cwd: tmpDir, stdio: 'pipe' });
 
       const env = {
         ...process.env,
         WORKLOG_SKIP_PRE_PUSH: '1',
       };
       // This should succeed (exit 0)
-      execSync('git push -u origin HEAD 2>&1', { cwd: tmpDir, env, stdio: 'pipe' });
+      execGit('git push -u origin HEAD 2>&1', { cwd: tmpDir, env, stdio: 'pipe' });
       // If we get here, the push succeeded
       assert.ok(true, 'Push from feature branch should succeed');
     } finally {
@@ -168,21 +176,21 @@ describe('pre-push hook: branch policy', () => {
     // (though it may fail on wl sync, that's OK — we only care the policy is skipped)
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pre-push-bypass-'));
     try {
-      execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git init', { cwd: tmpDir, stdio: 'pipe' });
       const hooksDir = path.join(tmpDir, '.git', 'hooks');
       fs.mkdirSync(hooksDir, { recursive: true });
       const hookContent = fs.readFileSync(HOOK_PATH, 'utf8');
       fs.writeFileSync(path.join(hooksDir, 'pre-push'), hookContent, { mode: 0o755 });
-      execSync('git config core.hooksPath .git/hooks', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git config core.hooksPath .git/hooks', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
       fs.writeFileSync(path.join(tmpDir, 'README.md'), '# test');
-      execSync('git add .', { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git add .', { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
 
       const fakeRemote = path.join(tmpDir, 'fake-remote.git');
-      execSync(`git init --bare ${fakeRemote}`, { cwd: tmpDir, stdio: 'pipe' });
-      execSync('git remote add origin ' + fakeRemote, { cwd: tmpDir, stdio: 'pipe' });
+      execGit(`git init --bare ${fakeRemote}`, { cwd: tmpDir, stdio: 'pipe' });
+      execGit('git remote add origin ' + fakeRemote, { cwd: tmpDir, stdio: 'pipe' });
 
       const env = {
         ...process.env,
@@ -197,7 +205,7 @@ describe('pre-push hook: branch policy', () => {
         CONTEXT_BUDGET_SKIP: '1',
       };
       // With all skips enabled, push should succeed
-      execSync('git push -u origin HEAD 2>&1', { cwd: tmpDir, env, stdio: 'pipe' });
+      execGit('git push -u origin HEAD 2>&1', { cwd: tmpDir, env, stdio: 'pipe' });
       assert.ok(true, 'Push with BRANCH_POLICY_SKIP=1 should succeed');
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });

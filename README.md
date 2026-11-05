@@ -66,6 +66,22 @@ cache entry. See [`skill/test/SKILL.md`](skill/test/SKILL.md),
 [`skill/test_cache.py`](skill/test_cache.py) and
 [`docs/dev/release-tests.md`](docs/dev/release-tests.md).
 
+Every push to `dev`/`main` is also gated by the pre-push hook, which runs the
+full suite against **the pushed commit** rather than the main checkout's
+working tree. The hook forwards git's `<local_sha>` as
+`run_tests.py --gate-commit <sha>`; the runner resolves a clean checkout that
+holds that commit (the pusher's worktree when possible) and keys the cache on
+that state, so a green `scope: full` entry computed for any other state —
+including the main checkout's own `HEAD` plus its dirty `.worklog/` churn —
+cannot satisfy the gate. If no clean checkout holds the commit, the push is
+refused and the message names the commit, the remote ref, the remedy and the
+`TEST_SCOPE_SKIP=1` escape hatch. The gate prints the state it validated
+(`gate-subject` / `gate-root` / `gate-verdict` on `stderr`), and the hook
+mirrors the resulting cache entry into the main checkout so Step-9
+`--summary` and audit F3 can consume it. See
+[`docs/dev/test-skill-reference.md`](docs/dev/test-skill-reference.md#04-pre-push-gate-subject-binding-sa-0mvtrbt50005dueh)
+and [`docs/dev/test-isolation.md`](docs/dev/test-isolation.md).
+
 ### For Release Managers
 
 Running a release does not require a work item — the `/skill:ship release`
