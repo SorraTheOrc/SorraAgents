@@ -1997,19 +1997,22 @@ including the bounded-wait timeout message and the `start` refresh window).
 ## Verified reversible local-dev sync and post-push ancestry assertion (SA-0MVPZG7A0000N66U)
 
 **The dev-push gate's subject is the pushed commit, and the push runs from the
-worktree that holds it (SA-0MVTFMB7K002Y1F3).** `.githooks/pre-push` runs the
-full suite against the tree of the directory `git push` is launched from (`git
-rev-parse --show-toplevel` in the pushing cwd), not against the pushed commit,
-so `phase_finish` Step 6 calls `git_push_to_dev(worktree_path, …)` — never the
-main checkout. A pre-push subject guard (`_assert_push_subject`) refuses the
-push with `PushSubjectMismatchError` when the worktree cannot hold the pushed
-commit (missing, not a git working tree, or its `HEAD` is a different commit);
-the message names the commit, branch, worktree and actual `HEAD`, so a checkout
-holding a different commit can never silently gate the wrong tree. The
-non-fast-forward recovery re-establishes the same subject: it fetches and
-rebases inside the worktree, recomputes the rewritten commit **there**, guards
-again and retries `git_push_to_dev(worktree_path, …)` — so the rebased
-replacement hash, not the pre-rebase commit, is what the gate measures.
+worktree that holds it (SA-0MVTFMB7K002Y1F3).** `.githooks/pre-push` forwards
+git's `<local_sha>` as `run_tests.py --gate-commit <sha>`, so the gate resolves
+a clean checkout of the pushed commit and measures that tree
+(SA-0MVTRBT50005DUEH). `phase_finish` Step 6 therefore calls
+`git_push_to_dev(worktree_path, …)` — never the main checkout — so the gate can
+always materialise the pushed commit. A pre-push subject guard
+(`_assert_push_subject`) refuses the push with `PushSubjectMismatchError` when
+the worktree cannot hold the pushed commit (missing, not a git working tree,
+its `HEAD` is a different commit, or it has tracked uncommitted changes that a
+recovery rebase cannot carry); the message names the commit, branch, worktree
+and actual `HEAD`, so a checkout holding a different commit can never silently
+gate the wrong tree. The non-fast-forward recovery re-establishes the same
+subject: it fetches and rebases inside the worktree, recomputes the rewritten
+commit **there**, guards again and retries `git_push_to_dev(worktree_path, …)`
+— so the rebased replacement hash, not the pre-rebase commit, is what the gate
+measures.
 
 On success `git_push_to_dev` logs the hook's `stderr` (so "the gate ran" is
 visible) and one structured line:

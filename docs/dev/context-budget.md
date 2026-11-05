@@ -254,11 +254,12 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 >    threshold exceed blocks the push. Both run on every test-suite execution,
 >    so CI and pre-`in_review` runs fail on regression.
 >
-> **Subject of the gate:** the context-budget gate measures the tree of the
-> directory the push is executed from. `implement.py finish` now pushes from the
+> **Subject of the gate:** the context-budget gate's subject is the pushed
+> commit (`run_tests.py --gate-commit`). `implement.py finish` pushes from the
 > **worktree** that holds the pushed commit (SA-0MVTFMB7K002Y1F3), so the gate
-> measures the pushed files, not a stale main checkout; `finish` also fails
-> closed when the worktree cannot hold the pushed commit, and its
+> materialises and measures the pushed files, not a stale main checkout;
+> `finish` also fails closed (naming the commit, branch, worktree and actual
+> `HEAD`) when the worktree cannot hold the pushed commit, and its
 > `dev-push gate evidence` line records the resolved `root`/`head`/`pushed` and
 > whether the full-suite entry was `cached`, `executed` or `no-evidence`.
 > Because a worktree's test cache is private to it, the hook's

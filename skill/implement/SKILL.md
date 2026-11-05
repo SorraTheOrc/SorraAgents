@@ -266,7 +266,8 @@ full test suite):
   (commit hash + branch + `git push origin` instruction).
 - The work item status is reset to `open` (not silently abandoned).
 
-Recovery: push manually from the main checkout:
+Recovery: push manually from the worktree that holds the pushed commit
+(never the main checkout, or the gate could measure a different tree):
 
 ```bash
 git push origin <branch>:refs/heads/dev
@@ -1495,8 +1496,8 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 
 `<worktree>/.implement_state.json` carries `repo_root`, and it always means the
 **main checkout root** — never the worktree, never a path inside it. Every
-consumer acts on the main checkout: the `dev` fast-forward and push in
-`finish`, the parent-branch sync, the signal handler's `_restore_repo_state`,
+consumer acts on the main checkout: the `dev` fast-forward in `finish`, the
+parent-branch sync, the signal handler's `_restore_repo_state`,
 and `_remove_worktree(..., repo_root=…)`, whose safety gate refuses a path that
 resolves to `repo_root`. A worktree recorded as `repo_root` therefore makes
 `finish` raise `REFUSE to remove the repository root` *after* a successful push

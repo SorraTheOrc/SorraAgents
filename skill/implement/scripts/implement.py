@@ -4165,11 +4165,12 @@ class PushSubjectMismatchError(RuntimeError):
 
     ``finish`` pushes from the worktree that holds its commit so the pre-push
     full-suite gate measures the pushed tree. When that checkout cannot be the
-    subject (missing worktree, not a git working tree, or its ``HEAD`` is a
-    different commit), pushing anyway would let the gate verify — and cache —
-    a tree the pushed commit does not describe. The guard therefore refuses
-    before any push, naming the commit, branch, worktree and the actual
-    ``HEAD`` so a human can recover (SA-0MVTFMB7K002Y1F3 AC2/AC3).
+    subject (missing worktree, not a git working tree, its ``HEAD`` is a
+    different commit, or it has tracked uncommitted changes that a recovery
+    rebase cannot carry), pushing anyway would let the gate verify — and
+    cache — a tree the pushed commit does not describe. The guard therefore
+    refuses before any push, naming the commit, branch, worktree and the
+    actual ``HEAD`` so a human can recover (SA-0MVTFMB7K002Y1F3 AC2/AC3).
     """
 
     def __init__(
@@ -4189,9 +4190,10 @@ class PushSubjectMismatchError(RuntimeError):
             f"Refusing to push commit {commit_hash} on branch {branch}: the "
             f"worktree {worktree_path} does not hold the pushed commit "
             f"(HEAD={actual_head or 'unresolved'}; {reason}). The dev-push "
-            f"gate validates the tree of the directory the push runs from, so "
-            f"pushing from a checkout holding a different commit would gate "
-            f"the wrong tree. Recovery: check out {commit_hash} in "
+            f"gate's subject is the pushed commit and it resolves that commit "
+            f"from the push checkout, so pushing from a checkout holding a "
+            f"different commit would gate the wrong tree. Recovery: check out "
+            f"{commit_hash} in "
             f"{worktree_path} (or recreate the worktree from {branch}) and "
             f"re-run finish. The commit is local on branch {branch}."
         )
@@ -4302,7 +4304,8 @@ def _full_suite_cache_present(cwd: str) -> bool:
         try:
             if query_cached(command, cwd=cwd) is not None:
                 return True
-        except Exception:  # noqa: BLE001 - a corrupt entry is a miss
+        except Exception as exc:  # noqa: BLE001 - a corrupt entry is a miss
+            LOG.debug("Full-suite cache query failed for %r: %s", command, exc)
             continue
     return False
 
@@ -6574,6 +6577,31 @@ def _resolve_origin_parent_tip(
     )
 
 
+def _push_cwd_has_tracked_changes(cwd: str) -> bool:
+    """Whether *cwd* has tracked files modified or staged (untracked ignored).
+
+    A tracked change in the push checkout means the worktree's tree is not the
+    pushed commit's tree, and a recovery rebase cannot carry it safely, so the
+    subject guard refuses rather than let the gate verify (and cache) a tree
+    the pushed commit does not describe. Untracked files are ignored because a
+    rebase can usually proceed with them present. Fail-closed: an unreadable
+    status is treated as dirty.
+    """
+    try:
+        result = run_cmd(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=cwd,
+            check=False,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        LOG.debug("Push-subject status check failed for %s: %s", cwd, exc)
+        return True
+    if result.returncode != 0:
+        return True
+    return bool(result.stdout.strip())
+
+
 def _assert_push_subject(
     push_cwd: str,
     commit_hash: str,
@@ -6582,15 +6610,17 @@ def _assert_push_subject(
 ) -> None:
     """Assert *push_cwd* holds *commit_hash* before the dev push.
 
-    ``.githooks/pre-push`` runs the full suite against the tree of the
-    directory the push is launched from (``git rev-parse --show-toplevel`` in
-    the pushing cwd), not against the pushed commit. ``finish`` therefore
-    pushes from the worktree that has the commit checked out; this guard
-    proves that invariant **before** ``git push`` runs and fails closed when
-    the push directory cannot be the subject: it does not exist, is not a git
-    working tree, does not contain the commit, or its ``HEAD`` is a different
-    commit. Pushing anyway would let the gate verify (and cache) a different
-    tree than the one that lands on ``dev`` (SA-0MVTFMB7K002Y1F3 AC1/AC2).
+    ``.githooks/pre-push`` resolves the pushed commit as the gate's subject
+    (``run_tests.py --gate-commit``) and runs the full suite against a clean
+    checkout holding it. ``finish`` therefore pushes from the worktree that
+    has the commit checked out, so the gate always measures the pushed commit;
+    this guard proves that invariant **before** ``git push`` runs and fails
+    closed when the push directory cannot be the subject: it does not exist,
+    is not a git working tree, does not contain the commit, its ``HEAD`` is a
+    different commit, or it has tracked uncommitted changes that a recovery
+    rebase cannot carry. Pushing anyway would let the gate verify (and cache)
+    a tree the pushed commit does not describe
+    (SA-0MVTFMB7K002Y1F3 AC1/AC2).
 
     Args:
         push_cwd: Directory the push will run from (the worktree).
@@ -6620,6 +6650,11 @@ def _assert_push_subject(
                 reason = (
                     f"the push directory's HEAD ({actual_head}) is not the "
                     f"pushed commit ({pushed})"
+                )
+            elif _push_cwd_has_tracked_changes(push_cwd):
+                reason = (
+                    "the push directory has tracked uncommitted changes that "
+                    "a recovery rebase cannot carry"
                 )
     if not reason:
         return
@@ -6860,13 +6895,13 @@ def _fast_forward_local_dev_for_push(
 ) -> dict[str, Any]:
     """Advance the main checkout's local parent branch to *commit_hash*.
 
-    The pre-push fast-forward exists so the dev-push integration gate measures
-    the **main checkout** with the new files already present (commits touching
-    ``AGENTS.md`` and friends would otherwise be rejected against a stale
-    checkout — SA-0MVECQUGF0064U81). The advance is therefore inherently
-    unverified: the commit is by definition not on ``origin/<parent_branch>``
-    yet. Instead of the previous silent best-effort (a broad ``except`` that
-    disabled the whole fast-forward), it is made **loud and reversible**:
+    This fast-forward is **main-checkout hygiene only**: the dev-push gate's
+    subject is the pushed commit (resolved from the worktree that holds it),
+    so it does not measure this checkout. The advance merely keeps the main
+    checkout's local branch up to date so the next worktree forks from a
+    current base and the checkout does not lag ``dev`` (the historical reason
+    — a pre-push gate that measured the main checkout — no longer applies; see
+    SA-0MVTFMB7K002Y1F3). It is still made **loud and reversible**:
 
     * local ``dev`` is only ever advanced with ``git merge --ff-only`` — its
       history is never rewritten;
@@ -6952,8 +6987,10 @@ def _fast_forward_local_dev_for_push(
             f"commit {commit_hash} is verified after it.",
         )
 
-    # 2. Ensure the main checkout is on the parent branch: the pre-push gate
-    #    measures this working tree, so the new files must be checked out.
+    # 2. Ensure the main checkout is on the parent branch. This is hygiene
+    #    only: the dev-push gate's subject is the pushed commit (resolved from
+    #    the worktree), never this checkout, so the fast-forward just keeps the
+    #    main checkout current for the next worktree.
     checkout_result = run_cmd(
         ["git", "checkout", parent_branch], cwd=repo_root, check=False
     )

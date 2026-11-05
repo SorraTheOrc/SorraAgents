@@ -144,8 +144,9 @@ This matters because every consumer of that field acts on the main checkout:
 - the **dev push runs from the worktree** that holds the pushed commit — not
   from `repo_root` — so `.githooks/pre-push` resolves its project root to the
   pushed tree and validates the pushed commit (SA-0MVTFMB7K002Y1F3); a
-  pre-push subject guard refuses the push when the worktree does not hold that
-  commit;
+  pre-push subject guard refuses the push (naming the commit, branch, worktree
+  and actual `HEAD`) when the worktree does not hold that commit or has tracked
+  uncommitted changes that a recovery rebase cannot carry;
 - the pre-push gate's **subject is the pushed commit**
   (SA-0MVTRBT50005DUEH): the hook forwards `<local_sha>` as
   `run_tests.py --gate-commit`, which measures (and cache-keys against) a

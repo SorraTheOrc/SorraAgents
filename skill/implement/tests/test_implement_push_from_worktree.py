@@ -456,6 +456,38 @@ def test_mismatched_push_subject_is_refused_before_pushing(sandbox):
 
 
 # ---------------------------------------------------------------------------
+# AC2 — a dirty push subject (tracked changes) is refused, never gated
+# ---------------------------------------------------------------------------
+
+
+def test_dirty_push_subject_is_refused_before_pushing(sandbox):
+    """A worktree with tracked uncommitted changes is refused before any push.
+
+    A recovery rebase cannot safely carry tracked changes, so the subject guard
+    refuses rather than let the gate measure (and cache) a tree the pushed
+    commit does not describe. Here ``HEAD`` **is** the pushed commit, so the
+    dirty state is the deciding fact, and the refusal still names the commit,
+    branch, worktree and the actual ``HEAD``.
+    """
+    wt = sandbox["wt"]
+    # A tracked modification: the worktree no longer describes the pushed
+    # commit's tree, and a rebase cannot proceed with it in place.
+    (wt / "feature.txt").write_text("dirty edit\n", encoding="utf-8")
+
+    with pytest.raises(implement.PushSubjectMismatchError) as excinfo:
+        implement._assert_push_subject(
+            str(wt), sandbox["feature"], BRANCH, str(wt)
+        )
+
+    err = excinfo.value
+    assert err.actual_head == sandbox["feature"], err.actual_head
+    message = str(err)
+    assert str(wt) in message, message
+    assert BRANCH in message, message
+    assert "uncommitted" in message, message
+
+
+# ---------------------------------------------------------------------------
 # Shared evidence helpers — the dev-push gate's resolved tree
 # ---------------------------------------------------------------------------
 
