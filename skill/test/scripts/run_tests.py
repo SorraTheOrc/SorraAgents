@@ -138,6 +138,8 @@ from test_cache import (
     DEFAULT_TTL_SECONDS,
     GitStateUnavailable,
     Runner,
+    STATE_CHANGED_EXIT_CODE,
+    STATE_CHANGED_NOTICE_CODE,
     _default_runner,
     compute_git_state,
     is_worktree_clean,
@@ -221,6 +223,12 @@ TEST_LOCK_JITTER_DEFAULT = 0.1
 NOTICE_SLOT_BUSY = "slot_busy"
 NOTICE_COMMAND_NOT_FOUND = "command_not_found"
 NOTICE_SUITE_TIMEOUT = "suite_timeout"
+#: A command's guarded checkout moved while it executed (SA-0MW3FF18I003KGZE
+#: AC1): the mixed-tree verdict is quarantined and reported non-green with the
+#: distinct ``STATE_CHANGED_EXIT_CODE``, never parsed as a code failure. The
+#: code is the cache's stable notice (:data:`test_cache.STATE_CHANGED_NOTICE_CODE`)
+#: so the runner and the cache cannot drift.
+NOTICE_STATE_CHANGED_DURING_RUN = STATE_CHANGED_NOTICE_CODE
 
 #: Stable code for the **non-fatal** resolution notice that a pinned
 #: ``.pi/test-config.json`` ``suiteCommands`` list does not cover some of the
@@ -2685,6 +2693,11 @@ def run_suite(
             # entries were reused.
             "cached": use_cache and all(cached_flags) if cached_flags else False,
             "cache_entries": cache_entries,
+            # Mid-run checkout movement (SA-0MW3FF18I003KGZE): None on every
+            # stable path; the flag dict {notice_code, checkout, before_commit,
+            # after_commit, message} when the guarded checkout moved while a
+            # command executed.
+            "state_changed_during_run": None,
         }
         result.update(overrides)
         return result
@@ -2692,6 +2705,9 @@ def run_suite(
     for cmd in commands:
         command_waits: list[float] = []
         command_elapsed: list[float] = []
+        # Set when run_cached reports the guarded checkout moved while this
+        # command executed (SA-0MW3FF18I003KGZE).
+        state_changed_flag: dict[str, Any] | None = None
 
         def _record_wait(
             _queued_at: float,
@@ -2727,6 +2743,7 @@ def run_suite(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
                 )
                 cached_flags.append(run["cached"])
+                state_changed_flag = run.get("state_changed_during_run")
                 if run["cached"]:
                     cache_entries.append(_cache_entry_metadata(run, cmd))
                 if run.get("interpreter"):
@@ -2764,6 +2781,18 @@ def run_suite(
         output = f"{proc.stdout}\n{proc.stderr}"
         stdout_parts.append(proc.stdout or "")
         stderr_parts.append(proc.stderr or "")
+        # A checkout that moved mid-run (SA-0MW3FF18I003KGZE) makes this
+        # command's output a mixed-tree verdict: its content is evidence for
+        # no single commit. No failure is parsed from it (the parser would
+        # happily match failures that exist in neither tree), the suite is
+        # forced non-green with the distinct STATE_CHANGED_EXIT_CODE, and the
+        # detail is carried on the result for consumers.
+        if state_changed_flag:
+            overall_returncode = STATE_CHANGED_EXIT_CODE
+            # One moved command invalidates the whole suite: the remaining
+            # commands would run against the same unstable checkout and
+            # contribute nothing usable.
+            break
         if "pytest" in cmd:
             failures = parse_pytest_failures(output)
         else:
@@ -2772,13 +2801,33 @@ def run_suite(
         if proc.returncode != 0:
             overall_returncode = proc.returncode
 
+    state_changed_detail = (
+        state_changed_flag if state_changed_flag is not None else None
+    )
+    flagged_notice = ""
+    flagged_notice_code = ""
+    if state_changed_detail is not None:
+        flagged_notice_code = NOTICE_STATE_CHANGED_DURING_RUN
+        flagged_notice = (
+            f"[{NOTICE_STATE_CHANGED_DURING_RUN}] "
+            f"checkout {state_changed_detail.get('checkout')} changed while "
+            f"the test suite executed (HEAD "
+            f"{state_changed_detail.get('before_commit') or '<none>'} -> "
+            f"{state_changed_detail.get('after_commit') or '<none>'}): the "
+            f"mixed tree exists at no single commit, so the verdict is "
+            f"discarded — re-run the suite from a stable checkout."
+        )
+
     result = _result(
         success=overall_returncode == 0 and not all_failures,
         returncode=overall_returncode,
         exit_code=overall_returncode,
         command=command,
         failures=all_failures,
+        notice=flagged_notice,
+        notice_code=flagged_notice_code,
         cached=use_cache and all(cached_flags) if cached_flags else False,
+        state_changed_during_run=state_changed_detail,
     )
     # Classification precedence (SA-0MVU8XRBQ000DG9D): a parsable failure is
     # always a code failure. Only a non-zero suite with NO parsable failure is
@@ -2786,7 +2835,13 @@ def run_suite(
     # (negative return code — OOM kill, worker crash) is distinguished from a
     # plain non-zero exit. Cache-served non-zero results are classified from
     # their stored exit code and output too (their elapsed time is ``None``).
-    if not all_failures and overall_returncode != 0:
+    # A flagged (moved-checkout) run is never given a failure-style
+    # classification: its notice code already names the movement.
+    if (
+        not all_failures
+        and overall_returncode != 0
+        and state_changed_detail is None
+    ):
         if overall_returncode < 0:
             signal_number = abs(overall_returncode)
             result["signal"] = signal_number
@@ -2908,6 +2963,10 @@ def run_all(
     resolution_notices = full_suite_notices(Path(cwd or REPO_ROOT).resolve())
     for notice in resolution_notices:
         print(f"run_tests: notice [{notice['code']}] {notice['message']}", file=sys.stderr)
+    #: Moved-checkout flags (SA-0MW3FF18I003KGZE): carried through the
+    #: aggregate so a consumer never loses the detail a suite-level notice
+    #: references by code alone.
+    state_changed_flags: list[dict[str, Any]] = []
     with Timer("run_all") as _all_timer:
         for name in suites:
             with Timer(f"suite:{name}"):
@@ -2926,6 +2985,9 @@ def run_all(
                     fingerprint=fingerprint,
                 )
             results[name] = result
+            suite_flag = result.get("state_changed_during_run")
+            if suite_flag:
+                state_changed_flags.append(suite_flag)
             resolved_scopes.append(result["scope"])
             suite_elapsed = result.get("elapsed_seconds")
             if suite_elapsed is not None:
@@ -2948,6 +3010,9 @@ def run_all(
         "failures": all_failures,
         "notices": notices,
         "notice_codes": notice_codes,
+        # Moved-checkout flags (SA-0MW3FF18I003KGZE): the detail behind each
+        # ``state_changed_during_run`` notice code.
+        "state_changed_during_run": state_changed_flags,
         # Resolution notices are informational and carry a stable machine-
         # readable shape (code/directories/source); they are deliberately kept
         # out of ``notices``/``notice_codes`` so a consumer classifying a
