@@ -2886,3 +2886,125 @@ class TestTransientClassificationAssembly:
 
         assert "Audit classification:" not in report, report[:400]
 
+# C3 (WL-0MW32YGSY008GRQP): Phase-2 budget and gate-remediation alignment
+# ---------------------------------------------------------------------------
+# Regression tests for the test-first pair with C4 (WL-0MW32YZP7005LZ5B): the
+# Phase-2 deep-analysis default must be the documented 2,400 s budget (not the
+# 1,800 s placeholder), an explicit override must still win, the Phase-2
+# timeout diagnostic must report the resolved effective timeout (not a
+# hardcoded constant) and name the Phase 2 deep-analysis phase, and the
+# Phase-1 screen budgets (1,080 s) / stall-abort threshold (600 s) must stay
+# unchanged. Red against current HEAD; green after C4.
+
+
+class TestPhase2BudgetAndDiagnostic:
+    """Phase-2 budget, override precedence and truthful timeout diagnostic."""
+
+    def test_phase2_default_effective_timeout_is_documented_2400(self):
+        """The Phase-2 default effective timeout equals the documented 2,400 s
+        budget (parent WL-0MW2F2T1I001ZNH7 plan D2; measured p90 x 2)."""
+        from audit.scripts.audit_runner import _resolve_call_timeout
+
+        assert _resolve_call_timeout(None) == 2400, (
+            "Phase-2 default effective timeout must be the documented 2,400 s "
+            "budget, not the 1,800 s placeholder"
+        )
+
+    def test_phase2_explicit_timeout_override_wins(self):
+        """An explicit ``--timeout`` value must win over the Phase-2 default."""
+        from audit.scripts.audit_runner import _resolve_call_timeout
+
+        assert _resolve_call_timeout(2700) == 2700
+        assert _resolve_call_timeout(60) == 60
+
+    def test_audit_pi_timeout_env_override_wins(self, monkeypatch):
+        """``AUDIT_PI_TIMEOUT`` must win over the Phase-2 default."""
+        from audit.scripts.audit_runner import (
+            _resolve_call_timeout,
+            _resolve_effective_timeout,
+        )
+
+        monkeypatch.delenv("AUDIT_PI_TIMEOUT", raising=False)
+        assert _resolve_effective_timeout(None) is None
+        monkeypatch.setenv("AUDIT_PI_TIMEOUT", "2700")
+        effective = _resolve_effective_timeout(None)
+        assert effective == 2700
+        assert _resolve_call_timeout(effective) == 2700
+
+    def test_phase2_timeout_diagnostic_reports_effective_timeout(self):
+        """The Phase-2 timeout diagnostic reports the resolved effective
+        timeout (a 2,700 s override reports 2,700 s, not the hardcoded
+        1,800 s/``CALL_PI_TIMEOUT``) and names the Phase 2 deep-analysis
+        phase (SA-0MV9J471W002LCE1)."""
+        import audit.scripts.audit_runner as audit_runner
+        from unittest import mock
+
+        captured: list[tuple[str, str]] = []
+
+        def fake_call(issue_id, context, prompt, **kwargs):
+            return {"_timeout": True, "evidence": "Deep analysis timed out."}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call,
+        ), mock.patch.object(
+            audit_runner, "_build_file_scope_manifest", return_value="manifest",
+        ), mock.patch.object(
+            audit_runner, "_validate_file_scope_manifest", return_value=None,
+        ), mock.patch.object(
+            audit_runner, "_resolve_touched_files", return_value=[],
+        ):
+            audit_runner._run_phase2_deep_analysis(
+                {"id": "P2T-1", "description": "## Acceptance Criteria\n1. AC one\n"},
+                [{"text": "AC one", "verdict": "unmet", "evidence": ""}],
+                [],
+                "full-model",
+                timeout=2700,
+                script_failure_callback=lambda label, exc: captured.append(
+                    (label, str(exc))
+                ),
+            )
+
+        assert captured, "the Phase-2 timeout must invoke script_failure_callback"
+        label, message = captured[0]
+        assert label == "pi (Phase 2 deep analysis)", label
+        assert "Phase 2 deep analysis" in message
+        assert "2700" in message, (
+            f"diagnostic must name the effective 2,700 s timeout, got: {message!r}"
+        )
+        assert "1800" not in message, (
+            "diagnostic must not report the hardcoded 1,800 s placeholder: "
+            f"{message!r}"
+        )
+
+    def test_phase1_screen_budgets_and_stall_threshold_unchanged(
+        self, monkeypatch
+    ):
+        """Phase-1 screen budgets (1,080 s) and the stall-abort threshold
+        (600 s) are unchanged — the Phase-2 change cannot silently widen
+        screening budgets (parent plan D2)."""
+        from audit.scripts.audit_runner import (
+            _CHILD_SCREEN_TIMEOUT_DEFAULT,
+            _PARENT_SCREEN_TIMEOUT_DEFAULT,
+            _STALL_TIMEOUT_DEFAULT,
+            _resolve_call_timeout,
+            _resolve_child_screen_timeout,
+            _resolve_parent_screen_timeout,
+            _resolve_stall_timeout,
+        )
+
+        for var in (
+            "AUDIT_CHILD_SCREEN_TIMEOUT",
+            "AUDIT_PARENT_SCREEN_TIMEOUT",
+            "AUDIT_STALL_TIMEOUT",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        assert _PARENT_SCREEN_TIMEOUT_DEFAULT == 1080
+        assert _resolve_parent_screen_timeout(None) is None
+        assert _resolve_call_timeout(None, parent_screen=True) == 1080
+        assert _CHILD_SCREEN_TIMEOUT_DEFAULT == 1080
+        assert _resolve_child_screen_timeout(None) is None
+        assert _resolve_call_timeout(None, child_screen=True) == 1080
+        assert _STALL_TIMEOUT_DEFAULT == 600
+        assert _resolve_stall_timeout() == 600
+
