@@ -406,12 +406,18 @@ consistency test keeps the three documents and the producing constants in step.
 | `suite_timeout` | The command exceeded `timeoutPerCommand` (`TimeoutExpired`). |
 | `killed` | The child was terminated by a signal (`returncode < 0`, e.g. an OOM kill or a worker crash) and produced no parsable failure. |
 | `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). |
+| `state_changed_during_run` | The guarded checkout moved while a command executed (HEAD and/or the tracked tree it resolves to changed mid-run, e.g. a concurrent `implement.py finish` fast-forward); the mixed-tree verdict is quarantined (no cache entry under either state), the command's parsed failures are dropped and the suite is reported non-green with the distinct exit status 75 (`EX_TEMPFAIL`). The result carries the detail (checkout path + before/after commits) on `state_changed_during_run` — a non-empty dict for the suite, a list under the `run_all` aggregate; the human output prints a `notice: [state_changed_during_run] …` line naming the checkout movement and the required re-run. Runs whose only difference is churn attributable to another session (start-of-run-dirty → end-clean resolutions) are never flagged (SA-0MW3FF18I003KGZE AC3). |
 
 **Precedence.** Structured (parsable) test failures always win: `killed` and
 `unparsed_failure` are set only when `failures` is empty, so a genuine code
-failure is never reclassified as an infrastructure condition. A non-zero
-result served **from cache** is classified too — its stored exit code and
-output are enough, and its elapsed time is reported as `null` (see below).
+failure is never reclassified as an infrastructure condition. The
+`state_changed_during_run` flag is the single exception, and it wins **before**
+the failure check: a moved checkout makes every parsed failure a mixed-tree
+artefact that exists at no single commit, so a flagged run is always classified
+as `infrastructure` (never `test_failure`) by the shared `gate_reason`
+classifier and by `implement.py`'s finish gate. A non-zero result served
+**from cache** is classified too — its stored exit code and output are enough,
+and its elapsed time is reported as `null` (see below).
 
 #### Diagnostic fact fields
 

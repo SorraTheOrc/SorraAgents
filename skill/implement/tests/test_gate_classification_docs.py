@@ -52,6 +52,7 @@ RUNNER_NOTICE_CODES: tuple[str, ...] = (
     run_tests.NOTICE_SUITE_TIMEOUT,
     run_tests.NOTICE_KILLED,
     run_tests.NOTICE_UNPARSED_FAILURE,
+    run_tests.NOTICE_STATE_CHANGED_DURING_RUN,
 )
 
 

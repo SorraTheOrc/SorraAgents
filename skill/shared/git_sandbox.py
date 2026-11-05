@@ -60,7 +60,12 @@ Design constraints (SA-0MUG0WFP8008WN63 F3 AC1/N-L5):
   config rewrites of any
   non-excluded key, working-tree contamination, and moves of non-excluded
   refs (SA-0MUIA3OE40001QJX); a ``refs/heads/dev``-only ref move is no longer
-  a standalone incident signal (see ``docs/dev/test-isolation.md`` §8.4).
+  a standalone incident signal (see ``docs/dev/test-isolation.md`` §8.4),
+  and a *clean* own-checkout fast-forward of the shared integration branch is
+  only caught on the new own-checkout state surface
+  (``snapshot_own_checkout`` / ``compare_own_checkout_states``,
+  ``state_changed_during_run`` — SA-0MW3FF18I003KGZE), never through the
+  guard's ref/config/working-tree surfaces.
 
 **Working-tree attribution rule (SA-0MUIJAHXS003M7BG).** The working-tree
 surface is attributed by *start-of-run provenance*, derived only from git

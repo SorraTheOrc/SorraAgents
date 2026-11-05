@@ -477,12 +477,23 @@ Genuine mutations still fail the guard and name the offending test:
    incident class detectable (a name pattern is forbidden).
 2. **`refs/heads/dev`-only movement is no longer a standalone incident
    signal.** Because the integration branch is concurrency-excluded, a
-   mutation that moves *only* `dev` is no longer detected via the ref surface.
-   The SA-0MUIA3OE40001QJX leak class is still caught through the other
-   surfaces — a `GIT_DIR`-leak incident also rewrites local config and/or the
-   working tree (see §9), and those surfaces always fire — but detection of a
+   mutation that moves *only* `dev` is no longer detected via the guard's
+   ref surface. The SA-0MUIA3OE40001QJX leak class is still caught through
+   the other surfaces — a `GIT_DIR`-leak incident also rewrites local config
+   and/or the working tree (see §9), and those surfaces always fire — but a
+   **clean** own-checkout fast-forward (the 2026-11-03 mixed-tree incident
+   class: `git status` clean before and after, HEAD and tracked files
+   rewritten by a concurrent `implement.py finish`) is invisible to every
+   one of the guard's surfaces. That class is now detected on the new
+   **own-checkout state surface** — `snapshot_own_checkout` /
+   `compare_own_checkout_states` in `skill/shared/git_sandbox.py`, consumed
+   by the test cache's `state_changed_during_run` flag (SA-0MW3FF18I003KGZE,
+   §8.6) — which compares the guarded root's own HEAD and tracked-tree
+   content around the run instead of the ref surface. Detection of a
    hypothetical *pure* ref-only `dev` rewrite is traded away for multi-agent
-   false-positive immunity (WL-0MV5MYBKJ0033P8U).
+   false-positive immunity (WL-0MV5MYBKJ0033P8U); the own-checkout surface
+   is the replacement signal for the incident class that ref-only detection
+   used to cover.
 
 Regression coverage:
 
@@ -556,6 +567,44 @@ pinned boundaries), ``TestWorkingTreeAttributionNested`` in
 ``tests/test_live_repo_mutation_guard.py`` (inner-plugin parity) and the
 ``live_repo_excluded`` tests in
 ``skill/test/tests/test_guarded_run_all.py`` (outer-guard parity, AC3 note).
+
+### 8.6 Own-checkout state surface (`state_changed_during_run`)
+
+The guard's surfaces are **refs + config + working tree**, and §8.4 records
+what they cannot see: a *clean* own-checkout fast-forward of the
+concurrency-excluded `dev` rewrites the checkout's HEAD and tracked files
+while `git status --porcelain=v1 -uall` stays clean before and after. That
+incident class is now detected on a **separate, deliberately narrow surface**
+— the guarded root's own state (SA-0MW3FF18I003KGZE):
+
+- `snapshot_own_checkout(root)` captures the checkout's own HEAD commit plus
+  a content fingerprint of the working-tree deltas the tree resolves to.
+  It never reads the ref surface at all, so `refs/heads/dev`,
+  `refs/remotes/origin/*` and `refs/heads/worklog/*` movement stays
+  invisible *by construction* — a sibling fast-forward only matters when it
+  rewrites this checkout's own HEAD/tree, which the fingerprint captures.
+- `compare_own_checkout_states(before, after)` reports `moved` (with both
+  commits) unless the difference is fully explained by the §8.5
+  start-of-run working-tree attribution (a sibling committing work it had
+  itself dirtied mid-run is churn, never a move — reported in
+  `attributed`). An unfingerprintable checkout is fail-closed and never
+  reported as movement.
+
+The test cache brackets every executed run with this snapshot pair
+(`skill/test_cache.py`); on `moved` it quarantines the verdict — no cache
+entry under either state, a distinct exit status 75
+(`STATE_CHANGED_EXIT_CODE`), the `state_changed_during_run` notice naming
+checkout + before/after commits, and no parsed failure records — and the
+finish gate/audit classify it as infrastructure (see
+docs/dev/test-skill-reference.md, “Notice codes”). A stable run is unchanged.
+
+Regression pins: `TestOwnCheckoutState` in
+`skill/shared/tests/test_git_sandbox.py` (helper), the harness in
+`tests/test_test_cache.py` (`TestStateChangedDuringRun`, end-to-end through
+`run_cached`), and the runner/gate/audit surface tests in
+`skill/test/tests/test_run_tests_failure_notices.py`,
+`skill/implement/tests/test_finish_gate_state_changed.py` and
+`skill/audit/tests/test_audit_runner_green_run.py`.
 
 
 ## 9. Production test-execution scrub (2026-09-26 recurrence, SA-0MUIA3OE40001QJX)
