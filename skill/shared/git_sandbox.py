@@ -81,10 +81,24 @@ that reverts or deletes another session's *uncommitted* work is masked (the
 path was pre-dirty, so its resolution is attributed), the clean→dirty
 false-positive direction is deliberately retained, and a content-only change
 to an already-dirty path is invisible to a status-code surface.
+
+**Own-checkout state surface (``state_changed_during_run``).**
+``snapshot_own_checkout`` / ``compare_own_checkout_states`` snapshot the
+*guarded root's own* HEAD commit plus a content fingerprint of the
+working-tree deltas the tree resolves to — never the ref surface.
+``refs/heads/dev``, ``refs/remotes/origin/*`` and
+``refs/heads/worklog/*`` therefore stay silent for this signal by
+construction (a sibling finish fast-forwarding the checkout's own HEAD is
+still caught, because HEAD and the tracked content it resolves to are the
+surface); differences fully explained by the start-of-run working-tree
+attribution above are reported as attributed, not as movement
+(SA-0MW3FF18I003KGZE AC3, Q2 = b). An unfingerprintable checkout is
+fail-closed and never reported as movement.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from collections.abc import Callable, Mapping
@@ -1299,3 +1313,169 @@ def describe_diff(diff: dict[str, Any]) -> str:
     for path, (old, new) in sorted(status.get("changed", {}).items()):
         lines.append(f"  changed path   [{old}->{new}] {path}")
     return "\n".join(lines) if lines else "  (no differences)"
+
+
+# ---------------------------------------------------------------------------
+# Own-checkout state snapshot + comparison (state_changed_during_run)
+# ---------------------------------------------------------------------------
+
+
+def snapshot_own_checkout(
+    root: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Snapshot the guarded checkout's own state: HEAD + tracked-tree content.
+
+    The detection surface for ``state_changed_during_run``
+    (SA-0MW3FF18I003KGZE, Q2 = b): the checkout's own ``HEAD`` commit plus a
+    content fingerprint of the working-tree deltas the tree resolves to —
+    never the ref surface. ``refs/heads/dev``, ``refs/remotes/origin/*`` and
+    ``refs/heads/worklog/*`` therefore stay invisible to this signal by
+    construction (their movement only matters when it rewrites this
+    checkout's own HEAD/tree, which IS captured), matching the parent's
+    constraint that the shared integration branch never becomes
+    verdict-bearing.
+
+    Returns ``{"checkout": <abs path>, "git": bool, "ok": bool, "head": <sha>,
+    "tracked": <hex>, "status": {path: code}}``. ``ok`` is False for a non-git
+    root or when the state cannot be fingerprinted (fail closed: an
+    unfingerprintable checkout is never reported as movement, and the
+    ``run_cached`` consumer keeps today's no-lookup/no-store behaviour).
+    """
+    resolved = Path(root).resolve()
+    top = git_toplevel(resolved)
+    if top is None:
+        return {
+            "checkout": str(resolved),
+            "git": False,
+            "ok": False,
+            "head": "",
+            "tracked": "",
+            "status": {},
+        }
+    head_proc = run_git(resolved, ["rev-parse", "HEAD"])
+    status_proc = run_git(resolved, ["status", "--porcelain=v1", "-uall"])
+    if head_proc.returncode != 0 or status_proc.returncode != 0:
+        return {
+            "checkout": str(resolved),
+            "git": True,
+            "ok": False,
+            "head": "",
+            "tracked": "",
+            "status": {},
+        }
+    head = head_proc.stdout.strip()
+    status = _parse_status(status_proc.stdout)
+    tracked = _own_checkout_fingerprint(resolved, head, status)
+    if tracked is None:
+        return {
+            "checkout": str(resolved),
+            "git": True,
+            "ok": False,
+            "head": head,
+            "tracked": "",
+            "status": status,
+        }
+    return {
+        "checkout": str(resolved),
+        "git": True,
+        "ok": True,
+        "head": head,
+        "tracked": tracked,
+        "status": status,
+    }
+
+
+def _own_checkout_fingerprint(
+    root: Path, head: str, status: dict[str, str]
+) -> str | None:
+    """Content fingerprint of HEAD + the working-tree deltas in *status*.
+
+    Content (not just status codes) is hashed for every readable dirty path,
+    so a content-only rewrite of an already-dirty path is a move too (the Q2
+    = b dimension). Returns None when a path cannot be read (fail closed: an
+    unfingerprintable state is never treated as an unchanged one).
+    """
+    h = hashlib.sha256()
+    h.update(b"head\x00")
+    h.update(head.encode("utf-8"))
+    h.update(b"\n")
+    for path in sorted(status):
+        h.update(b"path\x00")
+        h.update(path.encode("utf-8"))
+        h.update(b"\x00code\x00")
+        h.update(status[path].encode("utf-8"))
+        h.update(b"\x00content\x00")
+        full = root / path
+        try:
+            if full.is_file():
+                h.update(full.read_bytes())
+        except OSError:
+            return None
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def compare_own_checkout_states(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare two :func:`snapshot_own_checkout` snapshots.
+
+    Returns ``{"moved": bool, "checkout": <path>, "before_commit": <sha>,
+    "after_commit": <sha>, "attributed": [<note>, ...]}``.
+
+    ``moved`` is True when the checkout's own state changed between the
+    snapshots AND the change is not fully explained by the existing
+    start-of-run working-tree attribution (:func:`diff_snapshots` /
+    :func:`excluded_churn_notes`, SA-0MUIJAHXS003M7BG): a difference that is
+    exactly a set of start-dirty → end-clean resolutions (a sibling session
+    committing work it had itself dirtied mid-run) is attributed, reported in
+    ``attributed`` and does NOT set ``moved``. Everything else — a
+    fast-forward of a clean checkout (HEAD-only move), a tracked-tree rewrite
+    with an unchanged HEAD, a path dirtying from a clean start, a
+    content-only change to an already-dirty path — is a move. A snapshot with
+    ``ok: False`` (non-git or unfingerprintable) never moves.
+    """
+    if not before.get("ok") or not after.get("ok"):
+        return {
+            "moved": False,
+            "checkout": str(after.get("checkout") or before.get("checkout") or ""),
+            "before_commit": before.get("head") or "",
+            "after_commit": after.get("head") or "",
+            "attributed": [],
+        }
+    checkout = str(after.get("checkout") or before.get("checkout") or "")
+    before_commit = before.get("head") or ""
+    after_commit = after.get("head") or ""
+    # Reuse diff_snapshots' start-of-run working-tree attribution verbatim on
+    # minimal snapshots: only the status surface is relevant to this signal
+    # (refs/config/worktrees are deliberately not part of it), and the shared
+    # note vocabulary (excluded_churn_notes) stays the single renderer.
+    diff = diff_snapshots(
+        {
+            "git": True,
+            "refs": {},
+            "config": {},
+            "status": before.get("status", {}),
+            "excluded_refs": set(),
+        },
+        {
+            "git": True,
+            "refs": {},
+            "config": {},
+            "status": after.get("status", {}),
+            "excluded_refs": set(),
+        },
+    )
+    attributed = excluded_churn_notes(diff)
+    verdict_clean = not diff["status"]["added"] and not diff["status"]["changed"]
+    resolved_any = bool(excluded_working_tree_churn(diff))
+    fully_attributed = verdict_clean and resolved_any
+    moved = before.get("tracked") != after.get("tracked") and not fully_attributed
+    return {
+        "moved": moved,
+        "checkout": checkout,
+        "before_commit": before_commit,
+        "after_commit": after_commit,
+        "attributed": attributed,
+    }
