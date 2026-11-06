@@ -161,8 +161,12 @@ try:
     # TMPDIR — logged and unchanged — instead of blocking the start
     # (SA-0MW3ENQY0001RBSW AC4, fail-open).
     from shared.test_tmpdir import resolve_test_tmpdir as _resolve_test_tmpdir
-except Exception:  # pragma: no cover - only partial installs hit this
-    _resolve_test_tmpdir = None
+except Exception:  # noqa: BLE001 -- broad by design; see the comment below
+    # Broad by design (BLE001): a partial skill install without the
+    # test_tmpdir module must degrade to the ambient TMPDIR — logged and
+    # unchanged — and must never block a start (SA-0MW3ENQY0001RBSW AC4,
+    # fail-open). Mirrors the self_referential_upstream guard above.
+    _resolve_test_tmpdir = None  # pragma: no cover - partial install
 
 try:
     # The shared changed-file → test selector (SA-0MT6CENPW004V2JN). Kept
