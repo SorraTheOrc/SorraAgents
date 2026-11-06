@@ -66,6 +66,16 @@ cache entry. See [`skill/test/SKILL.md`](skill/test/SKILL.md),
 [`skill/test_cache.py`](skill/test_cache.py) and
 [`docs/dev/release-tests.md`](docs/dev/release-tests.md).
 
+Suite and build subprocesses run on a **disk-backed `TMPDIR`** (resolved in
+the precedence order documented in
+[`docs/dev/test-skill-reference.md` §3](docs/dev/test-skill-reference.md#3-disk-backed-test-temporary-storage-and-the-inode-exhaustion-signature-sa-0mw2qed9m005fwok)),
+so a host with many concurrent agents cannot exhaust the small tmpfs `/tmp`
+inode budget (`ENOSPC` inside Playwright `createContext`, reported by the
+gate as `reason: unparsed` / infrastructure). Stale
+`pytest-of-<user>/pytest-*` roots are pruned automatically before full-scope
+runs; see the same section for the operator remedy. The `TMPDIR`/prune work is
+env-only and never changes suite command strings or cache keys.
+
 Every push to `dev`/`main` is also gated by the pre-push hook, which runs the
 full suite against **the pushed commit** rather than the main checkout's
 working tree. The hook forwards git's `<local_sha>` as
