@@ -4987,8 +4987,10 @@ def _dev_push_gate_failure_comment(
         f"Commit: {commit_hash}",
         f"Branch: {branch}",
         f"Worktree: {worktree_path}",
-        "Local dev was restored to origin/dev (the commit stays on its "
-        "feature branch).",
+        (
+            "Local dev was restored to origin/dev (the commit stays on its "
+            "feature branch)."
+        ),
     ]
     if stderr_tail:
         lines.extend(["", "Gate output (tail):", stderr_tail])
