@@ -639,7 +639,7 @@ def test_interrupting_signal_releases_the_claim(tmp_path: Path, signum) -> None:
     )
     proc = subprocess.run(
         [sys.executable, "-c", script],
-        cwd=str(root), capture_output=True, text=True, timeout=120,
+        cwd=str(root), capture_output=True, text=True, timeout=120, check=False,
     )
 
     assert proc.returncode == 128 + int(signum), proc.stderr
