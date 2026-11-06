@@ -1616,8 +1616,10 @@ def uncovered_entry_points(
 
 def _uncovered_message(uncovered: dict[str, set[str]]) -> str:
     lines = [
-        "Assignee-mutating skill entry point(s) are not covered by the "
-        "assignee-release regression matrix:",
+        (
+            "Assignee-mutating skill entry point(s) are not covered by the "
+            "assignee-release regression matrix:"
+        ),
     ]
     for source, entry_points in sorted(uncovered.items()):
         for entry_point in sorted(entry_points):
