@@ -136,10 +136,10 @@ from shared.test_tmpdir import prune_stale_test_roots, resolve_test_tmpdir
 from shared.timing import Timer
 from test_cache import (
     DEFAULT_TTL_SECONDS,
-    GitStateUnavailable,
-    Runner,
     STATE_CHANGED_EXIT_CODE,
     STATE_CHANGED_NOTICE_CODE,
+    GitStateUnavailable,
+    Runner,
     _default_runner,
     compute_git_state,
     is_worktree_clean,
