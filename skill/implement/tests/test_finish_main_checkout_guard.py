@@ -37,8 +37,6 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) in sys.path:
     sys.path.remove(str(REPO_ROOT))
@@ -574,37 +572,36 @@ def _run_failure_path(tmp_path, *, kind: str, snapshots: list[dict[str, str]]):
     transition and the comments are production code.
     """
     failing_gate = (_failing_gate_result(), {"available": True, "tree": "failed"})
-    with _finish_harness(tmp_path) as mocks:
-        with contextlib.ExitStack() as stack:
+    with _finish_harness(tmp_path) as mocks, contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                implement,
+                "_snapshot_main_checkout",
+                side_effect=_snapshots(snapshots),
+            )
+        )
+        if kind == "build_failure":
             stack.enter_context(
                 patch.object(
-                    implement,
-                    "_snapshot_main_checkout",
-                    side_effect=_snapshots(snapshots),
+                    implement, "run_build", return_value=_failed_build_result()
                 )
             )
-            if kind == "build_failure":
-                stack.enter_context(
-                    patch.object(
-                        implement, "run_build", return_value=_failed_build_result()
-                    )
-                )
-            elif kind in {"gate_json", "gate_retries", "user_abort"}:
-                stack.enter_context(
-                    patch.object(implement, "run_gate_suite", return_value=failing_gate)
-                )
-            else:  # pragma: no cover - guard against a typo'd test
-                raise AssertionError(f"unknown failure path: {kind}")
-            if kind == "gate_retries":
-                stack.enter_context(patch("builtins.input", return_value=""))
-            elif kind == "user_abort":
-                stack.enter_context(patch("builtins.input", return_value="abort"))
-            report = implement.phase_finish(
-                "WL-TEST",
-                json_output=(kind == "gate_json"),
-                no_refactor=True,
-                max_retry=1 if kind == "gate_retries" else implement.DEFAULT_MAX_RETRY,
+        elif kind in {"gate_json", "gate_retries", "user_abort"}:
+            stack.enter_context(
+                patch.object(implement, "run_gate_suite", return_value=failing_gate)
             )
+        else:  # pragma: no cover - guard against a typo'd test
+            raise AssertionError(f"unknown failure path: {kind}")
+        if kind == "gate_retries":
+            stack.enter_context(patch("builtins.input", return_value=""))
+        elif kind == "user_abort":
+            stack.enter_context(patch("builtins.input", return_value="abort"))
+        report = implement.phase_finish(
+            "WL-TEST",
+            json_output=(kind == "gate_json"),
+            no_refactor=True,
+            max_retry=1 if kind == "gate_retries" else implement.DEFAULT_MAX_RETRY,
+        )
     return report, mocks
 
 
