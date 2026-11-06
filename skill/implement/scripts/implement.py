@@ -1476,8 +1476,10 @@ def _forward_child_lock_reclamation(
     forwarded = list(child_report.get("warnings") or [])
     if not forwarded:
         forwarded = [
-            f"Reclaimed a stale per-child lock for {child_id} from "
-            f"{_describe_child_lock_holder(child_report.get('reclaimed_from'))}."
+            (
+                f"Reclaimed a stale per-child lock for {child_id} from "
+                f"{_describe_child_lock_holder(child_report.get('reclaimed_from'))}."
+            )
         ]
     for warning in forwarded:
         if warning not in warnings:
