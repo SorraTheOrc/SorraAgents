@@ -147,8 +147,12 @@ try:
     from shared.self_referential_upstream import (
         detect_self_referential_upstreams as _detect_self_referential_upstreams,
     )
-except Exception:  # pragma: no cover - only partial installs hit this
-    _detect_self_referential_upstreams = None
+except Exception:  # noqa: BLE001 -- broad by design; see the comment below
+    # Broad by design (BLE001): a missing module, a missing runtime dependency
+    # or a module-level guard clause must ALL degrade to the logged skip below
+    # and never block a start. Pinned by
+    # skill/implement/tests/test_optional_import_fail_open.py.
+    _detect_self_referential_upstreams = None  # pragma: no cover - partial install
 
 try:
     # Disk-backed TMPDIR resolution shared with the test runner (F1,
