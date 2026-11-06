@@ -848,14 +848,15 @@ export async function checkAuditReadyToClose(options = {}) {
       `wl audit-show ${workItemId} --json`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
-    runAuditCommand = (runnerPath, workItemId) => execSync(
+    runAuditCommand = (runnerPath, workItemId, timeoutMs) => execSync(
       `python3 "${runnerPath}" issue ${workItemId}`,
       // Per-item timeout guard (SA-0MSUT8GQP004WSYN AC6 / R1): a hung audit
       // runner must not stall the whole release gate. The default audit
       // runner hard-times-out internally, so this is a belt-and-braces cap.
       // Configurable via SHIP_AUDIT_REMEDIATION_TIMEOUT_MS
-      // (SA-0MUOO5V0P00461X8).
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: resolveRemediationTimeoutMs() },
+      // (SA-0MUOO5V0P00461X8) and clamped to the remaining budget by the
+      // caller (WL-0MW32YZP7005LZ5B).
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs ?? resolveRemediationTimeoutMs() },
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
     createRemediationBudgetFn = () => new RemediationBudget(),
@@ -986,9 +987,16 @@ export async function checkAuditReadyToClose(options = {}) {
         });
         continue;
       }
+      // Per-attempt timeout is clamped to the wall clock still remaining in
+      // the gate budget, so one slow attempt can never consume more than the
+      // budget reserved for the whole run (WL-0MW32YZP7005LZ5B).
       const remediation = await attemptAuditRemediation(item, {
         runAuditShow,
-        runAuditCommand,
+        runAuditCommand: (runnerPath, id) => runAuditCommand(
+          runnerPath,
+          id,
+          budget.clampedTimeoutMs(resolveRemediationTimeoutMs()),
+        ),
         resolveAuditRunnerFn,
         queryContentFreshnessFn,
       });

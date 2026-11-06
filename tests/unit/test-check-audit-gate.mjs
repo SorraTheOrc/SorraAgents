@@ -1388,6 +1388,77 @@ describe('checkAuditReadyToClose - remediation runner failure', () => {
   });
 });
 
+describe('checkAuditReadyToClose - remediation timeout clamped to the remaining budget (WL-0MW32YZP7005LZ5B)', () => {
+  const ITEM = {
+    id: 'SA-TO',
+    title: 'Timeout Item',
+    needsProducerReview: false,
+    parentId: null,
+    updatedAt: '2026-09-04T10:00:00Z',
+  };
+
+  function runWithBudget(mod, createBudget) {
+    const seen = [];
+    let shows = 0;
+    return mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [ITEM],
+      runAuditShow: () => {
+        shows += 1;
+        return shows === 1
+          ? JSON.stringify({ audit: null })
+          : JSON.stringify({
+            audit: { readyToClose: true, auditedAt: '2999-09-05T11:00:00Z' },
+          });
+      },
+      runAuditCommand: (path, id, timeoutMs) => {
+        seen.push({ path, id, timeoutMs });
+        return 'ok';
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      createRemediationBudgetFn: createBudget,
+    }).then((report) => ({ report, seen }));
+  }
+
+  test('the per-item runner timeout is clamped to the budget remaining', async () => {
+    const mod = await import(MODULE_PATH);
+    const budgetMod = await import(
+      join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js')
+    );
+    // 60 s of budget left against a 29 min per-item default: the attempt must
+    // be clamped down to what is left, never allowed to overrun the budget
+    // (the 1865s-of-1800s incident).
+    const { report, seen } = await runWithBudget(
+      mod,
+      () => new budgetMod.RemediationBudget({ budgetMs: 60_000, maxItems: 5, now: () => 0 }),
+    );
+
+    assert.equal(seen.length, 1, 'one remediation attempt is made');
+    assert.equal(seen[0].timeoutMs, 60_000, 'timeout clamped to the remaining budget');
+    assert.equal(report.remediatedItems.length, 1);
+  });
+
+  test('a fresh budget passes the full per-item timeout, which is below the total budget', async () => {
+    const mod = await import(MODULE_PATH);
+    const budgetMod = await import(
+      join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js')
+    );
+    const { seen } = await runWithBudget(
+      mod,
+      () => new budgetMod.RemediationBudget({
+        budgetMs: budgetMod.DEFAULT_REMEDIATION_BUDGET_MS,
+        maxItems: 5,
+        now: () => 0,
+      }),
+    );
+
+    assert.ok(
+      budgetMod.DEFAULT_REMEDIATION_TIMEOUT_MS < budgetMod.DEFAULT_REMEDIATION_BUDGET_MS,
+      'the default per-item timeout must be smaller than the total budget',
+    );
+    assert.equal(seen[0].timeoutMs, budgetMod.DEFAULT_REMEDIATION_TIMEOUT_MS);
+  });
+});
+
 describe('checkAuditReadyToClose - bounded remediation budget', () => {
   test('stops at the attempt cap and blocks remaining items with offline guidance', async () => {
     const mod = await import(MODULE_PATH);

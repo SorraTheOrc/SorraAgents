@@ -121,6 +121,20 @@ parent's, so a child-level gap must never spuriously block a release.
 - **Remediation-runner failure/timeout** — treated as blocking for that item
   with the manual remediation command surfaced; never silently passed.
 
+**Bounded, per-attempt-clamped remediation (WL-0MW32YZP7005LZ5B):** in-gate
+remediation is bounded by `audit-remediation.js` — a per-item timeout
+(`SHIP_AUDIT_REMEDIATION_TIMEOUT_MS`, default 29 min), a total wall-clock
+budget (`SHIP_AUDIT_REMEDIATION_BUDGET_MS`, default 30 min) and an attempt cap
+(`SHIP_AUDIT_REMEDIATION_MAX_ITEMS`, default 5). The per-item default is
+**strictly below** the total budget, and every attempt is clamped to the
+budget's remaining wall clock (`RemediationBudget.clampedTimeoutMs()` =
+`min(per-item, remaining)`) by the audit gate, the Step-3.7 final-validation
+sweep and `refresh-audits.js`. Before the clamp, the two defaults were equal
+and a single attempt that overran by 65 s consumed the whole gate budget
+(`1865s of 1800s`). Exhaustion blocks the remaining items with an
+offline-refresh instruction. Full configuration table:
+[`skill/ship/docs/dev/ship-skill-reference.md`](../../skill/ship/docs/dev/ship-skill-reference.md).
+
 **Content-freshness contract (SA-0MVTU2643004QTQN):** content-fresh audits are
 trusted regardless of `updatedAt` — when the stored v2 content fingerprint
 still matches the work item, the time gate never overrides that verdict, so a

@@ -3103,7 +3103,7 @@ class TestChildScreenShortBudget:
 
         The effective per-call budget for a child screen defaults to
         ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080s, derived from measured p95 x
-        2 — SA-0MVI3608M0080QLW), never the full 1800s.
+        2 — SA-0MVI3608M0080QLW), never the full Phase-2 budget (2,400s).
         """
         mock_process = self._timeout_mock_process()
         with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
@@ -3123,8 +3123,8 @@ class TestChildScreenShortBudget:
         assert result.get("_timeout") is True
         assert "300" in result.get("evidence", "")
 
-    def test_phase2_retains_1800_budget(self):
-        """Phase 2 (non-child) calls keep the existing 1800s budget."""
+    def test_phase2_retains_full_phase2_budget(self):
+        """Phase 2 (non-child) calls keep the full Phase-2 budget (2,400s)."""
         mock_process = self._timeout_mock_process()
         with mock.patch.object(audit_runner.subprocess, "Popen", return_value=mock_process), \
              mock.patch.dict(audit_runner.os.environ, {}, clear=True):
@@ -3521,8 +3521,10 @@ class TestStallAndBudgetRegression:
         assert result.get("_timeout") is None
 
     def test_full_budget_still_available_for_phase2(self):
-        """Phase 2 calls (no child_screen) still resolve to CALL_PI_TIMEOUT=1800."""
-        assert audit_runner.CALL_PI_TIMEOUT == 1800
+        """Phase 2 calls (no child_screen) still resolve to the data-derived
+        ``CALL_PI_TIMEOUT`` (2,400 s — WL-0MW32YZP7005LZ5B), while screens keep
+        their 1080 s budget."""
+        assert audit_runner.CALL_PI_TIMEOUT == 2400
         with mock.patch.dict(audit_runner.os.environ, {}, clear=True):
             assert audit_runner._resolve_call_timeout(None, child_screen=False) == audit_runner.CALL_PI_TIMEOUT
             assert audit_runner._resolve_call_timeout(None, child_screen=True) == audit_runner._CHILD_SCREEN_TIMEOUT_DEFAULT
