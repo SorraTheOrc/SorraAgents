@@ -3049,7 +3049,13 @@ def warn_self_referential_upstream(repo_root: str) -> dict[str, Any]:
             for finding in _detect_self_referential_upstreams(repo_root)
             if finding.get("type") == "defect"
         ]
-    except Exception as exc:  # fail-open: never block a work item
+    except Exception as exc:  # noqa: BLE001 -- fail-open; see the comment below
+        # Broad by design (BLE001): the detector can raise not only
+        # ``NotARepositoryError`` but also a ``TypeError`` (a non-path repo),
+        # an ``OSError`` from the git subprocess or a broken-config failure.
+        # Every one of them must degrade to the logged skip below and never
+        # block a work item (SA-0MVX35AUC003CNUD AC2/AC3). Pinned by
+        # skill/implement/tests/test_self_upstream_wiring.py.
         LOG.warning("Self-referential-upstream check skipped: %s", exc)
         return {"status": "skipped", "reason": str(exc)}
     if not defects:
