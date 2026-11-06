@@ -3809,8 +3809,10 @@ def _build_failure_message(
         The comment body (Markdown).
     """
     sections = [
-        "Build failed during finish phase "
-        f"(exit code {build_result['exit_code']})."
+        (
+            "Build failed during finish phase "
+            f"(exit code {build_result['exit_code']})."
+        )
     ]
     if engine_lag.get("advanced"):
         sections.append(
