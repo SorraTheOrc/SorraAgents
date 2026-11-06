@@ -189,9 +189,7 @@ def should_release_assignee(item: dict[str, Any]) -> bool:
         return False
     if bool(item.get("needsProducerReview")):
         return False
-    if is_producer_assignee(assignee):
-        return False
-    return True
+    return not is_producer_assignee(assignee)
 
 
 def _release_skip_reason(item: dict[str, Any]) -> str:
