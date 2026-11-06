@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MW58A4S8003W36C
+# smell: simplification
+# severity: medium
+# description: Use a single `with` statement with multiple contexts instead of nested `with` statements
+# -->
 """Tracer-bullet regressions: the dev-push gate's subject is the pushed commit.
 
 Parent **SA-0MVTFMB7K002Y1F3** — test-first slice (child **SA-0MVUTXILY003DVTE**).
@@ -728,6 +734,81 @@ def test_push_gate_infrastructure_reason_is_reported_and_commented(sandbox):
         "slot_contention" in comment and "TEST_LOCK_TIMEOUT" in comment
         for comment in comments
     ), f"the work-item comment must name the reason and remedy; got {comments}"
+
+
+def test_phase_finish_exposes_the_retry_trail_on_a_gate_refusal(sandbox):
+    """AC3: the transport retry trail reaches ``report["steps"]["push"]``.
+
+    A gate refusal after a transient transport retry must expose the attempt
+    count and the trail (attempt, backoff, reason) to a ``--json`` consumer —
+    not only to the log (SA-0MVXEQEI500641SJ AC3).
+    """
+    trail = [
+        {"attempt": 1, "delay_seconds": 2.1, "reason": "transport_close"},
+    ]
+
+    def failing_push(cwd, branch, commit_hash=None, **kwargs):
+        evidence = kwargs.get("evidence_out")
+        if evidence is not None:
+            evidence.update(
+                {
+                    "success": False,
+                    "gate_reason": "slot_contention",
+                    "stderr_tail": "gate_reason=slot_contention",
+                    "attempts": 2,
+                    "retry_trail": trail,
+                }
+            )
+        return False
+
+    pushes: list[tuple] = []
+    with _stubbed_finish(sandbox, sandbox["feature_short"], pushes):
+        with patch.object(implement, "git_push_to_dev", side_effect=failing_push):
+            with patch.object(implement, "wl_add_comment", return_value=True):
+                report = implement.phase_finish(
+                    "SA-TEST", json_output=True, no_refactor=True
+                )
+
+    push_step = report["steps"]["push"]
+    assert push_step["reason"] == "slot_contention", push_step
+    assert push_step["attempts"] == 2, push_step
+    assert push_step["retry_trail"] == trail, push_step
+
+
+def test_phase_finish_exposes_the_retry_trail_on_a_successful_push(sandbox):
+    """AC3: a push that succeeded after a retry also reports its trail."""
+    trail = [
+        {"attempt": 1, "delay_seconds": 2.0, "reason": "transport_close"},
+        {"attempt": 2, "delay_seconds": 4.0, "reason": "transport_close"},
+    ]
+
+    def recovering_push(cwd, branch, commit_hash=None, **kwargs):
+        evidence = kwargs.get("evidence_out")
+        if evidence is not None:
+            evidence.update(
+                {
+                    "root": str(cwd),
+                    "head": sandbox["feature"],
+                    "pushed": sandbox["feature"],
+                    "full_suite": "cached",
+                    "attempts": 3,
+                    "retry_trail": trail,
+                }
+            )
+        return True
+
+    pushes: list[tuple] = []
+    with _stubbed_finish(sandbox, sandbox["feature_short"], pushes):
+        with patch.object(implement, "git_push_to_dev", side_effect=recovering_push):
+            report = implement.phase_finish(
+                "SA-TEST", json_output=True, no_refactor=True
+            )
+
+    assert report["success"] is True, report["message"]
+    push_step = report["steps"]["push"]
+    assert push_step["attempts"] == 3, push_step
+    assert push_step["retry_trail"] == trail, push_step
+    assert push_step["gate_evidence"]["full_suite"] == "cached", push_step
 
 
 # ---------------------------------------------------------------------------

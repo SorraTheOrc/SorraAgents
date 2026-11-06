@@ -4972,6 +4972,27 @@ def _push_gate_remediation(gate_reason: str | None) -> str:
     )
 
 
+def _push_retry_trail_fields(evidence: dict[str, Any] | None) -> dict[str, Any]:
+    """The attempt-trail keys to expose on ``report["steps"]["push"]`` (AC3).
+
+    ``git_push_to_dev`` records every transport retry (the failed attempt
+    number, the backoff actually slept and the reason) plus the total attempt
+    count in its ``evidence_out``. Finish carries them onto the push step so a
+    ``--json`` report exposes the retry trail instead of leaving it in the log
+    only (SA-0MVXEQEI500641SJ AC3). Absent keys are omitted, never fabricated.
+    """
+    if not evidence:
+        return {}
+    fields: dict[str, Any] = {}
+    trail = evidence.get("retry_trail")
+    if trail:
+        fields["retry_trail"] = list(trail)
+    attempts = evidence.get("attempts")
+    if attempts:
+        fields["attempts"] = attempts
+    return fields
+
+
 def _dev_push_gate_failure_comment(
     gate_reason: str,
     stderr_tail: str,
@@ -5063,6 +5084,19 @@ def git_push_to_dev(
     # never misreported as "cached" merely because the first attempt executed.
     before_present = _full_suite_cache_present(cwd)
 
+    #: Every transport retry this push made, in order. Carried into
+    #: ``evidence_out`` (and from there onto ``report["steps"]["push"]``) so a
+    #: ``--json`` finish report shows the attempt trail, not only a log line
+    #: (SA-0MVXEQEI500641SJ AC3).
+    retry_trail: list[dict[str, Any]] = []
+
+    def _attach_trail(out: dict[str, Any] | None, attempts: int) -> None:
+        """Record the attempt count and retry trail on *out* (additive)."""
+        if out is None:
+            return
+        out["attempts"] = attempts
+        out["retry_trail"] = [dict(entry) for entry in retry_trail]
+
     for attempt in range(1, PUSH_RETRY_MAX_ATTEMPTS + 1):
         # Spawn the push in its own process group so that a timeout kills the
         # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
@@ -5115,6 +5149,7 @@ def git_push_to_dev(
                 if evidence_out is not None:
                     evidence_out.clear()
                     evidence_out.update(evidence)
+                    _attach_trail(evidence_out, attempt)
                 return True
 
             # Failure: detect non-fast-forward errors (dev advanced
@@ -5145,6 +5180,13 @@ def git_push_to_dev(
                 and attempt < PUSH_RETRY_MAX_ATTEMPTS
             ):
                 delay = _push_transport_backoff(attempt)
+                retry_trail.append(
+                    {
+                        "attempt": attempt,
+                        "delay_seconds": round(delay, 3),
+                        "reason": "transport_close",
+                    }
+                )
                 LOG.warning(
                     "git push to dev attempt %d/%d failed with a transient "
                     "transport error; retrying in %.1fs from the same cwd %s. "
@@ -5178,6 +5220,7 @@ def git_push_to_dev(
                 if pushed_commit_guard is not None:
                     failure["pushed_commit_guard"] = pushed_commit_guard
                 evidence_out.update(failure)
+                _attach_trail(evidence_out, attempt)
             LOG.error(
                 "git push to dev failed (attempt %d/%d, gate_reason=%s): %s",
                 attempt,
@@ -11326,6 +11369,9 @@ def phase_finish(
                     "hash": commit_hash,
                     "gate_evidence": push_evidence,
                 }
+                report["steps"]["push"].update(
+                    _push_retry_trail_fields(push_evidence)
+                )
                 # An interruption from here on names the rebased replacement
                 # hash, which is the commit that actually landed.
                 _set_finish_progress(commit=commit_hash, pushed=True)
@@ -11343,6 +11389,10 @@ def phase_finish(
                 guard_details = push_evidence.get("pushed_commit_guard")
                 if guard_details:
                     push_step["refused_by_pushed_commit_guard"] = guard_details
+                # AC3: expose the transport retry trail (attempt count, the
+                # backoff slept and the reason) on the push step, not only in
+                # the log.
+                push_step.update(_push_retry_trail_fields(push_evidence))
                 report["steps"]["push"] = push_step
                 report["steps"]["local_dev_restore"] = (
                     _restore_local_dev_after_failed_push(
@@ -11385,6 +11435,9 @@ def phase_finish(
                     "hash": commit_hash,
                     "gate_evidence": push_evidence,
                 }
+                report["steps"]["push"].update(
+                    _push_retry_trail_fields(push_evidence)
+                )
                 # The commit is now on dev: the interruption record must say
                 # so (AC2), so a released item is never mistaken for
                 # unpublished work.

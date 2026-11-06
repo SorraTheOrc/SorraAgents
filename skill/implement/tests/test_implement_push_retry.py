@@ -378,6 +378,63 @@ class TestGateReasonEvidence:
         assert evidence["gate_reason"] is None
 
 
+# ── Retry trail carried on the evidence (AC3, SA-0MVXEQEI500641SJ) ──────────
+
+
+class TestRetryTrailEvidence:
+    """The attempt trail must reach ``evidence_out``, not only the log.
+
+    ``finish`` exposes this on ``report["steps"]["push"]`` so a ``--json``
+    consumer can see how many attempts a dev push made and the backoff it
+    actually slept (SA-0MVXEQEI500641SJ AC3).
+    """
+
+    def test_success_after_a_retry_exposes_the_trail(self, push_harness):
+        push_harness["install"]([(128, TRANSPORT_CLOSE), (0, b"")])
+        evidence: dict = {}
+
+        result = implement.git_push_to_dev(
+            push_harness["cwd"], "wl-test", "abc123", evidence_out=evidence
+        )
+
+        assert result is True
+        assert evidence["attempts"] == 2
+        trail = evidence["retry_trail"]
+        assert len(trail) == 1, trail
+        assert trail[0]["attempt"] == 1
+        assert trail[0]["reason"] == "transport_close"
+        assert trail[0]["delay_seconds"] == pytest.approx(
+            push_harness["sleeps"][0], abs=0.001
+        ), "the trail must report the backoff actually slept"
+
+    def test_exhausted_trail_is_exposed_on_failure(self, push_harness):
+        transport = (128, TRANSPORT_CLOSE)
+        push_harness["install"]([transport] * implement.PUSH_RETRY_MAX_ATTEMPTS)
+        evidence: dict = {}
+
+        result = implement.git_push_to_dev(
+            push_harness["cwd"], "wl-test", "abc123", evidence_out=evidence
+        )
+
+        assert result is False
+        assert evidence["attempts"] == implement.PUSH_RETRY_MAX_ATTEMPTS
+        trail = evidence["retry_trail"]
+        assert [entry["attempt"] for entry in trail] == [1, 2], trail
+        for entry, slept in zip(trail, push_harness["sleeps"]):
+            assert entry["delay_seconds"] == pytest.approx(slept, abs=0.001)
+
+    def test_fail_fast_still_reports_a_single_attempt(self, push_harness):
+        push_harness["install"]([(128, AUTH_FAILURE)])
+        evidence: dict = {}
+
+        implement.git_push_to_dev(
+            push_harness["cwd"], "wl-test", "abc123", evidence_out=evidence
+        )
+
+        assert evidence["attempts"] == 1
+        assert evidence["retry_trail"] == []
+
+
 class TestParseGateReason:
     def test_last_gate_reason_line_wins(self) -> None:
         stderr = "gate_reason=unknown\ngate_reason=timeout\n"

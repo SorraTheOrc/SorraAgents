@@ -1472,7 +1472,12 @@ capped at `PUSH_RETRY_CAP_SECONDS = 30.0`, +/-25% jitter).
   push timeout raises `PushTimeoutError` immediately.
 - **Observable:** every attempt logs `attempt N/3`, the delay and the same cwd;
   the attempt bound and backoff are module constants, and the sleep is the
-  `_push_retry_sleep()` seam used by the hermetic tests.
+  `_push_retry_sleep()` seam used by the hermetic tests. The trail is also
+  carried in the push helper's `evidence_out` (`attempts` plus `retry_trail`
+  entries of `{attempt, delay_seconds, reason}`), which `phase_finish` exposes
+  on `report["steps"]["push"]` for both a successful and a gate-refused push —
+  so a `--json` finish report shows the attempt trail, not just a log line
+  (SA-0MVXEQEI500641SJ AC3).
 
 ### Dev-push gate reason reporting (SA-0MVSJX5HS002DJHI AC2)
 
