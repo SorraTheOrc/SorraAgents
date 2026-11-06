@@ -14575,10 +14575,12 @@ def _preserved_ref_comment(
         f"- Child state: {reconciliation.get('evidence') or 'unknown'}",
         step_line,
         "",
-        "No `git reset --hard` or `git clean -fd` was run, so no committed "
-        "work was discarded. Recover the slice from the preserved ref "
-        f"(`git branch <name> {preserved.get('ref')}`), or delete it once it "
-        f"is no longer needed (`git update-ref -d {preserved.get('ref')}`).",
+        (
+            "No `git reset --hard` or `git clean -fd` was run, so no committed "
+            "work was discarded. Recover the slice from the preserved ref "
+            f"(`git branch <name> {preserved.get('ref')}`), or delete it once it "
+            f"is no longer needed (`git update-ref -d {preserved.get('ref')}`)."
+        ),
     ]
     return "\n".join(lines)
 
