@@ -590,7 +590,7 @@ def _read_assignee(root: Path, item_id: str) -> str:
             REAL_WL, "--worklog-dir", str(root / ".worklog"),
             "show", item_id, "--json",
         ],
-        cwd=str(root), capture_output=True, text=True, timeout=120,
+        cwd=str(root), capture_output=True, text=True, timeout=120, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     return str(json.loads(proc.stdout)["workItem"].get("assignee") or "")
