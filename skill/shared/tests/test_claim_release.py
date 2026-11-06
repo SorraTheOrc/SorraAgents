@@ -578,7 +578,7 @@ def _create_claimed_item(root: Path, assignee: str) -> str:
             "--status", "in-progress",
             "--json",
         ],
-        cwd=str(root), capture_output=True, text=True, timeout=120,
+        cwd=str(root), capture_output=True, text=True, timeout=120, check=False,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     return json.loads(proc.stdout)["workItem"]["id"]
