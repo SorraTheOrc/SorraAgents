@@ -170,8 +170,10 @@ ROUTINE_PHRASINGS = (
 #: must never be classified as routine (prefer false negatives over hiding a
 #: real producer action).
 BLOCKING_PHRASINGS = (
-    "Answer the OPEN QUESTION in comment SA-C0MVQ1QK1R0052WGP before "
-    "/skill:plan can start",
+    (
+        "Answer the OPEN QUESTION in comment SA-C0MVQ1QK1R0052WGP before "
+        "/skill:plan can start"
+    ),
     "Approve the remediation list in comment #4",
     "Please review the PR",
     "Choose option A or B",
