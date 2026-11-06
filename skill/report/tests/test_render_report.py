@@ -1128,8 +1128,10 @@ ROUTINE_PRODUCER_ACTIONS = [
 ]
 
 BLOCKING_PRODUCER_ACTIONS = [
-    "Answer the OPEN QUESTION in comment SA-C0MVQ1QK1R0052WGP "
-    "before /skill:plan can start",
+    (
+        "Answer the OPEN QUESTION in comment SA-C0MVQ1QK1R0052WGP "
+        "before /skill:plan can start"
+    ),
     "Approve the remediation list in comment #4",
 ]
 
