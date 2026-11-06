@@ -744,9 +744,11 @@ def _build_pipeline_runner(args: argparse.Namespace) -> Callable[[], dict[str, A
             # lifecycle exit, so without it the item's claim (including the
             # workflow pre-claim the run did not set itself) survives the
             # session (SA-0MW0F91KN004J06U).
-            with signal_release(args.work_item_id, reason="refactor-signal"):
-                with StatusLifecycle(args.work_item_id, restore_on_exit=True):
-                    return _run()
+            with (
+                signal_release(args.work_item_id, reason="refactor-signal"),
+                StatusLifecycle(args.work_item_id, restore_on_exit=True),
+            ):
+                return _run()
         return _wrapped
 
     return _run
