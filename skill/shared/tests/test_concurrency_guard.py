@@ -29,8 +29,11 @@ if str(REPO_ROOT) not in sys.path:
 _SKILLS_ROOT_FOR_TESTS = REPO_ROOT / "skill"
 if str(_SKILLS_ROOT_FOR_TESTS) not in sys.path:
     sys.path.append(str(_SKILLS_ROOT_FOR_TESTS))
+import errno
+import fcntl
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -564,6 +567,161 @@ def test_killed_queued_waiter_does_not_hold_its_turn(tmp_path):
     finally:
         for proc in (holder,):
             if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+
+
+def _turnstile_has_locked_ticket(sem):
+    """True when the turnstile directory holds a ticket locked by a live waiter.
+
+    A locked (``flock``-held) ticket file is an outstanding arrival: its owner
+    has allocated the ticket and is still queued. A reclaimable (unlocked)
+    ticket file belongs to a waiter that acquired, timed out or died.
+    """
+    try:
+        names = os.listdir(sem._turnstile_dir)
+    except OSError:
+        return False
+    for entry in names:
+        if not entry.isdigit():
+            continue
+        path = sem._turnstile_dir / entry
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return True  # locked: a live waiter holds this ticket
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+    return False
+
+
+def test_fail_fast_acquires_free_slot_while_tickets_are_outstanding(tmp_path):
+    """A fail-fast caller (timeout=0) must take a free slot immediately even
+    when tickets are outstanding — the turnstile bypass must not gate it.
+
+    Closes the audit gap (AC3): the free-slot fail-fast case was only asserted
+    with no outstanding ticket, and the outstanding-ticket case only exercised
+    the full-pool ``TimeoutError`` path, so “slot free while tickets
+    outstanding” was never exercised. Here the only holder is killed so the
+    slot is free at the exact moment a frozen (SIGSTOPed) waiter still holds
+    the lowest ticket — without the bypass, a fail-fast caller behind that
+    ticket would raise immediately instead of acquiring.
+    """
+    name = f"guard-ff-free-{int(time.time())}"
+
+    # A holder takes (and keeps) the only slot.
+    holder_env = dict(os.environ)
+    holder_env.update(
+        {
+            "REPO_ROOT": str(REPO_ROOT),
+            "SKILLS_ROOT": str(REPO_ROOT / "skill"),
+            "SEM_NAME": name,
+            "SEM_MAX": "1",
+            "SEM_HOLD": "30",
+            "SEM_TIMEOUT": "60",
+        }
+    )
+    holder = subprocess.Popen(
+        [sys.executable, "-c", WORKER_TEMPLATE],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=holder_env,
+    )
+    queued = None
+    try:
+        # Wait until the holder reports acquisition.
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            line = holder.stderr.readline()
+            if line.strip() and "acquired" in line:
+                break
+        else:  # pragma: no cover - holder failed to start
+            holder.kill()
+            holder.wait(timeout=10)
+            raise RuntimeError("holder worker failed to acquire slot")
+
+        # A second waiter queues behind the holder (lowest outstanding ticket).
+        start = tmp_path / "start-ff-free"
+        start.write_text("go", encoding="utf-8")
+        queued_env = dict(os.environ)
+        queued_env.update(
+            {
+                "REPO_ROOT": str(REPO_ROOT),
+                "SKILLS_ROOT": str(REPO_ROOT / "skill"),
+                "SEM_NAME": name,
+                "SEM_MAX": "1",
+                "SEM_HOLD": "30",
+                "SEM_TIMEOUT": "60",
+                "SEM_START_FILE": str(start),
+            }
+        )
+        queued = subprocess.Popen(
+            [sys.executable, "-c", ORDERED_WORKER_TEMPLATE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=queued_env,
+        )
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            line = queued.stderr.readline()
+            if line.strip() == "arrived":
+                break
+        else:  # pragma: no cover - waiter failed to start
+            queued.kill()
+            queued.wait(timeout=10)
+            raise RuntimeError("queued worker never arrived")
+
+        # Wait until the waiter holds a locked ticket (it is genuinely
+        # queued), then FREEZE it in place with SIGSTOP: it stays alive so its
+        # kernel flock stays held (an outstanding ticket), but it can never
+        # retry the pool — the upcoming free slot is uncontested and the test
+        # is deterministic (no sleep-duration ordering).
+        probe = Semaphore(name, max_workers=1, timeout=5)
+        deadline = time.monotonic() + 5.0
+        while (
+            not _turnstile_has_locked_ticket(probe)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        assert _turnstile_has_locked_ticket(probe), (
+            "queued worker never held a ticket"
+        )
+        os.kill(queued.pid, signal.SIGSTOP)
+        assert _turnstile_has_locked_ticket(probe), (
+            "ticket not held after freeze — SIGSTOP released the flock"
+        )
+
+        # Free the slot while the frozen waiter's ticket stays outstanding.
+        holder.kill()
+        holder.wait(timeout=10)
+
+        # The fail-fast caller must bypass the turnstile and take the slot now
+        # (audit_runner's timeout=0 semantics: no turnstile deadlock).
+        fast = Semaphore(name, max_workers=1, timeout=0)
+        t0 = time.monotonic()
+        assert fast.acquire() is True
+        elapsed = time.monotonic() - t0
+        fast.release()
+
+        assert elapsed < 1.0, (
+            "fail-fast caller queued behind an outstanding ticket; "
+            f"took {elapsed:.2f}s"
+        )
+        assert fast.last_ticket is None, (
+            "fail-fast callers must be exempt from the turnstile"
+        )
+    finally:
+        for proc in (holder, queued):
+            if proc is not None and proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=10)
 
