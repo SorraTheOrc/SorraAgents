@@ -180,6 +180,8 @@ class TestShouldRelease:
             ({"assignee": "Map"}, False),
             ({"assignee": "map"}, False),
             ({"assignee": "MAP"}, False),
+            ({"assignee": "dispatcher"}, True),
+            ({"assignee": "Dispatcher"}, True),
             (
                 {"assignee": "agent", "needsProducerReview": True},
                 False,
@@ -480,6 +482,110 @@ class TestReaper:
         assert report["scanned"] == 2
         assert report["released_count"] == 0
         assert set(report["skipped"]) == {"producer-hold", "fresh"}
+
+
+# ---------------------------------------------------------------------------
+# The dispatcher claim identity (WL-0MW51OB1Y0073TLG)
+# ---------------------------------------------------------------------------
+
+
+class TestDispatcherIdentity:
+    """``dispatcher`` is a claim, never a producer hold.
+
+    The herdr downtime dispatcher used to claim with the producer sentinel
+    ``Map``, which stranded auto-dispatched work: sessions preserved the claim
+    believing it was a deliberate producer hold and the reaper never touched
+    it. The identity is now its own value, and every release path treats it
+    exactly like an agent claim while ``Map``/``needsProducerReview`` stay
+    sacrosanct.
+    """
+
+    @pytest.mark.parametrize(
+        ("assignee", "expected"),
+        (
+            ("dispatcher", True),
+            ("Dispatcher", True),
+            ("  dispatcher  ", True),
+            ("dispatchers", False),
+            ("Map", False),
+            ("", False),
+            (None, False),
+        ),
+    )
+    def test_identity_is_recognised_case_and_whitespace_insensitively(
+        self, assignee, expected
+    ) -> None:
+        assert claim_release.is_dispatcher_assignee(assignee) is expected
+
+    def test_dispatcher_is_not_the_producer_hold(self) -> None:
+        """The two identities must never collapse back into one value."""
+        assert claim_release.DISPATCHER_ASSIGNEE_DEFAULT != (
+            claim_release.PRODUCER_ASSIGNEE_DEFAULT
+        )
+        assert claim_release.is_producer_assignee("dispatcher") is False
+        assert claim_release.is_dispatcher_assignee("Map") is False
+
+    def test_release_claim_releases_a_dispatcher_claim(self) -> None:
+        store = MemoryWl({"QZ-1": {"assignee": "dispatcher"}})
+
+        result = claim_release.release_claim(
+            "QZ-1",
+            reason="session-end",
+            author=_AGENT,
+            runner=store.runner,
+        )
+
+        assert result["released"] is True
+        assert result["reason"] == "released"
+        assert result["previous_assignee"] == "dispatcher"
+        assert store.assignee("QZ-1") == ""
+
+    def test_session_backstop_releases_a_dispatcher_claim(
+        self, monkeypatch
+    ) -> None:
+        """With no session identity the backstop clears any non-producer claim."""
+        for var in claim_release.SESSION_AGENT_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        store = MemoryWl({"QZ-1": {"assignee": "dispatcher"}})
+
+        result = claim_release.release_session_claim(
+            "QZ-1", runner=store.runner
+        )
+
+        assert result["released"] is True
+        assert store.assignee("QZ-1") == ""
+
+    def test_reaper_releases_a_stale_dispatcher_claim(self) -> None:
+        """A dispatcher claim orphaned by a dead session is reaped."""
+        store = MemoryWl({"QZ-1": _held("dispatcher", age_hours=48)})
+
+        report = claim_release.reap_stale_claims(
+            runner=store.runner, ttl_hours=24
+        )
+
+        assert report["released_count"] == 1
+        assert report["released"][0]["previous_assignee"] == "dispatcher"
+        assert store.assignee("QZ-1") == ""
+
+    def test_producer_hold_is_still_sacrosanct_beside_a_dispatcher_claim(
+        self,
+    ) -> None:
+        """The two identities in one window: only the dispatcher claim moves."""
+        store = MemoryWl(
+            {
+                "QZ-1": _held("Map", age_hours=48),
+                "QZ-2": _held("dispatcher", age_hours=48),
+            }
+        )
+
+        report = claim_release.reap_stale_claims(
+            runner=store.runner, ttl_hours=24
+        )
+
+        assert report["released_count"] == 1
+        assert [entry["id"] for entry in report["released"]] == ["QZ-2"]
+        assert store.assignee("QZ-1") == "Map"
+        assert store.assignee("QZ-2") == ""
 
 
 # ---------------------------------------------------------------------------

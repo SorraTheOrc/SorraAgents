@@ -39,6 +39,23 @@ by every release path here and by :class:`shared.status_lifecycle.StatusLifecycl
 so the reaper and the lifecycle transition can never disagree about what a
 protected hold is.
 
+Three identities appear in the ``assignee`` field, and only one is a hold:
+
+* ``Map`` (:data:`PRODUCER_ASSIGNEE_DEFAULT`, overridable with
+  ``WORKLOG_PRODUCER_ASSIGNEE``) — the producer's deliberate hold: never
+  released, never reaped;
+* ``dispatcher`` (:data:`DISPATCHER_ASSIGNEE_DEFAULT`) — the herdr downtime
+  dispatcher's claim, recorded when it auto-dispatches a work item
+  (WL-0MW51OB1Y0073TLG). It means "an agent is on it", **not** "the producer
+  parked it", so it is released exactly like an agent claim;
+* any other value — an agent identity (``implement``, ``plan``, …): released.
+
+The dispatcher used to claim with ``Map``, which made an auto-dispatched claim
+indistinguishable from a deliberate producer hold: sessions preserved it, the
+reaper never reaped it, and the item was stranded as a scheduling hold with no
+agent working. Keeping both identities single-sourced here is what stops the
+two concepts drifting apart again.
+
 Usage::
 
     from shared.claim_release import release_session_claim, reap_stale_claims
@@ -93,6 +110,16 @@ Runner = Callable[[list[str]], subprocess.CompletedProcess]
 PRODUCER_ASSIGNEE_ENV = "WORKLOG_PRODUCER_ASSIGNEE"
 #: The producer assignee (``Map`` per ``AGENTS_GLOBAL.md``).
 PRODUCER_ASSIGNEE_DEFAULT = "Map"
+
+#: The herdr downtime dispatcher's claim identity (WL-0MW51OB1Y0073TLG).
+#:
+#: Deliberately NOT the producer sentinel: ``dispatcher`` is a claim ("an agent
+#: is on it"), so :func:`should_release_assignee` releases it and
+#: :func:`reap_stale_claims` reaps it like any other agent claim. The
+#: TypeScript counterpart is ``DISPATCHER_ASSIGNEE`` in the herdr claim module
+#: (ContextHub, ``packages/herdr/src/index.claim.ts``); both sides must name the
+#: same value.
+DISPATCHER_ASSIGNEE_DEFAULT = "dispatcher"
 
 #: Environment variable overriding the reaper TTL (hours).
 REAPER_TTL_ENV = "WORKLOG_CLAIM_REAPER_TTL_HOURS"
@@ -163,6 +190,13 @@ def is_producer_assignee(assignee: object) -> bool:
     return bool(producer) and assignee.strip().casefold() == producer.casefold()
 
 
+def is_dispatcher_assignee(assignee: object) -> bool:
+    """True when *assignee* names the auto-dispatcher's claim."""
+    if not isinstance(assignee, str):
+        return False
+    return assignee.strip().casefold() == DISPATCHER_ASSIGNEE_DEFAULT.casefold()
+
+
 def is_deleted(item: dict[str, Any]) -> bool:
     """True when *item* is soft-deleted."""
     return bool(item.get("deletedBy")) or _normalise_status(item.get("status")) == (
@@ -176,7 +210,9 @@ def should_release_assignee(item: dict[str, Any]) -> bool:
     The single producer-aware predicate shared by every release path (the
     lifecycle transition, the session backstop and the reaper). Producer holds
     (``Map``) and ``needsProducerReview`` items are sacrosanct — they are the
-    sanctioned persistent holds, not a lingering agent claim.
+    sanctioned persistent holds, not a lingering agent claim. The
+    auto-dispatcher's ``dispatcher`` claim is NOT one of them: it is a claim
+    (try :func:`is_dispatcher_assignee`) and is released like an agent claim.
 
     Args:
         item: A work item mapping (``wl show --json`` → ``workItem``).
@@ -189,6 +225,9 @@ def should_release_assignee(item: dict[str, Any]) -> bool:
         return False
     if bool(item.get("needsProducerReview")):
         return False
+    # A ``dispatcher`` claim (the downtime dispatcher's identity) is deliberately
+    # released here: it is a claim, not the producer's scheduling hold
+    # (WL-0MW51OB1Y0073TLG).
     return not is_producer_assignee(assignee)
 
 

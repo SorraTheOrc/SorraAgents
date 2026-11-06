@@ -13,6 +13,35 @@ cross-referenced here rather than restated:
 This document is the reference for *how* that invariant is enforced across
 three layers, and what each layer guarantees (SA-0MW0F91KN004J06U).
 
+## 0. The three identities that appear in `assignee`
+
+Only one of them is a hold (WL-0MW51OB1Y0073TLG):
+
+| Identity | Written by | Meaning | Released? |
+|---|---|---|---|
+| `Map` (`WORKLOG_PRODUCER_ASSIGNEE`, `PRODUCER_ASSIGNEE_DEFAULT`) | the producer | a deliberate scheduling hold | **never** |
+| `dispatcher` (`DISPATCHER_ASSIGNEE_DEFAULT`) | the herdr downtime dispatcher, when it auto-dispatches an item | "an agent is on it" | yes — every terminal outcome, and the TTL reaper |
+| any other value (`implement`, `plan`, `audit`, …) | an agent session | an agent claim | yes — every terminal outcome, and the TTL reaper |
+
+An item also counts as held when it carries `needsProducerReview`, which is the
+second sanctioned persistent hold.
+
+The dispatcher originally claimed with `Map`. An auto-dispatched claim was then
+indistinguishable from a deliberate producer hold: sessions preserved it, the
+reaper never reaped it, and the item was stranded as a scheduling hold with no
+agent working (WL-0MVR8GDJ3008WY3Y was the first casualty). The identity is
+now its own value, single-sourced on both sides of the split:
+
+- Python: `skill/shared/claim_release.py` (`DISPATCHER_ASSIGNEE_DEFAULT`,
+  `is_dispatcher_assignee`, `should_release_assignee`);
+- TypeScript: `DISPATCHER_ASSIGNEE` in ContextHub's
+  `packages/herdr/src/index.claim.ts`, which also makes the dispatch gates
+  (`isAssigneeHeld`) and the all-held-window attribution treat the claim as
+  free rather than held.
+
+A `dispatcher` claim therefore behaves exactly like an agent claim here: it is
+never a protected hold and never a bypass of any gate.
+
 ## 1. The lifecycle transition (`StatusLifecycle`)
 
 `skill/shared/status_lifecycle.py` releases **any non-producer claim** on
@@ -36,7 +65,8 @@ The decision uses the one producer-aware predicate,
 the backstops below can never disagree about what a protected hold is.
 
 **Never released:** the producer `Map` hold and any item carrying
-`needsProducerReview` — the two sanctioned persistent holds.
+`needsProducerReview` — the two sanctioned persistent holds. The `dispatcher`
+claim is *not* one of them (§0): it is released like an agent claim.
 
 **Opt-out:** `preserve_assignee_on_exit=True`, for a deliberate producer /
 scheduling hold or a caller that restores a pre-existing assignee itself (the
@@ -204,7 +234,8 @@ through `wl show` to prove the item was dispatchable again.
   against a real `wl` store (pre-claim → run → empty assignee, status/stage
   preserved).
 - `skill/shared/tests/test_claim_release.py` — predicate, session backstop,
-  interrupting signal (real store), reaper release/idempotence/preservation.
+  interrupting signal (real store), reaper release/idempotence/preservation,
+  and the `dispatcher` claim identity (released, never protected).
 - `skill/shared/tests/test_worklog_sync.py` — the post-sync reaper hook.
 - `skill/report/tests/test_render_report.py` — the end-of-session backstop.
 - `tests/test_assignee_release_docs.py` — this documentation and the canonical
