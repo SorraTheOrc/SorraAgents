@@ -14,7 +14,10 @@ passes. The gate's machine-readable ``gate_reason`` is carried into
 """
 from __future__ import annotations
 
+import logging
+import os
 import random
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -75,7 +78,13 @@ def _scripted_popen(script, calls):
     def factory(argv, **kwargs):
         if list(argv[:2]) != ["git", "push"]:
             return _REAL_POPEN(argv, **kwargs)
-        calls.append({"argv": list(argv), "cwd": kwargs.get("cwd")})
+        calls.append(
+            {
+                "argv": list(argv),
+                "cwd": kwargs.get("cwd"),
+                "env": kwargs.get("env"),
+            }
+        )
         item = next(iterator)
         if item == "timeout":
             return _FakeProc(-9, b"", timeout=True)
@@ -192,7 +201,14 @@ class TestGitPushToDevRetry:
         assert len(push_harness["calls"]) == 3
         assert len(push_harness["sleeps"]) == 2
 
-    def test_retry_reuses_the_same_cwd_and_argv(self, push_harness):
+    def test_retry_reuses_same_cwd_argv_and_env_without_bypass(self, push_harness):
+        """AC3: a transport retry is byte-identical to the first attempt.
+
+        Same cwd, same argv, same env — and none of the documented bypass
+        injections (``--no-verify``, ``TEST_SCOPE_SKIP``) may appear, so the
+        pre-push gate runs again against the same tree and serves its cached
+        full-suite entry.
+        """
         push_harness["install"](
             [(128, TRANSPORT_CLOSE), (128, TRANSPORT_CLOSE), (0, b"")]
         )
@@ -201,10 +217,28 @@ class TestGitPushToDevRetry:
 
         calls = push_harness["calls"]
         assert {call["cwd"] for call in calls} == {push_harness["cwd"]}
-        assert len({tuple(call["argv"]) for call in calls}) == 1, (
-            "a retry must re-run the identical push so the gate re-serves its "
-            f"cached entry; argv varied: {[c['argv'] for c in calls]}"
+
+        expected_argv = [
+            "git", "push", implement.PUSH_REMOTE_NAME, "wl-test:refs/heads/dev",
+        ]
+        for call in calls:
+            assert call["argv"] == expected_argv, (
+                "a retry must re-run the identical push; no --no-verify or "
+                f"other injected args (got {call['argv']})"
+            )
+
+        envs = [call["env"] or {} for call in calls]
+        assert len({tuple(sorted(env.items())) for env in envs}) == 1, (
+            "a retry must re-run with the identical env so the gate re-serves "
+            f"its cached entry; env varied across attempts: {envs}"
         )
+        ambient = set(os.environ.items())
+        for env in envs:
+            extras = set(env.items()) - ambient
+            assert all(key == "TMPDIR" for key, _ in extras), (
+                "a retry must not inject TEST_SCOPE_SKIP or any other bypass "
+                f"env; unexpected keys: {extras}"
+            )
 
     def test_transport_retry_is_bounded(self, push_harness):
         transport = (128, TRANSPORT_CLOSE)
@@ -217,6 +251,59 @@ class TestGitPushToDevRetry:
         assert result is False
         assert len(push_harness["calls"]) == implement.PUSH_RETRY_MAX_ATTEMPTS
         assert len(push_harness["sleeps"]) == implement.PUSH_RETRY_MAX_ATTEMPTS - 1
+
+    def test_exhausted_trail_reports_attempts_backoff_and_final_reason(
+        self, push_harness, caplog
+    ):
+        """AC4: an exhausted retry trail reports the attempt count, the
+        backoff actually used and the final reason (via the log trail).
+        """
+        transport = (128, TRANSPORT_CLOSE)
+        push_harness["install"]([transport] * implement.PUSH_RETRY_MAX_ATTEMPTS)
+
+        with caplog.at_level(logging.WARNING, logger=implement.LOG.name):
+            result = implement.git_push_to_dev(
+                push_harness["cwd"], "wl-test", "abc123"
+            )
+
+        assert result is False
+        assert len(push_harness["calls"]) == implement.PUSH_RETRY_MAX_ATTEMPTS
+        assert len(push_harness["sleeps"]) == implement.PUSH_RETRY_MAX_ATTEMPTS - 1
+
+        records = [r for r in caplog.records if r.name == implement.LOG.name]
+        retries = [
+            r.getMessage() for r in records if "retrying in" in r.getMessage()
+        ]
+        assert len(retries) == implement.PUSH_RETRY_MAX_ATTEMPTS - 1, (
+            f"the trail must log each retry with its backoff; got {retries}"
+        )
+        for index, message in enumerate(retries):
+            match = re.search(
+                r"attempt (\d)/\d failed.*retrying in ([\d.]+)s", message
+            )
+            assert match is not None, (
+                f"retry record must name the attempt and backoff: {message}"
+            )
+            attempt, logged_delay = int(match.group(1)), float(match.group(2))
+            assert attempt == index + 1
+            assert logged_delay == pytest.approx(
+                push_harness["sleeps"][index], abs=0.06
+            ), "the trail must report the backoff that was actually used"
+
+        final = next(
+            (
+                r.getMessage()
+                for r in records
+                if "attempt" in r.getMessage()
+                and "retrying" not in r.getMessage()
+            ),
+            "",
+        )
+        assert f"attempt {implement.PUSH_RETRY_MAX_ATTEMPTS}/" in final
+        assert "Could not read from remote repository." in final, (
+            "the exhausted trail must end with the final reason (the stderr): "
+            f"{final}"
+        )
 
     def test_non_retryable_failure_fails_fast(self, push_harness):
         push_harness["install"]([(128, AUTH_FAILURE)])
