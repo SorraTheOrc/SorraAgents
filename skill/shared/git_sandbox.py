@@ -147,9 +147,13 @@ WORKLOG_HEADS_REF_NAMESPACE = "refs/heads/worklog/"
 #: indistinguishable from suite-caused movement (WL-0MV5MYBKJ0033P8U).
 #: ``refs/heads/dev`` is the shared integration branch: sibling agents'
 #: ``implement.py finish`` fast-forwards it on the shared main checkout while
-#: this suite runs, so its movement is never a hermetic-fixture signal. The
-#: incident class stays detectable through the config / working-tree /
-#: non-excluded-ref surfaces (see docs/dev/test-isolation.md §8).
+#: this suite runs, so its movement is never a hermetic-fixture signal. A
+#: *clean* own-checkout fast-forward of this branch is therefore never
+#: detected through the guard's ref/config/working-tree surfaces; that
+#: incident class is caught only on the new own-checkout state surface
+#: (``snapshot_own_checkout`` / ``compare_own_checkout_states``, the
+#: ``state_changed_during_run`` signal — SA-0MW3FF18I003KGZE, see
+#: docs/dev/test-isolation.md §8.4/§8.6).
 CONCURRENCY_EXCLUDED_REF_EXACT = "refs/heads/dev"
 
 #: Remote-tracking ref namespace excluded for the same reason: on a multi-agent
