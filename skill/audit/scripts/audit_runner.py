@@ -3626,9 +3626,11 @@ def _classify_herdr_suite_cache(
     candidates = _resolve_herdr_suite_commands(project_root)
     if not candidates:
         return _HERDR_SUITE_CACHE_EMPTY, head_sha, [
-            "the item touches packages/herdr/** but the project defines no "
-            "herdr suite profile (--type herdr / --group herdr); run the "
-            "herdr suite once via the test skill to populate the cache"
+            (
+                "the item touches packages/herdr/** but the project defines no "
+                "herdr suite profile (--type herdr / --group herdr); run the "
+                "herdr suite once via the test skill to populate the cache"
+            ),
         ], []
 
     green_keys: list[str] = []
