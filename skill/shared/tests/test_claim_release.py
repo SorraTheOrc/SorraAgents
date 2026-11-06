@@ -541,7 +541,8 @@ def _fixture_project(base: Path) -> Path:
 
     def run(cmd: list[str]) -> subprocess.CompletedProcess:
         proc = subprocess.run(
-            cmd, cwd=str(root), capture_output=True, text=True, env=env, timeout=120
+            cmd, cwd=str(root), capture_output=True, text=True, env=env, timeout=120,
+            check=False,
         )
         assert proc.returncode == 0, f"{cmd}\n{proc.stdout}\n{proc.stderr}"
         return proc
