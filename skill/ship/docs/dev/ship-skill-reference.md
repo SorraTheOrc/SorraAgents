@@ -168,7 +168,7 @@ by `audit-remediation.js` so a backlog of slow audits cannot hold the release
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `SHIP_AUDIT_REMEDIATION_TIMEOUT_MS` | `1800000` (30 min) | Per-item `audit_runner.py issue` timeout |
+| `SHIP_AUDIT_REMEDIATION_TIMEOUT_MS` | `1740000` (29 min) | Per-item `audit_runner.py issue` timeout (strictly below the total budget; clamped to the budget's remaining wall clock on every attempt) |
 | `SHIP_AUDIT_REMEDIATION_BUDGET_MS` | `1800000` (30 min) | Total wall-clock remediation budget per gate run |
 | `SHIP_AUDIT_REMEDIATION_MAX_ITEMS` | `5` | Maximum in-gate remediation attempts per gate run |
 
@@ -178,6 +178,21 @@ batch`), never as "not ready to close". `classifyRemediationError()` labels a
 runner failure `timeout` / `concurrency` / `provider` / `error`, so an
 infrastructure failure is distinguishable from a work verdict (surfaced as the
 `category` field on the blocking entry and in the reason text).
+
+**The per-item timeout is clamped to the remaining budget
+(WL-0MW32YZP7005LZ5B).** Every attempt gets
+`RemediationBudget.clampedTimeoutMs(perItemTimeoutMs)` =
+`min(per-item timeout, remainingMs)`, and the default per-item timeout is
+**strictly smaller** than the total budget (29 min vs 30 min — the 60 s
+reserve). Before this, the two defaults were equal (30 min) and a single
+attempt that overran by 65 s consumed the whole gate budget
+(`1865s of 1800s`), leaving nothing for any further item. The 29 min cap
+stays close to the 30 min budget because the Phase-2 per-call budget is
+2,400 s (40 min) and a lower cap would kill legitimate audits; the headroom
+that makes a second attempt possible comes from the clamp — an attempt after
+a partial spend gets only what is actually left (`min(per-item, remaining)`).
+An operator override still wins for the first attempt and is clamped
+thereafter.
 
 **Narrow audit bypass (`--skip-audit-remediation`, SA-0MUOO5WV0006D7UD):** skips
 only the in-gate re-audit attempts. The `readyToClose === true` requirement is

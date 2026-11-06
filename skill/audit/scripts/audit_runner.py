@@ -573,14 +573,40 @@ def _resolve_max_findings_in_report() -> int:
     return parsed
 
 
-CALL_PI_TIMEOUT = 1800
-"""Internal timeout (seconds) for each Pi model subprocess call.
+CALL_PI_TIMEOUT = 2400
+"""Default per-call timeout (seconds) for each Pi model subprocess call.
 
 This is a generous safety net for individual Pi model calls during audit
-processing. Phase 2 deep analysis now runs Pi in agent mode (with file-reading
-tools), which is inherently slower than bare LLM calls. 1800s (30 min)
-accommodates typical agent-mode analyses where the model reads and searches
-multiple implementation files.
+processing. Phase 2 deep analysis runs Pi in agent mode (with file-reading
+tools), which is inherently slower than bare LLM calls, so this budget is
+sized from measurement rather than guessed.
+
+**Derivation (WL-0MW32YZP7005LZ5B, measured — not guessed).** The 2026-11-05
+corpus (``python3 scripts/measure_audit_performance.py --root ~/.audit_debug
+--json``; 934 logs / 2,456 timing lines) for the Phase-2 family:
+
+    context         calls   p50     p90     max    calls at the 1800 s cap
+    phase2_deep      476    288    1085    3600    15
+    phase2_child     454    341    1116    2071    10
+    verdict_reask    211    462    1339    2372     6
+
+The Phase-2 p90 is 1,085–1,116 s and **25 Phase-2 calls landed exactly on the
+old 1,800 s ceiling** — 1,800 s was under-sized for this family, not merely a
+saturation artefact. Following the repository's derivation discipline
+(``ceil(p90 x safety factor 2)``, rounded), the family p90 (1,085–1,116 s) is
+rounded up to the next 100 s bucket (1,200 s) and doubled:
+``ceil(1200 x 2) = 2400`` s (40 min).
+
+Re-derive on a new corpus with::
+
+    python3 scripts/measure_audit_performance.py --root ~/.audit_debug --json
+    # phase2_deep / phase2_child p90 columns -> round up to the next 100 s,
+    # then x 2
+
+The Phase-1 screening budgets (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` and
+``_PARENT_SCREEN_TIMEOUT_DEFAULT`` = 1080 s) and the stall-abort threshold
+(``_STALL_TIMEOUT_DEFAULT`` = 600 s) are unchanged: this constant sizes
+Phase-2 deep-analysis calls only.
 
 The cumulative elapsed-time guard in ``cmd_issue`` (default
 ``PARENT_TIMEOUT_DEFAULT + N x PARENT_TIMEOUT_PER_CHILD``, scaled by the
@@ -648,10 +674,11 @@ AUDIT_CHILD_SCREEN_TIMEOUT_ENV = "AUDIT_CHILD_SCREEN_TIMEOUT"
 Child Phase-1 AC-review screens use a right-sized per-call budget
 (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, derived as
 ``ceil(measured p95 x 2)`` — see that constant's docstring) instead of the
-full 1800 s Phase-2 budget. A screen that exceeds its budget is quarantined
-— the conservative ``partial`` verdict with evidence naming the budget and
-phase, plus a ``child_screen_timeouts`` count in the reliability summary —
-never a full 1800 s burn and never an unqualified judgement. Overridable via
+full Phase-2 budget (``CALL_PI_TIMEOUT`` = 2,400 s). A screen that exceeds its
+budget is quarantined — the conservative ``partial`` verdict with evidence
+naming the budget and phase, plus a ``child_screen_timeouts`` count in the
+reliability summary — never a full 2,400 s burn and never an unqualified
+judgement. Overridable via
 the ``--child-screen-timeout`` CLI flag (flag wins) or this env var.
 """
 
@@ -671,7 +698,7 @@ host-load increase converted completions into timeouts, and 5 of 11 screens
 ``ceil(p95 x safety_factor)`` with a documented **safety factor of 2**:
 ``ceil(506 x 2) = 1012`` s, rounded up to **1080 s** (18 min) for a round value
 with a little extra slack. That keeps ~2.1x headroom over measured p95 while
-staying far below the 1800 s Phase-2 budget, so a genuinely stalled screen
+staying far below the 2,400 s Phase-2 budget, so a genuinely stalled screen
 still fails fast.
 
 Re-derivation on a new corpus::
@@ -696,7 +723,7 @@ The parent Phase-1 AC screen is the same structural screening call as a
 child screen (read the FILE SCOPE manifest, map each AC to a
 met/unmet/partial/adjusted verdict), so it shares the measured right-sized
 screening budget (``_PARENT_SCREEN_TIMEOUT_DEFAULT`` = 1080 s) instead of the
-full 1800 s Phase-2 budget — a parent screen that exceeds its budget is
+full 2,400 s Phase-2 budget — a parent screen that exceeds its budget is
 quarantined exactly like a capped child screen (SA-0MVJ3Q662006RDJR).
 Overridable via the ``--parent-screen-timeout`` CLI flag (flag wins) or this
 env var.
@@ -730,7 +757,7 @@ Re-derivation on a new corpus::
 A capped parent screen never triggers the JSON re-ask and never burns a second
 call: it degrades to ``partial`` with evidence naming the budget and phase and
 increments ``parent_screen_timeouts`` in ``AUDIT_RELIABILITY_SUMMARY``. It
-stays far below the 1800 s Phase-2 budget, so a genuinely stalled parent
+stays far below the 2,400 s Phase-2 budget, so a genuinely stalled parent
 screen still fails fast.
 """
 
@@ -749,7 +776,8 @@ _STALL_TIMEOUT_DEFAULT = 600
 """Default in-process stall-abort threshold (seconds).
 
 10 min is generous vs healthy Phase 1 screens (30-190 s) while still aborting
-a genuinely hung call well before its 1800 s budget (LP-0MSQ32S2M001EA74 AC2).
+a genuinely hung call well before its 2,400 s Phase-2 budget
+(LP-0MSQ32S2M001EA74 AC2).
 """
 
 
@@ -4934,13 +4962,14 @@ def _resolve_call_timeout(timeout: int | None, child_screen: bool = False,
          ``_PARENT_SCREEN_TIMEOUT_DEFAULT`` (1080 s — the same measured
          screening budget as child screens, `ceil(p95 x 2)`), so a parent
          screen that exceeds its budget is quarantined instead of burning
-         the full 1800 s (SA-0MVJ3Q662006RDJR)
+         the full 2,400 s (SA-0MVJ3Q662006RDJR)
       3. child Phase-1 AC-review screens: ``AUDIT_CHILD_SCREEN_TIMEOUT``
          env or ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080 s, derived from
          measured p95 x 2) — a child screen that exceeds its budget is
-         quarantined instead of burning the full 1800 s
+         quarantined instead of burning the full 2,400 s
          (LP-0MSQ32S2M001EA74 AC1, SA-0MVI3608M0080QLW)
-      4. all other calls: ``CALL_PI_TIMEOUT`` (1800 s)
+      4. all other calls: ``CALL_PI_TIMEOUT`` (2,400 s — data-derived Phase-2
+         budget, WL-0MW32YZP7005LZ5B)
     """
     if timeout is not None:
         return timeout
@@ -5111,14 +5140,14 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, derived from measured
             p95 x 2, configurable via
             ``AUDIT_CHILD_SCREEN_TIMEOUT`` / ``--child-screen-timeout``)
-            instead of the 1800 s Phase-2 budget (LP-0MSQ32S2M001EA74 AC1).
+            instead of the 2,400 s Phase-2 budget (LP-0MSQ32S2M001EA74 AC1).
 
         parent_screen: If True, this is the parent Phase-1 AC screen; it uses
             the same measured right-sized screening budget
             (``_PARENT_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, configurable via
             ``AUDIT_PARENT_SCREEN_TIMEOUT`` / ``--parent-screen-timeout``)
-            instead of the 1800 s Phase-2 budget, so a capped parent screen is
-            quarantined rather than burning 30 minutes
+            instead of the 2,400 s Phase-2 budget, so a capped parent screen
+            is quarantined rather than burning 40 minutes
             (SA-0MVJ3Q662006RDJR AC1/AC3).
 
         issue_id: Work-item ID used in the ``--session-id`` flag.
@@ -7635,7 +7664,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             (LP-0MSQ32S2M001EA74 AC1).
         parent_screen: If True, forwards to _call_pi() so the parent Phase-1
             AC screen uses the right-sized screening budget instead of the
-            1800 s Phase-2 budget (SA-0MVJ3Q662006RDJR AC1).
+            2,400 s Phase-2 budget (SA-0MVJ3Q662006RDJR AC1).
         ac_count: Number of acceptance criteria covered by this call. When
             supplied, the per-call timing line appends ``ac_count=N`` and
             ``avg_ac_elapsed_seconds`` (elapsed / N) so Phase-2 per-AC
@@ -9531,7 +9560,14 @@ def _run_phase2_deep_analysis(
             if script_failure_callback:
                 script_failure_callback(
                     "pi (Phase 2 deep analysis)",
-                    RuntimeError(f"Phase 2 deep analysis timed out after {CALL_PI_TIMEOUT}s"),
+                    # Report the timeout that was ACTUALLY applied (resolved
+                    # from --timeout / AUDIT_PI_TIMEOUT / CALL_PI_TIMEOUT), never
+                    # a hardcoded constant: a 2,700 s override must report
+                    # 2,700 s (WL-0MW32YZP7005LZ5B, absorbing SA-0MV9J471W002LCE1).
+                    RuntimeError(
+                        "Phase 2 deep analysis timed out after "
+                        f"{_resolve_call_timeout(timeout)}s"
+                    ),
                 )
             # Mark all ACs as partial with timeout evidence
             timeout_acs = []
@@ -15574,7 +15610,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "AC-review screens in seconds (default: "
                              "AUDIT_CHILD_SCREEN_TIMEOUT env or 1080; lightweight "
                              "child screens fail fast instead of burning the full "
-                             "1800s budget)"
+                             "Phase-2 budget (2400s))"
                          ))
     p_issue.add_argument("--parent-screen-timeout", type=int, default=None,
                          help=(

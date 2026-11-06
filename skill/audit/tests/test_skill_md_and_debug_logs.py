@@ -732,3 +732,60 @@ class TestCleanupDebugLogs:
         )
         assert proc.returncode == 0
         assert (root / "audit_debug_OLD.jsonl").exists()
+
+
+# ===========================================================================
+# Phase-2 budget and gate-remediation documentation
+# ===========================================================================
+
+SHIP_REF = REPO_ROOT / "skill" / "ship" / "docs" / "dev" / "ship-skill-reference.md"
+
+
+class TestPhase2BudgetDocumentation:
+    """The Phase-2 budget and the gate-remediation clamp are documented.
+
+    WL-0MW32YZP7005LZ5B AC5: the reference docs must record the new Phase-2
+    budget, its measured derivation and the command that re-derives it, and
+    the ship doc must describe the per-item remediation timeout clamp. These
+    assertions pin the wording so a silent doc/code divergence fails a test.
+    """
+
+    def test_reference_doc_records_phase2_budget_and_derivation(self) -> None:
+        text = SKILL_REF.read_text()
+        assert "2400 s (40 min)" in text, (
+            "docs/dev/audit-skill-reference.md must state the data-derived "
+            "2400 s Phase-2 per-call budget"
+        )
+        assert "ceil(1200 x 2) = 2400" in text, (
+            "the doc must record the derivation, not just the number"
+        )
+        assert "25 Phase-2 calls landed exactly on the old 1800 s ceiling" in text, (
+            "the measured evidence (calls capped at 1800 s) must be recorded"
+        )
+
+    def test_reference_doc_records_rederivation_command(self) -> None:
+        text = SKILL_REF.read_text()
+        assert "scripts/measure_audit_performance.py" in text
+        assert "phase2_deep" in text and "phase2_child" in text
+
+    def test_reference_doc_records_truthful_timeout_diagnostic(self) -> None:
+        text = SKILL_REF.read_text()
+        assert "timed out after 2700s" in text, (
+            "the doc must state that the diagnostic reports the resolved "
+            "effective timeout, not a hardcoded constant"
+        )
+
+    def test_ship_doc_records_clamped_per_item_timeout(self) -> None:
+        text = SHIP_REF.read_text()
+        assert "| `SHIP_AUDIT_REMEDIATION_TIMEOUT_MS` | `1740000` (29 min)" in text, (
+            "the ship doc must record the right-sized per-item timeout"
+        )
+        assert "clampedTimeoutMs" in text, (
+            "the ship doc must record that the per-item timeout is clamped to "
+            "the remaining budget"
+        )
+        assert "clamped to the remaining budget" in text
+
+    def test_skill_md_points_at_the_phase2_budget(self) -> None:
+        text = SKILL_MD.read_text()
+        assert "data-derived Phase-2 budget of 2400 s" in text

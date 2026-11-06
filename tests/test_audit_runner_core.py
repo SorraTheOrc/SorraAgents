@@ -729,10 +729,12 @@ class TestCallPiTimeoutConstant:
         )
 
     def test_call_pi_timeout_not_excessive(self):
-        """Timeout should still have a reasonable upper bound."""
-        assert CALL_PI_TIMEOUT <= 1800, (
-            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 1800s "
-            "to bound the original indefinite-hang risk"
+        """Timeout keeps a reasonable upper bound (the data-derived Phase-2
+        budget, WL-0MW32YZP7005LZ5B)."""
+        assert CALL_PI_TIMEOUT <= 2400, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 2400s "
+            "(the measured Phase-2 budget: ceil(p90 x 2) rounded) to bound "
+            "the original indefinite-hang risk"
         )
 
 
@@ -2869,8 +2871,9 @@ class TestPhase2BudgetAndDiagnostic:
         timeout (a 2,700 s override reports 2,700 s, not the hardcoded
         1,800 s/``CALL_PI_TIMEOUT``) and names the Phase 2 deep-analysis
         phase (SA-0MV9J471W002LCE1)."""
-        import audit.scripts.audit_runner as audit_runner
         from unittest import mock
+
+        from audit.scripts import audit_runner
 
         captured: list[tuple[str, str]] = []
 
