@@ -14565,8 +14565,10 @@ def _preserved_ref_comment(
         f"- Failing `finish` step: `{step}` (reason: `{reason}`)"
     )
     lines = [
-        f"Drive refused to reset this child's worktree (`{child_id}`) "
-        "because it carries commits.",
+        (
+            f"Drive refused to reset this child's worktree (`{child_id}`) "
+            "because it carries commits."
+        ),
         "",
         f"- Worktree tip preserved at: `{preserved.get('ref')}`",
         f"- Preserved commit: `{preserved.get('commit')}`",
