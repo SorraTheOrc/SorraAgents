@@ -52,8 +52,20 @@ def _run_hook(
     suite_exit: int = 1,
     runner_stderr: str = "",
     stdin_text: str = "refs/heads/wl-SA-1-x abc123 refs/heads/dev 1111\n",
+    with_classifier: bool = True,
+    with_global_classifier: bool = False,
+    classifier_src: Path | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run the pre-push hook with a fake runner emitting *result* as JSON."""
+    """Run the pre-push hook with a fake runner emitting *result* as JSON.
+
+    *with_classifier* controls whether the shared classifier is present next
+    to the runner (repo-local tier); *with_global_classifier* additionally
+    plants a copy under the sandboxed $HOME/.pi/agent/skills/... to exercise
+    the installed-global-skill tier (AC4). *classifier_src* overrides the
+    repo-local classifier source so a test can plant a stub module. HOME is
+    always redirected into the sandbox so an ambient global skill install
+    cannot leak into the test.
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(
@@ -69,15 +81,34 @@ def _run_hook(
     runner = repo / "skill" / "test" / "scripts" / "run_tests.py"
     runner.parent.mkdir(parents=True, exist_ok=True)
     runner.write_text(_FAKE_RUNNER, encoding="utf-8")
-    # The hook imports the shared classifier from the runner's directory, just
-    # as the installed framework ships both files side by side.
-    shutil.copy(
-        REPO_ROOT / "skill" / "test" / "scripts" / "gate_reason.py",
-        runner.parent / "gate_reason.py",
-    )
+    if classifier_src is not None:
+        shutil.copy(classifier_src, runner.parent / "gate_reason.py")
+    elif with_classifier:
+        # The hook imports the shared classifier from the runner's directory, just
+        # as the installed framework ships both files side by side.
+        shutil.copy(
+            REPO_ROOT / "skill" / "test" / "scripts" / "gate_reason.py",
+            runner.parent / "gate_reason.py",
+        )
+    if with_global_classifier:
+        global_dir = (
+            tmp_path
+            / "home"
+            / ".pi"
+            / "agent"
+            / "skills"
+            / "test"
+            / "scripts"
+        )
+        global_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(
+            REPO_ROOT / "skill" / "test" / "scripts" / "gate_reason.py",
+            global_dir / "gate_reason.py",
+        )
 
     env = {
         **fixture_git_env(),
+        "HOME": str(tmp_path / "home"),
         "CONTEXT_BUDGET_SKIP": "1",
         "WORKLOG_SKIP_PRE_PUSH": "1",
         "BRANCH_POLICY_SKIP": "1",
@@ -209,6 +240,77 @@ class TestRedSuite:
         )
         assert result.returncode == 1
         assert "gate_reason=test_failure" in result.stderr, result.stderr
+
+
+# ── Tiered classifier resolution (AC4) ─────────────────────────────────────
+
+
+class TestClassifierResolutionTiers:
+    """The classifier must resolve repo-local first, then the installed global
+    skill ($HOME/.pi/agent/skills/...), and fall back to a conservative
+    `infrastructure` reason when no tier holds an importable copy."""
+
+    def test_global_skill_classifier_is_used_when_repo_local_is_absent(
+        self, tmp_path: Path
+    ):
+        """A consumer repo without its own copy classifies via the global
+        skill tier and still emits a concrete reason."""
+        result = _run_hook(
+            tmp_path,
+            {"success": False, "failures": [{"test_name": "test_x.py::y"}]},
+            with_classifier=False,
+            with_global_classifier=True,
+        )
+        assert result.returncode == 1, result.stdout
+        assert "gate_reason=test_failure" in result.stderr, result.stderr
+        assert "Full test suite failed" in result.stderr, result.stderr
+
+    def test_no_classifier_anywhere_reports_infrastructure_and_fails_closed(
+        self, tmp_path: Path
+    ):
+        """Missing classifier in every tier must still block the push with the
+        conservative infrastructure reason — never `unknown`, never fail-open."""
+        result = _run_hook(
+            tmp_path,
+            {"success": False, "failures": [{"test_name": "test_x.py::y"}]},
+            with_classifier=False,
+            with_global_classifier=False,
+        )
+        assert result.returncode == 1, result.stdout
+        assert "gate_reason=infrastructure" in result.stderr, result.stderr
+        assert "gate_reason=unknown" not in result.stderr, result.stderr
+
+    def test_repo_local_classifier_wins_over_global(self, tmp_path: Path):
+        """A repo-local copy shadows the global skill tier (resolution order).
+
+        The repo-local module is replaced by a stub whose render always emits
+        `gate_reason=slot_contention`; the global tier holds the real module,
+        which would emit `test_failure` for a failures-bearing result. The hook
+        must resolve the repo-local tier first and report slot_contention.
+        """
+        stub = tmp_path / "gate_reason.py"
+        stub.write_text(
+            "def classify_gate_result(result):\n"
+            "    return 'slot_contention'\n"
+            "def render_gate_diagnostic(reason, result=None):\n"
+            "    return 'gate_reason=slot_contention\\nlocal-stub-won'\n",
+            encoding="utf-8",
+        )
+        result = _run_hook(
+            tmp_path,
+            {
+                "success": False,
+                "failures": [{"test_name": "test_x.py::y"}],
+                "notice_codes": [],
+                "notices": [],
+            },
+            classifier_src=stub,
+            with_global_classifier=True,
+        )
+        assert result.returncode == 1
+        assert "gate_reason=slot_contention" in result.stderr, result.stderr
+        assert "local-stub-won" in result.stderr, result.stderr
+        assert "gate_reason=test_failure" not in result.stderr, result.stderr
 
 
 # ── Unclassifiable failures still fail closed and name a reason ─────────────

@@ -313,7 +313,7 @@ committed per-project thresholds file
 
 | Project | Hook | `core.hooksPath` | Thresholds file |
 |---|---|---|---|
-| SorraAgents | v3 (context-budget gate + sync + branch policy + full-suite gate) | `.git/hooks` | `docs/dev/context-budget.thresholds.json` |
+| SorraAgents | v4 (context-budget gate + sync + branch policy + full-suite gate) | `.git/hooks` | `docs/dev/context-budget.thresholds.json` |
 | ContextHub | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |
 | dev-scripts | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |
 | llm-manager | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |

@@ -1478,7 +1478,10 @@ capped at `PUSH_RETRY_CAP_SECONDS = 30.0`, +/-25% jitter).
 
 `.githooks/pre-push` prints a stable `gate_reason=<code>` line on failure,
 derived from the runner's machine-readable aggregate via the shared
-`skill/test/scripts/gate_reason.py` classifier. When the push fails,
+`skill/test/scripts/gate_reason.py` classifier, resolved repo-local first and
+then from the installed global skill (`$HOME/.pi/agent/skills/test/scripts/`,
+SA-0MVXEQE01008JW5R AC4) with a conservative `infrastructure` fallback when
+no tier holds an importable copy. When the push fails,
 `git_push_to_dev()` parses that line into
 `evidence_out = {success: False, gate_reason, stderr_tail}` and
 `phase_finish` raises `PushGateFailureError` carrying it. The finish report

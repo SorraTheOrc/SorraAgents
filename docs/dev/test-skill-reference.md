@@ -382,9 +382,17 @@ diagnostic — `slot_contention`, `timeout`, `killed`, `unparsed`,
 the shared `skill/test/scripts/gate_reason.py` classifier (the same one
 `implement.py`'s changed-scope gate uses), which maps the published
 `notice_codes` above onto those reasons — the codes are consumed, never
-re-defined. The hook never fails open: an unparsable result is reported as
-`gate_reason=unknown` and the push still exits non-zero, and a red suite keeps
-`gate_reason=test_failure` with the unchanged "Full test suite failed" wording.
+re-defined. The classifier itself is resolved through a tiered search order
+(SA-0MVXEQE01008JW5R AC4): repo-local first (the runner's own directory,
+`skill/test/scripts/`), then the installed global skill
+(`$HOME/.pi/agent/skills/test/scripts/` — the same fallback the release gate
+uses for `run_tests.py`), so a consumer repo without its own copy still
+classifies from the installed skill. When no tier holds an importable copy
+the failure is conservatively reported as `gate_reason=infrastructure` — never
+`unknown`, never fail-open. The hook never fails open: an unparsable result is
+reported as `gate_reason=unknown` and the push still exits non-zero, and a red
+suite keeps `gate_reason=test_failure` with the unchanged "Full test suite
+failed" wording.
 `implement.py finish` reads the line from the push stderr and reports the
 reason with its remedy instead of a generic "git push to dev failed".
 

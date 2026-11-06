@@ -324,11 +324,11 @@ fi
 # `measure_context.py --generate-thresholds`.
 #
 # Two hook variants exist. The canonical source repo (SorraAgents) ships a
-# repo-local full-suite runner, so it gets the v3 hook (.githooks/pre-push:
+# repo-local full-suite runner, so it gets the v4 hook (.githooks/pre-push:
 # context-budget gate + worklog sync + branch policy + full-suite test gate).
 # Every other project gets the framework v2 hook (.githooks/pre-push.v2:
 # context-budget gate + worklog sync + branch policy, NO full-suite gate) —
-# only SorraAgents ships skill/test/scripts/run_tests.py, and the v3
+# only SorraAgents ships skill/test/scripts/run_tests.py, and the v4
 # full-suite gate would otherwise hard-fail every dev/main push in a project
 # that lacks the repo-local runner (SA-0MV8M4OVX000QHSM).
 #
@@ -339,20 +339,30 @@ if [ "${PI_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
     GITHOOKS_DIR="$CURRENT_REPO_ROOT/.githooks"
     if [ -f "$CURRENT_REPO_ROOT/skill/test/scripts/run_tests.py" ]; then
       HOOK_SRC="$SRC_DIR/.githooks/pre-push"
-      HOOK_LABEL="v3"
+      HOOK_LABEL="v4"
     else
       HOOK_SRC="$SRC_DIR/.githooks/pre-push.v2"
       HOOK_LABEL="framework v2"
     fi
     HOOK_DST="$GITHOOKS_DIR/pre-push"
 
-    # 1. Ensure the selected hook is present in .githooks/pre-push (idempotent).
+    # 1. Ensure the selected hook is present in .githooks/pre-push and is the
+    #    current version (idempotent). The hook carries a stable version marker
+    #    (`# worklog:pre-push-hook:vN`); an installed copy whose marker differs
+    #    from the source is refreshed in place, so a hook bump propagates to
+    #    already-wired projects on the next install run without manual removal.
     if [ -f "$HOOK_SRC" ]; then
+      HOOK_SRC_MARKER="$(grep -m1 '^# worklog:pre-push-hook:' "$HOOK_SRC" 2>/dev/null || true)"
+      HOOK_DST_MARKER="$(grep -m1 '^# worklog:pre-push-hook:' "$HOOK_DST" 2>/dev/null || true)"
       if [ ! -f "$HOOK_DST" ]; then
         mkdir -p "$GITHOOKS_DIR"
         cp "$HOOK_SRC" "$HOOK_DST"
         chmod +x "$HOOK_DST"
         echo "Installed $HOOK_LABEL pre-push hook: $HOOK_DST (context-budget gate + worklog sync)"
+      elif [ -n "$HOOK_SRC_MARKER" ] && [ "$HOOK_DST_MARKER" != "$HOOK_SRC_MARKER" ]; then
+        cp "$HOOK_SRC" "$HOOK_DST"
+        chmod +x "$HOOK_DST"
+        echo "Refreshed $HOOK_LABEL pre-push hook: $HOOK_DST ($HOOK_DST_MARKER -> $HOOK_SRC_MARKER)"
       else
         echo "OK: pre-push hook already present: $HOOK_DST"
       fi

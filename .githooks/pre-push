@@ -1,5 +1,5 @@
 #!/bin/sh
-# worklog:pre-push-hook:v3
+# worklog:pre-push-hook:v4
 # 1. Auto-sync Worklog data before pushing (committed hooks).
 # 2. Enforce branch naming policy: block pushes to protected branches.
 # 3. Context-budget regression gate (F6, SA-0MSLK7XNZ00366YY): fail the push
@@ -213,18 +213,33 @@ if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
       # the pusher is told *why* — no free slot, timeout, killed/unparsed run
       # versus a genuine red suite — and `implement.py finish` can report the
       # stable `gate_reason=<code>` line. Never fail open: every path exits 1.
+      # AC4: the shared classifier is resolved through a tiered search order —
+      # repo-local first (the runner's own directory), then the installed
+      # global skill ($HOME/.pi/agent/skills/...), mirroring the release
+      # gate's run_tests.py resolution. When no tier holds an importable copy
+      # the failure is conservatively reported as infrastructure, never
+      # fail-open and never a guessed reason.
+      classifier_dirs="$(dirname "$runner")"
+      if [ -d "$HOME/.pi/agent/skills/test/scripts" ]; then
+        classifier_dirs="$classifier_dirs $HOME/.pi/agent/skills/test/scripts"
+      fi
       gate_diag=""
-      if ! gate_diag="$(python3 - "$gate_out" "$gate_err" "$(dirname "$runner")" <<'PY'
+      if ! gate_diag="$(python3 - "$gate_out" "$gate_err" "$classifier_dirs" <<'PY'
 import json
 import sys
 
-out_path, err_path, scripts_dir = sys.argv[1], sys.argv[2], sys.argv[3]
-sys.path.insert(0, scripts_dir)
+out_path, err_path, classifier_dirs = sys.argv[1], sys.argv[2], sys.argv[3]
+# Repo-local tier first: sys.path is searched in order, so a repo copy wins
+# over the installed global-skill copy when both exist (AC4).
+sys.path[:0] = [d for d in classifier_dirs.split() if d]
 try:
     from gate_reason import classify_gate_result, render_gate_diagnostic
-except Exception:  # classifier unavailable -> fail closed, still name it
-    print("gate_reason=unknown")
-    print("The gate failed and the reason classifier was unavailable.")
+except Exception:  # classifier unavailable in every tier -> conservative infra
+    print("gate_reason=infrastructure")
+    print(
+        "ERROR: The gate failed and the reason classifier was unavailable — "
+        "treating the failure as infrastructure, not a test failure."
+    )
     raise SystemExit(0)
 
 result = None
@@ -251,8 +266,8 @@ else:
 print(render_gate_diagnostic(reason, result))
 PY
 )"; then
-        gate_diag="gate_reason=unknown
-The gate failed and its machine-readable result could not be classified."
+        gate_diag="gate_reason=infrastructure
+The gate failed and its machine-readable result could not be classified — treating the failure as infrastructure."
       fi
       # Preserve the historical message substance for an unclassifiable run
       # (no structured reason available); classified infrastructure reasons
