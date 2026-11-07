@@ -188,7 +188,7 @@ user/stakeholder, the problem being solved, and the measurable outcome.
 
 ### 5. Draft intake brief (agent responsibility)
 
-- Write a brief to `.worklog/tmp/intake-draft-<title>-<work-item-id>.md` with: **Problem statement** (1–2 sentences), **Users** (with example user stories), **Acceptance Criteria** (3–5 measurable bullets), **Constraints**, **Existing state**, **Desired change**, **Key Files (predicted)** (published as a `**Key Files:**` section; e.g. ``- `path/to/file.py` — Needs new function for X feature``), **Related work**.
+- Write a brief to `.worklog/tmp/intake-draft-<title>-<work-item-id>.md` with: **Problem statement** (1–2 sentences), **Users** (with example user stories), **Acceptance Criteria** (3–5 measurable bullets), **Impact** (published as a `## Impact` section: one sentence describing the user-experience impact — optional but recommended at intake, required when the item is completed), **Constraints**, **Existing state**, **Desired change**, **Key Files (predicted)** (published as a `**Key Files:**` section; e.g. ``- `path/to/file.py` — Needs new function for X feature``), **Related work**.
 - **AC list format:** the AC coverage review recognises the following list markers inside an
   `## Acceptance Criteria` section — `- ` (dash bullet), `+ ` (plus bullet), `1. `
   (period-numbered) and `1) ` (paren-numbered); `*` star bullets are **not** recognised.

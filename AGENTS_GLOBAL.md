@@ -66,6 +66,11 @@ and relevant context.
 
 <!-- WORKFLOW: end -->
 
+## Work-item completion conventions
+
+- **`## Impact` is required on newly completed items.** Before advancing a work item to `in_review`, add an `## Impact` section to its description: **one sentence describing the user-experience impact** — what a user can now do, see, or stop worrying about — not a technical summary of what was built. Standup reports quote it verbatim, falling back to the item's user story when the section is absent.
+- **Existing completed items are deliberately not retrofitted.** The convention applies to items completed from now on; rewriting already-completed descriptions is intentionally out of scope.
+
 ## CRITICAL RULES
 
 - **Write in UK English.** All written output must use UK English spelling (e.g. "colour" not "color", "organise" not "organize").

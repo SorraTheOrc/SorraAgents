@@ -1206,6 +1206,7 @@ See ``../refactor/SKILL.md``.
   marks the item `in_review`; the manual steps below are the reference for
   what it does, in the order it does them.
 - Follow the mandatory build → test → commit order before committing.
+- **Add the `## Impact` sentence before finishing.** The description of a newly completed item must carry an `## Impact` section: one sentence describing the user-experience impact — what a user can now do, see, or stop worrying about — phrased for a non-technical reader, not as a technical summary of what was built. `finish` advances the item to `in_review`, so write the sentence before running it. Standup reports quote it verbatim. The convention, together with the intentional no-retrofit rule for already-completed items, is stated in `AGENTS_GLOBAL.md`.
 - **Do NOT create a Pull Request to `main`** — work is integrated into `dev`; the `dev`→`main` promotion is handled by the release process.
 - Push the feature branch into `dev` via the ship skill (`pushToDev()` from `$(skill_path ship)/scripts/ship.js`, preferred) or `git push origin HEAD:refs/heads/dev`. `dev` is **not** protected; only `main`, `master`, `HEAD` are blocked.
 

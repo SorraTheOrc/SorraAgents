@@ -124,10 +124,10 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 15226,
-  "project_agents": 3285,
+  "global_agents": 15843,
+  "project_agents": 3875,
   "skills_prose": 2339,
-  "total": 20850
+  "total": 22057
 }
 ```
 
@@ -239,6 +239,15 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > content; `tests/test_agents_global_links.py` now fails if a repository-relative
 > link returns, so the thresholds were regenerated to the accepted surface
 > rather than compacting normative wording.
+>
+> **Impact completion convention bump (2026-11-07, SA-0MW6EUWCF005W16Z):**
+> the `## Impact` work-item completion convention added ~617 B to
+> `AGENTS_GLOBAL.md` (`global_agents 15226` → `15843`) and ~590 B to
+> `AGENTS.md` (`project_agents 3285` → `3875`; `skills_prose` unchanged;
+> `total 20850` → `22057`). The addition is deliberate completion guidance —
+> the standup report quotes each item's `## Impact` sentence — so the
+> thresholds were regenerated to the new measured surface rather than
+> compacting the convention.
 >
 > ### Enforcement (committed gate)
 >
