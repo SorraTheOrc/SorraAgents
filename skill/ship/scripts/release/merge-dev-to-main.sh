@@ -20,6 +20,10 @@ set -euo pipefail
 #   After the dev merge, when package.json declares a `build` script, the
 #   script runs the build and commits regenerated tracked files (e.g.
 #   ContextHub src/version.ts) so they match the bumped version (non-fatal).
+#   Submodule pointers the build advanced are restored to their recorded
+#   commits, and any pin file the build rewrote to follow the advanced commit
+#   is restored with them (SA-0MW6LOXBO0008706); the regeneration line names
+#   the restored paths.
 
 # Resolve the directory where this script resides (used to find sibling scripts)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -309,9 +313,17 @@ fi
 if [[ "$DRY_RUN" != "true" && -n "${NEW_VERSION:-}" ]]; then
   REGEN_SCRIPT="${SCRIPT_DIR}/regenerate-version.js"
   if [[ -f "$REGEN_SCRIPT" ]]; then
-    node "$REGEN_SCRIPT" "$NEW_VERSION" || {
+    # Capture the regeneration report so the release log names any submodule
+    # pointer / pin file the build rewrote and the step restored to the
+    # recorded commit (SA-0MW6LOXBO0008706). Non-fatal: a failed build logs a
+    # warning and the release continues, mirroring the CHANGELOG step.
+    REGEN_OUTPUT=""
+    if ! REGEN_OUTPUT="$(node "$REGEN_SCRIPT" "$NEW_VERSION" 2>&1)"; then
       echo "Warning: derived version file regeneration failed (continuing with release)" >&2
-    }
+    fi
+    if [[ -n "$REGEN_OUTPUT" ]]; then
+      echo "Regeneration: ${REGEN_OUTPUT}" >&2
+    fi
   fi
 elif [[ "$DRY_RUN" == "true" ]]; then
   echo "Dry-run: derived version files would be regenerated for v${NEW_VERSION:-<version>}"

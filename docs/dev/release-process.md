@@ -373,14 +373,21 @@ Trigger and constraints:
   untracked build droppings (e.g. `dist/`) are never committed. A derived file
   that is generated fresh (untracked/gitignored) is out of scope — the fix
   targets repos that already track their derived version file.
-- **Submodule pointers excluded:** after `git add -u`, every staged gitlink
-  (index mode `160000`) is restored to its recorded commit, so a build that
+- **Submodule pointers and their pins restored:** after `git add -u`, every
+  staged gitlink (index mode `160000`) is restored to its recorded commit, and
+  every staged tracked file the build rewrote to record the advanced submodule
+  SHA — a **pin** such as main-street's `configs/engine-pin.json` — is restored
+  with it (both the index entry and the working-tree file). A build that
   advances a submodule checkout — e.g. main-street's `engine:sync` moving
-  `./core` — can never smuggle a pointer bump into the derived-files commit.
-  This keeps pin/pointer invariants intact (the committed pointer still equals
-  `configs/engine-pin.json`); a deliberate engine advance for a release is a
-  separate, pinned commit, never a side effect of regeneration
-  (SA-0MVO274QN006GXGQ).
+  `./core` — therefore leaves neither a pointer bump nor a pin that disagrees
+  with the recorded pointer. The rule is derived from the recorded/advanced SHA
+  pair alone (no pin path list, no per-repo configuration; a full or
+  ≥7-character abbreviated SHA matches), and a pin the release deliberately
+  bumped in an earlier commit is preserved because the restore returns to
+  `HEAD`. A deliberate engine advance for a release is a separate, pinned
+  commit, never a side effect of regeneration (SA-0MVO274QN006GXGQ,
+  SA-0MW6LOXBO0008706). The regeneration line names the restored pointer(s) and
+  pin file(s), so the release log records what the build tried to change.
 
 Implementation: `skill/ship/scripts/release/regenerate-version.js` (invoked by
 `merge-dev-to-main.sh` after the dev merge, before the tag).
