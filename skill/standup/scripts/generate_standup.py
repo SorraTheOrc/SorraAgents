@@ -2,7 +2,30 @@
 """Generate a standup meeting report from the Herdr selection list.
 
 Outputs a concise, human-readable standup report suitable for a 2-minute read.
-Focuses on user stories rather than technical details.
+Focuses on user-experience impact rather than technical details.
+
+The script is the DETERMINISTIC DATA LAYER, not the narrative author
+(epic SA-0MW6ER1NX0094QCG). ``--json`` emits one structured item array per
+report section (``yesterday_items``, ``today_critical_items``,
+``today_additional_items``, ``regressions_items``) plus ``blockers_tts``,
+``project_name`` and ``window``. The INVOKING AGENT then clusters each
+section's items into free-form categories chosen at report time and renders
+one spoken paragraph per category, one sentence per item — see
+``skill/standup/SKILL.md`` for that rendering contract.
+
+Every item carries an ``impact`` field: the sentence from the item's
+explicit ``## Impact`` section, describing the user-experience impact of the
+change. A missing or malformed ``## Impact`` section yields an empty
+``impact`` field (never an error), and renderers fall back to the
+``Title — user story`` phrasing taken from the item description. Multi-
+sentence Impact paragraphs are trimmed to their first sentence so the
+~2-minute read budget holds. Rendered and spoken lines never carry work item
+ids, backticks or underscores.
+
+The same rules apply to this script's own markdown rendering
+(``format_report``), which is the deterministic FALLBACK used by scheduled,
+non-agent runs: it emits one impact-first line per item under the fixed
+section headings.
 
 The Herdr selection list is the SOLE ranking path (WL-0MTK1ILM2009QYB2):
   fetcher.ts:fetchNextItems → smart-selection.ts:selectWorkItems
@@ -14,13 +37,17 @@ Default time window: 24 hours starting at 06:00 the previous day
 (calendar day). Override with --startTime and --duration.
 
 Usage:
-    python3 generate_standup.py [--json] [--verbose] [--output-path <path>] [--count N]
-                            [--startTime <ISO>] [--duration <hours>]
-                            [--worklog-dir <path>] [--no-sync] [--no-commit]
+    python3 generate_standup.py [--json] [--verbose] [--output-path <path>]
+                                [--count N] [--startTime <ISO>]
+                                [--duration <hours>] [--worklog-dir <path>]
+                                [--no-sync] [--no-commit]
 
 Flags:
     --json           Output raw JSON data instead of the formatted report
-                     (streamed to stdout unless --output-path is given)
+                     (streamed to stdout unless --output-path is given). This
+                     is the agent-rendering contract: each section's items
+                     with title, status, priority and the ``impact`` field
+                     (empty when the item has no ``## Impact`` section).
     --verbose        Include extra detail (priority, status, stage) in output
     --output-path    Write the report to a file (default: ./standups/YYYY_MM_DD.md)
                      Relative to project root (worklog parent when --worklog-dir
@@ -1069,6 +1096,21 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
 
 
 def format_report(data, browse_count=None, project_name: str | None = None):
+    """Render the deterministic FALLBACK markdown report (one line per item).
+
+    This is not the clustered narrative: the invoking agent renders that from
+    ``--json`` data per ``SKILL.md``. ``format_report`` stays the fallback for
+    scheduled, non-agent runs — same five fixed sections, one impact-first
+    line per item, no work item ids in the spoken output.
+
+    Per-item lines come from the pre-formatted ``*_tts`` arrays when present
+    and fall back to the legacy fields for back-compat consumers. Each
+    ``*_tts`` line prefers the item's ``## Impact`` sentence and falls back to
+    the ``Title — user story`` phrasing when ``impact`` is empty; a
+    multi-sentence Impact is trimmed to its first sentence to keep the
+    ~2-minute read budget. Lines are sanitised so an id, backtick or
+    underscore never reaches a TTS engine.
+    """
     now = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
     # Resolve project name: explicit arg > data dict > shared resolver with WORKLOG_DIR
     name = project_name or data.get("project_name") or resolve_project_name(worklog_dir=WORKLOG_DIR)
