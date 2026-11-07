@@ -610,9 +610,17 @@ _BULLET_PREFIX_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
 
 
 def _strip_markdown_emphasis(text):
-    """Remove markdown emphasis markers so the sentence is TTS-friendly."""
+    """Remove markdown emphasis markers so the sentence is TTS-friendly.
+
+    Strong emphasis (``**text**``/``__text__``) goes first, then single
+    emphasis (``*text*``/``_text_``) — the latter restricted to marker pairs
+    that do not sit inside a word, so a snake_case identifier such as
+    ``deck_setup`` is never mangled into emphasis (SA-0MW6EUQ16003QBVL).
+    """
     s = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     s = re.sub(r"__(.+?)__", r"\1", s)
+    s = re.sub(r"\*([^*]+)\*", r"\1", s)
+    s = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", s)
     return s.strip().strip("*_").strip()
 
 
@@ -621,11 +629,12 @@ def extract_impact(description):
 
     Work items may carry an explicit ``## Impact`` section whose first
     paragraph is one sentence describing the user-experience impact of the
-    change. The section ends at the next heading of the same or a higher
-    level, so a later ``## Acceptance Criteria`` never bleeds into the
-    sentence. Returns ``""`` for a missing, empty or malformed section (and
-    for a missing/non-string description) without raising, letting renderers
-    fall back to the existing ``Title — user story`` phrasing.
+    change. The section ends at the next heading of *any* level — so neither a
+    later ``## Acceptance Criteria`` nor a deeper ``#### Notes`` sub-heading
+    bleeds its markup into the spoken sentence. Returns ``""`` for a missing,
+    empty or malformed section (and for a missing/non-string description)
+    without raising, letting renderers fall back to the existing
+    ``Title — user story`` phrasing.
     """
     if not isinstance(description, str) or not description.strip():
         return ""
@@ -634,16 +643,14 @@ def extract_impact(description):
         heading = _HEADING_RE.match(line.strip())
         if not heading:
             continue
-        level = len(heading.group(1))
         label = heading.group(2).strip().rstrip(":").strip().lower()
         if not re.match(r"^impact\b", label):
             continue
         body = []
         for nxt in lines[index + 1:]:
             stripped = nxt.strip()
-            nxt_heading = _HEADING_RE.match(stripped)
-            if nxt_heading and len(nxt_heading.group(1)) <= level:
-                break
+            if _HEADING_RE.match(stripped):
+                break  # a heading at any level ends the section
             if not stripped:
                 if body:  # first paragraph only — stop at the blank line
                     break
