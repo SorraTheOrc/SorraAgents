@@ -89,6 +89,48 @@ human checkpoint is never silently skipped. The returned `reason` names both
 the effort scale and the risk level that triggered the gate
 (SA-0MUYG0HE6001YTEM, SA-0MUIUTJJS008W06Y).
 
+## AC coverage review: triage-generated children are excluded
+
+The AC coverage review (`run_coverage_review` / `apply_coverage_review` in
+`skill/shared/tree_coverage.py`) compares a parent's acceptance criteria (ACs)
+against the ACs of its direct children. Direct children that were auto-created
+by the **triage** skill are excluded from that comparison.
+
+**Marker.** The marker is the `test-failure` **tag** set by
+`skill/triage/scripts/check_or_create.py` (`--tags test-failure`). The
+`[test-failure]` title prefix is not the marker, and neither is the child's
+status.
+
+**Behaviour.**
+
+- A triage-generated child is not passed to `compute_coverage`; coverage is
+  computed from the remaining (evaluated) children only.
+- Excluded children stay visible for the audit trail: they are listed in
+  `child_summary` with `excluded: true` (and `ac_count: 0`) and in the
+  top-level `excluded_children` list (`id` / `title` / `reason`).
+- When **every** direct child is excluded there is no decomposition left to
+  check, so coverage is vacuously complete and the review recommends
+  `proceed` — the same outcome as a parent with no children. This is what
+  lets a parent whose only children are reparented triage items reach
+  `stage: plan_complete`.
+- Tag-less children keep today's behaviour exactly: the same Jaccard
+  thresholds (0.4 coverage, 0.2 auto-close floor) and the same `stop`
+  semantics, so genuine decompositions stay gated.
+- **Closed children.** A child is exempt only when it also carries the
+  `test-failure` tag. A closed tag-less feature child still takes part in the
+  comparison, so closing an uncovered feature child cannot weaken the gate.
+
+**Rationale.** Triage children are incident fixes re-parented onto the item
+that owns the flake (the documented triage practice). Their ACs come from a
+boilerplate `[test-failure]` template ("the test passes on latest `dev`",
+"all related documentation is updated", "full project test suite passes") and
+are not a decomposition of the parent's ACs. Comparing them against the
+parent made the coverage review return `stop`, so the item could never reach
+`plan_complete` (observed on AH-0MVWCFS7K000RIWI). Treating the
+`test-failure` tag as a non-decomposition marker fixes the false block while
+leaving the gate intact for real feature decompositions
+(AH-0MVWNR4XF007FX5T).
+
 ## Appendix: Clarifying questions & answers (must include)
 
 Every planning session must produce an auditable Appendix of questions asked and answers received, appended to the plan content in the parent work item (description or comment).

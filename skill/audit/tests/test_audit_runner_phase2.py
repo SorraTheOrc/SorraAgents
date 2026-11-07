@@ -1323,11 +1323,13 @@ class TestPhase2RetryTuning:
         assert kwargs.get("max_retries") == audit_runner._PHASE2_MAX_RETRIES
         assert audit_runner._PHASE2_MAX_RETRIES == 1
 
-    def test_call_pi_timeout_default_exactly_1800(self):
-        """AC5 (SA-0MSGAUD3H007P8Y4): the default CALL_PI_TIMEOUT remains
-        exactly 1800s (operator overrides via --timeout/AUDIT_PI_TIMEOUT are
-        intentional and documented in SKILL.md)."""
-        assert audit_runner.CALL_PI_TIMEOUT == 1800
+    def test_call_pi_timeout_default_is_data_derived_phase2_budget(self):
+        """AC5 (SA-0MSGAUD3H007P8Y4) updated by WL-0MW32YZP7005LZ5B: the default
+        CALL_PI_TIMEOUT is the measured Phase-2 budget (2,400 s = ceil(p90 x 2)
+        rounded, see the constant's docstring), not the 1,800 s placeholder.
+        Operator overrides via --timeout/AUDIT_PI_TIMEOUT are intentional and
+        documented in SKILL.md."""
+        assert audit_runner.CALL_PI_TIMEOUT == 2400
 
     def test_child_provider_error_degrades_to_partial(self):
         """AC2 (child path): a provider error in phase2_child degrades ACs.

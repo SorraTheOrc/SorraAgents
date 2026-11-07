@@ -1,6 +1,7 @@
 """Tests for the find-related automation script."""
 
 import contextlib
+import re
 import subprocess
 import sys
 import threading
@@ -131,8 +132,13 @@ def test_script_uses_status_lifecycle():
     content = SCRIPT_PATH.read_text()
     assert "from shared.status_lifecycle import" in content, \
         "Script must import StatusLifecycle from the shared (top-level) module"
-    assert "with StatusLifecycle" in content, \
-        "Script must use StatusLifecycle as a context manager"
+    # The lifecycle is entered together with the session-end claim-release
+    # signal guard (SA-0MW0F91KN004J06U), so the ``with`` statement may carry
+    # more than one context manager (and span lines) — StatusLifecycle must
+    # still be one of them.
+    assert re.search(
+        r"\bwith\b[\s\S]{0,200}?\bStatusLifecycle\(", content
+    ), "Script must use StatusLifecycle as a context manager"
 
 
 def test_keywords_from_title():

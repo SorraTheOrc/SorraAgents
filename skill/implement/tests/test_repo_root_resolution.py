@@ -242,6 +242,12 @@ def _mocked_phase_finish(worktree_path: Path):
         stack.enter_context(
             patch.object(implement, "git_push_to_dev", return_value=True)
         )
+        # The dev push now runs from the worktree and its subject guard reads
+        # the real git HEAD (SA-0MVUTXJ4300301ZN); this harness uses a
+        # placeholder, non-git worktree, so the guard is stubbed like the push
+        # itself. The guard has dedicated coverage in
+        # ``skill/implement/tests/test_implement_push_from_worktree.py``.
+        stack.enter_context(patch.object(implement, "_assert_push_subject"))
         # The post-push ancestry assertion (SA-0MVPZG7A0000N66U) resolves the
         # pushed commit and ``refs/remotes/origin/dev`` in the fixture repo.
         # This harness stubs ``git_commit`` and reports the synthetic hash
@@ -481,3 +487,87 @@ def test_abort_from_main_checkout_restores_main_checkout(
     mocks["restore"].assert_called_once()
     restored_root = mocks["restore"].call_args.args[0]
     assert Path(restored_root).resolve() == main.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed resolution against a stated root in ANOTHER repository
+# (SA-0MVXVBZF2009HRRN — test-first slice for SA-0MVXVC03O0034A7V)
+# ---------------------------------------------------------------------------
+#
+# ``_resolve_main_repo_root`` trusted any ``state.repo_root`` that was not the
+# worktree or inside it. A state file naming a **sibling checkout** therefore
+# made ``phase_finish`` snapshot, fast-forward and push that other repository
+# (the 2026-10-31 cross-checkout attribution defect). The hardening requires the
+# derived main root (``git --git-common-dir``'s parent for the worktree) and
+# only falls back to the stated value when derivation is impossible — always
+# loudly. The pinning assertions were ``xfail(strict=True)`` on the pre-fix tree
+# and are unmarked now that SA-0MVXVC03O0034A7V landed. The stale-state cases
+# above (the worktree, or a path inside it) stay covered unchanged.
+
+
+def _sibling_repo(path: Path) -> Path:
+    """A second, unrelated real git repo (a sibling checkout)."""
+    path.mkdir()
+    _git(path, "init", "--quiet")
+    _git(path, "checkout", "--quiet", "-b", "dev")
+    (path / "README.md").write_text("sibling checkout\n")
+    _git(path, "add", "-A")
+    _git(path, "commit", "--quiet", "-m", "seed")
+    return path
+
+
+def test_resolve_main_repo_root_rejects_stated_sibling_checkout(
+    repo_with_worktree, tmp_path, caplog
+):
+    """The derived main root wins; the stated sibling root is rejected loudly.
+
+    Resolution must return the main checkout that owns the worktree — never the
+    stated foreign value — and name both roots in a WARNING so the mismatch is
+    auditable.
+    """
+    main, worktree = repo_with_worktree
+    sibling = _sibling_repo(tmp_path / "sibling-checkout")
+    state = implement.ImplementState(
+        work_item_id=WORK_ITEM,
+        worktree_path=str(worktree),
+        repo_root=str(sibling),  # foreign value the defect trusted
+        parent_branch="dev",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=LOG_NAME):
+        resolved = implement._resolve_main_repo_root(str(worktree), state)
+
+    assert Path(resolved).resolve() == main.resolve()
+    assert Path(resolved).resolve() != sibling.resolve()
+    assert str(sibling) in caplog.text
+    assert str(main) in caplog.text
+
+
+def test_resolve_main_repo_root_falls_back_loudly_when_underivable(
+    tmp_path, monkeypatch, caplog
+):
+    """With no derivable main root the documented fallback stays, with a warning.
+
+    A non-git worktree makes derivation impossible, so the stated root is used
+    (today's behaviour) — but the fallback must be surfaced, naming the value it
+    fell back to, instead of silently trusting it.
+    """
+    worktree = tmp_path / "not-a-git-worktree"
+    worktree.mkdir()
+    stated = tmp_path / "stated-root"
+    stated.mkdir()
+    # Derivation from the process directory must also fail, so the fallback is
+    # the only remaining answer (and the live checkout is never consulted).
+    monkeypatch.chdir(worktree)
+    state = implement.ImplementState(
+        work_item_id=WORK_ITEM,
+        worktree_path=str(worktree),
+        repo_root=str(stated),
+        parent_branch="dev",
+    )
+
+    with caplog.at_level(logging.WARNING, logger=LOG_NAME):
+        resolved = implement._resolve_main_repo_root(str(worktree), state)
+
+    assert Path(resolved).resolve() == stated.resolve()
+    assert str(stated) in caplog.text

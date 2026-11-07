@@ -2,7 +2,30 @@
 """Generate a standup meeting report from the Herdr selection list.
 
 Outputs a concise, human-readable standup report suitable for a 2-minute read.
-Focuses on user stories rather than technical details.
+Focuses on user-experience impact rather than technical details.
+
+The script is the DETERMINISTIC DATA LAYER, not the narrative author
+(epic SA-0MW6ER1NX0094QCG). ``--json`` emits one structured item array per
+report section (``yesterday_items``, ``today_critical_items``,
+``today_additional_items``, ``regressions_items``) plus ``blockers_tts``,
+``project_name`` and ``window``. The INVOKING AGENT then clusters each
+section's items into free-form categories chosen at report time and renders
+one spoken paragraph per category, one sentence per item — see
+``skill/standup/SKILL.md`` for that rendering contract.
+
+Every item carries an ``impact`` field: the sentence from the item's
+explicit ``## Impact`` section, describing the user-experience impact of the
+change. A missing or malformed ``## Impact`` section yields an empty
+``impact`` field (never an error), and renderers fall back to the
+``Title — user story`` phrasing taken from the item description. Multi-
+sentence Impact paragraphs are trimmed to their first sentence so the
+~2-minute read budget holds. Rendered and spoken lines never carry work item
+ids, backticks or underscores.
+
+The same rules apply to this script's own markdown rendering
+(``format_report``), which is the deterministic FALLBACK used by scheduled,
+non-agent runs: it emits one impact-first line per item under the fixed
+section headings.
 
 The Herdr selection list is the SOLE ranking path (WL-0MTK1ILM2009QYB2):
   fetcher.ts:fetchNextItems → smart-selection.ts:selectWorkItems
@@ -14,13 +37,17 @@ Default time window: 24 hours starting at 06:00 the previous day
 (calendar day). Override with --startTime and --duration.
 
 Usage:
-    python3 generate_standup.py [--json] [--verbose] [--output-path <path>] [--count N]
-                            [--startTime <ISO>] [--duration <hours>]
-                            [--worklog-dir <path>] [--no-sync] [--no-commit]
+    python3 generate_standup.py [--json] [--verbose] [--output-path <path>]
+                                [--count N] [--startTime <ISO>]
+                                [--duration <hours>] [--worklog-dir <path>]
+                                [--no-sync] [--no-commit]
 
 Flags:
     --json           Output raw JSON data instead of the formatted report
-                     (streamed to stdout unless --output-path is given)
+                     (streamed to stdout unless --output-path is given). This
+                     is the agent-rendering contract: each section's items
+                     with title, status, priority and the ``impact`` field
+                     (empty when the item has no ``## Impact`` section).
     --verbose        Include extra detail (priority, status, stage) in output
     --output-path    Write the report to a file (default: ./standups/YYYY_MM_DD.md)
                      Relative to project root (worklog parent when --worklog-dir
@@ -159,6 +186,9 @@ def normalize_item(raw):
         "risk": raw.get("risk"),
         "effort": raw.get("effort"),
         "description": raw.get("description", ""),
+        # Explicit ``## Impact`` sentence (epic SA-0MW6ER1NX0094QCG); "" when
+        # absent or malformed so renderers can fall back to the user story.
+        "impact": extract_impact(raw.get("description", "")),
         "group": raw.get("group"),
         "groupLabel": raw.get("groupLabel"),
         "needsProducerReview": raw.get("needsProducerReview"),
@@ -602,6 +632,111 @@ def extract_user_story(description):
     return ""
 
 
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_BULLET_PREFIX_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+
+
+def _strip_markdown_emphasis(text):
+    """Remove markdown emphasis markers so the sentence is TTS-friendly.
+
+    Strong emphasis (``**text**``/``__text__``) goes first, then single
+    emphasis (``*text*``/``_text_``) — the latter restricted to marker pairs
+    that do not sit inside a word, so a snake_case identifier such as
+    ``deck_setup`` is never mangled into emphasis (SA-0MW6EUQ16003QBVL).
+    """
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    s = re.sub(r"__(.+?)__", r"\1", s)
+    s = re.sub(r"\*([^*]+)\*", r"\1", s)
+    s = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", s)
+    return s.strip().strip("*_").strip()
+
+
+def extract_impact(description):
+    """Read an item's ``## Impact`` sentence, trimmed of markdown emphasis.
+
+    Work items may carry an explicit ``## Impact`` section whose first
+    paragraph is one sentence describing the user-experience impact of the
+    change. The section ends at the next heading of *any* level — so neither a
+    later ``## Acceptance Criteria`` nor a deeper ``#### Notes`` sub-heading
+    bleeds its markup into the spoken sentence. Returns ``""`` for a missing,
+    empty or malformed section (and for a missing/non-string description)
+    without raising, letting renderers fall back to the existing
+    ``Title — user story`` phrasing.
+    """
+    if not isinstance(description, str) or not description.strip():
+        return ""
+    lines = description.split("\n")
+    for index, line in enumerate(lines):
+        heading = _HEADING_RE.match(line.strip())
+        if not heading:
+            continue
+        label = heading.group(2).strip().rstrip(":").strip().lower()
+        if not re.match(r"^impact\b", label):
+            continue
+        body = []
+        for nxt in lines[index + 1:]:
+            stripped = nxt.strip()
+            if _HEADING_RE.match(stripped):
+                break  # a heading at any level ends the section
+            if not stripped:
+                if body:  # first paragraph only — stop at the blank line
+                    break
+                continue
+            body.append(stripped)
+        if not body:
+            return ""
+        return _strip_markdown_emphasis(_BULLET_PREFIX_RE.sub("", " ".join(body)))
+    return ""
+
+
+#: Work item ids as they appear in rendered text (bare or in brackets).
+_SPOKEN_ID_RE = re.compile(r"\b[A-Z]{2,}-\d[A-Z0-9]{6,}\b")
+_SPOKEN_ID_BRACKET_RE = re.compile(r"\s*\((?=[A-Z]{2,}-\d)[A-Za-z0-9\-]+\)")
+#: Sentence boundary used to keep one sentence per item in the read budget.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(]?[A-Z])")
+
+
+def _sanitize_spoken_text(text):
+    """Make *text* safe to read aloud.
+
+    Removes markdown emphasis, backticks, work item ids (bare or bracketed)
+    and underscores, because a TTS engine reads them as noise
+    (SA-0MW6EUQVW008N4BA). Whitespace is collapsed so removals never leave
+    double spaces behind.
+    """
+    if not text:
+        return ""
+    s = _strip_markdown_emphasis(str(text))
+    s = s.replace("`", "")
+    s = _SPOKEN_ID_BRACKET_RE.sub("", s)
+    s = _SPOKEN_ID_RE.sub("", s)
+    s = s.replace("_", " ")
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
+
+def _first_sentence(text):
+    """Return *text* up to and including its first sentence-ending punctuation.
+
+    The standup report budgets roughly one sentence per item, so a longer (or
+    malformed) ``## Impact`` paragraph must not push the reading time past the
+    ~2-minute target (SA-0MW6EUQVW008N4BA).
+    """
+    if not text:
+        return ""
+    return _SENTENCE_SPLIT_RE.split(text.strip(), maxsplit=1)[0].strip()
+
+
+def _spoken_report_lines(lines):
+    """Sanitise rendered item/blocker lines for TTS, keeping their indentation."""
+    out = []
+    for line in lines or []:
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+        out.append(f"{indent}{_sanitize_spoken_text(stripped)}" if stripped else line)
+    return out
+
+
 def extract_problem(description):
     if not description:
         return ""
@@ -803,25 +938,37 @@ def detect_regressions(window_start, window_end):
 
 
 def _format_item_tts(item):
-    """TTS-friendly single line: 'Title — user story / summary' without ID brackets."""
-    title = (item.get("title") or "Untitled").strip()
+    """TTS-friendly single line: impact sentence first, else 'Title — user story'.
+
+    Impact-first rendering (epic SA-0MW6ER1NX0094QCG): the explicit ``##
+    Impact`` sentence says what the user gained, so it is preferred over the
+    technical user story. An empty or missing impact falls back to the legacy
+    ``Title — user story`` phrasing, and a multi-sentence impact is trimmed to
+    its first sentence so the report stays inside the ~2-minute read budget.
+    Spoken lines never carry ids, backticks or underscores.
+    """
+    title = _sanitize_spoken_text(item.get("title") or "Untitled") or "Untitled"
     desc = item.get("description", "") or ""
-    us = extract_user_story(desc)
-    if us:
-        summary = us
-    else:
-        prob = extract_problem(desc)
-        if prob:
-            summary = prob
+    # Prefer the structured field; read it from the description for raw items.
+    impact = str(item.get("impact") or "").strip() or extract_impact(desc)
+    summary = _first_sentence(_sanitize_spoken_text(impact)) if impact else ""
+    if not summary:
+        us = extract_user_story(desc)
+        if us:
+            summary = us
         else:
-            summary = ""
-            for line in desc.split("\n"):
-                s = line.strip()
-                if s and not s.startswith("#") and len(s) > 20:
-                    summary = s[:200]
-                    break
-    # Clean markdown emphasis for TTS
-    summary = summary.lstrip("- *").strip()
+            prob = extract_problem(desc)
+            if prob:
+                summary = prob
+            else:
+                summary = ""
+                for line in desc.split("\n"):
+                    s = line.strip()
+                    if s and not s.startswith("#") and len(s) > 20:
+                        summary = s[:200]
+                        break
+    # Clean markdown emphasis / code punctuation for TTS
+    summary = _sanitize_spoken_text(summary).lstrip("- *").strip()
     if summary:
         return f"  - {title} — {summary}"
     return f"  - {title}"
@@ -830,12 +977,8 @@ def _format_item_tts(item):
 def _format_blocker_tts(blocker_raw):
     """Convert raw blocker string to TTS-friendly 'Blocked on X, because Y' if possible."""
     # blocker_raw already looks like '- **Title** (ID) blocked by **Other** (ID)' or '- **Title** (ID): status is blocked'
-    # Produce a spoken form without IDs and markdown.
-    import re as _re
-    # Strip markdown and IDs for TTS
-    s = _re.sub(r"\*\*", "", blocker_raw)
-    s = _re.sub(r"\s*\([A-Z0-9\-]+\)", "", s)
-    s = s.lstrip("- ").strip()
+    # Produce a spoken form without IDs, backticks, underscores or markdown.
+    s = _sanitize_spoken_text(blocker_raw).lstrip("- ").strip()
     if "blocked by" in s:
         parts = s.split("blocked by")
         return f"  - Blocked on {parts[0].strip()}, because blocked by {parts[1].strip()}"
@@ -843,6 +986,25 @@ def _format_blocker_tts(blocker_raw):
         title = s.replace("status is blocked", "").replace(":", "").strip()
         return f"  - Blocked on {title}, because its status is blocked"
     return f"  - {s}"
+
+
+def _structured_item(item):
+    """Minimal structured item data for agent-side, impact-first rendering.
+
+    The script stays deterministic: it emits data, the invoking agent clusters
+    and renders. ``impact`` is "" when the item has no ``## Impact`` section.
+    """
+    return {
+        "id": item.get("id"),
+        "title": item.get("title", "Untitled"),
+        "status": item.get("status"),
+        "priority": item.get("priority"),
+        "impact": item.get("impact", ""),
+    }
+
+
+def _structured_items(items):
+    return [_structured_item(it) for it in items]
 
 
 def generate_report(verbose=False, browse_count=None, window_start=None, window_end=None):
@@ -901,17 +1063,21 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
         "yesterday": [format_item(i, verbose) for i in yesterday_items],
         "yesterday_count": len(yesterday_items),
         "yesterday_tts": yesterday_tts,
+        "yesterday_items": _structured_items(yesterday_items),
         "today": [format_item(i, verbose) for i in today_items],
         "today_count": len(today_items),
         "today_critical": [format_item(i, verbose) for i in today_critical_items],
         "today_critical_count": len(today_critical_items),
         "today_critical_tts": critical_tts,
+        "today_critical_items": _structured_items(today_critical_items),
         "today_additional": [format_item(i, verbose) for i in today_additional_items],
         "today_additional_count": len(today_additional_items),
         "today_additional_tts": additional_tts,
+        "today_additional_items": _structured_items(today_additional_items),
         "regressions": [format_item(i, verbose) for i in regressions],
         "regressions_count": len(regressions),
         "regressions_tts": regressions_tts,
+        "regressions_items": _structured_items(regressions),
         "blockers": blocker_lines,
         "blockers_tts": blockers_tts,
         "window": {
@@ -930,6 +1096,21 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
 
 
 def format_report(data, browse_count=None, project_name: str | None = None):
+    """Render the deterministic FALLBACK markdown report (one line per item).
+
+    This is not the clustered narrative: the invoking agent renders that from
+    ``--json`` data per ``SKILL.md``. ``format_report`` stays the fallback for
+    scheduled, non-agent runs — same five fixed sections, one impact-first
+    line per item, no work item ids in the spoken output.
+
+    Per-item lines come from the pre-formatted ``*_tts`` arrays when present
+    and fall back to the legacy fields for back-compat consumers. Each
+    ``*_tts`` line prefers the item's ``## Impact`` sentence and falls back to
+    the ``Title — user story`` phrasing when ``impact`` is empty; a
+    multi-sentence Impact is trimmed to its first sentence to keep the
+    ~2-minute read budget. Lines are sanitised so an id, backtick or
+    underscore never reaches a TTS engine.
+    """
     now = datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
     # Resolve project name: explicit arg > data dict > shared resolver with WORKLOG_DIR
     name = project_name or data.get("project_name") or resolve_project_name(worklog_dir=WORKLOG_DIR)
@@ -944,7 +1125,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     lines.append("### Yesterday I completed work on...")
     lines.append("")
     if yesterday_lines:
-        lines.extend(yesterday_lines)
+        lines.extend(_spoken_report_lines(yesterday_lines))
     else:
         lines.append("  - Nothing completed in this window.")
     lines.append("")
@@ -952,7 +1133,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     lines.append("### Open critical items")
     lines.append("")
     if critical_lines:
-        lines.extend(critical_lines)
+        lines.extend(_spoken_report_lines(critical_lines))
     else:
         lines.append("  - No open critical items.")
     lines.append("")
@@ -960,7 +1141,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     lines.append("### Additional focus items for today")
     lines.append("")
     if additional_lines:
-        lines.extend(additional_lines)
+        lines.extend(_spoken_report_lines(additional_lines))
     else:
         # If critical already consumed 5+, note that explicitly; otherwise no additional
         crit_count = data.get("today_critical_count", len(critical_lines))
@@ -975,7 +1156,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     lines.append("### Regressions")
     lines.append("")
     if regressions_lines:
-        lines.extend(regressions_lines)
+        lines.extend(_spoken_report_lines(regressions_lines))
     else:
         lines.append("  - No regressions — no items slipped back from completed.")
     lines.append("")
@@ -983,7 +1164,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     lines.append("### Blockers")
     lines.append("")
     if blocker_tts_lines:
-        lines.extend(blocker_tts_lines)
+        lines.extend(_spoken_report_lines(blocker_tts_lines))
     else:
         lines.append("  - No immediate blockers.")
     # surface fetch errors quietly if any

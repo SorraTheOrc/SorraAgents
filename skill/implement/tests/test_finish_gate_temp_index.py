@@ -189,20 +189,17 @@ def test_finish_aborts_without_committing_when_the_tree_assertion_fails(
     repo = _build_clean_repo(tmp_path)
     monkeypatch.delenv("IMPLEMENT_TEST_COMMAND", raising=False)
 
-    with _stubbed_finish_boundaries(repo, tmp_path):
-        with patch.object(
-            implement,
-            "stage_tested_tree",
-            return_value={
-                "success": False,
-                "expected": "expected-tree",
-                "tree": "drifted-tree",
-                "message": "The commit's tree does not match the tree the finish gate tested.",
-            },
-        ), patch.object(implement, "git_commit") as commit:
-            report = implement.phase_finish(
-                "SA-TEST", json_output=True, no_refactor=True
-            )
+    with _stubbed_finish_boundaries(repo, tmp_path), patch.object(
+        implement,
+        "stage_tested_tree",
+        return_value={
+            "success": False,
+            "expected": "expected-tree",
+            "tree": "drifted-tree",
+            "message": "The commit's tree does not match the tree the finish gate tested.",
+        },
+    ), patch.object(implement, "git_commit") as commit:
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
 
     assert report["success"] is False, report
     assert "does not match the tree" in report["message"], report["message"]

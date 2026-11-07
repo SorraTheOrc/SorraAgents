@@ -139,8 +139,22 @@ the worktree, never a path inside it.
 
 This matters because every consumer of that field acts on the main checkout:
 
-- `finish` fast-forwards `dev` in the main checkout and pushes from it;
-- `finish` posts the parent-branch sync against the main checkout;
+- `finish` fast-forwards `dev` in the main checkout (hygiene only) and posts
+  the parent-branch sync there;
+- the **dev push runs from the worktree** that holds the pushed commit — not
+  from `repo_root` — so `.githooks/pre-push` resolves its project root to the
+  pushed tree and validates the pushed commit (SA-0MVTFMB7K002Y1F3); a
+  pre-push subject guard refuses the push (naming the commit, branch, worktree
+  and actual `HEAD`) when the worktree does not hold that commit or has tracked
+  uncommitted changes that a recovery rebase cannot carry;
+- the pre-push gate's **subject is the pushed commit**
+  (SA-0MVTRBT50005DUEH): the hook forwards `<local_sha>` as
+  `run_tests.py --gate-commit`, which measures (and cache-keys against) a
+  checkout of that commit with no dirty paths — the pusher's worktree on the
+  normal finish path, else another clean `git worktree list` checkout — and
+  refuses the push when none exists. A push from a **dirty** linked worktree
+  therefore cannot leave a green verdict behind: either another clean worktree
+  of the commit is gated, or the push is refused;
 - `_remove_worktree(..., repo_root=<value>)` refuses to remove a path that
   resolves to `repo_root`, so a worktree recorded as the root makes finish
   raise `REFUSE to remove the repository root` *after* a successful push;
@@ -164,19 +178,39 @@ supplied to them, the gates are never relaxed.
 Regression coverage (real temp git repo plus linked worktree, no
 `_get_repo_root` mocking): `skill/implement/tests/test_repo_root_resolution.py`.
 
+**Worktree-path resolution rule.** The default worktree path returned by
+`worktree_path_for()` is **relative to the main checkout**
+(`.worklog/worktrees/wl-<id>-<slug>`), not to `cwd`. `phase_start` resolves it
+by joining it onto the main checkout root (`_get_repo_root()`, preserving the
+historical `cwd` fallback when that returns `None`) — never with
+`Path(wt_path).resolve()`. Resolving a relative path against `cwd` when `cwd`
+is the item's own linked worktree nests it as
+`<worktree>/.worklog/worktrees/wl-<id>-<slug>`: `_is_worktree()` then misses the
+registered tree and `git worktree add` attempts a nested creation that fails,
+breaking the driven-child / post-crash resume (SA-0MVXUGXS5006M3HF).
+`--worktree-path` keeps its historical semantics: an absolute override is used
+as given, a relative override resolves against `cwd`.
+
+Regression coverage (real temp git repo plus linked worktree, no
+`_get_repo_root` mocking):
+`skill/implement/tests/test_phase_start_resume_from_worktree.py`
+(SA-0MVXUGXS5006M3HF).
+
 ## Worktree removal ownership
 
 A worktree must never be deleted out from under the session that owns it as
 its cwd: doing so makes every later `bash` call fail with `Working directory
 does not exist` (absolute-path file tools keep working), exactly when the
-session still has to write its completion comment, render its report and
-verify the pushed commit (SA-0MVTE8XAJ002IUDR). Exactly one owner removes a
-worktree, decided by context:
+session still has to render its end-of-session report (SA-0MVTE8XAJ002IUDR).
+The completion comment and the read-only post-push verification are no longer
+session steps: they run inside `finish`, before the terminal write
+(SA-0MVXUSK02003ZMDN). Exactly one owner removes a worktree, decided by
+context:
 
 | Flow | Owner | When |
 |---|---|---|
 | Driven child session (`IMPLEMENT_DRIVE_ACTIVE=1`) | `implement.py drive` | After the child's session exits; terminal child, clean tree only |
-| Opted-in plain leaf (`finish --keep-worktree` / `IMPLEMENT_KEEP_WORKTREE=1`) | The session itself (or an operator) | The session's **last** bash command, after the comment, report and post-push verification |
+| Opted-in plain leaf (`finish --keep-worktree` / `IMPLEMENT_KEEP_WORKTREE=1`) | The session itself (or an operator) | The session's **last** bash command, after the report (the comment and verification already ran inside `finish`, SA-0MVXUSK02003ZMDN) |
 | Plain leaf (default) | `finish` | Immediately after a successful dev push |
 | Parent/parent-phase flow | `phase_parent` (its own `finish` subprocess per child) | Each child is finished in its own subprocess and its worktree removed there — no session-level cleanup instruction applies |
 | Aborted item | `abort` | Unconditionally |
@@ -350,7 +384,7 @@ Only these main-checkout mutations are legitimate during a worktree-scoped run:
 | Defect class | Enforcement point | Evidence |
 |---|---|---|
 | A test run mutates the guarded checkout, or the main checkout of a worktree-scoped run | outer `guarded_run_all` guard and the inner `live_repo_guard` plugin (both snapshot **every reachable checkout**) | `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`), `skill/test/tests/test_guarded_run_all.py`, `tests/test_live_repo_mutation_guard.py` |
-| A foreign mutation of the main checkout is observed by `finish` (deletion **or** modification) | finish main-checkout guard (`_snapshot_main_checkout` → `_verify_main_checkout` at `pre_push` and `pre_worktree_removal`): aborts loudly, names every offending path, the concurrent-actor evidence and `git checkout -- <path>`; the item stays `open` | `skill/implement/tests/test_finish_main_checkout_guard.py` |
+| A foreign mutation of the main checkout is observed by `finish` (deletion **or** modification) | finish main-checkout guard (`_snapshot_main_checkout` → `_verify_main_checkout` on every pre-push abort path — `build_failure`, `gate_failure`, `user_abort` — at `pre_push` and at `pre_worktree_removal`; the refactor verify is advisory): aborts loudly, names every offending path, the concurrent-actor evidence and `git checkout -- <path>`; the item stays `open` | `skill/implement/tests/test_finish_main_checkout_guard.py` |
 | Two finishes operate on the same main checkout concurrently | per-checkout exclusive `flock` on `<main-checkout>/.worklog/locks/main-checkout.lock` (bounded wait, kernel-released, stale lock files never block): the second finish exits non-zero naming the holder, without touching the checkout or the work item | `skill/implement/tests/test_finish_main_checkout_lock.py` |
 | A finish commit never reaches `origin/dev` (including the rebased replacement hash produced by non-fast-forward recovery) | post-push ancestry assertion (`git merge-base --is-ancestor <commit> refs/remotes/origin/dev`) fails closed: worktree + branch retained, item `open`, refusal comment posted | `tests/test_implement_finish_local_dev_verified_sync.py` |
 | A failed push leaves local `dev` pointing at an unpushed commit (the 2026-10-25 orphan shape) | push-failure restore returns local `dev` to `refs/remotes/origin/dev` (`reset --merge` when checked out, never `--hard`; compare-and-swap `update-ref` otherwise) | `tests/test_implement_finish_local_dev_verified_sync.py` |

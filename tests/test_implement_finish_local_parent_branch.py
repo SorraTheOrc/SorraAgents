@@ -41,7 +41,7 @@ _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from shared.git_sandbox import fixture_git_env as _shared_fixture_git_env  # noqa: E402
+from shared.git_sandbox import fixture_git_env as _shared_fixture_git_env
 
 
 @pytest.fixture(scope="module")
@@ -524,6 +524,12 @@ def test_phase_finish_syncs_parent_branch_after_push(implement_mod, tmp_path):
         mock.patch.object(
             implement_mod, "git_push_to_dev", side_effect=_record_push
         ),
+        # The dev push now runs from the worktree and its subject guard reads
+        # the real git HEAD (SA-0MVUTXJ4300301ZN); this harness uses
+        # placeholder, non-git directories, so the guard is stubbed like the
+        # push itself. The guard has dedicated coverage in
+        # ``skill/implement/tests/test_implement_push_from_worktree.py``.
+        mock.patch.object(implement_mod, "_assert_push_subject"),
         mock.patch.object(
             implement_mod, "_sync_parent_branch", side_effect=_record_sync
         ),
@@ -563,7 +569,11 @@ class TestFinishOrdering:
         # Match the call prefix: the push helper gained recovery args
         # (commit_hash/timeout) in SA-0MUH9R74O002MQDU, and this guard
         # only verifies push-before-sync ordering (SA-0MUM5UWL4005YH0X).
-        push_idx = body.index("git_push_to_dev(repo_root, branch")
+        # The push's *cwd* (the worktree holding the pushed commit, not
+        # ``repo_root``) is pinned by
+        # ``skill/implement/tests/test_implement_push_from_worktree.py``
+        # (SA-0MVUTXILY003DVTE) — this guard is only about ordering.
+        push_idx = body.index("git_push_to_dev(")
         sync_idx = body.index("_sync_parent_branch(repo_root,")
         assert sync_idx > push_idx, (
             "local parent sync must run AFTER the push to dev"

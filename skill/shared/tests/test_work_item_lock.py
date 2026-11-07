@@ -302,10 +302,12 @@ def test_context_manager_releases_on_normal_exit(worklog_dir: Path):
 
 def test_context_manager_releases_on_exception(worklog_dir: Path):
     """AC3: an exception inside the block still releases the lock."""
-    with pytest.raises(RuntimeError, match="boom"):
-        with _make_lock(worklog_dir, agent="implement", session="sess-exc") as result:
-            assert result.acquired is True
-            raise RuntimeError("boom")
+    with (
+        pytest.raises(RuntimeError, match="boom"),
+        _make_lock(worklog_dir, agent="implement", session="sess-exc") as result,
+    ):
+        assert result.acquired is True
+        raise RuntimeError("boom")
 
     fresh = _make_lock(worklog_dir, agent="implement", session="sess-after-exc")
     fresh_result = fresh.acquire()

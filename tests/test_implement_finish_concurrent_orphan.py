@@ -280,8 +280,12 @@ def _run_finish(implement_mod, sandbox: dict, worktree: Path, item: str, push=No
             patcher.stop()
 
 
-def _push_fails(repo_root, branch, commit_hash=None, timeout=None) -> bool:
-    """A transient failure: nothing reached ``origin``."""
+def _push_fails(repo_root, branch, commit_hash=None, timeout=None, **kwargs) -> bool:
+    """A transient failure: nothing reached ``origin``.
+
+    Accepts (and ignores) ``evidence_out`` — ``phase_finish`` threads it into
+    every ``git_push_to_dev`` call (SA-0MVUTXJM8006PQY4).
+    """
     return False
 
 
@@ -289,8 +293,8 @@ def _push_reports_failure_but_lands(implement_mod, counter: dict):
     """Push for real, then report failure (the ambiguous false negative)."""
     real_push = implement_mod.git_push_to_dev
 
-    def _push(repo_root, branch, commit_hash=None, timeout=None) -> bool:
-        ok = real_push(repo_root, branch, commit_hash, timeout)
+    def _push(repo_root, branch, commit_hash=None, timeout=None, **kwargs) -> bool:
+        ok = real_push(repo_root, branch, commit_hash, timeout, **kwargs)
         counter["calls"] = counter.get("calls", 0) + 1
         if counter["calls"] == 1:
             return False
@@ -300,7 +304,7 @@ def _push_reports_failure_but_lands(implement_mod, counter: dict):
 
 
 def _push_reports_success_but_does_nothing(
-    repo_root, branch, commit_hash=None, timeout=None
+    repo_root, branch, commit_hash=None, timeout=None, **kwargs
 ) -> bool:
     """The mirror-image false positive: report success without publishing."""
     return True

@@ -20,6 +20,10 @@ set -euo pipefail
 #   After the dev merge, when package.json declares a `build` script, the
 #   script runs the build and commits regenerated tracked files (e.g.
 #   ContextHub src/version.ts) so they match the bumped version (non-fatal).
+#   Submodule pointers the build advanced are restored to their recorded
+#   commits, and any pin file the build rewrote to follow the advanced commit
+#   is restored with them (SA-0MW6LOXBO0008706); the regeneration line names
+#   the restored paths.
 
 # Resolve the directory where this script resides (used to find sibling scripts)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -194,16 +198,24 @@ elif [[ "$DRY_RUN" == "true" ]]; then
 fi
 
 # ── Generate CHANGELOG.md (only on actual release) ─────────────────
+# CHANGELOG_GENERATED records whether a release section was successfully
+# produced AND committed. It gates the post-merge preservation guard below:
+# a failed generation stays non-fatal (warn + continue), while a section that
+# WAS generated must survive the dev merge (SA-0MVXY0VPC002B0MO).
+CHANGELOG_GENERATED=0
+CHANGELOG_MERGE_SCRIPT="${SCRIPT_DIR}/changelog-merge.js"
 if [[ "$DRY_RUN" != "true" && -n "${NEW_VERSION:-}" ]]; then
   CHANGELOG_SCRIPT="${SCRIPT_DIR}/generate-changelog.js"
   if [[ -f "$CHANGELOG_SCRIPT" ]]; then
-    node "$CHANGELOG_SCRIPT" "$NEW_VERSION" 2>&1 || {
+    if node "$CHANGELOG_SCRIPT" "$NEW_VERSION" 2>&1; then
+      if [[ -f "$(git rev-parse --show-toplevel)/CHANGELOG.md" ]]; then
+        git add "$(git rev-parse --show-toplevel)/CHANGELOG.md"
+        git commit -m "Update CHANGELOG.md for v${NEW_VERSION}"
+        CHANGELOG_GENERATED=1
+        echo "CHANGELOG.md updated for v${NEW_VERSION}"
+      fi
+    else
       echo "Warning: CHANGELOG.md generation failed (continuing with release)" >&2
-    }
-    if [[ -f "$(git rev-parse --show-toplevel)/CHANGELOG.md" ]]; then
-      git add "$(git rev-parse --show-toplevel)/CHANGELOG.md"
-      git commit -m "Update CHANGELOG.md for v${NEW_VERSION}"
-      echo "CHANGELOG.md updated for v${NEW_VERSION}"
     fi
   fi
 elif [[ "$DRY_RUN" == "true" ]]; then
@@ -214,12 +226,37 @@ fi
 if git merge --no-ff origin/dev -m "Merge origin/dev into main (automated)"; then
   echo "Created merge commit on $BRANCH"
 else
-  # Auto-resolve CHANGELOG.md conflicts: dev's CHANGELOG carries both the
-  # previously released history and the unreleased entries for this release
-  # (generate-changelog.js rewrites it for the new version afterwards).
+  # Auto-resolve CHANGELOG.md conflicts. The generated release section was
+  # committed on the release branch BEFORE this merge (see the generation step
+  # above), while dev carries its own top-of-file history (an `## Unreleased`
+  # block and previously released sections). Taking dev's version wholesale
+  # would silently discard the generated `## v<version>` section — the v0.1.23
+  # regression (SA-0MVXY0VPC002B0MO). Start from dev's content, then re-insert
+  # the generated section (changelog-merge.js) so both survive in the merged
+  # tree; the post-merge guard below asserts it and aborts before tagging when
+  # a generated section was lost.
   if git ls-files -u | grep -q 'CHANGELOG.md'; then
-    echo "Resolving CHANGELOG.md merge conflict (taking dev's version)" >&2
+    echo "Resolving CHANGELOG.md merge conflict (keeping dev's content + generated release section)" >&2
     git checkout --theirs CHANGELOG.md
+    if [[ -n "${NEW_VERSION:-}" && -f "$CHANGELOG_MERGE_SCRIPT" ]]; then
+      OURS_FILE="$(mktemp)"
+      MERGED_FILE="$(mktemp)"
+      MERGE_ERR="$(mktemp)"
+      # HEAD is still the release branch tip here (the merge is unresolved), so
+      # it carries the generated section written by the generation step above.
+      git show "HEAD:CHANGELOG.md" > "$OURS_FILE" 2>/dev/null || true
+      if node "$CHANGELOG_MERGE_SCRIPT" merge --version "$NEW_VERSION" \
+           --ours "$OURS_FILE" --theirs CHANGELOG.md > "$MERGED_FILE" 2>"$MERGE_ERR"; then
+        cp "$MERGED_FILE" CHANGELOG.md
+        sed 's/^/  /' "$MERGE_ERR" >&2 || true
+      else
+        echo "Warning: changelog-merge.js could not re-insert the generated release section; keeping dev's CHANGELOG.md (the guard below will abort if a section was generated)." >&2
+        sed 's/^/  /' "$MERGE_ERR" >&2 || true
+      fi
+      rm -f "$OURS_FILE" "$MERGED_FILE" "$MERGE_ERR"
+    else
+      echo "Warning: changelog-merge.js not found at '$CHANGELOG_MERGE_SCRIPT'; taking dev's CHANGELOG.md (the guard below will abort if a section was generated)." >&2
+    fi
     git add CHANGELOG.md
   fi
   # Auto-resolve version-file conflicts: keep the bumped release version
@@ -243,6 +280,30 @@ else
   fi
 fi
 
+# ── CHANGELOG release-section guard (SA-0MVXY0VPC002B0MO) ──────────
+# A release section that was successfully generated must survive the dev
+# merge. If it is missing from the merged tree, abort BEFORE the tag is
+# created: shipping without the section is exactly the v0.1.23 regression
+# (the released tree had no `## v<version>` heading, so the Discord embed lost
+# both the release focus and the release notes). A failed generation
+# (CHANGELOG_GENERATED=0) is deliberately non-fatal — the guard only fires for
+# a section that was actually generated.
+if [[ "$CHANGELOG_GENERATED" == "1" && -n "${NEW_VERSION:-}" ]]; then
+  if [[ -f "$CHANGELOG_MERGE_SCRIPT" ]]; then
+    if ! GUARD_OUTPUT=$(node "$CHANGELOG_MERGE_SCRIPT" guard \
+          --version "$NEW_VERSION" --generated 1 --file CHANGELOG.md 2>&1); then
+      echo "ERROR: CHANGELOG.md lost the generated ## v${NEW_VERSION} section during the dev→main merge." >&2
+      echo "  Aborting the release before tagging — the released tree would carry no release notes for v${NEW_VERSION}." >&2
+      [[ -n "$GUARD_OUTPUT" ]] && printf '%s\n' "$GUARD_OUTPUT" | sed 's/^/  /' >&2
+      echo "  Recover the section from the release branch (git show 'HEAD:CHANGELOG.md') and re-run the release." >&2
+      exit 1
+    fi
+    echo "CHANGELOG guard: generated ## v${NEW_VERSION} section present in the merged tree." >&2
+  else
+    echo "Warning: changelog-merge.js not found at '$CHANGELOG_MERGE_SCRIPT'; skipping the post-merge CHANGELOG section guard." >&2
+  fi
+fi
+
 # ── Regenerate derived version files (only on actual release) ───────
 # After the dev merge (final tree) and before tagging, run the repo's build
 # so auto-generated derived version files (e.g. ContextHub src/version.ts)
@@ -252,9 +313,17 @@ fi
 if [[ "$DRY_RUN" != "true" && -n "${NEW_VERSION:-}" ]]; then
   REGEN_SCRIPT="${SCRIPT_DIR}/regenerate-version.js"
   if [[ -f "$REGEN_SCRIPT" ]]; then
-    node "$REGEN_SCRIPT" "$NEW_VERSION" || {
+    # Capture the regeneration report so the release log names any submodule
+    # pointer / pin file the build rewrote and the step restored to the
+    # recorded commit (SA-0MW6LOXBO0008706). Non-fatal: a failed build logs a
+    # warning and the release continues, mirroring the CHANGELOG step.
+    REGEN_OUTPUT=""
+    if ! REGEN_OUTPUT="$(node "$REGEN_SCRIPT" "$NEW_VERSION" 2>&1)"; then
       echo "Warning: derived version file regeneration failed (continuing with release)" >&2
-    }
+    fi
+    if [[ -n "$REGEN_OUTPUT" ]]; then
+      echo "Regeneration: ${REGEN_OUTPUT}" >&2
+    fi
   fi
 elif [[ "$DRY_RUN" == "true" ]]; then
   echo "Dry-run: derived version files would be regenerated for v${NEW_VERSION:-<version>}"

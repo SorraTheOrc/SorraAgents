@@ -328,3 +328,97 @@ class TestScreenedInRunChildAssessment:
         child["budget_exceeded"] = True
         assert ar._classify_child_assessment_reason(
             child, None) == ar.REASON_NOT_ASSESSED
+
+
+def serviced_child_audit_not_ready(child_id="CHILD-NR"):
+    """A SERVICED in-main-slot child whose stored audit says ``No``.
+
+    Reproduces the classification gap behind defect **D2**
+    (SA-0MVSTZ71J001P67S): the invoking session performed the emitted
+    ``[AUDIT_IN_MAIN_SLOT_WORK]`` screen and persisted the child audit with
+    ``Ready to close: No``. On the parent re-run the child-verdict reuse path
+    records ``reused_from`` plus ``child_audit_not_ready=True`` and fills
+    ``ac_results`` from the child's own audit (blocking verdicts) — exactly
+    the shape below. Its criteria WERE judged (by the child's audit), so it is
+    an ASSESSED child that happens not to be ready; it must never be reported
+    as ``not_assessed`` ("never judged"), which is reserved for children
+    whose screens were never serviced or whose screening produced nothing.
+
+    The child still BLOCKS the parent's readiness — being assessed is not the
+    same as being ready.
+    """
+    return {
+        "id": child_id,
+        "title": f"Child {child_id}",
+        "status": "in_progress",
+        "stage": "in_review",
+        "child_audit_ready": False,
+        "child_audit_not_ready": True,
+        "reused_from": "2026-10-29T00:10:00.000Z",
+        "ac_results": [
+            {"text": "CAC1", "verdict": "unmet",
+             "evidence": "child.py:4 — blocking"},
+        ],
+    }
+
+
+class TestServicedChildAuditNotReadyClassification:
+    """D2 reproduction (parent AC3): a serviced child whose stored audit
+    verdict is ``Ready to close: No`` is ASSESSED with
+    ``child_audit_not_ready`` — never ``not_assessed`` — and still blocks the
+    parent's readiness.
+
+    Observed production symptom (LP-0MVLNBCTN0084MT0): of the two serviced
+    children, LP-0MVOG7IP80003MLV was persisted ``Ready to close: No``; a
+    collector that cannot distinguish "judged and not ready" from "never
+    judged" reports it ``not_assessed``, so the parent report claims the
+    child's criteria were never looked at — and an orchestrator grepping the
+    reason codes cannot tell a serviced-but-blocking child from an unserviced
+    one.
+
+    RED before the D2 fix: ``_classify_child_assessment_reason`` keyed only on
+    ``child_audit_ready is False`` + non-acceptable ``ac_results``, so the
+    ``child_audit_not_ready``/``reused_from`` markers of the reuse path were
+    ignored and the child was classified ``not_assessed``.
+    """
+
+    def test_serviced_not_ready_child_is_not_classified_not_assessed(self):
+        """The stored-verdict (not-ready) child is assessed — no reason code."""
+        child = serviced_child_audit_not_ready()
+        reason = ar._classify_child_assessment_reason(child, None)
+        assert reason is None, f"D2: serviced not-ready child classified {reason}"
+
+    def test_json_payload_omits_not_assessed_for_serviced_not_ready_child(self):
+        """JSON: no reason code, not in ``not_assessed_children``, still No."""
+        child = serviced_child_audit_not_ready()
+        payload = ar._build_issue_json(
+            {"id": "TEST-1"}, _PARENT_ACS, [child],
+        )
+        assert "CHILD-NR" not in payload["child_reasons"], payload["child_reasons"]
+        assert payload["not_assessed_children"] == [], (
+            payload["not_assessed_children"]
+        )
+        # Assessed is not ready: the child's blocking verdicts still block.
+        assert payload["ready_to_close"] is False
+
+    def test_report_has_no_not_assessed_line_and_still_blocks(self):
+        child = serviced_child_audit_not_ready()
+        report = ar._assemble_issue_report(
+            {"id": "TEST-1"}, _PARENT_ACS, [child],
+        )
+        not_assessed_line = "[not_assessed] CHILD-NR" in report
+        assert not not_assessed_line, (
+            "D2: serviced not-ready child reported not_assessed"
+        )
+        assert "Ready to close: No" in report
+
+    def test_child_without_reuse_markers_still_not_assessed(self):
+        """Control (unchanged behaviour): a child whose screening produced no
+        verdict and carries NO reuse markers is still genuinely
+        not-assessed — the fix must key on the reuse markers, not merely on
+        the presence of blocking verdicts."""
+        child = serviced_child_audit_not_ready()
+        child.pop("child_audit_not_ready")
+        child.pop("reused_from")
+        assert ar._classify_child_assessment_reason(
+            child, None) == ar.REASON_NOT_ASSESSED

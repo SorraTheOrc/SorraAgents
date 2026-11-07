@@ -21,16 +21,34 @@ The helper is idempotent — safe to call when the work item is already in the
 target state. It logs all transitions and raises exceptions on ``wl`` command
 failures so callers can handle them explicitly.
 
-Assignee release (release by default)
--------------------------------------
+Assignee release (release by default, any non-producer claim)
+-------------------------------------------------------------
 
 A non-empty ``assignee`` is a scheduling hold (``wl next`` skips a held item),
 so leaving an agent's claim behind after a run blocks re-dispatch. The helper
 therefore **releases the assignee on every exit path by default** — the
 successful (``completed``) exit, the exception/rollback exit and the
-``restore_on_exit`` exit — clearing only the assignee *it holds* (the
-``assignee=`` it set on entry). A hold the helper never established (a
-producer's ``Map`` hold on an item it merely transitions) is never wiped.
+``restore_on_exit`` exit.
+
+The release covers **any non-producer claim**, not only one the helper set
+itself: the assignee observed on entry is captured, and a non-empty,
+non-producer value is cleared on the terminal transition. That closes the gap
+where an agent's pre-claim (``AGENTS_GLOBAL.md`` step 1 claims *before* the
+skill runs) survived the skill's own terminal transition
+(SA-0MW0F91KN004J06U). The producer hold (``Map``) and a
+``needsProducerReview`` item are the sanctioned persistent holds and are never
+wiped, so the release cannot silently widen to the producer's intent. The
+producer-aware predicate is shared with the session/abort backstop and the
+stale-claim reaper (``shared.claim_release.should_release_assignee``).
+
+The same rule is enforced by :meth:`StatusLifecycle.update_status`, the single
+choke point every skill's status write goes through. A **direct durable
+write** — a prose-only skill such as ``plan``, ``tree_coverage._advance_stage``,
+``effort-and-risk``'s status restore — leaves the active-work state without
+entering the context manager, so it releases the observed non-producer claim
+too (``release_assignee=None`` decides automatically; ``False`` preserves an
+explicit caller decision). That is why a skill cannot reintroduce the hold by
+reaching for the low-overhead helper instead of the context manager.
 
 A caller that legitimately needs the hold to survive passes
 ``preserve_assignee_on_exit=True`` and says why in a comment. The legacy
@@ -79,6 +97,11 @@ import subprocess
 import warnings
 from collections.abc import Callable
 from pathlib import Path
+
+try:
+    from .claim_release import should_release_assignee
+except ImportError:  # pragma: no cover - top-level module layout fallback
+    from claim_release import should_release_assignee  # type: ignore[no-redef]
 
 LOG = logging.getLogger("skill.shared.status_lifecycle")
 
@@ -158,6 +181,18 @@ VALID_STAGES: tuple[str, ...] = (
     "in_review",
     "done",
 )
+
+#: The one status that represents *active work*. A transition **to** it is a
+#: claim (``StatusLifecycle`` holds the item), never a release. Every other
+#: status is a terminal outcome for the run, so a transition to it releases a
+#: non-producer claim through the shared choke point
+#: (:meth:`StatusLifecycle.update_status`) — not only through the context
+#: manager's exit. This is what makes a prose-only skill (``plan``) and a
+#: direct durable write (``tree_coverage._advance_stage``,
+#: ``effort-and-risk``'s status restore) honour the assignee-release invariant
+#: without having to remember an explicit ``assignee=""``
+#: (SA-0MW0F91KN004J06U).
+ACTIVE_WORK_STATUS = "in-progress"
 
 
 # Type alias for an injectable command runner.
@@ -551,14 +586,16 @@ class StatusLifecycle:
 
     - **Normal exit:** transitions to ``completed`` (optionally advancing stage)
     - **Exception exit:** restores original status (rollback)
-    - **Assignee release (default):** any assignee the context manager holds
-      — the ``assignee=`` it set on entry — is cleared on **every** exit path:
-      the successful (``completed``) exit, the exception/rollback exit and the
-      ``restore_on_exit`` exit. This releases the scheduling hold (non-empty
-      assignee = hold; clear to release) so an item is never left on a
-      lingering agent claim that blocks re-dispatch. Only an assignee the
-      context manager itself holds is cleared: a pre-existing hold on an item
-      it merely transitions (e.g. the producer's ``Map``) is left untouched.
+    - **Assignee release (default):** any **non-producer** claim is cleared on
+      **every** exit path: the successful (``completed``) exit, the
+      exception/rollback exit and the ``restore_on_exit`` exit. This releases
+      the scheduling hold (non-empty assignee = hold; clear to release) so an
+      item is never left on a lingering agent claim that blocks re-dispatch.
+      The rule covers an externally pre-set agent claim the run did not set
+      itself (the workflow's pre-claim), as well as the ``assignee=`` set on
+      entry. The producer ``Map`` hold and a ``needsProducerReview`` item are
+      the sanctioned persistent holds and are left untouched
+      (SA-0MW0F91KN004J06U; predicate shared with ``shared.claim_release``).
     - **preserve_assignee_on_exit=True:** the documented opt-out — the
       assignee is never touched on any exit path. Legitimate uses: a caller
       that is deliberately keeping the item on a producer/scheduling hold, and
@@ -650,6 +687,12 @@ class StatusLifecycle:
         self._runner = runner or _default_runner
         self._original_status: str = "open"  # safe default
         self._did_set_in_progress: bool = False
+        # The hold observed on entry (before this run claimed anything). It is
+        # what the widened release covers: a claim set outside this context
+        # manager (the workflow pre-claim) is released on the terminal
+        # transition too (SA-0MW0F91KN004J06U).
+        self._original_assignee: str = ""
+        self._original_needs_producer_review: bool = False
 
     # ------------------------------------------------------------------
     # Public helpers (usable outside context manager too)
@@ -680,19 +723,39 @@ class StatusLifecycle:
         assignee: str | None = None,
         needs_producer_review: bool | None = None,
         runner: Runner | None = None,
+        release_assignee: bool | None = None,
     ) -> dict:
         """Update a work item's status (and optionally stage/assignee/needs_producer_review).
+
+        This is the **single choke point** every skill's status transition goes
+        through, so it also enforces the assignee-release invariant for direct
+        durable writes (a skill that never wraps its run in the context
+        manager). Unless the caller says otherwise, a transition that leaves
+        the active-work state releases a non-producer claim the item currently
+        carries — including a workflow pre-claim the caller did not set itself
+        (SA-0MW0F91KN004J06U).
 
         Args:
             work_item_id: The work item ID.
             status: New status value (e.g. ``open``, ``in_progress``, ``completed``).
             stage: Optional new stage value.
-            assignee: Optional new assignee value.
+            assignee: Optional new assignee value. An explicit value (including
+                ``""``) is written verbatim and disables the automatic
+                release, so a caller that manages the hold itself is never
+                overridden.
             needs_producer_review: Optional boolean. When set, passes
                 ``--needs-producer-review yes|no`` to ``wl update``.
                 ``None`` (default) omits the flag entirely, preserving
-                backward compatibility.
+                backward compatibility. ``True`` also suppresses the automatic
+                release: the handoff is a sanctioned persistent hold.
             runner: Optional injectable runner for testing.
+            release_assignee: Explicit release decision. ``None`` (default)
+                decides automatically — release a non-producer claim when the
+                transition leaves the active-work state
+                (:data:`ACTIVE_WORK_STATUS`). ``True`` forces the check even
+                for a claim status, ``False`` never releases (used by
+                :class:`StatusLifecycle` itself, which has already decided on
+                its exit path).
 
         Returns:
             The parsed JSON dict from ``wl update``.
@@ -714,13 +777,69 @@ class StatusLifecycle:
         cmd = ["wl", "update", work_item_id, "--status", status, "--json"]
         if stage is not None:
             cmd.extend(["--stage", stage])
+        r = runner or _default_runner
+        if (
+            assignee is None
+            and StatusLifecycle._auto_release_requested(
+                status, needs_producer_review, release_assignee
+            )
+            and StatusLifecycle._holds_releasable_claim(work_item_id, r)
+        ):
+            # Release the scheduling hold together with the terminal
+            # transition (assignee-hold convention: non-empty assignee = hold;
+            # clear to release). Producer holds and needsProducerReview items
+            # are excluded by the shared predicate, so this can never wipe the
+            # producer's intent.
+            assignee = ""
         if assignee is not None:
             cmd.extend(["--assignee", assignee])
         if needs_producer_review is not None:
             npr_value = "yes" if needs_producer_review else "no"
             cmd.extend(["--needs-producer-review", npr_value])
-        r = runner or _default_runner
         return _run_wl_with_runner(r, cmd)
+
+    @staticmethod
+    def _auto_release_requested(
+        status: str,
+        needs_producer_review: bool | None,
+        release_assignee: bool | None,
+    ) -> bool:
+        """Whether a transition should release an observed claim on its own.
+
+        ``release_assignee`` is the caller's explicit decision and always
+        wins. Otherwise a transition **away** from the active-work status is a
+        terminal outcome of the run, so the hold goes; a handoff that sets
+        ``needs_producer_review=True`` in the same write is the sanctioned
+        persistent hold and keeps it.
+        """
+        if release_assignee is not None:
+            return release_assignee
+        return (
+            needs_producer_review is not True
+            and _normalise_status(status) != ACTIVE_WORK_STATUS
+        )
+
+    @staticmethod
+    def _holds_releasable_claim(work_item_id: str, runner: Runner) -> bool:
+        """Whether *work_item_id* currently holds a releasable non-producer claim.
+
+        Best-effort read: when the item cannot be fetched the transition still
+        proceeds (logging a debug line) rather than failing the status write —
+        the release is a backstop, never a precondition for the transition.
+        """
+        try:
+            data = _run_wl_with_runner(
+                runner, ["wl", "show", work_item_id, "--json"]
+            )
+        except RuntimeError:
+            LOG.debug(
+                "Could not read %s to inspect its assignee; proceeding without "
+                "an automatic release",
+                work_item_id,
+            )
+            return False
+        item = data.get("workItem") if isinstance(data, dict) else None
+        return should_release_assignee(item if isinstance(item, dict) else {})
 
     @staticmethod
     def require_claimed(
@@ -838,10 +957,15 @@ class StatusLifecycle:
             data = self.show(self._work_item_id, runner=self._runner)
             wi = data.get("workItem", {})
             self._original_status = wi.get("status", "open")
+            self._original_assignee = str(wi.get("assignee") or "")
+            self._original_needs_producer_review = bool(
+                wi.get("needsProducerReview")
+            )
             LOG.info(
-                "Captured original status for %s: %s",
+                "Captured original status for %s: %s (assignee=%r)",
                 self._work_item_id,
                 self._original_status,
+                self._original_assignee,
             )
         except RuntimeError:
             LOG.warning(
@@ -901,7 +1025,13 @@ class StatusLifecycle:
 
         # Success path — transition to completed
         try:
-            kwargs: dict = {"status": "completed", "runner": self._runner}
+            kwargs: dict = {
+                "status": "completed",
+                "runner": self._runner,
+                # The exit path has already decided: never let the
+                # update_status backstop second-guess preserve_assignee_on_exit.
+                "release_assignee": False,
+            }
             if self._target_stage is not None:
                 kwargs["stage"] = self._target_stage
             if self._should_release_assignee():
@@ -935,11 +1065,16 @@ class StatusLifecycle:
 
         Release is the default on **every** exit path (success, rollback and
         ``restore_on_exit``), so a caller cannot reintroduce a scheduling hold
-        by omission. It stays deliberately narrow: only an assignee this
-        context manager holds — the ``assignee=`` it set on entry — is ever
-        cleared. A hold it never established (a producer's ``Map`` hold on an
-        item it merely transitions) is left untouched, so the release can
-        never silently widen to someone else's hold.
+        by omission. Two claims are covered:
+
+        * the ``assignee=`` this context manager set on entry (its own hold);
+        * a non-producer claim the run **observed on entry** but did not set
+          itself — the workflow pre-claim (``AGENTS_GLOBAL.md`` step 1 claims
+          before the skill runs), whose hold previously survived the skill's
+          terminal transition (SA-0MW0F91KN004J06U).
+
+        The producer ``Map`` hold and a ``needsProducerReview`` item are never
+        released (shared predicate: :func:`shared.claim_release.should_release_assignee`).
 
         Returns:
             ``True`` when the exit path should write ``--assignee ""``.
@@ -948,7 +1083,14 @@ class StatusLifecycle:
             # Documented opt-out: the caller owns the hold (producer hold, or a
             # pre-existing assignee it restores itself).
             return False
-        return self._assignee is not None
+        if self._assignee is not None:
+            return True
+        return should_release_assignee(
+            {
+                "assignee": self._original_assignee,
+                "needsProducerReview": self._original_needs_producer_review,
+            }
+        )
 
     def _restore_original(self, *, reason: str = "failure") -> None:
         """Restore the original status (releasing a held assignee)."""
@@ -956,7 +1098,13 @@ class StatusLifecycle:
             return  # Nothing was changed, nothing to restore
 
         try:
-            kwargs: dict = {"status": self._original_status, "runner": self._runner}
+            kwargs: dict = {
+                "status": self._original_status,
+                "runner": self._runner,
+                # The exit path has already decided: never let the
+                # update_status backstop second-guess preserve_assignee_on_exit.
+                "release_assignee": False,
+            }
             release = self._should_release_assignee()
             if release:
                 # Release the scheduling hold on the way out (default on every

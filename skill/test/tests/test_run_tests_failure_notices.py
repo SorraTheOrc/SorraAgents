@@ -82,6 +82,30 @@ class TestRunSuiteDiagnostics:
         assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
         assert "no parsable failures" in result["notice"]
 
+    def test_inode_exhaustion_signature_is_unparsed_failure(self, tmp_path) -> None:
+        """The captured inode-exhaustion output (SA-0MW2QED9M005FWOK) is
+        classified ``unparsed_failure`` by the runner — an infrastructure
+        condition, never a code failure.
+
+        The incident surfaced as ``ENOSPC`` inside
+        ``PlaywrightBrowserProvider.createContext`` while the ``/tmp`` tmpfs
+        inode budget was at 100 %. The output contains no ``FAILED`` line, so
+        ``run_suite`` must report ``unparsed_failure`` and the gate then maps
+        it to ``reason: unparsed``.
+        """
+        proc = fx.enospc_in_playwright(exit_code=1)
+        with mock.patch.object(run_tests, "_run_cmd", return_value=proc), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite("all", cwd=_repo(tmp_path), use_cache=False)
+
+        assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
+        assert result["failures"] == []
+        assert result["success"] is False
+        assert result["exit_code"] == 1
+        assert "ENOSPC" in result["stderr"]
+        assert "PlaywrightBrowserProvider.createContext" in result["stderr"]
+        assert "no parsable failures" in result["notice"]
+
     def test_command_not_found_is_classified(self, tmp_path) -> None:
         def raise_not_found(*args, **kwargs):
             # errno + filename form so ``exc.filename == "vitest"``.
@@ -533,3 +557,160 @@ class TestQueueWaitIsOutsideTheTimeoutBudget:
             f"(elapsed={result['elapsed_seconds']!r}, "
             f"slot_wait={result['slot_wait_seconds']!r})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Mid-run checkout movement: state_changed_during_run (SA-0MW3FF18I003KGZE)
+# ---------------------------------------------------------------------------
+
+
+def _state_changed_flag(checkout: str, before: str, after: str) -> dict:
+    """The flag dict ``run_cached`` returns when the checkout moved mid-run."""
+    return {
+        "notice_code": run_tests.NOTICE_STATE_CHANGED_DURING_RUN,
+        "checkout": checkout,
+        "before_commit": before,
+        "after_commit": after,
+        "message": "checkout moved while the suite executed",
+    }
+
+
+def _flagged_run(flag: dict, stdout: str = "", returncode: int = 75) -> dict:
+    """A ``run_cached`` result for a flagged (moved-checkout) command."""
+    return {
+        "stdout": stdout,
+        "stderr": "",
+        "exit_code": returncode,
+        "completed_at": 0.0,
+        "command": _CMD,
+        "git_state": "",
+        "fingerprint_kind": "worktree",
+        "scope": "full",
+        "test_type": "full",
+        "interpreter": "",
+        "cached": False,
+        "state_changed_during_run": flag,
+    }
+
+
+class TestStateChangedDuringRunNotice:
+    """The runner reports a moved checkout instead of failing the tests."""
+
+    def test_flagged_command_is_non_green_with_the_state_changed_exit_code(
+        self, tmp_path
+    ) -> None:
+        """A moved checkout is non-green with 75, never a code failure."""
+        flag = _state_changed_flag(str(tmp_path), "a" * 40, "b" * 40)
+        with mock.patch.object(
+            run_tests, "run_cached", return_value=_flagged_run(flag)
+        ), mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite("all", cwd=_repo(tmp_path))
+
+        assert result["success"] is False
+        assert result["returncode"] == 75
+        assert result["notice_code"] == run_tests.NOTICE_STATE_CHANGED_DURING_RUN
+        assert result["state_changed_during_run"] == flag
+        assert "re-run" in result["notice"]
+        assert str(tmp_path) in result["notice"]
+
+    def test_flagged_command_publishes_no_structured_failures(
+        self, tmp_path
+    ) -> None:
+        """Even parseable failure text is dropped: it exists at no commit."""
+        flag = _state_changed_flag(str(tmp_path), "a" * 40, "b" * 40)
+        red_output = f"FAILED tests/test_x.py::test_x - AssertionError\n{_NOISE}"
+        with mock.patch.object(
+            run_tests,
+            "run_cached",
+            return_value=_flagged_run(flag, stdout=red_output, returncode=75),
+        ), mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite("all", cwd=_repo(tmp_path))
+
+        assert result["failures"] == [], "no mixed-tree failure may be published"
+        assert result["success"] is False
+        assert result["notice_code"] == run_tests.NOTICE_STATE_CHANGED_DURING_RUN
+
+    def test_stable_run_result_shape_is_unchanged(self, tmp_path) -> None:
+        """Control: a stable run keeps today's result exactly."""
+        stable = {
+            "stdout": "3 passed\n",
+            "stderr": "",
+            "exit_code": 0,
+            "completed_at": 1.0,
+            "command": _CMD,
+            "git_state": "s",
+            "fingerprint_kind": "worktree",
+            "scope": "full",
+            "test_type": "full",
+            "interpreter": "",
+            "cached": False,
+            "state_changed_during_run": None,
+        }
+        with mock.patch.object(
+            run_tests, "run_cached", return_value=stable
+        ), mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite("all", cwd=_repo(tmp_path))
+
+        assert result["success"] is True
+        assert result["returncode"] == 0
+        assert result["exit_code"] == 0
+        assert result["notice_code"] == ""
+        assert result["notice"] == ""
+        assert result["failures"] == []
+        assert result["state_changed_during_run"] is None
+        assert result["cached"] is False
+
+    def test_run_all_publishes_the_code_and_fails_the_aggregate(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The aggregate carries the code, no failures and a red verdict."""
+        flag = _state_changed_flag(str(tmp_path), "a" * 40, "b" * 40)
+        monkeypatch.setenv("TEST_SCOPE_SKIP", "1")
+        with mock.patch.object(
+            run_tests,
+            "run_cached",
+            return_value=_flagged_run(flag, stdout="FAILED tests/test_y.py::test_y\n"),
+        ), mock.patch.object(run_tests, "_test_concurrency_slot"):
+            aggregate = run_all(("all",), cwd=_repo(tmp_path))
+
+        assert aggregate["success"] is False
+        assert run_tests.NOTICE_STATE_CHANGED_DURING_RUN in aggregate["notice_codes"]
+        assert aggregate["failures"] == []
+        assert aggregate["state_changed_during_run"] == [flag]
+
+    def test_run_all_stable_aggregate_is_unchanged(self, tmp_path, monkeypatch) -> None:
+        """Control: a stable aggregate keeps today's shape."""
+        stable = {
+            "stdout": "3 passed\n",
+            "stderr": "",
+            "exit_code": 0,
+            "completed_at": 1.0,
+            "command": _CMD,
+            "git_state": "s",
+            "fingerprint_kind": "worktree",
+            "scope": "full",
+            "test_type": "full",
+            "interpreter": "",
+            "cached": False,
+            "state_changed_during_run": None,
+        }
+        monkeypatch.setenv("TEST_SCOPE_SKIP", "1")
+        with mock.patch.object(
+            run_tests, "run_cached", return_value=stable
+        ), mock.patch.object(run_tests, "_test_concurrency_slot"):
+            aggregate = run_all(("all",), cwd=_repo(tmp_path))
+
+        assert aggregate["success"] is True
+        assert aggregate["notice_codes"] == []
+        assert aggregate["failures"] == []
+        assert aggregate["state_changed_during_run"] == []
+
+    def test_notice_code_matches_the_cache_constant(self) -> None:
+        """The runner and the cache share one vocabulary (no drift)."""
+        import test_cache
+
+        assert (
+            run_tests.NOTICE_STATE_CHANGED_DURING_RUN
+            == test_cache.STATE_CHANGED_NOTICE_CODE
+        )
+        assert run_tests.STATE_CHANGED_EXIT_CODE == test_cache.STATE_CHANGED_EXIT_CODE

@@ -30,6 +30,7 @@ GLOBAL_SKILL = Path.home() / ".pi" / "agent" / "skills" / "context-audit" / "scr
 # Markers distinguishing the two hook variants.
 V2_HEADER = "worklog:pre-push-hook:v2"
 V3_HEADER = "worklog:pre-push-hook:v3"
+V4_HEADER = "worklog:pre-push-hook:v4"
 FULL_SUITE_MARKER = "Scope-aware test gate"
 CONTEXT_BUDGET_MARKER = "Context-budget regression gate"
 BRANCH_POLICY_MARKER = "Branch policy enforcement"
@@ -286,11 +287,11 @@ class TestInstallPiHooks:
 class TestFreshProjectHookVariant:
     """install_pi.sh must install the framework v2 hook (no full-suite gate)
     into a fresh project that lacks the repo-local test runner, and keep the
-    v3 hook (with the full-suite gate) for the canonical source repo."""
+    v4 hook (with the full-suite gate) for the canonical source repo."""
 
     def test_fresh_project_gets_framework_v2_hook(self, tmp_path: Path):
         """A project without skill/test/scripts/run_tests.py must receive the v2
-        hook, not the v3 hook that hard-fails when the runner is absent."""
+        hook, not the v4 hook that hard-fails when the runner is absent."""
         result, project = _install_into_git_project(tmp_path, with_runner=False)
         assert "Done." in result.stdout, (
             f"install_pi.sh should complete; stdout: {result.stdout} stderr: {result.stderr}"
@@ -299,7 +300,7 @@ class TestFreshProjectHookVariant:
         assert V2_HEADER in installed, (
             "fresh project should receive the framework v2 hook, got:" f"\n{installed}"
         )
-        assert V3_HEADER not in installed, "v3 hook must not be installed here"
+        assert V4_HEADER not in installed, "v4 hook must not be installed here"
         assert FULL_SUITE_MARKER not in installed, (
             "installed hook must not carry the SorraAgents-only full-suite gate"
         )
@@ -326,18 +327,37 @@ class TestFreshProjectHookVariant:
         assert BRANCH_POLICY_MARKER in installed, "branch policy missing"
         assert WORKLOG_SYNC_MARKER in installed, "worklog sync missing"
 
-    def test_source_repo_with_runner_keeps_v3_hook(self, tmp_path: Path):
-        """A project that ships the repo-local runner must still receive the v3
+    def test_source_repo_with_runner_keeps_v4_hook(self, tmp_path: Path):
+        """A project that ships the repo-local runner must still receive the v4
         hook with the full-suite gate."""
         result, project = _install_into_git_project(tmp_path, with_runner=True)
         assert "Done." in result.stdout, (
             f"install_pi.sh should complete; stdout: {result.stdout} stderr: {result.stderr}"
         )
         installed = (project / ".githooks" / "pre-push").read_text(encoding="utf-8")
-        assert V3_HEADER in installed, (
-            "repo with local runner should receive the v3 hook, got:" f"\n{installed}"
+        assert V4_HEADER in installed, (
+            "repo with local runner should receive the v4 hook, got:" f"\n{installed}"
         )
-        assert FULL_SUITE_MARKER in installed, "v3 hook missing full-suite gate"
+        assert FULL_SUITE_MARKER in installed, "v4 hook missing full-suite gate"
+
+    def test_stale_marker_hook_is_refreshed(self, tmp_path: Path):
+        """An installed v3 hook is refreshed in place to v4 when install_pi.sh
+        re-runs, so a hook bump propagates without manual removal."""
+        result, project = _install_into_git_project(tmp_path, with_runner=True)
+        assert "Done." in result.stdout
+        installed = (project / ".githooks" / "pre-push").read_text(encoding="utf-8")
+        assert V4_HEADER in installed
+        # Downgrade the installed copy to the previous marker, then re-run the
+        # installer: the wiring must detect the stale marker and refresh it.
+        stale = installed.replace(V4_HEADER, V3_HEADER, 1)
+        (project / ".githooks" / "pre-push").write_text(stale, encoding="utf-8")
+        result2, _ = _install_into_git_project(tmp_path, with_runner=True)
+        assert "Refreshed" in result2.stdout, (
+            f"install_pi.sh should report the refresh; stdout: {result2.stdout}"
+        )
+        refreshed = (project / ".githooks" / "pre-push").read_text(encoding="utf-8")
+        assert V4_HEADER in refreshed, "stale v3 hook must be refreshed to v4"
+        assert "Full test suite failed" in refreshed
 
     def test_v2_template_is_framework_safe(self):
         """The committed v2 template carries the framework gates and no

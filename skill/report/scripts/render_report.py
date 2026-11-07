@@ -76,6 +76,14 @@ except ImportError:
         return []
 
 try:
+    from shared.claim_release import (
+        release_session_claim,  # type: ignore[import-not-found]
+    )
+except ImportError:
+    def release_session_claim(*_a, **_kw):  # type: ignore[no-redef]
+        return {"released": False, "reason": "unavailable"}
+
+try:
     from shared.herdr_pane import (
         derive_status,  # type: ignore[import-not-found]
         icons_enabled,  # type: ignore[import-not-found]
@@ -730,6 +738,16 @@ def main():
         default=None,
         help="Use-case string (repeatable). Rendered as a bulleted list under ## Use Cases.",
     )
+    parser.add_argument(
+        "--no-release-claim",
+        action="store_true",
+        help=(
+            "Do not release the session's work-item claim. The end-of-session "
+            "report is every skill's final step and doubles as the claim-release "
+            "backstop (producer Map holds and needsProducerReview items are "
+            "always preserved)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.json:
@@ -780,6 +798,26 @@ def main():
         ac_rows, args.producer_actions, args.notes, no_icons=args.no_icons,
     )
     print(report)
+
+    # Session-end claim-release backstop (SA-0MW0F91KN004J06U). The canonical
+    # report is every skill's final step, so a session that never reached a
+    # terminal lifecycle transition still releases its claim here. Best-effort:
+    # a release failure must never break the report. Producer Map holds and
+    # needsProducerReview items are preserved by the shared predicate, and a
+    # configured session identity guards against clearing a live sibling's
+    # claim.
+    if not args.no_release_claim:
+        try:
+            release = release_session_claim(
+                work_item_id, reason="end-of-session-report", author=args.skill_name
+            )
+        except Exception as exc:  # noqa: BLE001 - the report must always render
+            release = {"released": False, "reason": "error", "error": str(exc)}
+        if release.get("released"):
+            print(
+                f"\nRelease: claim on {work_item_id} released "
+                f"(was {release.get('previous_assignee')!r})."
+            )
 
 
 if __name__ == "__main__":

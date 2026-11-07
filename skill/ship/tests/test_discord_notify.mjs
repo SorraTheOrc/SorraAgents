@@ -1116,3 +1116,118 @@ describe('discord-notify: notification composition integration (SA-0MUVWL09T001N
     rmTmpDir(dir);
   });
 });
+
+// ---------------------------------------------------------------------------
+// SA-0MVXY0VPC002B0MO — missing release-section warning + generated-section
+// composition (the v0.1.23 CHANGELOG regression).
+// ---------------------------------------------------------------------------
+
+describe('discord-notify: missing release-section warning (SA-0MVXY0VPC002B0MO AC4)', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = mkTmpDir('discord-missing-section-');
+  });
+
+  afterEach(() => {
+    rmTmpDir(tmpDir);
+  });
+
+  /** Run sendReleaseNotification with console.warn captured. */
+  async function notifyCapturingWarnings({ version, changelogContent }) {
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (...args) => { warnings.push(args.join(' ')); };
+    try {
+      let sentBody = null;
+      const result = await sendReleaseNotification(
+        { version, projectRoot: tmpDir },
+        {
+          fetchFn: async (_url, opts) => { sentBody = JSON.parse(opts.body); return { ok: true }; },
+          projectConfigPath: join(tmpDir, 'config.yaml'),
+          globalConfigPath: join(tmpDir, 'config.yaml'),
+          changelogContent,
+          readmePath: join(tmpDir, 'none.md'),
+          now: () => new Date('2024-08-01'),
+        },
+      );
+      return { result, warnings, sentBody };
+    } finally {
+      console.warn = originalWarn;
+    }
+  }
+
+  it('AC4: warns naming the version when the ## v<version> section is absent, and still sends', async () => {
+    writeWebhookConfig(tmpDir);
+
+    const { result, warnings, sentBody } = await notifyCapturingWarnings({
+      version: '1.2.3',
+      // A dev-style changelog WITHOUT the released version's section.
+      changelogContent: '# Changelog\n\n## v1.2.2 (2024-07-01)\n### Features\n- Old feature\n',
+    });
+
+    assert.strictEqual(result.success, true);
+    assert.strictEqual(result.notified, true, 'the notification still sends (non-blocking)');
+    assert.ok(sentBody, 'a webhook POST was attempted');
+
+    const named = warnings.find((w) => w.includes('v1.2.3'));
+    assert.ok(named, `expected a warning naming v1.2.3; got ${JSON.stringify(warnings)}`);
+    assert.ok(/no "## v1\.2\.3" section/.test(named), 'the warning names the missing section');
+  });
+
+  it('AC4: does not emit the missing-section warning when the section is present', async () => {
+    writeWebhookConfig(tmpDir);
+
+    const { result, warnings } = await notifyCapturingWarnings({
+      version: '1.2.3',
+      changelogContent: '## v1.2.3 (2024-08-01)\n### Features\n- New feature\n',
+    });
+
+    assert.strictEqual(result.notified, true);
+    assert.ok(
+      !warnings.some((w) => /no "## v1\.2\.3" section/.test(w)),
+      'no missing-section warning when the section exists',
+    );
+  });
+});
+
+describe('discord-notify: generated release-section composition (SA-0MVXY0VPC002B0MO AC5)', () => {
+  it('AC5: the embed carries both the release focus and the changelog body', () => {
+    const generatedChangelog = [
+      '# Changelog',
+      '',
+      '## v0.1.23 (2026-11-01)',
+      '> **Release focus:** The changelog-preservation fix release.',
+      '### Bug Fixes',
+      '- Releases keep their changelog section after the dev→main merge. (SA-0MVXY0VPC002B0MO)',
+      '',
+      '## v0.1.22 (2026-10-15)',
+      '### Features',
+      '- Old feature (SA-OLD)',
+      '',
+    ].join('\n');
+
+    const section = extractChangelogSection(generatedChangelog, '0.1.23');
+    assert.ok(section, 'the generated section is extracted');
+
+    const { focus, body } = extractReleaseFocus(section.text);
+    assert.strictEqual(focus, 'The changelog-preservation fix release.');
+
+    const description = buildDiscordPayload({
+      version: '0.1.23',
+      projectName: 'Test Project',
+      focus,
+      changelog: body,
+    }).embeds[0].description;
+
+    assert.ok(description.includes('The changelog-preservation fix release.'), 'focus present');
+    assert.ok(description.includes('Releases keep their changelog section'), 'changelog body present');
+    assert.ok(!description.includes('Old feature'), 'the body is scoped to the released version');
+    assert.ok(!description.includes('Release focus'), 'the marker line is not duplicated');
+    assert.ok(
+      description.indexOf('The changelog-preservation fix release.') <
+      description.indexOf('Releases keep their changelog section'),
+      'focus precedes the changelog body',
+    );
+  });
+});

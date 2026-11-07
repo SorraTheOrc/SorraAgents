@@ -134,6 +134,80 @@ class TestZombieScenario(unittest.TestCase):
         self.assertTrue(any(a["action"] == "prune" for a in result["actions"]))
 
 
+class TestMultiAgentHostScenario(unittest.TestCase):
+    """AC2/AC6: a 16-core multi-agent host profile is green after recalibration.
+
+    The profile reproduces the 2025-10-21 evidence: 560 processes, 2250
+    threads, 69 % swap, 35 % memory use, no PSI memory stalls, no zombies and
+    no genuinely stale locks. Every status is computed through the real
+    config, so a future threshold regression fails this test.
+    """
+
+    CORES = 16
+
+    def _status(self, cfg_key, value):
+        thresholds = metrics._multiplier_thresholds(
+            metrics.load_config()[cfg_key], self.CORES
+        )
+        return metrics.classify_metric(value, thresholds)["status"]
+
+    def _profile(self):
+        cfg = metrics.load_config()
+        profile = _base_metrics()
+        profile["process_count"] = {
+            "value": 560, "status": self._status("process_count", 560),
+            "description": "Total processes",
+        }
+        profile["thread_count"] = {
+            "value": 2250, "status": self._status("thread_count", 2250),
+            "description": "Total threads",
+        }
+        profile["swap_usage"] = {
+            "value": 69.0,
+            "status": metrics._classify_swap_usage(69.0, 35.0, 0.0, cfg)["status"],
+            "description": "Swap 69 %, memory 35 %, no PSI memory stalls",
+        }
+        profile["memory_usage"] = {
+            "value": 35.0, "status": "low", "description": "mem"
+        }
+        profile["runnable_processes"] = {
+            "value": 18, "status": "low", "description": "run"
+        }
+        profile["stale_lock_files"] = {
+            "value": 0, "status": "low", "description": "none"
+        }
+        return profile
+
+    def test_profile_has_no_critical_or_warning_rows(self):
+        before = tables.render_before_table(self._profile())
+        self.assertNotIn("🔴", before)
+        self.assertNotIn("CRIT", before)
+        self.assertNotIn("critical", before)
+        self.assertNotIn("🟡", before)
+
+    def test_profile_produces_no_pressures_or_stale_lock_prune(self):
+        profile = self._profile()
+        pressures = pa.analyze_pressures(profile, ancestry_fn=_safe_ancestry)
+        self.assertEqual(pressures, [])
+        actions = pa.propose_remediations_from_metrics(profile, pressures)
+        self.assertFalse(any(
+            a["target"].get("scope") == "stale-lock-files" for a in actions
+        ))
+
+    def test_workflow_is_clean_for_multi_agent_profile(self):
+        result = evaluate.run_workflow(
+            metrics_fn=self._profile,
+            ancestry_fn=_safe_ancestry,
+            auto_approve=True,
+            dry_run=True,
+        )
+        self.assertEqual(result["pressures"], [])
+        self.assertFalse(any(
+            a["target"].get("scope") == "stale-lock-files"
+            for a in result["actions"]
+        ))
+
+
 class TestTemporaryProcFixtures(unittest.TestCase):
     """AC2: temporary /proc-like fixture data."""
 

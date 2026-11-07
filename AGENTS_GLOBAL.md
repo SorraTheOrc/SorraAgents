@@ -66,6 +66,11 @@ and relevant context.
 
 <!-- WORKFLOW: end -->
 
+## Work-item completion conventions
+
+- **`## Impact` is required on newly completed items.** Before advancing a work item to `in_review`, add an `## Impact` section to its description: **one sentence describing the user-experience impact** — what a user can now do, see, or stop worrying about — not a technical summary of what was built. Standup reports quote it verbatim, falling back to the item's user story when the section is absent.
+- **Existing completed items are deliberately not retrofitted.** The convention applies to items completed from now on; rewriting already-completed descriptions is intentionally out of scope.
+
 ## CRITICAL RULES
 
 - **Write in UK English.** All written output must use UK English spelling (e.g. "colour" not "color", "organise" not "organize").
@@ -112,7 +117,9 @@ A non-empty `assignee` is a **scheduling hold** (`wl next` skips a held item), s
 
 > any code path that claims an `assignee` must release it on every terminal outcome; a persistent hold is represented by the producer assignee (`Map`) or `needsProducerReview`, never by a lingering agent assignee.
 
-The shared `StatusLifecycle` helper (`skill/shared/status_lifecycle.py`) releases the claim it holds on **every** exit path by default — the successful `completed` transition, the exception/rollback path and the `restore_on_exit` path alike — clearing only the assignee it set on entry (a producer `Map` hold it never claimed is left untouched). The one documented opt-out is `preserve_assignee_on_exit=True`, whose legitimate uses are a deliberate producer/scheduling hold and the `verify_context_reduction` assignee restore; a call site that passes it must explain why in an inline comment.
+The shared `StatusLifecycle` helper (`skill/shared/status_lifecycle.py`) releases **any non-producer claim** on **every** exit path by default — the `completed` transition, the exception/rollback path and `restore_on_exit` alike. It covers the assignee it sets on entry *and* an agent pre-claim it merely observed there (the workflow's step-1 claim), so a pre-existing claim cannot survive its terminal transition. Only the producer `Map` hold and a `needsProducerReview` item are never released; the downtime dispatcher's `dispatcher` claim is an agent claim, not a hold. The predicate lives once in `skill/shared/claim_release.py` (`should_release_assignee`), shared with the backstops below. The one documented opt-out is `preserve_assignee_on_exit=True`, whose legitimate uses are a deliberate producer/scheduling hold and the `verify_context_reduction` restore; a call site that passes it must explain why in an inline comment.
+
+Two backstops cover sessions that never reach a lifecycle exit: `release_session_claim` (the end-of-session report and the `signal_release` SIGINT/SIGTERM guard), and a TTL-bounded (default 24 h), idempotent `reap_stale_claims` sweep hooked into the worklog sync path, which releases non-producer claims idle beyond the TTL, recording each as a comment naming the previous assignee. Neither touches a producer hold, a `needsProducerReview` item or a `completed`/`deleted` item. Reference: `docs/dev/assignee-release.md`.
 
 ## Stage vs Status distinction
 

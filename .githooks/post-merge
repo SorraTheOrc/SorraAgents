@@ -1,4 +1,37 @@
 #!/bin/sh
 # worklog:post-pull-hook:v1
-# Wrapper that delegates to central Worklog post-pull script (committed hooks).
-exec "/home/rgardler/.config/pi/.githooks/worklog-post-pull" "$@"
+# Wrapper that delegates to the shared Worklog post-pull script.
+#
+# The script is resolved portably - never through a hard-coded per-user path
+# (SA-0MVK1Q30O0067NXX) - in this order:
+#   1. this repository's committed .githooks/worklog-post-pull
+#   2. $HOME/.config/pi/.githooks/worklog-post-pull (installed by
+#      scripts/install_pi.sh for machines that have no project copy)
+#   3. a single stderr notice, then exit 0
+#
+# Exit 0 on a missing script is deliberate: a hook that exits 127 (or any
+# non-zero status) aborts `git checkout`, `git merge` and `git worktree add` -
+# and `wl sync` creates a temporary worktree, so it would fail too. Every
+# resolution step is best-effort because hooks inherit git's environment
+# (GIT_DIR/GIT_* pollution - SA-0MUIZSXEY008NGR8).
+SCRIPT=""
+toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$toplevel" ] && [ -f "$toplevel/.githooks/worklog-post-pull" ]; then
+  SCRIPT="$toplevel/.githooks/worklog-post-pull"
+else
+  here="$(dirname "$0" 2>/dev/null || true)"
+  if [ -n "$here" ] && [ -f "$here/worklog-post-pull" ]; then
+    SCRIPT="$here/worklog-post-pull"
+  elif [ -n "$HOME" ] && [ -f "$HOME/.config/pi/.githooks/worklog-post-pull" ]; then
+    SCRIPT="$HOME/.config/pi/.githooks/worklog-post-pull"
+  fi
+fi
+if [ -z "$SCRIPT" ]; then
+  echo "worklog: post-pull hook not found (tried <repo>/.githooks/worklog-post-pull and \$HOME/.config/pi/.githooks/worklog-post-pull); run scripts/install_pi.sh; skipping sync" >&2
+  exit 0
+fi
+if [ -x "$SCRIPT" ]; then
+  exec "$SCRIPT" "$@"
+fi
+# A checkout that lost the executable bit must still work.
+exec sh "$SCRIPT" "$@"

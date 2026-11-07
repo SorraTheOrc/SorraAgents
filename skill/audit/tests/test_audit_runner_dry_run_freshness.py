@@ -331,6 +331,46 @@ class TestDryRunLifecycleFreshness:
         rc = audit_runner._apply_terminal_lifecycle(ctx)
         assert rc == 3
 
+    def test_pending_child_screens_block_the_dry_run_refresh(self, capsys):
+        """AC5 (SA-0MW2J7NGP006CIEG): a dry run may never re-publish
+        "fresh" while an in-main-slot child screen is outstanding.
+
+        The child-audit execution gate keeps such a run at ``Ready to close:
+        No`` — a "Yes" with pending screens is therefore unreachable through
+        the pipeline. The guard is defence in depth: even a caller that hands
+        the lifecycle a "Yes" verdict together with pending child screens
+        must not refresh ``auditedAt``.
+        """
+        store = _DryRunWlStore(status="completed", stage="in_review")
+        before = (store.audited_at, store.raw_output, store.ready_to_close)
+        ctx = _make_ctx(
+            store,
+            persist=False,
+            audit_verdict="yes",
+            audit_completed=True,
+            content_fingerprint="f" * 64,
+            original_status="completed",
+            original_stage="in_review",
+            child_results=[{
+                "id": "CHILD-1",
+                "ac_results": [{
+                    "verdict": audit_runner.VERDICT_PARTIAL,
+                    "evidence": audit_runner.MAIN_SLOT_PENDING_EVIDENCE,
+                }],
+            }],
+        )
+
+        rc = audit_runner._apply_terminal_lifecycle(ctx)
+
+        assert rc != 0, "the refused refresh must be surfaced, not silent"
+        assert store.audit_set_calls == [], (
+            "a report with outstanding child screens must not be marked fresh"
+        )
+        assert (store.audited_at, store.raw_output, store.ready_to_close) == before
+        err = capsys.readouterr().err
+        assert "CHILD-1" in err
+        assert "not a final verdict" in err
+
 
 # ---------------------------------------------------------------------------
 # Help text + SKILL.md documentation (AC2 / AC4(c))

@@ -266,11 +266,53 @@ full test suite):
   (commit hash + branch + `git push origin` instruction).
 - The work item status is reset to `open` (not silently abandoned).
 
-Recovery: push manually from the main checkout:
+Recovery: push manually from the worktree that holds the pushed commit
+(never the main checkout, or the gate could measure a different tree):
 
 ```bash
 git push origin <branch>:refs/heads/dev
 ```
+
+### Dev-push gate reason and transport retry (SA-0MVSJX5HS002DJHI)
+
+The dev push used to report `git push to dev failed` for every non-zero exit,
+so an agent could not tell *fix the code* from *retry later*.
+
+- **The hook names its reason.** `.githooks/pre-push` consumes the runner's
+  `--json` aggregate and prints a stable `gate_reason=<code>` line plus a
+  distinct diagnostic: `slot_contention`, `timeout`, `killed`, `unparsed`,
+  `test_failure`, `infrastructure` or `unknown`. `finish` parses the line and
+  records `report["steps"]["push"]["reason"]` and posts the reason with its
+  remedy on the work item, instead of the generic failure. The red-suite
+  `test_failure` message is unchanged in substance.
+- **The pushed-commit guard is distinguishable.** §3a of `.githooks/pre-push`
+  refuses a dev/main push *before* the suite runs when the gate tree is not the
+  pushed commit (or is dirty at it), so it prints no `gate_reason=` line.
+  `finish` recognises the guard's stable diagnostic and reports the distinct
+  reason `refused_by_pushed_commit_guard`, with the pushed sha, gate HEAD and
+  gate tree in `report["steps"]["push"]["refused_by_pushed_commit_guard"]`;
+  the remedy names the worktree push. The normal path already pushes from the
+  worktree that holds the commit, so this is a fail-closed safety net.
+- **The fast-forward is retried after the recovery rebase.** When Step 5's
+  local-dev fast-forward was refused (`local_dev_diverged` /
+  `commit_not_based_on_remote_tip`) because a sibling moved `dev`, the
+  non-fast-forward recovery rebases onto `origin/dev` and then retries the
+  fast-forward for the rebased commit
+  (`report["steps"]["local_dev_fast_forward"]["retry"]`), so the main
+  checkout's `dev` tracks the pushed commit. A second refusal is recorded and
+  never fails the finish.
+- **Transient transport closes retry.** `Connection … closed by remote host`,
+  `Connection reset by peer`, `remote end hung up unexpectedly` and
+  `kex_exchange_identification` are retried up to 3 attempts with jittered
+  exponential backoff from the **same cwd**, so the gate re-runs and serves its
+  cached full-suite entry. Auth, branch-policy and non-fast-forward errors are
+  never retried (non-fast-forward keeps its dedicated rebase recovery), and a
+  timeout still raises `PushTimeoutError` immediately.
+- **Fairness, not capacity.** `process_semaphore`'s arrival-ordered turnstile
+  grants a free slot to the lowest outstanding ticket, so a waiter is bounded
+  by its queue position instead of being overtaken indefinitely;
+  `TEST_MAX_CONCURRENCY` is unchanged. See
+  [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
 
 ### Reading a gate failure: `reason` and its facts (SA-0MVTET8KQ0031R6Z)
 
@@ -347,6 +389,27 @@ On unexpected error (API/network failure, exception): (1) reset to open
 If the operator cancels after Step 2: reset to `open`
 (`StatusLifecycle.update_status(<work-item-id>, "open")`), return control, and
 document: `wl comment add <work-item-id> --comment "Aborted by operator" --author "<AGENT>" --json`.
+
+### Recoverable interruption (interrupted after the push)
+
+An `implement.py finish` interrupted **after** its commit/push but **before**
+the final lifecycle write leaves the item `open` with the assignee cleared —
+never `completed`/`in_review` for unfinished work — and records one comment
+starting `Run interrupted:` that names the commit (marked `pushed to dev` or
+`committed locally, not pushed`), the branch, whether the worktree survived,
+and the command that resumes (SA-0MVXUSJJY009HMQ0). Retry with:
+
+```bash
+python3 $(skill_path implement)/scripts/implement.py finish <id>   # tree retained
+python3 $(skill_path implement)/scripts/implement.py start <id>    # tree removed; then finish
+python3 $(skill_path implement)/scripts/implement.py finish <id>
+```
+
+A commit that already reached `dev` makes the branch diff-free, so the retry
+converges through the ordinary no-op-push path. Both the interruption record
+and the completion comment are deduplicated on a stable marker plus the
+commit hash, so a recovery never stacks a duplicate completion comment or a
+second terminal transition in one run.
 
 ## Handling Assets
 
@@ -611,20 +674,77 @@ git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-
 cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 ```
 
-> **`node_modules` is auto-symlinked:** `implement.py start` creates
-> `<worktree>/node_modules -> <repo-root>/node_modules` when the main checkout
-> has one (SA-0MSGS763C006SM1B). It also symlinks **nested** `node_modules`
-> directories: every `<pkg>/node_modules` found in the main checkout whose
-> parent package directory already exists in the worktree gets a matching
-> symlink (`<worktree>/<pkg>/node_modules -> <main-checkout>/<pkg>/node_modules`),
-> so workspace/monorepo packages and pi packages resolve their dependencies in
-> the worktree (OSL-0MUFG3PJA00379CT). Discovery is bounded — it prunes `.git`
-> and `.worklog` and never descends into a `node_modules` tree. Existing
-> entries are never overwritten and a missing parent package directory is never
-> fabricated. **Do NOT run `npm install` inside a worktree** — writes pass
-> through the symlink, corrupting the shared tree. A branch that changes
-> `package.json` still resolves the main checkout's dependencies; reinstall in
-> the main checkout if that matters.
+> **Resume is `cwd`-independent.** The default worktree path is relative to
+> the **main checkout** (`.worklog/worktrees/wl-<id>-<slug>`) and
+> `implement.py start` resolves it against the main checkout root, never
+> against `cwd`. Running `start <id>` from inside the item's own worktree
+> (the driven-child / post-crash resume) therefore resumes the registered
+> tree instead of resolving a doubly-nested
+> `<worktree>/.worklog/worktrees/…` path and failing in `git worktree add`
+> (SA-0MVXUGXS5006M3HF). `--worktree-path` keeps its historical semantics:
+> an absolute override is used as given, a relative one resolves against
+> `cwd`.
+
+> **`node_modules` is a worktree-local link farm:** `implement.py start`
+> materialises `<worktree>/node_modules` as a **real directory** (not a
+> whole-directory symlink) holding one symlink per entry of the main
+> checkout's `node_modules`. Scoped packages (`@types/*`, `@worklog/*`, …) get
+> a real scope directory with one symlink per package, and `.bin` is linked as
+> a whole directory. Workspace packages consumed by path (e.g.
+> `@worklog/shared`) are **overridden to the worktree's own `packages/*`**
+> (discovered from the `workspaces` field), so every import — tests,
+> `src/**`, and spawned CLI subprocesses — resolves to the code in *this*
+> worktree instead of the main checkout's gitignored `dist` (introduced as a
+> whole-directory symlink by SA-0MSGS763C006SM1B; superseded by this link farm
+> in SA-0MVPI400Y001FOM1).
+>
+> **Resolution order:** `<worktree>/node_modules/<pkg>` → (symlink) the main
+> checkout's `node_modules/<pkg>` for third-party dependencies, but → the
+> worktree's `packages/<pkg>` for workspace packages consumed by path. The
+> step is idempotent and re-materialises entries when the main checkout's
+> dependency set changes. It also links **nested** `node_modules` directories
+> whose parent package directory already exists in the worktree
+> (`<worktree>/<pkg>/node_modules -> <main-checkout>/<pkg>/node_modules`,
+> OSL-0MUFG3PJA00379CT). Discovery is bounded — it prunes `.git`/`.worklog`
+> and never descends into a dependency tree; existing entries are never
+> overwritten and a missing parent package directory is never fabricated.
+> Repositories without a workspace package consumed by path degrade to the
+> previous whole-directory symlink.
+>
+> **Refresh command.** After the main checkout's dependency set changes,
+> re-run the link step by running `implement.py start <work-item-id>` (or
+> `implement.py parent`/`drive`) from the **main checkout**; the step is
+> idempotent, so an existing worktree is reconciled in place. The `start`
+> JSON report records the outcome under `node_modules` (`link_created`) and
+> `shared_resolution` / `shared_resolution_ok`.
+>
+> **Stale-resolution failure signature.** If a worktree changes
+> `packages/shared/src/**` while `@worklog/shared` still resolves to the main
+> checkout's `packages/shared` (a pre-link-farm worktree, a missing farm, or
+> a stale one), the gate tests the wrong code:
+>
+> - **false red** — a correct new shared export is invisible; a test that
+>   spies on it fails with “spy never called” (the WL-0MVK6S4HM005GBCO
+>   symptom);
+> - **false green** — a broken shared change still passes.
+>
+> `implement.py finish` now **fails closed** in this case (after the build,
+> before the test gate) with a message naming the stale
+> `<main-checkout>/packages/shared/dist` path and the remediation: re-run
+> `implement.py start <work-item-id>` from the main checkout to refresh the
+> link farm, then rebuild and re-run `finish` (SA-0MVPI41SR008JYXL). Repos
+> without a workspace shared package no-op.
+>
+> **Do NOT run `npm install` inside a worktree** — writes pass through the
+> farm into the shared install and corrupt it, and the link farm needs no
+> install. A branch that changes `package.json` still resolves the main
+> checkout's dependencies; reinstall in the main checkout if that matters.
+>
+> **The manual `rsync` workaround is superseded.** Copying a worktree's
+> `packages/shared/dist` into the main checkout mutates the `dist` that the
+> live `wl` CLI and every concurrent worktree execute (the
+> WL-0MQRBT8BS00355AB incident class) and is no longer needed: the link farm
+> makes the worktree's own build visible to its gate.
 
 > **Git submodules are auto-initialised:** `implement.py start` runs
 > ``git submodule update --init --recursive`` inside the new worktree (SA-0MSN52GGN002B0AZ).
@@ -645,6 +765,18 @@ See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 python3 $(skill_path implement)/scripts/implement.py drive <parent-id>
 ```
 
+Pane-driving flags and variables (opt-in; headless `pi -p` stays the
+default for every caller that does not opt in):
+
+| Flag / variable | Effect |
+|---|---|
+| `--pane-sessions` | Drive each child as an interactive Pi TUI agent in a sibling Herdr pane of the calling tab. Requires Herdr (`HERDR_ENV=1` **and** a resolvable herdr binary). |
+| `--no-pane-sessions` | Force the headless `pi -p` spawner; wins over an ambient `IMPLEMENT_DRIVE_PANE_SESSIONS=1`. |
+| `IMPLEMENT_DRIVE_PANE_SESSIONS=1` | Environment equivalent of `--pane-sessions` (for a repeated/scripted drive). |
+| `--focus` / `--no-focus` | Whether each new child pane takes focus (**default `--no-focus`**: driving an epic never moves the operator's focus). |
+| `IMPLEMENT_DRIVE_ACTIVE=1` | Set by the driver on the child session (recursion guard; it also defers that child's worktree removal to the driver). |
+| `IMPLEMENT_WORKTREE_PATH` | Set on the child session to its own worktree root, so the child can verify where it writes. |
+
 `phase_drive()` loops over `phase_parent` reports and, for every startable
 child, spawns a **fresh Pi session** (`pi -p "/skill:implement <child>"`) in
 that child's own worktree, waits for it to exit, then continues. A single
@@ -657,10 +789,69 @@ each child keeps its own clean context window and its own worktree. Options:
 infrastructure-refusal `finish` retries on a separate budget with backoff,
 `--child-timeout S` (default 3600),
 `--finalise-stranded` (opt-in, evidence-gated finalisation of stranded
-children — see below). When no Pi executable is available it stops with
-actionable manual instructions rather than silently skipping a child
-(`IMPLEMENT_DRIVE_PI_BIN` overrides the binary). A driven session is marked
-`IMPLEMENT_DRIVE_ACTIVE=1` and refuses to re-enter `drive`.
+children — see below), and `--pane-sessions` / `--no-pane-sessions` with
+`--focus` / `--no-focus` (default `--no-focus`). When no Pi executable is
+available it stops with actionable manual instructions rather than silently
+skipping a child (`IMPLEMENT_DRIVE_PI_BIN` overrides the binary). A driven
+session is marked `IMPLEMENT_DRIVE_ACTIVE=1` and refuses to re-enter `drive`.
+
+**Pane transport (opt-in, fail-open).** With `--pane-sessions` (or
+`IMPLEMENT_DRIVE_PANE_SESSIONS=1`) **and** Herdr detected (`HERDR_ENV=1` plus a
+resolvable herdr binary), each child is instead driven as an interactive Pi TUI
+agent in a sibling pane of the calling tab: `herdr pane split --current --cwd
+<child worktree>` → `herdr agent start … -- --approve --no-extensions` →
+`herdr agent prompt … "/skill:implement <child>" --wait`. The child pane gets
+`IMPLEMENT_DRIVE_ACTIVE=1` and `IMPLEMENT_WORKTREE_PATH` but never the driving
+session's `PI_SESSION_ID` / `PI_SESSION_FILE`. Focus never moves unless
+`--focus` is passed. Without Herdr or without the opt-in, drive uses the
+headless `pi -p` spawner unchanged — so automated callers (downtime worker,
+audit dispatch, CI) are unaffected. Child terminality is still decided by the
+next `phase_parent` stage re-read, never by process exit.
+
+**A driven pane is closed or retained — never leaked
+(SA-0MVPHZ1CI0045QR0).** The agent's settled state
+(`agent prompt … --wait --until done --until blocked`) is a fast-path signal,
+not the verdict: once the next `phase_parent` re-read confirms the child is
+terminal, the pane is closed (`pane close <id>`). A pane whose child the parent
+still sees non-terminal is kept, titled ⚠️ and listed in
+`report["retained_panes"]` with its `herdr pane read <id>` remedy. An agent
+that reports `blocked` **stops the chain**: `blocked_child` / `blocked_pane`
+are recorded, the pane is **deliberately left open for inspection** and titled
+🚫, and the message names it. A timeout closes the pane (after reconciling the
+child's real stage) and stops the chain; any other failed session keeps its
+pane as evidence.
+Completion is never inferred from process exit. Every `children_driven` entry
+carries `transport` and `pane_id` (`None` for the headless transport), and the
+human summary lists retained panes with their inspection remedy.
+
+**Worked example — driving an epic in a Herdr tab.** From a Pi session running
+in a Herdr pane, in the epic's project:
+
+```bash
+python3 $(skill_path implement)/scripts/implement.py drive SA-0MVLKHY27005UK40 --pane-sessions
+```
+
+What the operator sees: one sibling pane opens to the **right** of the calling
+pane for each child (never a new tab or workspace), running an interactive Pi
+TUI agent named `drive-<child-id>`; focus stays in the invoking pane because
+the default is `--no-focus`. The invoking pane prints a `transport: pane, pane
+<id>` line per driven child, and closes that child's pane once the next
+`phase_parent` re-read confirms the child is terminal.
+
+A child agent that settles **`blocked`** needs a human decision: the chain
+stops, `report["blocked_child"]` / `report["blocked_pane"]` name it, the pane
+is **left open** and titled 🚫, and the message names the pane to look at. Read
+it with the reported remedy:
+
+```bash
+herdr pane read <pane_id>     # retained_panes[].remedy prints this exact command
+```
+
+After intervening (answering in that pane, or resolving the blocker with
+`wl`), re-run the **same** `drive` command. Terminal children are skipped and
+the chain resumes at the first child with work left; a pane session that is
+still alive holds its child's per-child lock, so the re-run reports that child
+as `skipped-held` (naming the holder) instead of racing it.
 
 **The driver owns the child's worktree (SA-0MVTE8XAJ002IUDR).** A driven
 child's `finish` defers worktree removal (the tree is that session's own cwd,
@@ -826,7 +1017,9 @@ the parent reports all children terminal. Each child is implemented in its
 own worktree (never the main checkout); sequential children reuse/rotate the
 `.worklog/worktrees` machinery. (With `drive` this loop is performed for you;
 the driven child session may call `finish` for its own item — `start` resumes
-the pre-created worktree idempotently.)
+the pre-created worktree idempotently from **either** `cwd` — the main
+checkout or inside the worktree — because the default worktree path is
+resolved against the main checkout root, not `cwd`.)
 
 **Single-pass, subprocess-isolated orchestration.** Every child's start and
 finish runs through `_invoke_implement` — a **separate `implement.py`
@@ -980,6 +1173,18 @@ See ``../refactor/SKILL.md``.
 
 9. Commit, Push to dev and mark in_review
 
+> **Ordering contract (SA-0MVXUSK02003ZMDN).** `finish` returns only when the
+> run is **fully complete**: it performs the read-only post-push verification,
+> the completion comment and (unless deferred) the worktree removal *before*
+> the terminal write, and the terminal `completed`/`in_review` write plus the
+> assignee release are its **last lifecycle action** (design A,
+> SA-0MVXUSED6008J04R). The item stays `in_progress` with the assignee held
+> for that whole window, so the herdr downtime dispatcher can never dispatch
+> an audit that races a still-running implement run. Do **not** perform a
+> lifecycle-relevant step after `finish` returns; only the non-lifecycle
+> worktree cleanup and the end-of-session report remain. Full contract:
+> [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md#finalisation-ordering-and-the-audit-dispatch-hold-sa-0mvxusk02003zmdn).
+
 - **Plain leaf flow — run the finish with the deferral flag:**
 
   ```bash
@@ -988,7 +1193,8 @@ See ``../refactor/SKILL.md``.
 
   `--keep-worktree` (or `IMPLEMENT_KEEP_WORKTREE=1`) defers `finish`'s own
   worktree removal, so the worktree — this session's cwd — survives for the
-  worklog comment, the end-of-session report and the post-push verification.
+  end-of-session report (the completion comment and the post-push
+  verification already ran inside `finish`, before the terminal write).
   The session then removes it itself with `implement.py cleanup <work-item-id>`
   as its **last** bash command (see
   [Worktree removal ownership](#worktree-removal-ownership-sa-0mvte8xaj002iudr)
@@ -996,9 +1202,11 @@ See ``../refactor/SKILL.md``.
   at the end of this file). Driven child sessions never pass the flag:
   `IMPLEMENT_DRIVE_ACTIVE=1` defers automatically and `implement.py drive`
   removes the tree after the session exits. `finish` itself builds, tests,
-  commits, pushes to `dev` and marks the item `in_review`; the manual steps
-  below are the reference for what it does.
+  commits, pushes to `dev`, runs the read-only post-push verification and
+  marks the item `in_review`; the manual steps below are the reference for
+  what it does, in the order it does them.
 - Follow the mandatory build → test → commit order before committing.
+- **Add the `## Impact` sentence before finishing.** The description of a newly completed item must carry an `## Impact` section: one sentence describing the user-experience impact — what a user can now do, see, or stop worrying about — phrased for a non-technical reader, not as a technical summary of what was built. `finish` advances the item to `in_review`, so write the sentence before running it. Standup reports quote it verbatim. The convention, together with the intentional no-retrofit rule for already-completed items, is stated in `AGENTS_GLOBAL.md`.
 - **Do NOT create a Pull Request to `main`** — work is integrated into `dev`; the `dev`→`main` promotion is handled by the release process.
 - Push the feature branch into `dev` via the ship skill (`pushToDev()` from `$(skill_path ship)/scripts/ship.js`, preferred) or `git push origin HEAD:refs/heads/dev`. `dev` is **not** protected; only `main`, `master`, `HEAD` are blocked.
 
@@ -1009,6 +1217,43 @@ See ``../refactor/SKILL.md``.
   > `WORKLOG_SKIP_PRE_PUSH=1 git push origin HEAD:refs/heads/dev`. Nothing is
   > lost by skipping the sync at push time — the main checkout syncs the data
   > on its own pushes.
+
+  > **The dev push runs from the worktree (SA-0MVTFMB7K002Y1F3).** `finish`
+  > launches `git push` from the **worktree that holds the pushed commit**, on
+  > the first attempt and the non-fast-forward retry, so the pre-push
+  > full-suite gate resolves its project root with
+  > `git rev-parse --show-toplevel` in the pushed tree — the main checkout's
+  > working tree is never the gate's subject. A pre-push subject guard **fails
+  > closed** (`PushSubjectMismatchError`, naming the commit, branch, worktree
+  > and actual `HEAD`) when the worktree cannot hold the pushed commit, instead
+  > of pushing from a checkout holding a different commit. On success the hook's
+  > `stderr` is logged and one
+  > `dev-push gate evidence: root=… head=… pushed=… full-suite=<cached|executed|no-evidence>`
+  > line is emitted (also in `report["steps"]["push"]["gate_evidence"]`); the
+  > hook's `mirror_suite_cache` copies the worktree's cache entries into the
+  > main checkout's `.worklog/cache` so the pushed commit's green full-suite
+  > entry stays visible to post-push verification and the audit. The mirroring
+  > is behaviour of the **canonical pre-push hook template** shipped by the
+  > `worklog` package (`PRE_PUSH_HOOK_CONTENT`, emitted by `wl init` and kept
+  > current by `wl doctor upgrade`) — not a repository-local patch, so
+  > `wl doctor upgrade --dry-run` reports `pending: []` and `--confirm` never
+  > replaces the capability.
+
+  > **The gate's subject is the pushed commit (SA-0MVTRBT50005DUEH).**
+  > `.githooks/pre-push` forwards git's `<local_sha>` as
+  > `run_tests.py --gate-commit <sha>`; the runner resolves a checkout whose
+  > `HEAD` is that commit with **no dirty paths** (the push cwd when it
+  > qualifies — the normal `finish` path — else any clean
+  > `git worktree list` checkout), runs/caches the full suite there, and
+  > **refuses the push** (exit 2, naming the commit and `TEST_SCOPE_SKIP=1`)
+  > when no clean checkout holds it. So "the dev push succeeded" means the
+  > full suite ran against what landed: a green `scope: full` cache entry for
+  > any other state (the main checkout's `HEAD` plus its dirty `.worklog/`
+  > churn, or another commit) cannot satisfy the gate. The runner emits
+  > `run_tests: gate-subject` / `gate-root` / `gate-verdict` lines on stderr
+  > (echoed by the hook) naming the validated checkout, its `git_state`,
+  > `fingerprint_kind` and executed-vs-cached; the hook mirrors the entry from
+  > the checkout actually gated, not merely from the push cwd.
 
 - **Post-push local parent sync (SA-0MUGX1DIT000M7S1).** `implement.py finish`
   fast-forwards the main checkout's **local parent branch** (`dev`) to the
@@ -1042,9 +1287,8 @@ See ``../refactor/SKILL.md``.
   - **Plain leaf flow** — the session removes its own tree with
     `implement.py cleanup <work-item-id>` as its **last** bash command (see
     the [final cleanup step](#final-cleanup-step-remove-the-retained-worktree-plain-leaf-sessions)
-    below), after the worklog comment, the end-of-session report and the
-    post-push verification. After that command no bash works in the session
-    (the cwd is gone by design).
+    below), after the end-of-session report. After that command no bash works
+    in the session (the cwd is gone by design).
   - **Driven child session** (`IMPLEMENT_DRIVE_ACTIVE=1`) — **do not remove
     your own worktree:** `implement.py drive` removes it once this session
     has exited (terminal child, clean tree only, SA-0MVTE8XAJ002IUDR).
@@ -1074,38 +1318,41 @@ See ``../refactor/SKILL.md``.
   and [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md#worktree-removal-ownership).
 
   > **Why rebuild?** `dist/` is gitignored; `git pull` does not update it. See [[concepts/git-worktree-best-practices-for-agent-workflows]].
-- Add a work-item comment with the commit hash: `wl comment add <work-item-id> --comment "Completed work pushed to dev, see commit <hash>." --author "<AGENT>" --json`
+- **The completion comment is posted by `finish` before the terminal write**
+  (commit hash, branch, verdict provenance, retained tree), so no separate
+  post-`finish` comment is required. A manual comment added after `finish`
+  returns bumps `updatedAt` on an already-audit-ready item and can invalidate
+  a fresh audit's freshness window — avoid it; if you must record context, do
+  so before the audit is persisted.
 
   > **Ordering vs. audit persistence (SA-0MTHC710X003ORZM):** when closing an audited work item, do NOT add a post-audit comment *after* the audit has been persisted (`wl audit-set` / `persist_audit.py`). A `wl comment add` bumps `workItem.updatedAt` (via `touchWorkItemUpdatedAt()`); if that bump falls after `auditedAt` it can invalidate the runner's 60 s freshness gate and the TUI shows a stale icon (⏳) on a passed audit. Record any audit-result commentary **before** calling `persist_audit.py`, or rely on the persisted audit report itself as the record — the runner's `_apply_terminal_lifecycle` plus the audit skill's Persistence Procedure ordering contract already cover this (see the audit skill docs and `$(skill_path audit)/scripts/audit_runner.py:_check_audit_freshness` / `persist_audit.py:_run_audit_text_update`).
 - Close your response with: `<work-item-id>: <concise-summary>\n\nWork committed to dev`
 
   > **Parent/epic items already advanced at Step 6.1:** skip the status update.
-  > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`
+  > **Manual (leaf items, or parents not yet advanced):** mark `in_review` (do **NOT** close): `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`. `finish` already performs this terminal write as its last lifecycle action, so run it manually only when `finish` was not used — never as a step *after* `finish` returns.
 
   > The item stays `in_review` until release promotes `dev` to `main` (see `../ship/SKILL.md`).
 
-- **Read-only post-push verification (belt-and-suspenders, post-push,
-  post-`in_review`):** verify, WITHOUT executing a suite, that the full
-  suite is green at the exact pushed commit. The dev-push pre-push hook ran
-  it moments ago (full suite, `--scope full`) and cached it in the
-  main-checkout `.worklog/cache`; this step asserts that green entry exists
-  (SA-0MVECQUGF0064U81):
+- **Read-only post-push verification (inside `finish`, before the terminal
+  write — SA-0MVXUSK02003ZMDN):** `finish` verifies, WITHOUT executing a
+  suite, that the full suite is green at the exact pushed commit. The dev-push
+  pre-push hook ran it moments ago (full suite, `--scope full`) and cached it;
+  the verification resolves the cache entry for the pushed tree
+  (SA-0MVECQUGF0064U81). `green` or `not_applicable` permits the terminal
+  write; `red` or `missing` **refuses** it — `finish` releases the item to
+  `open`, retains (never reverts) the pushed commit, records the refusal on
+  the work item and routes the failure to triage (SA-0MVXUSJ2P009T97H AC4).
+  The session does **not** run this check again after `finish` returns.
 
-  ```bash
-  python3 $(skill_path test)/scripts/run_tests.py --summary --suite all --json
-  ```
-
-  - A `missing` result means no cached full-suite entry exists for HEAD
-    (e.g. TTL expired or the push bypassed the hook) — then, and only then,
-    run the suite to generate the evidence:
-    `python3 $(skill_path test)/scripts/run_tests.py --scope full --json`
-    (or `/skill:test`).
-  - A non-green summary (cached failures) or a genuinely failing run →
-    triage helper:
+  - **If `finish` refused on the verification**, generate the evidence through
+    the test skill and re-run `finish` (idempotent — the no-diff path
+    converges):
+    `python3 $(skill_path test)/scripts/run_tests.py --scope full` then
+    `python3 $(skill_path implement)/scripts/implement.py finish <work-item-id>`.
+  - A genuinely failing suite → triage helper:
     `python3 $(skill_path triage)/scripts/check_or_create.py
     '{"test_name":"<name>", "stdout_excerpt":"...", "stack_trace":"...",
-    "parent_work_item_id":"<this-work-item-id>"}'` → fix → re-run.
-  - All green → close your response.
+    "parent_work_item_id":"<this-work-item-id>"}'` → fix → re-run `finish`.
   - **Parent/epic runs:** parent/epic items are validated per child at each
     child's Step 9; the parent itself is covered by the per-child test runs
     at Step 6.1.
@@ -1114,7 +1361,9 @@ Finish lock, verified sync and refusal recovery
 -----------------------------------------------
 
 `finish`'s main-checkout critical section — commit → local `dev` fast-forward
-→ push → worktree removal → post-push parent-branch sync — is serialised by a
+→ push → ancestry assertion → read-only post-push verification → worktree
+removal → post-push parent-branch sync → completion comment → terminal write —
+is serialised by a
 **per-repository exclusive advisory lock**
 (`<main-checkout>/.worklog/locks/main-checkout.lock`,
 `$(skill_path shared)/repo_lock.py`). `start`'s pre-worktree parent-branch refresh
@@ -1238,8 +1487,9 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 |-------|-----------|--------|-------|
 | Claim (Step 1) | `update_status(id, "in_progress", assignee="<AGENT>")` / `phase_start()` (status-only; stage unchanged) | in_progress | unchanged |
 | Epic/parent all children done (5.1) | `update_status(id, "completed", stage="in_review", assignee="")` | completed | in_review |
-| Final (Step 9) | `with StatusLifecycle(id, assignee="<AGENT>", target_stage="in_review"):` / `phase_finish()` (release is the helper's default) | completed | in_review |
+| Final (Step 9) | `with StatusLifecycle(id, assignee="<AGENT>", target_stage="in_review"):` / `phase_finish()` (release is the helper's default). The terminal write is the run's **last lifecycle action**: the read-only post-push verification, the completion comment and the (non-deferred) worktree removal precede it (SA-0MVXUSK02003ZMDN) | completed | in_review |
 | Abort (dirty/gate/user/error/termination) | `update_status(id, "open", assignee="")` via `phase_abort()` (error: context manager restores original; termination: final cleanup resets) | open | unchanged |
+| Interrupted after the commit/push (signal or failure before the terminal write) | `_safety_reset_if_in_progress()` / the failure handler's `update_status(id, "open", assignee="")`, plus one deduplicated `Run interrupted:` record naming the commit and resume command (SA-0MVXUSJJY009HMQ0) | open | unchanged |
 
 > **All abort/failure transitions reset to `open` and clear the assignee.** Never leave a work item in `in_progress` unless actively implementing; never leave a completed or released item on an assignee hold.
 
@@ -1247,8 +1497,8 @@ Before exiting at any point, `wl show <work-item-id> --json`; if `status: in_pro
 
 `<worktree>/.implement_state.json` carries `repo_root`, and it always means the
 **main checkout root** — never the worktree, never a path inside it. Every
-consumer acts on the main checkout: the `dev` fast-forward and push in
-`finish`, the parent-branch sync, the signal handler's `_restore_repo_state`,
+consumer acts on the main checkout: the `dev` fast-forward in `finish`, the
+parent-branch sync, the signal handler's `_restore_repo_state`,
 and `_remove_worktree(..., repo_root=…)`, whose safety gate refuses a path that
 resolves to `repo_root`. A worktree recorded as `repo_root` therefore makes
 `finish` raise `REFUSE to remove the repository root` *after* a successful push
@@ -1391,9 +1641,8 @@ re-summarize the report in a different format — the report is the summary. Whe
 
 A plain leaf session that ran `implement.py finish <work-item-id> --keep-worktree`
 (or exported `IMPLEMENT_KEEP_WORKTREE=1`) owns the removal of its own
-worktree — no one else will do it. Run it after the worklog comment, the
-end-of-session report above and the post-push verification, as the session's
-**very last** bash command:
+worktree — no one else will do it. Run it after the end-of-session report
+above, as the session's **very last** bash command:
 
 ```bash
 python3 $(skill_path implement)/scripts/implement.py cleanup <work-item-id> --json
@@ -1401,10 +1650,11 @@ python3 $(skill_path implement)/scripts/implement.py cleanup <work-item-id> --js
 
 This must be the session's **last** bash command: `cleanup` deletes the tree
 this session stands in (its cwd), so every later bash call would fail with
-`Working directory does not exist` — which is why the comment, the report and
-the verification all come **first**. After `cleanup` returns you may still
-render the final response text (that is not a bash command), but you cannot
-run another command.
+`Working directory does not exist` — which is why the report comes **first**.
+After `cleanup` returns you may still render the final response text (that is
+not a bash command), but you cannot run another command. The post-push
+verification is not repeated here: it already ran inside `finish`, before the
+terminal write (SA-0MVXUSK02003ZMDN).
 
 **When `cleanup` reports `retained_dirty` or `retained_non_terminal`:** the
 tree was kept on purpose — never force it (the action has no force switch).

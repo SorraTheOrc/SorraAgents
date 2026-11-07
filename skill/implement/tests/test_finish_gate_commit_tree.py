@@ -43,6 +43,7 @@ from __future__ import annotations
 import contextlib
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -200,6 +201,11 @@ def _stubbed_finish_boundaries(repo: Path, tmp_path: Path):
         stack.enter_context(
             patch.object(implement, "git_push_to_dev", return_value=True)
         )
+        # The push subject is the synthetic hash ``abc1234`` in this harness, so
+        # the worktree-holding guard (SA-0MVUTXJ4300301ZN) is stubbed like the
+        # push itself; it has dedicated coverage in
+        # ``skill/implement/tests/test_implement_push_from_worktree.py``.
+        stack.enter_context(patch.object(implement, "_assert_push_subject"))
         stack.enter_context(patch.object(implement, "run_cmd", side_effect=_fake_run_cmd))
         stack.enter_context(
             patch.object(
@@ -217,6 +223,29 @@ def _stubbed_finish_boundaries(repo: Path, tmp_path: Path):
         )
         stack.enter_context(patch.object(implement, "wl_add_comment", return_value=True))
         stack.enter_context(patch.object(implement, "_surface_postfix_prose"))
+        # The post-push verification (design A, SA-0MVXUSJ2P009T97H) queries
+        # the test cache read-only for the pushed tree. This harness models
+        # the pre-push gate's cached green entry; the verification's own
+        # verdict/refusal semantics are covered by
+        # ``test_finish_finalisation_ordering.py``.
+        stack.enter_context(
+            patch.object(
+                implement,
+                "query_cached",
+                return_value={
+                    "stdout": "1 passed",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "completed_at": time.time(),
+                    "command": implement.PYTEST_CMD,
+                    "git_state": "stub-git-state",
+                    "fingerprint_kind": "worktree",
+                    "scope": "full",
+                    "test_type": "full",
+                    "cached": True,
+                },
+            )
+        )
         stack.enter_context(
             patch.object(implement.StatusLifecycle, "update_status", MagicMock())
         )

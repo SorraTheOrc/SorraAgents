@@ -32,3 +32,10 @@ anti-patterns **Self-Referential Simulations** (a Gym Scene test re-implementing
 game logic instead of exercising production code) and **Duplicates of Existing
 Core Coverage** (a Gym Scene test re-testing behaviour already covered by a
 core game test).
+
+## Work-item completion conventions
+
+- **`## Impact` is required on newly completed items.** Before advancing a work item to `in_review`, add an `## Impact` section to its description: **one sentence describing the user-experience impact** — what a user can now do, see, or stop worrying about — not a technical summary of what was built. Standup reports quote it verbatim.
+- **Existing completed items are deliberately not retrofitted.** The convention applies to items completed from now on.
+
+The canonical wording lives in `AGENTS_GLOBAL.md` (installed as `~/.pi/agent/AGENTS.md`).

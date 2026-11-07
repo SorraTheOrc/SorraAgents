@@ -224,6 +224,45 @@ class TestProposeRemediations(unittest.TestCase):
         )
         self.assertTrue(any(a["action"] == "renice" for a in actions))
 
+    def test_multi_agent_profile_has_no_critical_pressures(self):
+        """AC6: recalibrated metrics produce no spurious critical pressures."""
+        metrics = {
+            "load_average": {"value": 8.0, "status": "low", "description": "load"},
+            "cpu_pressure": {"value": 11.58, "status": "low", "description": "cpu"},
+            "memory_pressure": {"value": 0.0, "status": "low", "description": "mem"},
+            "io_pressure": {"value": 0.03, "status": "low", "description": "io"},
+            "memory_usage": {"value": 35.0, "status": "low", "description": "mem"},
+            "swap_usage": {"value": 69.0, "status": "low", "description": "swap"},
+            "runnable_processes": {"value": 18, "status": "low", "description": "run"},
+            "process_count": {"value": 560, "status": "low", "description": "procs"},
+            "thread_count": {"value": 2250, "status": "low", "description": "threads"},
+            "zombie_processes": {"value": 0, "status": "low", "description": "none"},
+            "stale_lock_files": {"value": 0, "status": "low", "description": "none"},
+            "rss_breakdown": {"value": []},
+        }
+        pressures = pa.analyze_pressures(metrics, ancestry_fn=_stub_ancestry)
+        self.assertEqual(pressures, [])
+        actions = pa.propose_remediations_from_metrics(metrics, pressures)
+        self.assertFalse(any(
+            a["target"].get("scope") == "stale-lock-files" for a in actions
+        ))
+        self.assertFalse(any(a["action"] == "prune" for a in actions))
+
+    def test_kernel_locks_are_excluded_upstream_of_prune(self):
+        """AC6: zero *genuinely* stale locks means no stale-lock prune."""
+        # metrics._detect_stale_devices filters kernel-owned ALSA locks, so the
+        # stale_lock_files count is 0 on a healthy host.
+        metrics = _metrics(
+            stale_lock_files={
+                "value": 0, "status": "low",
+                "description": "Stale lock files in /var/lock: 0",
+            }
+        )
+        actions = pa.propose_remediations_from_metrics(metrics)
+        self.assertFalse(any(
+            a["target"].get("scope") == "stale-lock-files" for a in actions
+        ))
+
 
 # ---------------------------------------------------------------------------
 # rank_actions

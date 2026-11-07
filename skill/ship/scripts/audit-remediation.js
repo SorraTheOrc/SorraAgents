@@ -23,8 +23,23 @@
  * @module audit-remediation
  */
 
-/** Default per-item remediation runner timeout (30 min). */
-export const DEFAULT_REMEDIATION_TIMEOUT_MS = 1_800_000;
+/**
+ * Default per-item remediation runner timeout (29 min).
+ *
+ * **Right-sized against the total budget, from measurement
+ * (WL-0MW32YZP7005LZ5B).** The measured Phase-2 deep-analysis p90 is
+ * 1,085-1,116 s and the Phase-2 per-call budget is 2,400 s (see
+ * `skill/audit/scripts/audit_runner.py` -> `CALL_PI_TIMEOUT`), so a per-item
+ * cap materially below the 30 min gate budget would kill legitimate audits.
+ * The cap is therefore `DEFAULT_REMEDIATION_BUDGET_MS - 60,000` (29 min):
+ * strictly **below** the total budget, so one attempt that overruns can never
+ * consume the whole gate budget — the 1865s-of-1800s incident, where the two
+ * defaults were equal and the 65 s overrun left nothing. Every attempt is
+ * further clamped to the budget's remaining wall clock
+ * ({@link RemediationBudget.clampedTimeoutMs}), so an attempt after a partial
+ * spend is bounded by what is actually left.
+ */
+export const DEFAULT_REMEDIATION_TIMEOUT_MS = 1_740_000;
 /** Default total wall-clock remediation budget per gate run (30 min). */
 export const DEFAULT_REMEDIATION_BUDGET_MS = 1_800_000;
 /** Default maximum number of in-gate remediation attempts per gate run. */
@@ -171,6 +186,22 @@ export class RemediationBudget {
   /** @returns {boolean} Whether another remediation attempt is allowed. */
   canAttempt() {
     return !this.exhausted;
+  }
+
+  /**
+   * Clamp a per-item timeout to the wall clock still remaining in the budget.
+   *
+   * A per-item timeout larger than what is left would let one attempt consume
+   * more than the budget reserved for the whole gate run (the
+   * 1865s-of-1800s incident). Every attempt therefore gets
+   * `min(perItemTimeoutMs, remainingMs)`; a fresh budget allows the full
+   * per-item timeout.
+   *
+   * @param {number} perItemTimeoutMs - Configured per-item timeout (ms).
+   * @returns {number} The timeout to apply to this attempt (ms).
+   */
+  clampedTimeoutMs(perItemTimeoutMs) {
+    return Math.min(perItemTimeoutMs, this.remainingMs);
   }
 
   /** Record a completed (or attempted) remediation run. */

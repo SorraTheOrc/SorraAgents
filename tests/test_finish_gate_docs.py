@@ -36,8 +36,9 @@ for _path in (str(_REPO_ROOT), str(_REPO_ROOT / "skill")):
     if _path not in sys.path:
         sys.path.append(_path)
 
-from skill.implement.scripts import implement
 from test_cache import FINGERPRINT_KIND_TREE, FINGERPRINT_KIND_WORKTREE
+
+from skill.implement.scripts import implement
 
 _IMPLEMENT_DOC = _REPO_ROOT / "docs" / "dev" / "implement-skill-reference.md"
 _TEST_SKILL_DOC = _REPO_ROOT / "docs" / "dev" / "test-skill-reference.md"

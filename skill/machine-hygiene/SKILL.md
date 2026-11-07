@@ -44,12 +44,12 @@ classified as **low** (green), **warning** (amber), or **critical** (red):
 | Memory pressure | `/proc/pressure/memory` | `full` avg10 (% of time *all* tasks stalled on memory) | Percentage thresholds (`memory_pressure`) |
 | I/O pressure | `/proc/pressure/io` | `full` avg10 (% of time *all* tasks stalled on I/O) | Percentage thresholds (`io_pressure`) |
 | Free memory | `/proc/meminfo` | — | Percentage thresholds (`memory_usage`) |
-| Swap usage | `/proc/meminfo` | — | Percentage thresholds (`swap_usage`) |
-| Process count | `/proc` scan | — | Core-count multiplier |
-| Thread count | `/proc` scan | — | Core-count multiplier |
+| Swap usage | `/proc/meminfo` | — | Percentage thresholds (`swap_usage`), gated on current memory pressure (see below) |
+| Process count | `/proc` scan | — | Core-count multiplier (`process_count`: warn `cores*48`, crit `cores*96`) |
+| Thread count | `/proc` scan | — | Core-count multiplier (`thread_count`: warn `cores*160`, crit `cores*320`) |
 | Per-command RSS (top 10) | `/proc/[pid]/status` | — | Absolute RSS bytes |
-| Runnable processes | `/proc` state scan | — | Core-count multiplier |
-| Stale devices | Zombie + lock detection | — | Absolute count |
+| Runnable processes | `/proc` state scan | — | Core-count multiplier (`runnable_processes`: warn `cores*2`, crit `cores*4`) |
+| Stale devices | Zombie + validated `/var/lock` scan | — | Absolute count of *genuinely* stale locks (see below) |
 
 ### Pressure stall (PSI) semantics
 
@@ -91,6 +91,54 @@ are inherited from the pre-parser-fix configuration and have not yet been
 validated against real stall data; `memory_pressure` (5/20) is a starting
 calibration for `full`-line semantics. Tune them in `config.yaml` from
 observed runs.
+
+#### Multi-agent host calibration (process and thread counts)
+
+`process_count` and `thread_count` have their **own** blocks; neither reuses
+the `runnable_processes` scheduler thresholds. A herdr multi-agent host runs
+16–21 concurrent pi sessions, and each session plus its test/build children
+legitimately contributes dozens of processes and ~100+ threads:
+
+- `process_count`: warn `cores * 48`, crit `cores * 96`. On a 16-core host:
+  768 / 1536 — a busy 560-process host is green; >1536 is critical.
+- `thread_count`: warn `cores * 160`, crit `cores * 320`. On a 16-core host:
+  2560 / 5120 — ~2250 threads is green; >5120 is critical.
+
+Both blocks are independently overridable in `config.yaml`, so a thread-heavy
+host can be retuned without loosening the process alarm (and vice versa).
+This recalibrates the alarm rather than disabling it: values above each
+critical multiplier still classify `critical`.
+
+#### Stale-lock validation (`/var/lock`)
+
+Each regular file in `/var/lock` is validated before it can count as stale:
+
+1. **Kernel-owned boot locks** (`asound.state.lock`, `card0.lock`,
+   `card1.lock`, `card2.lock` — ALSA locks created at boot) are never stale.
+2. **Ownership** — root-owned lock files are system/operator-managed and are
+   never reported as stale.
+3. **Age** — a lock touched within the last 24 h is treated as active.
+4. **Owning-process liveness** — when the lock file records a bare PID, a
+   live PID means the lock is held; only a dead PID (with age and ownership
+   satisfied) is stale.
+
+Only genuinely stale locks increment `stale_lock_files` and feed the
+pressure-analysis prune proposal. `actions.py` additionally refuses to
+remove stale locks automatically ("stale lock removal is
+operator-managed"), as defence in depth, so a misclassified lock is never
+removed.
+
+#### Swap/memory cross-check
+
+`swap_usage` is a **historical** figure: swap accumulates over days of paging
+and stays occupied after pressure has passed. Swap occupancy therefore only
+warns when memory is under *current* pressure — `memory_usage` at/above its
+warning threshold, or the PSI `memory_pressure` (`full` avg10) at/above its
+warning threshold. A warning-level swap reading is escalated to `critical`
+when `memory_usage` is critical. If PSI memory data is unavailable, the
+capacity figure (`memory_usage`) is the sole signal (graceful degradation).
+This is why a host at 69 % swap with 35 % RAM and no memory stalls now reads
+green instead of warning.
 
 ### Step 2 — Pressure Analysis
 
@@ -153,8 +201,11 @@ for documented defaults and descriptions.
 Each pressure metric has its own block: `cpu_pressure`, `memory_pressure`
 and `io_pressure` apply to the `avg10` value of the PSI line named in the
 metric table above; `memory_usage` and `swap_usage` are `/proc/meminfo`
-percentages. Threshold provenance and the `some` vs `full` rationale are
-documented both above and in `config.yaml`.
+percentages; `process_count`, `thread_count`, `runnable_processes` and
+`load_average` are core-count multipliers. Threshold provenance, the
+`some` vs `full` rationale, the multi-agent calibration, stale-lock
+validation and the swap/memory cross-check are documented both above and in
+`config.yaml`.
 
 ## Exit Codes
 

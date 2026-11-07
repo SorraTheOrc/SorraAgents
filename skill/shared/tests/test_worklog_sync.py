@@ -53,7 +53,7 @@ class TestIfIdleSingleFlight:
 
     def test_issues_if_idle_sync(self):
         runner, calls = _recording_runner(_proc())
-        result = sync_worklog(runner=runner)
+        result = sync_worklog(runner=runner, reap_stale_claims=False)
 
         assert result["status"] == "synced"
         assert len(calls) == 1
@@ -122,6 +122,56 @@ class TestNoWorklogContext:
         result = sync_worklog()
 
         assert result == {"status": "skipped", "reason": "no worklog context"}
+
+
+class TestStaleClaimReaperHook:
+    """The sync path is where the TTL-bounded stale-claim reaper runs.
+
+    Hooking the reaper here makes it reachable without any herdr/ContextHub
+    change (SA-0MW0F91KN004J06U AC3), and the hook is best-effort: it can
+    never downgrade a successful sync.
+    """
+
+    def test_runs_by_default_after_a_successful_sync(self):
+        runner, calls = _recording_runner(_proc())
+
+        result = sync_worklog(runner=runner)
+
+        assert result["status"] == "synced"
+        assert result["reaper"]["success"] is True
+        assert result["reaper"]["released_count"] == 0
+        # The first command is the sync; the sweep follows it.
+        assert "sync" in calls[0]
+        assert any("list" in call for call in calls[1:])
+
+    def test_can_be_disabled_per_call(self):
+        runner, calls = _recording_runner(_proc())
+
+        result = sync_worklog(runner=runner, reap_stale_claims=False)
+
+        assert "reaper" not in result
+        assert len(calls) == 1
+
+    def test_environment_switch_disables_the_hook(self, monkeypatch):
+        monkeypatch.setenv("WORKLOG_CLAIM_REAPER", "0")
+        runner, calls = _recording_runner(_proc())
+
+        result = sync_worklog(runner=runner)
+
+        assert "reaper" not in result
+        assert len(calls) == 1
+
+    def test_a_reaper_failure_never_downgrades_the_sync(self):
+        def runner(cmd):
+            if "sync" in cmd:
+                return _proc()
+            raise OSError("wl list exploded")
+
+        result = sync_worklog(runner=runner)
+
+        assert result["status"] == "synced"
+        assert result["reaper"]["success"] is False
+        assert "exploded" in result["reaper"]["error"]
 
 
 class TestExplicitWorklogDir:

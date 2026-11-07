@@ -1,9 +1,26 @@
 #!/bin/sh
 # worklog:post-pull-hook:v1
-# Central Worklog post-pull sync script (committed hooks).
+# Shared Worklog post-pull sync script. The committed wrappers
+# (.githooks/post-checkout, post-merge, post-rewrite) resolve it from this
+# repository first and from $HOME/.config/pi/.githooks second, so it runs
+# without a hard-coded per-user path (SA-0MVK1Q30O0067NXX).
 # Set WORKLOG_SKIP_POST_PULL=1 to bypass.
 set -e
 if [ "$WORKLOG_SKIP_POST_PULL" = "1" ]; then
+  exit 0
+fi
+# Skip when inside a temporary worktree created by `wl sync` for its own git
+# operations (`.worklog/tmp-worktree-*`). Those worktrees have no worklog, and
+# a sync started inside one would recurse into itself (SA-0MVK1Q30O0067NXX).
+case "$PWD" in
+  *tmp-worktree-*)
+    exit 0
+    ;;
+esac
+# Skip when inside a linked git worktree (not the main checkout). Worktrees are
+# for feature development; the sync runs from the main checkout only, so a hook
+# fired by `git worktree add` can never start a nested sync.
+if [ "$(git rev-parse --git-dir 2>/dev/null)" != "$(git rev-parse --git-common-dir 2>/dev/null)" ]; then
   exit 0
 fi
 if command -v wl >/dev/null 2>&1; then

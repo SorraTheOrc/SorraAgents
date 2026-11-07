@@ -1128,8 +1128,10 @@ ROUTINE_PRODUCER_ACTIONS = [
 ]
 
 BLOCKING_PRODUCER_ACTIONS = [
-    "Answer the OPEN QUESTION in comment SA-C0MVQ1QK1R0052WGP "
-    "before /skill:plan can start",
+    (
+        "Answer the OPEN QUESTION in comment SA-C0MVQ1QK1R0052WGP "
+        "before /skill:plan can start"
+    ),
     "Approve the remediation list in comment #4",
 ]
 
@@ -1267,6 +1269,91 @@ class TestPaneStatusNormalisation:
             ac=["All good|tests|met"],
         )
         assert pane.call_args.args[0] == "note"
+
+
+@pytest.fixture(autouse=True)
+def _stub_session_claim_release(monkeypatch):
+    """Never touch a real worklog from the renderer's CLI tests.
+
+    The end-of-session report doubles as the claim-release backstop
+    (SA-0MW0F91KN004J06U); the CLI tests below assert the hook is invoked, and
+    the dedicated tests in :class:`TestSessionClaimReleaseHook` control it
+    explicitly.
+    """
+    import render_report as rr
+
+    def fake(item_id, **kwargs):
+        return {
+            "success": True,
+            "work_item_id": item_id,
+            "released": False,
+            "reason": "stubbed",
+        }
+
+    monkeypatch.setattr(rr, "release_session_claim", fake)
+
+
+class TestSessionClaimReleaseHook:
+    """Rendering the end-of-session report releases the session's claim.
+
+    The report is every skill's final step, so it is the natural anchor for
+    the session-level release backstop: a session that never reached a
+    terminal lifecycle transition still leaves its item unheld
+    (SA-0MW0F91KN004J06U AC2). Producer holds and ``needsProducerReview``
+    items are preserved by the shared predicate, not by this CLI.
+    """
+
+    def _run(self, extra_argv, release):
+        import render_report as rr
+
+        argv = ["render_report.py", "SA-0TEST0000000001", *extra_argv]
+        with mock.patch.object(rr, "release_session_claim", release), \
+                mock.patch.object(rr, "render_from_wl", return_value="# report"), \
+                mock.patch.object(rr, "update_pane_title", return_value={"updated": True}), \
+                mock.patch.object(rr.sys, "argv", argv):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+                rr.main()
+        return buffer.getvalue()
+
+    def test_releases_the_claim_by_default(self):
+        calls = []
+
+        def release(item_id, **kwargs):
+            calls.append((item_id, kwargs))
+            return {
+                "success": True,
+                "released": True,
+                "previous_assignee": "implement",
+                "work_item_id": item_id,
+            }
+
+        output = self._run(["--skill-name", "implement"], release)
+
+        assert calls and calls[0][0] == "SA-0TEST0000000001"
+        assert calls[0][1]["reason"] == "end-of-session-report"
+        assert "released" in output
+
+    def test_no_release_flag_skips_the_release(self):
+        calls = []
+
+        def release(item_id, **kwargs):  # pragma: no cover - must not run
+            calls.append(item_id)
+            return {"released": False}
+
+        self._run(
+            ["--skill-name", "implement", "--no-release-claim"], release
+        )
+
+        assert calls == []
+
+    def test_a_release_failure_never_breaks_the_report(self):
+        def release(_item_id, **_kwargs):
+            raise RuntimeError("worklog unavailable")
+
+        output = self._run(["--skill-name", "implement"], release)
+
+        assert "# report" in output
 
 
 if __name__ == "__main__":

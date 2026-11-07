@@ -261,17 +261,18 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$pif_bin"; then
 fi
 # ── Central Worklog post-pull hook installation ──────────────────────────
 # The committed project hooks (.githooks/post-checkout, post-merge,
-# post-rewrite, all worklog:post-pull-hook:v1) delegate to ONE per-machine
-# script:
+# post-rewrite, all worklog:post-pull-hook:v1) delegate to the shared
+# .githooks/worklog-post-pull. They install nothing, so a fresh environment
+# used to fail every checkout/merge with `exec: .../worklog-post-pull: not
+# found` and the post-pull `wl sync` never ran (SA-0MU8CRX1X008IORP). Install
+# the central script here as an executable symlink to this repo's committed
+# source, so hook fixes propagate without a reinstall. The project's own
+# committed hooks are left untouched.
 #
-#   exec "$HOME/.config/pi/.githooks/worklog-post-pull" "$@"
-#
-# Nothing else creates that directory, so a fresh environment fails every
-# checkout/merge with `exec: .../worklog-post-pull: not found` and the
-# post-pull `wl sync` never runs (SA-0MU8CRX1X008IORP). Install the central
-# script here as an executable symlink to this repo's committed source, so
-# hook fixes propagate without a reinstall. The project's own committed hooks
-# are left untouched.
+# Portability (SA-0MVK1Q30O0067NXX): the committed wrappers resolve the script
+# portably - the repository's own .githooks/worklog-post-pull first, this
+# central path ($HOME/.config/pi/.githooks/worklog-post-pull) second, then a
+# single stderr notice and exit 0 - so they work on any machine or username.
 #
 # Set PI_SKIP_HOOK_INSTALL=1 to skip (the same opt-out as the pre-push wiring).
 # The install is machine-wide, so it does not require being inside a git repo.
@@ -290,17 +291,26 @@ if [ "${PI_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
     echo "WARNING: source post-pull hook not found at $POST_PULL_SRC; skipping central hook install" >&2
   fi
 
-  # Fail-open portability check (SA-0MVK1Q30O0067NXX): the committed wrappers
-  # hard-code the delegating path. If this machine's central path differs, the
-  # install above cannot fix checkout/merge, so surface it rather than leaving
-  # a silent `not found` on the next checkout.
+  # Fail-open portability check (SA-0MVK1Q30O0067NXX): warn only about
+  # *legacy* (or forked) wrappers that still `exec` a literal absolute path.
+  # Those break on any machine whose path differs, and the install above cannot
+  # fix them; the portable wrappers resolve the script repo-relatively and
+  # never hard-code a per-user path, so they stay silent here.
   POST_PULL_REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-  if [ -n "$POST_PULL_REPO_ROOT" ] && [ -f "$POST_PULL_REPO_ROOT/.githooks/post-checkout" ]; then
-    if ! grep -qF "$POST_PULL_DST" "$POST_PULL_REPO_ROOT/.githooks/post-checkout"; then
-      echo "WARNING: $POST_PULL_REPO_ROOT/.githooks/post-checkout does not delegate to $POST_PULL_DST" >&2
-      echo "  git checkout/merge will error with 'not found' until the committed wrapper" >&2
-      echo "  references this machine's central post-pull hook path." >&2
-    fi
+  if [ -n "$POST_PULL_REPO_ROOT" ]; then
+    for post_pull_wrapper in post-checkout post-merge post-rewrite; do
+      post_pull_wrapper_file="$POST_PULL_REPO_ROOT/.githooks/$post_pull_wrapper"
+      [ -f "$post_pull_wrapper_file" ] || continue
+      # Legacy = execs a literal absolute path, or names a per-user home
+      # directory (/home/<user>, /Users/<user>, /root) anywhere.
+      if grep -Eq '^[[:space:]]*exec[[:space:]]+"?/|/(home|Users|root)/' "$post_pull_wrapper_file" 2>/dev/null; then
+        echo "WARNING: $post_pull_wrapper_file execs a hard-coded absolute path;" >&2
+        echo "  git checkout/merge and 'git worktree add' fail with 'not found' on any" >&2
+        echo "  machine where that path is absent. Install the portable wrapper:" >&2
+        echo "    cp $SRC_DIR/.githooks/$post_pull_wrapper $post_pull_wrapper_file" >&2
+        echo "  (it resolves .githooks/worklog-post-pull, then $POST_PULL_DST)" >&2
+      fi
+    done
   fi
 fi
 
@@ -314,11 +324,11 @@ fi
 # `measure_context.py --generate-thresholds`.
 #
 # Two hook variants exist. The canonical source repo (SorraAgents) ships a
-# repo-local full-suite runner, so it gets the v3 hook (.githooks/pre-push:
+# repo-local full-suite runner, so it gets the v4 hook (.githooks/pre-push:
 # context-budget gate + worklog sync + branch policy + full-suite test gate).
 # Every other project gets the framework v2 hook (.githooks/pre-push.v2:
 # context-budget gate + worklog sync + branch policy, NO full-suite gate) —
-# only SorraAgents ships skill/test/scripts/run_tests.py, and the v3
+# only SorraAgents ships skill/test/scripts/run_tests.py, and the v4
 # full-suite gate would otherwise hard-fail every dev/main push in a project
 # that lacks the repo-local runner (SA-0MV8M4OVX000QHSM).
 #
@@ -329,20 +339,30 @@ if [ "${PI_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
     GITHOOKS_DIR="$CURRENT_REPO_ROOT/.githooks"
     if [ -f "$CURRENT_REPO_ROOT/skill/test/scripts/run_tests.py" ]; then
       HOOK_SRC="$SRC_DIR/.githooks/pre-push"
-      HOOK_LABEL="v3"
+      HOOK_LABEL="v4"
     else
       HOOK_SRC="$SRC_DIR/.githooks/pre-push.v2"
       HOOK_LABEL="framework v2"
     fi
     HOOK_DST="$GITHOOKS_DIR/pre-push"
 
-    # 1. Ensure the selected hook is present in .githooks/pre-push (idempotent).
+    # 1. Ensure the selected hook is present in .githooks/pre-push and is the
+    #    current version (idempotent). The hook carries a stable version marker
+    #    (`# worklog:pre-push-hook:vN`); an installed copy whose marker differs
+    #    from the source is refreshed in place, so a hook bump propagates to
+    #    already-wired projects on the next install run without manual removal.
     if [ -f "$HOOK_SRC" ]; then
+      HOOK_SRC_MARKER="$(grep -m1 '^# worklog:pre-push-hook:' "$HOOK_SRC" 2>/dev/null || true)"
+      HOOK_DST_MARKER="$(grep -m1 '^# worklog:pre-push-hook:' "$HOOK_DST" 2>/dev/null || true)"
       if [ ! -f "$HOOK_DST" ]; then
         mkdir -p "$GITHOOKS_DIR"
         cp "$HOOK_SRC" "$HOOK_DST"
         chmod +x "$HOOK_DST"
         echo "Installed $HOOK_LABEL pre-push hook: $HOOK_DST (context-budget gate + worklog sync)"
+      elif [ -n "$HOOK_SRC_MARKER" ] && [ "$HOOK_DST_MARKER" != "$HOOK_SRC_MARKER" ]; then
+        cp "$HOOK_SRC" "$HOOK_DST"
+        chmod +x "$HOOK_DST"
+        echo "Refreshed $HOOK_LABEL pre-push hook: $HOOK_DST ($HOOK_DST_MARKER -> $HOOK_SRC_MARKER)"
       else
         echo "OK: pre-push hook already present: $HOOK_DST"
       fi

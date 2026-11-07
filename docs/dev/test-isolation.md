@@ -58,6 +58,14 @@ create their repos in a **subdirectory** of `tmp_path`, so `git init` creates a
 refs or rewrite its config. The previous guard's docstring attributed the
 incident to this hypothesis; that attribution is insufficient.
 
+The framework's own test plumbing does not rely on that misresolution
+hypothesis either: it now *sets* a disk-backed `TMPDIR` for every suite
+subprocess and prunes stale `pytest-of-<user>/pytest-*` roots ahead of
+full-scope runs. See
+[`test-skill-reference.md` §3 “Disk-backed test temporary storage and the
+inode-exhaustion signature”](test-skill-reference.md#3-disk-backed-test-temporary-storage-and-the-inode-exhaustion-signature-sa-0mw2qed9m005fwok)
+for the precedence order, the prune rules and the operator remedy.
+
 ## 3. Deterministic reproduction (H1)
 
 The reproduction is **hermetic**: it creates a throwaway *victim* repository in
@@ -399,6 +407,17 @@ separately — see §8.5):
   `CONCURRENCY_EXCLUDED_REF_NAMESPACES`), derived from git plumbing
   namespaces — never a `wl-*` name pattern (which would also have excluded
   the incident's own fixture branches) and never directory names.
+- the `wl` data-branch namespace `refs/heads/worklog/*`
+  (SA-0MVV2W9610002CLW): every `wl` write and every `wl sync` moves
+  `refs/heads/worklog/data`, so a sibling agent session moves it mid-run.
+  It lives under `refs/heads/`, so the `refs/worklog/*` parser filter never
+  sees it; it is excluded as a namespace prefix in
+  `CONCURRENCY_EXCLUDED_REF_NAMESPACES` (`WORKLOG_HEADS_REF_NAMESPACE`) —
+  never a `wl-*` name heuristic. Unlike `refs/heads/dev` and
+  `refs/remotes/origin/*`, its movement is **reported as an informational
+  note** (`EXCLUDED_REF_CHURN_NOTE_PREFIX`, rendered by
+  `excluded_churn_notes()` and surfaced as `live_repo_excluded`), so the
+  exclusion is auditable rather than silent.
 
 A legitimately-created fixture branch that happens to be backed by a
 registered worktree other than the guard root is therefore excluded, as is
@@ -458,19 +477,31 @@ Genuine mutations still fail the guard and name the offending test:
    incident class detectable (a name pattern is forbidden).
 2. **`refs/heads/dev`-only movement is no longer a standalone incident
    signal.** Because the integration branch is concurrency-excluded, a
-   mutation that moves *only* `dev` is no longer detected via the ref surface.
-   The SA-0MUIA3OE40001QJX leak class is still caught through the other
-   surfaces — a `GIT_DIR`-leak incident also rewrites local config and/or the
-   working tree (see §9), and those surfaces always fire — but detection of a
+   mutation that moves *only* `dev` is no longer detected via the guard's
+   ref surface. The SA-0MUIA3OE40001QJX leak class is still caught through
+   the other surfaces — a `GIT_DIR`-leak incident also rewrites local config
+   and/or the working tree (see §9), and those surfaces always fire — but a
+   **clean** own-checkout fast-forward (the 2026-11-03 mixed-tree incident
+   class: `git status` clean before and after, HEAD and tracked files
+   rewritten by a concurrent `implement.py finish`) is invisible to every
+   one of the guard's surfaces. That class is now detected on the new
+   **own-checkout state surface** — `snapshot_own_checkout` /
+   `compare_own_checkout_states` in `skill/shared/git_sandbox.py`, consumed
+   by the test cache's `state_changed_during_run` flag (SA-0MW3FF18I003KGZE,
+   §8.6) — which compares the guarded root's own HEAD and tracked-tree
+   content around the run instead of the ref surface. Detection of a
    hypothetical *pure* ref-only `dev` rewrite is traded away for multi-agent
-   false-positive immunity (WL-0MV5MYBKJ0033P8U).
+   false-positive immunity (WL-0MV5MYBKJ0033P8U); the own-checkout surface
+   is the replacement signal for the incident class that ref-only detection
+   used to cover.
 
 Regression coverage:
 
 - helper-level `excluded_refs` ownership (`TestOwnershipBasedExclusion`,
   `TestOwnershipExclusionBoundaries`), linked-worktree anchoring
-  (`TestMainCheckoutAnchoring`) and concurrency namespaces
-  (`TestConcurrencyExcludedRefs`) in
+  (`TestMainCheckoutAnchoring`), concurrency namespaces
+  (`TestConcurrencyExcludedRefs`) and wl data-branch churn
+  (`TestWorklogHeadsRefChurn`) in
   `skill/shared/tests/test_git_sandbox.py`;
 - guard-level registration, `--track` registration, removal, concurrent-`dev`
   fast-forward, linked-worktree sibling churn, the config-rewrite and
@@ -537,6 +568,44 @@ pinned boundaries), ``TestWorkingTreeAttributionNested`` in
 ``live_repo_excluded`` tests in
 ``skill/test/tests/test_guarded_run_all.py`` (outer-guard parity, AC3 note).
 
+### 8.6 Own-checkout state surface (`state_changed_during_run`)
+
+The guard's surfaces are **refs + config + working tree**, and §8.4 records
+what they cannot see: a *clean* own-checkout fast-forward of the
+concurrency-excluded `dev` rewrites the checkout's HEAD and tracked files
+while `git status --porcelain=v1 -uall` stays clean before and after. That
+incident class is now detected on a **separate, deliberately narrow surface**
+— the guarded root's own state (SA-0MW3FF18I003KGZE):
+
+- `snapshot_own_checkout(root)` captures the checkout's own HEAD commit plus
+  a content fingerprint of the working-tree deltas the tree resolves to.
+  It never reads the ref surface at all, so `refs/heads/dev`,
+  `refs/remotes/origin/*` and `refs/heads/worklog/*` movement stays
+  invisible *by construction* — a sibling fast-forward only matters when it
+  rewrites this checkout's own HEAD/tree, which the fingerprint captures.
+- `compare_own_checkout_states(before, after)` reports `moved` (with both
+  commits) unless the difference is fully explained by the §8.5
+  start-of-run working-tree attribution (a sibling committing work it had
+  itself dirtied mid-run is churn, never a move — reported in
+  `attributed`). An unfingerprintable checkout is fail-closed and never
+  reported as movement.
+
+The test cache brackets every executed run with this snapshot pair
+(`skill/test_cache.py`); on `moved` it quarantines the verdict — no cache
+entry under either state, a distinct exit status 75
+(`STATE_CHANGED_EXIT_CODE`), the `state_changed_during_run` notice naming
+checkout + before/after commits, and no parsed failure records — and the
+finish gate/audit classify it as infrastructure (see
+docs/dev/test-skill-reference.md, “Notice codes”). A stable run is unchanged.
+
+Regression pins: `TestOwnCheckoutState` in
+`skill/shared/tests/test_git_sandbox.py` (helper), the harness in
+`tests/test_test_cache.py` (`TestStateChangedDuringRun`, end-to-end through
+`run_cached`), and the runner/gate/audit surface tests in
+`skill/test/tests/test_run_tests_failure_notices.py`,
+`skill/implement/tests/test_finish_gate_state_changed.py` and
+`skill/audit/tests/test_audit_runner_green_run.py`.
+
 
 ## 9. Production test-execution scrub (2026-09-26 recurrence, SA-0MUIA3OE40001QJX)
 
@@ -565,6 +634,7 @@ points every cached/audited suite run passes through.
 | Audit pi-launch scrub | `audit_runner._call_pi` | Passes a scrubbed `env=` to the `pi` subprocess so a later test run cannot inherit a leaked override. |
 | Startup diagnostic | `test_runner.log_repository_override_scrub` | Emits **once** per process, naming (never the values of) the stripped variables; silent when none are present. |
 | Release-gate fail-fast | `run_tests.py --strict-git-env` (invoked by `.githooks/pre-push` for `dev`/`main` and documented in [`skill/ship/SKILL.md`](../../skill/ship/SKILL.md)) | Refuses to start (exit 2) when an override var is present, before any suite command runs. Operator opt-out: `RUN_TESTS_ALLOW_REPO_OVERRIDES=1` (loud warning; scrub still applied). A **worktree-managed** `GIT_DIR` (`<main>/.git/worktrees/<name>`, which git exports to hooks run from a linked worktree) is exempt via `shared.git_sandbox.is_worktree_git_dir` — it is git's own hook environment, not a leak, and refusing it blocked every implement-workflow worktree push (SA-0MUMR3QPM002VK7M). Genuine leaks (any other `GIT_DIR`, and every other override var) are still refused. |
+| Release-gate subject binding | `.githooks/pre-push` → `run_tests.py --gate-commit <local_sha>` (SA-0MVTRBT50005DUEH) | The dev/main full-suite verdict is bound to the commit being pushed: the runner resolves a checkout whose `HEAD` is that commit with no dirty paths (the push cwd when it qualifies, else a clean `git worktree list` checkout) and runs/caches there, or refuses the push (exit 2) naming the commit and `TEST_SCOPE_SKIP=1`. A green `scope: full` entry computed from any other state — including the main checkout's own `HEAD` plus dirty `.worklog/` churn, which is how a red commit reached `dev` on another tree's verdict (MS-0MVM7NJF70037YU4) — is a miss, so the suite executes. The hook mirrors the resolved checkout's cache into the main checkout's `.worklog/cache` so post-push verification and audit F3 can see the entry. |
 | Host-wide audit cap | `audit_runner.main` `issue` ingress | Bounds independently launched `audit_runner.py issue` processes via the shared `audit-host` flock semaphore (`AUDIT_MAX_HOST_AUDITS`, default 6 — right-sized via F7 to the 3-slot proxy pool, SA-0MUSZJRB9006ZCHE; `AUDIT_HOST_LOCK_TIMEOUT`, default 90s bounded wait). The N+1th process waits for a slot and exits cleanly with a clear message if none frees in time, instead of adding another concurrent suite runner. |
 | Orphan detection | `audit_runner._find_orphaned_audit_processes` / `_warn_on_orphaned_audits` | Scans `/proc` for `audit_runner.py issue` processes with `PPID 1` and warns, so an orphaned fan-out is visible. |
 | Detect-only live-repo guard | `run_tests.py` `_detect_live_repo_mutation` (+ the repo-root `conftest.py` plugin) | Unchanged inner net: fails a run that mutated its own checkout, but only *after* the mutation. |
@@ -581,7 +651,11 @@ the file also fails if the name is ever added to
 `skill/audit/tests/test_audit_runner_concurrency.py` (host cap + orphan
 detection), `tests/test_run_tests_cache.py` (strict release gate,
 including the worktree-hook exemption and the non-worktree refusal,
-SA-0MUMR3QPM002VK7M), and
+SA-0MUMR3QPM002VK7M), `tests/test_pre_push_gate_subject.py` (gate subject
+binding: another tree's green entry cannot satisfy the gate, an entry at the
+pushed clean state is served, a dirty push cwd still gates the clean worktree,
+an unmaterialisable commit refuses and runs nothing, and the default
+no-`--gate-commit` path is unchanged — SA-0MVTRBT50005DUEH), and
 `tests/test_git_identity_guard.py::TestPrePushWiring::test_ambient_hook_bypass_var_is_scrubbed`
 (ambient hook-bypass variables scrubbed from the hook subprocess env; see
 §9.6, SA-0MUN83EXN004JBMW).

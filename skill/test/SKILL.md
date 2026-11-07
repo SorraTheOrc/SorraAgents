@@ -219,6 +219,18 @@ full suite (`--scope full`), feature-branch pushes skip tests
 with **changed scope only** during implementation — the full suite first runs
 at the dev-push integration gate (pre-push hook), and the ship release gate
 re-runs it on the merged dev→main tree (SA-0MVECQUGF0064U81).
+
+**The gate's subject is the pushed commit (SA-0MVTRBT50005DUEH).** The hook
+forwards git's `<local_sha>` as `run_tests.py --gate-commit <sha>`, and the
+runner resolves a checkout whose `HEAD` is that commit with no dirty paths
+(the push cwd when it qualifies, else a clean `git worktree list` checkout),
+refusing the push (exit 2) when none exists. The suite — and its cache key —
+therefore describe the pushed commit, so a green `scope: full` entry recorded
+for any other state (the main checkout's `HEAD` plus its dirty `.worklog/
+churn, another commit, another tree) is a **miss** and cannot satisfy the
+gate. The runner prints `run_tests: gate-subject` / `gate-root` /
+`gate-verdict` / `gate-refused` lines on stderr (echoed by the hook); without
+`--gate-commit` every other caller behaves exactly as before.
 Details: [docs/dev/test-skill-reference.md](../../docs/dev/test-skill-reference.md).
 
 ### 1b. Live-repo mutation guard (detect-only)

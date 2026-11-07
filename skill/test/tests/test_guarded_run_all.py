@@ -21,9 +21,10 @@ Contract under test:
   function stands down — it does not snapshot, does not touch the marker,
   and does not run the mutation detector.
 - The result is the ``run_all`` dict shape, plus ``live_repo_mutation`` when
-  the owning guard detected a mutation, and ``live_repo_excluded`` when
-  working-tree churn was attributed to a concurrent session and therefore
-  excluded from the verdict (SA-0MUIJAHXS003M7BG AC3).
+  the owning guard detected a mutation, and ``live_repo_excluded`` when churn
+  was attributed to concurrent infrastructure and therefore excluded from the
+  verdict — working-tree resolutions (SA-0MUIJAHXS003M7BG AC3) and
+  ``refs/heads/worklog/*`` movement (SA-0MVV2W9610002CLW AC1).
 """
 
 from __future__ import annotations
@@ -379,7 +380,7 @@ def test_guarded_run_from_worktree_fails_on_main_checkout_deletion(
     """
     from shared.process_semaphore import nested_semaphore_dir
 
-    gs, main, worktree = _main_with_linked_worktree(tmp_path)
+    _gs, main, worktree = _main_with_linked_worktree(tmp_path)
     victim = main / "keep.txt"
 
     # A nested run must not contend for the host-wide "test" slot this suite
@@ -587,3 +588,61 @@ def test_guarded_run_still_fails_on_a_newly_dirty_tracked_path(tmp_path, monkeyp
     mutation = result.get("live_repo_mutation")
     assert mutation and "README.md" in mutation, mutation
     assert "live_repo_excluded" not in result, result
+
+
+# ---------------------------------------------------------------------------
+# SA-0MVV2W9610002CLW — wl data-branch churn reaches the run report as a note
+# ---------------------------------------------------------------------------
+
+
+def test_guarded_run_reports_excluded_worklog_ref_churn(tmp_path, monkeypatch):
+    """AC1 (report path): a sibling ``wl`` write moving ``refs/heads/worklog/data``
+    keeps the run green and is surfaced as ``live_repo_excluded``.
+
+    The suite command is the concurrent actor: it advances the worklog store's
+    data branch exactly as ``wl`` does, leaving the verdict clean.
+    """
+    from shared import git_sandbox as gs
+    from shared.process_semaphore import nested_semaphore_dir
+
+    repo = gs.init_repo(tmp_path / "main", default_branch="dev")
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    gs.run_git(repo, ["update-ref", "refs/heads/worklog/data", "HEAD"], check=True)
+
+    move_worklog_ref = (
+        "import os\n"
+        "import subprocess\n"
+        "import sys\n"
+        # Hermetic: the finish gate exports GIT_INDEX_FILE while the suite runs.
+        "os.environ.pop('GIT_INDEX_FILE', None)\n"
+        f"repo = {str(repo)!r}\n"
+        "def git(*args):\n"
+        "    return subprocess.run(['git', '-C', repo, *args], check=True,\n"
+        "                          capture_output=True, text=True).stdout.strip()\n"
+        "head = git('rev-parse', 'HEAD')\n"
+        "tree = git('rev-parse', 'HEAD^{tree}')\n"
+        "fresh = git('commit-tree', tree, '-p', head, '-m', 'advance')\n"
+        "git('update-ref', 'refs/heads/worklog/data', fresh)\n"
+        "sys.exit(0)\n"
+    )
+
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(nested_semaphore_dir(tmp_path)))
+    monkeypatch.delenv(MARKER_ENV, raising=False)
+
+    result = guarded_run_all(
+        repo,
+        timeout=120,
+        suites=("all",),
+        commands=[_write_command(tmp_path, "move_worklog_ref.py", move_worklog_ref)],
+        scope="full",
+        use_cache=False,
+        no_cache=True,
+    )
+
+    assert result["success"] is True, result.get("live_repo_mutation")
+    assert "live_repo_mutation" not in result
+    notes = result.get("live_repo_excluded")
+    assert notes, result
+    assert any("refs/heads/worklog/data" in note for note in notes), notes
+    assert any(gs.EXCLUDED_REF_CHURN_NOTE_PREFIX in note for note in notes), notes
