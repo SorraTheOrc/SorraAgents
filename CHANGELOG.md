@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.1.26 (2026-11-07)
+> **Release focus:** This release focuses on making the dev push and test pipeline more reliable and trustworthy, ensuring tests run against the exact code being pushed and that pushes only pass after a full suite runs on that commit. It also hardens the system against concurrency issues, temporary failures, and false test results, while improving audit queue handling and engine version consistency.
+### Features
+- Dev pushes now wait their turn fairly and retry brief network drops, so green commits aren't stuck behind other agents. (SA-0MVSJX5HS002JDHI)
+- Worktree tests now use your branch's shared code, so results are trustworthy. (SA-0MVMZBJGT00718ZO)
+- Finished sessions now release their work items so nothing gets stuck or hidden from the queue. (SA-0MW0F91KN004J06U)
+- Test runs interrupted by a concurrent update are now flagged and discarded instead of reporting false failures. (SA-0MW3FF18I003KGZE)
+- Build failures now show when the engine advanced, so you can tell engine issues from code errors. (SA-0MW06FLFR009F0P4)
+- Herdr-only changes now verify automatically, so audits finish faster with less manual sign-off. (SA-0MW133H3P008TNPQ)
+- Pre-push cache mirroring is now standard behavior, so you no longer need to patch hooks manually. (SA-0MW20Y5YI004QS3M)
+### Bug Fixes
+- Failed finishes now warn you loudly if another agent changed the main checkout, so you never build on or push foreign deletions. (SA-0MVWMUBP10041CSM)
+- Finishes now verify the exact code being pushed, so nothing reaches dev untested. (SA-0MVTFMB7K002Y1F3)
+- Re-running a parent audit now picks up completed child screens instead of getting stuck. (SA-0MVSTZ71J001P67S)
+- Test runs no longer fail from temporary storage running out, so your changes push reliably even with many agents active. (SA-0MW2QED9M005FWOK)
+- Audits now check only your project's own code, so releases won't be blocked by issues in submodules or other repos. (SA-0MVPDTSRV0049KW2)
+- Work items now stay out of the audit queue until implementation is truly finished, preventing duplicate audits. (SA-0MVWFPI31000HP3H)
+- Your approved items stay approved through re-audits, and failing audits now always reach your review queue. (SA-0MVR9B1UH002BUST)
+- Test runs no longer fail when background worklog activity happens at the same time. (SA-0MVV2W9610002CLW)
+- Pushes to dev now only pass if the full test suite actually ran on the exact commit being pushed. (SA-0MVTRBT50005DUEH)
+- Releases now ship a consistent engine version, so updates no longer fail version checks. (SA-0MW6LOXBO0008706)
+- Resuming work from inside your worktree now works correctly instead of failing. (SA-0MVXUGXS5006M3HF)
+### Other
+- Drive now safely retries temporary failures and preserves committed work instead of losing it. (SA-0MVZEO59E004BCI8)
+
 ## v0.1.25 (2026-11-02)
 > **Release focus:** This release focuses on making test and release workflows faster and more reliable, with scoped test runs that target only changed files, quicker task release, and broader pipeline support for Python projects. It also fixes numerous reliability issues around task locking, epic retries, commit integrity, and test accuracy so results reflect exactly what was committed.
 ### Features
