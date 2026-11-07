@@ -5945,8 +5945,12 @@ def _normalize_heading_line(line: str) -> str:
 
 def _extract_acs(description: str) -> list[str]:
     """Extract acceptance criteria lines from a markdown description."""
+    # Prefix match — allows trailing qualifier text (e.g. "for this project").
+    # Aligns with tree_coverage.extract_acceptance_criteria which uses the
+    # same prefix pattern, so the audit and plan pipelines agree on what is
+    # an AC section (SA-0MVY6O4WU0022DNA).
     heading_re = re.compile(
-        r"^(?:Acceptance|Success)\s+Criteria:?\s*(?:\([^)]*\))?\s*$",
+        r"^(?:Acceptance|Success)\s+Criteria",
         re.IGNORECASE,
     )
     lines = description.splitlines()

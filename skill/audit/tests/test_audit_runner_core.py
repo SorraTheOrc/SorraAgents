@@ -2280,6 +2280,55 @@ class TestExtractAcs:
         acs = audit_runner._extract_acs(desc)
         assert acs == ["First criterion", "Second criterion"]
 
+    # ------------------------------------------------------------------
+    # Trailing-qualifier headings (SA-0MVY6O4WU0022DNA)
+    # ------------------------------------------------------------------
+
+    def test_qualifier_heading_acceptance_criteria_for_this_project(self):
+        """Heading with trailing qualifier matches — exact RISE-0MVXXKJGK reproduction (AC1, AC3).
+
+        The heading "## Acceptance criteria for this project" was previously
+        rejected by the anchored regex, causing the audit to return the
+        "No acceptance criteria defined." sentinel and demote the item.
+        """
+        desc = (
+            "## Acceptance criteria for this project\n"
+            "\n"
+            "1. First criterion\n"
+            "2. Second criterion\n"
+            "3. Third criterion\n"
+        )
+        acs = audit_runner._extract_acs(desc)
+        assert acs == [
+            "First criterion",
+            "Second criterion",
+            "Third criterion",
+        ]
+
+    def test_qualifier_heading_with_parenthetical(self):
+        """Trailing qualifier combined with parenthetical suffix matches."""
+        desc = (
+            "## Acceptance Criteria (for implementation)\n"
+            "\n"
+            "- [ ] Criterion one\n"
+        )
+        acs = audit_runner._extract_acs(desc)
+        assert acs == ["Criterion one"]
+
+    def test_success_criteria_qualifier(self):
+        """Success Criteria headings with trailing qualifiers also match."""
+        desc = (
+            "## Success Criteria for release\n"
+            "\n"
+            "- Must deploy without errors\n"
+            "- All tests must pass\n"
+        )
+        acs = audit_runner._extract_acs(desc)
+        assert acs == [
+            "Must deploy without errors",
+            "All tests must pass",
+        ]
+
 
 class TestZeroAcSentinelWarning:
     """SA-0MSRLLQ0V008EW3J: zero-AC sentinel yields warning, not met.
