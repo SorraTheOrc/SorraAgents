@@ -159,6 +159,9 @@ def normalize_item(raw):
         "risk": raw.get("risk"),
         "effort": raw.get("effort"),
         "description": raw.get("description", ""),
+        # Explicit ``## Impact`` sentence (epic SA-0MW6ER1NX0094QCG); "" when
+        # absent or malformed so renderers can fall back to the user story.
+        "impact": extract_impact(raw.get("description", "")),
         "group": raw.get("group"),
         "groupLabel": raw.get("groupLabel"),
         "needsProducerReview": raw.get("needsProducerReview"),
@@ -602,6 +605,56 @@ def extract_user_story(description):
     return ""
 
 
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+_BULLET_PREFIX_RE = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
+
+
+def _strip_markdown_emphasis(text):
+    """Remove markdown emphasis markers so the sentence is TTS-friendly."""
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    s = re.sub(r"__(.+?)__", r"\1", s)
+    return s.strip().strip("*_").strip()
+
+
+def extract_impact(description):
+    """Read an item's ``## Impact`` sentence, trimmed of markdown emphasis.
+
+    Work items may carry an explicit ``## Impact`` section whose first
+    paragraph is one sentence describing the user-experience impact of the
+    change. The section ends at the next heading of the same or a higher
+    level, so a later ``## Acceptance Criteria`` never bleeds into the
+    sentence. Returns ``""`` for a missing, empty or malformed section (and
+    for a missing/non-string description) without raising, letting renderers
+    fall back to the existing ``Title — user story`` phrasing.
+    """
+    if not isinstance(description, str) or not description.strip():
+        return ""
+    lines = description.split("\n")
+    for index, line in enumerate(lines):
+        heading = _HEADING_RE.match(line.strip())
+        if not heading:
+            continue
+        level = len(heading.group(1))
+        label = heading.group(2).strip().rstrip(":").strip().lower()
+        if not re.match(r"^impact\b", label):
+            continue
+        body = []
+        for nxt in lines[index + 1:]:
+            stripped = nxt.strip()
+            nxt_heading = _HEADING_RE.match(stripped)
+            if nxt_heading and len(nxt_heading.group(1)) <= level:
+                break
+            if not stripped:
+                if body:  # first paragraph only — stop at the blank line
+                    break
+                continue
+            body.append(stripped)
+        if not body:
+            return ""
+        return _strip_markdown_emphasis(_BULLET_PREFIX_RE.sub("", " ".join(body)))
+    return ""
+
+
 def extract_problem(description):
     if not description:
         return ""
@@ -845,6 +898,25 @@ def _format_blocker_tts(blocker_raw):
     return f"  - {s}"
 
 
+def _structured_item(item):
+    """Minimal structured item data for agent-side, impact-first rendering.
+
+    The script stays deterministic: it emits data, the invoking agent clusters
+    and renders. ``impact`` is "" when the item has no ``## Impact`` section.
+    """
+    return {
+        "id": item.get("id"),
+        "title": item.get("title", "Untitled"),
+        "status": item.get("status"),
+        "priority": item.get("priority"),
+        "impact": item.get("impact", ""),
+    }
+
+
+def _structured_items(items):
+    return [_structured_item(it) for it in items]
+
+
 def generate_report(verbose=False, browse_count=None, window_start=None, window_end=None):
     herdr_items, fetch_errors = fetch_herdr_selection_list(browse_count)
     herdr_items_sorted = sorted(herdr_items, key=lambda x: (x.get("group", 999), priority_sort_key(x)))
@@ -901,17 +973,21 @@ def generate_report(verbose=False, browse_count=None, window_start=None, window_
         "yesterday": [format_item(i, verbose) for i in yesterday_items],
         "yesterday_count": len(yesterday_items),
         "yesterday_tts": yesterday_tts,
+        "yesterday_items": _structured_items(yesterday_items),
         "today": [format_item(i, verbose) for i in today_items],
         "today_count": len(today_items),
         "today_critical": [format_item(i, verbose) for i in today_critical_items],
         "today_critical_count": len(today_critical_items),
         "today_critical_tts": critical_tts,
+        "today_critical_items": _structured_items(today_critical_items),
         "today_additional": [format_item(i, verbose) for i in today_additional_items],
         "today_additional_count": len(today_additional_items),
         "today_additional_tts": additional_tts,
+        "today_additional_items": _structured_items(today_additional_items),
         "regressions": [format_item(i, verbose) for i in regressions],
         "regressions_count": len(regressions),
         "regressions_tts": regressions_tts,
+        "regressions_items": _structured_items(regressions),
         "blockers": blocker_lines,
         "blockers_tts": blockers_tts,
         "window": {
