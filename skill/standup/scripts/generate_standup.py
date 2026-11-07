@@ -655,6 +655,54 @@ def extract_impact(description):
     return ""
 
 
+#: Work item ids as they appear in rendered text (bare or in brackets).
+_SPOKEN_ID_RE = re.compile(r"\b[A-Z]{2,}-\d[A-Z0-9]{6,}\b")
+_SPOKEN_ID_BRACKET_RE = re.compile(r"\s*\((?=[A-Z]{2,}-\d)[A-Za-z0-9\-]+\)")
+#: Sentence boundary used to keep one sentence per item in the read budget.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[\"'(]?[A-Z])")
+
+
+def _sanitize_spoken_text(text):
+    """Make *text* safe to read aloud.
+
+    Removes markdown emphasis, backticks, work item ids (bare or bracketed)
+    and underscores, because a TTS engine reads them as noise
+    (SA-0MW6EUQVW008N4BA). Whitespace is collapsed so removals never leave
+    double spaces behind.
+    """
+    if not text:
+        return ""
+    s = _strip_markdown_emphasis(str(text))
+    s = s.replace("`", "")
+    s = _SPOKEN_ID_BRACKET_RE.sub("", s)
+    s = _SPOKEN_ID_RE.sub("", s)
+    s = s.replace("_", " ")
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
+
+def _first_sentence(text):
+    """Return *text* up to and including its first sentence-ending punctuation.
+
+    The standup report budgets roughly one sentence per item, so a longer (or
+    malformed) ``## Impact`` paragraph must not push the reading time past the
+    ~2-minute target (SA-0MW6EUQVW008N4BA).
+    """
+    if not text:
+        return ""
+    return _SENTENCE_SPLIT_RE.split(text.strip(), maxsplit=1)[0].strip()
+
+
+def _spoken_report_lines(lines):
+    """Sanitise rendered item/blocker lines for TTS, keeping their indentation."""
+    out = []
+    for line in lines or []:
+        stripped = line.lstrip()
+        indent = line[: len(line) - len(stripped)]
+        out.append(f"{indent}{_sanitize_spoken_text(stripped)}" if stripped else line)
+    return out
+
+
 def extract_problem(description):
     if not description:
         return ""
@@ -856,25 +904,37 @@ def detect_regressions(window_start, window_end):
 
 
 def _format_item_tts(item):
-    """TTS-friendly single line: 'Title — user story / summary' without ID brackets."""
-    title = (item.get("title") or "Untitled").strip()
+    """TTS-friendly single line: impact sentence first, else 'Title — user story'.
+
+    Impact-first rendering (epic SA-0MW6ER1NX0094QCG): the explicit ``##
+    Impact`` sentence says what the user gained, so it is preferred over the
+    technical user story. An empty or missing impact falls back to the legacy
+    ``Title — user story`` phrasing, and a multi-sentence impact is trimmed to
+    its first sentence so the report stays inside the ~2-minute read budget.
+    Spoken lines never carry ids, backticks or underscores.
+    """
+    title = _sanitize_spoken_text(item.get("title") or "Untitled") or "Untitled"
     desc = item.get("description", "") or ""
-    us = extract_user_story(desc)
-    if us:
-        summary = us
-    else:
-        prob = extract_problem(desc)
-        if prob:
-            summary = prob
+    # Prefer the structured field; read it from the description for raw items.
+    impact = str(item.get("impact") or "").strip() or extract_impact(desc)
+    summary = _first_sentence(_sanitize_spoken_text(impact)) if impact else ""
+    if not summary:
+        us = extract_user_story(desc)
+        if us:
+            summary = us
         else:
-            summary = ""
-            for line in desc.split("\n"):
-                s = line.strip()
-                if s and not s.startswith("#") and len(s) > 20:
-                    summary = s[:200]
-                    break
-    # Clean markdown emphasis for TTS
-    summary = summary.lstrip("- *").strip()
+            prob = extract_problem(desc)
+            if prob:
+                summary = prob
+            else:
+                summary = ""
+                for line in desc.split("\n"):
+                    s = line.strip()
+                    if s and not s.startswith("#") and len(s) > 20:
+                        summary = s[:200]
+                        break
+    # Clean markdown emphasis / code punctuation for TTS
+    summary = _sanitize_spoken_text(summary).lstrip("- *").strip()
     if summary:
         return f"  - {title} — {summary}"
     return f"  - {title}"
@@ -883,12 +943,8 @@ def _format_item_tts(item):
 def _format_blocker_tts(blocker_raw):
     """Convert raw blocker string to TTS-friendly 'Blocked on X, because Y' if possible."""
     # blocker_raw already looks like '- **Title** (ID) blocked by **Other** (ID)' or '- **Title** (ID): status is blocked'
-    # Produce a spoken form without IDs and markdown.
-    import re as _re
-    # Strip markdown and IDs for TTS
-    s = _re.sub(r"\*\*", "", blocker_raw)
-    s = _re.sub(r"\s*\([A-Z0-9\-]+\)", "", s)
-    s = s.lstrip("- ").strip()
+    # Produce a spoken form without IDs, backticks, underscores or markdown.
+    s = _sanitize_spoken_text(blocker_raw).lstrip("- ").strip()
     if "blocked by" in s:
         parts = s.split("blocked by")
         return f"  - Blocked on {parts[0].strip()}, because blocked by {parts[1].strip()}"
@@ -1020,7 +1076,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     lines.append("### Yesterday I completed work on...")
     lines.append("")
     if yesterday_lines:
-        lines.extend(yesterday_lines)
+        lines.extend(_spoken_report_lines(yesterday_lines))
     else:
         lines.append("  - Nothing completed in this window.")
     lines.append("")
@@ -1028,7 +1084,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     lines.append("### Open critical items")
     lines.append("")
     if critical_lines:
-        lines.extend(critical_lines)
+        lines.extend(_spoken_report_lines(critical_lines))
     else:
         lines.append("  - No open critical items.")
     lines.append("")
@@ -1036,7 +1092,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     lines.append("### Additional focus items for today")
     lines.append("")
     if additional_lines:
-        lines.extend(additional_lines)
+        lines.extend(_spoken_report_lines(additional_lines))
     else:
         # If critical already consumed 5+, note that explicitly; otherwise no additional
         crit_count = data.get("today_critical_count", len(critical_lines))
@@ -1051,7 +1107,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     lines.append("### Regressions")
     lines.append("")
     if regressions_lines:
-        lines.extend(regressions_lines)
+        lines.extend(_spoken_report_lines(regressions_lines))
     else:
         lines.append("  - No regressions — no items slipped back from completed.")
     lines.append("")
@@ -1059,7 +1115,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     lines.append("### Blockers")
     lines.append("")
     if blocker_tts_lines:
-        lines.extend(blocker_tts_lines)
+        lines.extend(_spoken_report_lines(blocker_tts_lines))
     else:
         lines.append("  - No immediate blockers.")
     # surface fetch errors quietly if any
