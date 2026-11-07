@@ -729,10 +729,12 @@ class TestCallPiTimeoutConstant:
         )
 
     def test_call_pi_timeout_not_excessive(self):
-        """Timeout should still have a reasonable upper bound."""
-        assert CALL_PI_TIMEOUT <= 1800, (
-            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 1800s "
-            "to bound the original indefinite-hang risk"
+        """Timeout keeps a reasonable upper bound (the data-derived Phase-2
+        budget, WL-0MW32YZP7005LZ5B)."""
+        assert CALL_PI_TIMEOUT <= 2400, (
+            f"CALL_PI_TIMEOUT={CALL_PI_TIMEOUT} should be <= 2400s "
+            "(the measured Phase-2 budget: ceil(p90 x 2) rounded) to bound "
+            "the original indefinite-hang risk"
         )
 
 
@@ -1454,10 +1456,11 @@ class TestStatusLifecycle:
             f"Top-level yes verdict must set the restored --needs-producer-review yes, got: {final_update}"
         )
 
-    def test_no_needs_producer_review_when_not_ready_to_close(self, monkeypatch):
-        """When audit verdict is NOT ready-to-close, the status update must NOT
-        include --needs-producer-review (AC3: only set for a yes verdict on a
-        top-level item). The AC screen returns 'unmet' so the audit lands on a
+    def test_no_verdict_flags_needs_producer_review(self, monkeypatch):
+        """When the audit verdict is NOT ready-to-close, an independent
+        top-level ``No`` now flags the item for producer review
+        (SA-0MVR9B1UH002BUST AC3) — the flag is no longer reserved for the
+        yes verdict. The AC screen returns 'unmet' so the audit lands on a
         genuine 'Ready to close: No' verdict."""
         calls = []
 
@@ -1473,10 +1476,17 @@ class TestStatusLifecycle:
         cmd_issue("SA-NPR2", runner=self._fake_runner_with_calls(calls, has_acs=True), persist=False)
 
         wl_updates = [c for c in calls if c[:3] == ["wl", "update", "SA-NPR2"]]
+        final_update = wl_updates[-1] if wl_updates else []
+        assert "--needs-producer-review" in final_update and "yes" in final_update, (
+            f"Independent No verdict must flag the item for producer review, got: {final_update}"
+        )
+        # The runner must never clear a review.
         for update in wl_updates:
-            assert "--needs-producer-review" not in update, (
-                f"Status update should NOT include --needs-producer-review, got: {update}"
-            )
+            if "--needs-producer-review" in update:
+                idx = update.index("--needs-producer-review")
+                assert update[idx + 1] == "yes", (
+                    f"The runner must never write --needs-producer-review no, got: {update}"
+                )
 
     def test_no_needs_producer_review_on_exception(self, monkeypatch):
         """When audit fails with an exception, the status update must NOT
@@ -2808,4 +2818,196 @@ class TestRC2RCFallbackVerdict:
         assert "RAW UNPARSEABLE OUTPUT" in content, (
             f"Debug log should contain raw output, got: {content[:200]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# C1 (WL-0MW32Y8E90092TIM): transient classification in report assembly
+# ---------------------------------------------------------------------------
+# Regression tests for the test-first pair with C2 (WL-0MW32YQ29001ZN66):
+# when an AC verdict came from an infrastructure fallback (Phase-2 timeout,
+# provider error, unparseable output, concurrency cap) the assembled report
+# must carry `Audit classification: transient (verdict_assembly_failure:
+# <cause>)` instead of an unmarked verdict; a clean run emits no
+# classification line. Red against current HEAD; green after C2.
+
+class TestTransientClassificationAssembly:
+    """Report assembly distinguishes infra-fallback verdicts as transient."""
+
+    from typing import ClassVar
+
+    ISSUE: ClassVar[dict] = {"id": "SA-TRANSIENT", "title": "Transient assembly test"}
+
+    # Marker (from audit_runner._INFRA_FALLBACK_MARKERS) → cause token the
+    # classification line must carry. This is the contract C2 implements.
+    MARKER_TO_CAUSE: ClassVar[list[tuple[str, str]]] = [
+        ("Pi model output could not be parsed", "unparseable_output"),
+        ("Pi provider error: upstream unavailable", "provider_error"),
+        ("Audit concurrency limit reached", "concurrency_cap"),
+        ("timed out — manual review required", "timeout"),
+    ]
+
+    def test_infra_fallback_verdicts_emit_transient_classification(self):
+        """For each infrastructure-fallback marker the assembled report
+        starts with `Ready to close:` and carries
+        `Audit classification: transient (verdict_assembly_failure: <cause>)`
+        (AC2)."""
+        from audit.scripts.audit_runner import _assemble_issue_report
+
+        for marker, cause in self.MARKER_TO_CAUSE:
+            ac_results = [
+                {
+                    "text": "The system must do the thing.",
+                    "verdict": "partial",
+                    "evidence": f"criterion not assessed — {marker}",
+                },
+            ]
+            report = _assemble_issue_report(self.ISSUE, ac_results, [])
+
+            assert report.startswith("Ready to close:"), report.splitlines()[0]
+            assert (
+                f"Audit classification: transient "
+                f"(verdict_assembly_failure: {cause})" in report
+            ), (
+                f"marker {marker!r} should map to cause {cause!r}; "
+                f"report excerpt: {report[:400]!r}"
+            )
+
+    def test_clean_report_has_no_classification_line(self):
+        """A run whose verdicts are genuine model assessments emits no
+        classification line (AC2)."""
+        from audit.scripts.audit_runner import _assemble_issue_report
+
+        ac_results = [
+            {
+                "text": "Feature works as specified.",
+                "verdict": "met",
+                "evidence": "tests/test_feature.py:12 — verified",
+            },
+        ]
+        report = _assemble_issue_report(self.ISSUE, ac_results, [])
+
+        assert "Audit classification:" not in report, report[:400]
+
+# C3 (WL-0MW32YGSY008GRQP): Phase-2 budget and gate-remediation alignment
+# ---------------------------------------------------------------------------
+# Regression tests for the test-first pair with C4 (WL-0MW32YZP7005LZ5B): the
+# Phase-2 deep-analysis default must be the documented 2,400 s budget (not the
+# 1,800 s placeholder), an explicit override must still win, the Phase-2
+# timeout diagnostic must report the resolved effective timeout (not a
+# hardcoded constant) and name the Phase 2 deep-analysis phase, and the
+# Phase-1 screen budgets (1,080 s) / stall-abort threshold (600 s) must stay
+# unchanged. Red against current HEAD; green after C4.
+
+
+class TestPhase2BudgetAndDiagnostic:
+    """Phase-2 budget, override precedence and truthful timeout diagnostic."""
+
+    def test_phase2_default_effective_timeout_is_documented_2400(self):
+        """The Phase-2 default effective timeout equals the documented 2,400 s
+        budget (parent WL-0MW2F2T1I001ZNH7 plan D2; measured p90 x 2)."""
+        from audit.scripts.audit_runner import _resolve_call_timeout
+
+        assert _resolve_call_timeout(None) == 2400, (
+            "Phase-2 default effective timeout must be the documented 2,400 s "
+            "budget, not the 1,800 s placeholder"
+        )
+
+    def test_phase2_explicit_timeout_override_wins(self):
+        """An explicit ``--timeout`` value must win over the Phase-2 default."""
+        from audit.scripts.audit_runner import _resolve_call_timeout
+
+        assert _resolve_call_timeout(2700) == 2700
+        assert _resolve_call_timeout(60) == 60
+
+    def test_audit_pi_timeout_env_override_wins(self, monkeypatch):
+        """``AUDIT_PI_TIMEOUT`` must win over the Phase-2 default."""
+        from audit.scripts.audit_runner import (
+            _resolve_call_timeout,
+            _resolve_effective_timeout,
+        )
+
+        monkeypatch.delenv("AUDIT_PI_TIMEOUT", raising=False)
+        assert _resolve_effective_timeout(None) is None
+        monkeypatch.setenv("AUDIT_PI_TIMEOUT", "2700")
+        effective = _resolve_effective_timeout(None)
+        assert effective == 2700
+        assert _resolve_call_timeout(effective) == 2700
+
+    def test_phase2_timeout_diagnostic_reports_effective_timeout(self):
+        """The Phase-2 timeout diagnostic reports the resolved effective
+        timeout (a 2,700 s override reports 2,700 s, not the hardcoded
+        1,800 s/``CALL_PI_TIMEOUT``) and names the Phase 2 deep-analysis
+        phase (SA-0MV9J471W002LCE1)."""
+        from unittest import mock
+
+        from audit.scripts import audit_runner
+
+        captured: list[tuple[str, str]] = []
+
+        def fake_call(issue_id, context, prompt, **kwargs):
+            return {"_timeout": True, "evidence": "Deep analysis timed out."}
+
+        with mock.patch.object(
+            audit_runner, "_call_pi_and_maybe_log", side_effect=fake_call,
+        ), mock.patch.object(
+            audit_runner, "_build_file_scope_manifest", return_value="manifest",
+        ), mock.patch.object(
+            audit_runner, "_validate_file_scope_manifest", return_value=None,
+        ), mock.patch.object(
+            audit_runner, "_resolve_touched_files", return_value=[],
+        ):
+            audit_runner._run_phase2_deep_analysis(
+                {"id": "P2T-1", "description": "## Acceptance Criteria\n1. AC one\n"},
+                [{"text": "AC one", "verdict": "unmet", "evidence": ""}],
+                [],
+                "full-model",
+                timeout=2700,
+                script_failure_callback=lambda label, exc: captured.append(
+                    (label, str(exc))
+                ),
+            )
+
+        assert captured, "the Phase-2 timeout must invoke script_failure_callback"
+        label, message = captured[0]
+        assert label == "pi (Phase 2 deep analysis)", label
+        assert "Phase 2 deep analysis" in message
+        assert "2700" in message, (
+            f"diagnostic must name the effective 2,700 s timeout, got: {message!r}"
+        )
+        assert "1800" not in message, (
+            "diagnostic must not report the hardcoded 1,800 s placeholder: "
+            f"{message!r}"
+        )
+
+    def test_phase1_screen_budgets_and_stall_threshold_unchanged(
+        self, monkeypatch
+    ):
+        """Phase-1 screen budgets (1,080 s) and the stall-abort threshold
+        (600 s) are unchanged — the Phase-2 change cannot silently widen
+        screening budgets (parent plan D2)."""
+        from audit.scripts.audit_runner import (
+            _CHILD_SCREEN_TIMEOUT_DEFAULT,
+            _PARENT_SCREEN_TIMEOUT_DEFAULT,
+            _STALL_TIMEOUT_DEFAULT,
+            _resolve_call_timeout,
+            _resolve_child_screen_timeout,
+            _resolve_parent_screen_timeout,
+            _resolve_stall_timeout,
+        )
+
+        for var in (
+            "AUDIT_CHILD_SCREEN_TIMEOUT",
+            "AUDIT_PARENT_SCREEN_TIMEOUT",
+            "AUDIT_STALL_TIMEOUT",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+        assert _PARENT_SCREEN_TIMEOUT_DEFAULT == 1080
+        assert _resolve_parent_screen_timeout(None) is None
+        assert _resolve_call_timeout(None, parent_screen=True) == 1080
+        assert _CHILD_SCREEN_TIMEOUT_DEFAULT == 1080
+        assert _resolve_child_screen_timeout(None) is None
+        assert _resolve_call_timeout(None, child_screen=True) == 1080
+        assert _STALL_TIMEOUT_DEFAULT == 600
+        assert _resolve_stall_timeout() == 600
 

@@ -56,8 +56,9 @@ This is **guidance for the agent invoking the runner** — it does not change
 
 3. **Enforce a 180-minute hard budget.** The whole run must finish within
    **10800s (180 min)** of launch. This is the agent-side outer budget —
-   distinct from the runner's per-call `CALL_PI_TIMEOUT` (1800s default,
-   `--timeout` / `AUDIT_PI_TIMEOUT`) and its child-count-scaled parent
+   distinct from the runner's per-call `CALL_PI_TIMEOUT` (2400s default —
+   the data-derived Phase-2 budget, `--timeout` / `AUDIT_PI_TIMEOUT`) and its
+   child-count-scaled parent
    elapsed-time guard (`--parent-timeout` / `AUDIT_PARENT_TIMEOUT`). When the
    180-minute budget is exhausted the run MUST be aborted (see Abort &
    Mitigate below).
@@ -223,7 +224,7 @@ The item's integration evidence is derived from the item itself:
 - **No baseline:** an owning repo with neither `origin/dev` nor a local `dev` has no integration target — recorded as non-blocking (never an integration trigger).
 - **Integrate (when evidence exists, not merged, baseline present):** fetch `dev`; fresh detached worktree at `origin/dev`; merge `--no-ff` the feature branch (or cherry-pick each candidate NOT already in `dev`); symlink the owning repo's `node_modules` (implement-skill convention — never npm-install inside a worktree); build (`npm run build`, **skipped when the repo has no `scripts.build` entry** — docs-only/Python-only repos, SA-0MT9607Q5009JA2V); run the project test suite (test-skill runner, `run_suite("all")`); then push `HEAD:refs/heads/dev` — NEVER `main`. Post-merge the pushed sha is re-verified as an ancestor of `origin/dev`.
 - **Conditional build (SA-0MT9607Q5009JA2V):** `_has_build_script()` reads the root `package.json` directly (no npm needed) and skips the build step when the file is missing or has no `scripts.build` entry, recording "No build script … — skipped" as a non-blocking evidence note. Malformed JSON or a non-object `scripts` value counts as "no build script" (fail-open — a broken manifest never blocks the gate). A repo WITH a build script runs `npm run build` unchanged and still fails the gate on a non-zero exit. Mirrors the implement skill's `run_build()` / `_has_build_script()` convention (SA-0MSM6JHG9002CZA1).
-- **Fail closed (AC3):** when integration cannot complete (fetch/ref failure, conflicts, build/test failure, push failure, or any unexpected error after evidence resolution) the gate emits "Ready to close: No" (+ `--needs-producer-review yes` via the lifecycle's no-verdict branch) — the pipeline never proceeds past Phase 1 with unmerged work. No rest of Phase 1 screening and no Phase 2 run (assessment would be misleading against unmerged code).
+- **Fail closed (AC3):** when integration cannot complete (fetch/ref failure, conflicts, build/test failure, push failure, or any unexpected error after evidence resolution) the gate emits "Ready to close: No" (+ `--needs-producer-review yes` via the independent no-verdict branch — a cascade-demotion-suppressed `No` leaves the flag untouched, see *Producer-review flag lifecycle*) — the pipeline never proceeds past Phase 1 with unmerged work. No rest of Phase 1 screening and no Phase 2 run (assessment would be misleading against unmerged code).
 - **Fail open (never blockers):** items with NO resolvable evidence (docs/admin items — no feature branch, no referenced commits) and repos with NO dev baseline proceed with the gate recorded as a note.
 
 ### Stale-audit-base guard (SA-0MT9EK1UU000DT1R)
@@ -252,6 +253,24 @@ Short-circuits item-level audits when a recent, valid audit exists to avoid unne
 5. ``--force`` bypasses the gate — both for the item being audited and, on a parent run, for child verdict reuse (LP-0MSQ32MF200675AR): ``--force`` re-audits every child instead of reusing stored verdicts.
 
 **Fail-open:** `_compute_content_fingerprint` returns ``None`` — and the pipeline re-runs — only when the work item cannot be fetched (``wl show`` failure) or the payload cannot be built (a garbage title/description still yields a deterministic hash). The gate is deliberately **fail-stale, never fail-fresh**: being stale is only wasteful, while being fresh when the work item's own data changed is a correctness bug.
+
+### Pending-screens exception — the gate never marks outstanding child screens fresh (SA-0MVSTZ71J001P67S D1)
+
+A content-fresh report is **not** automatically a final verdict: a report whose own header says `Child screens pending: N (main-slot)` describes an **incomplete** audit, yet servicing the emitted screens never changes the parent's title/description — so the fingerprint alone would keep such an item clamped forever (production: `LP-0MVLNBCTN0084MT0`, where the documented re-run printed `Skipping: audit still fresh — Ready to close: No`).
+
+The decision to honour the gate therefore lives in `cmd_issue`, not in `_check_audit_freshness`: after the gate returns a report, `cmd_issue` reads the resumable signal via `_read_pending_screens_signal(issue_id, owning_root, ctx.explicit_checkpoint_dir)` — the same directory resolution as the checkpoint store (`--checkpoint-dir` > `AUDIT_CHECKPOINT_DIR`). **While it names any child, the short-circuit is suppressed**: the runner prints
+
+```
+Freshness gate bypassed: N child screen(s) still pending main-slot review (<ids>) — a report with outstanding child screens is not a final verdict; resuming the audit pipeline.
+```
+
+to stderr and falls through to the pipeline so the checkpoint resume / Phase 1 child-verdict pre-pass can collect the serviced child audits (see the child-audit execution contract below). Consequences:
+
+- `_check_audit_freshness` itself is unchanged (its read-only `check-freshness` probe keeps reporting the content verdict); only the caller's decision to treat that verdict as terminal changes.
+- `--force` behaviour is unchanged — it never consults the gate.
+- `--no-checkpoint` reads no signal, so its behaviour is byte-identical to before.
+- A `--do-not-persist` run cannot re-publish "fresh" for such an item: the short-circuit that would print/persist that verdict is never taken while the signal exists.
+- Once every serviced child is collected the pending list empties and `_write_pending_screens_signal([])` deletes the file, so the next run is gated on content again.
 
 **Migration note — one-time re-audit of legacy in-review items.** A legacy (fingerprint-less) audit whose work item's ``updatedAt`` moved after the audit (e.g. a comment was added, or the status was advanced to ``in_review``) fails the time gate once and gets a full re-audit. That re-audit persists a **v2** fingerprint, so the item is thereafter gated on item data only and never re-audits for timestamp churn again. The consequence to expect: **a legacy re-audit can block on the pre-flight full-suite cache gate** — exactly the failure seen on SA-0MSN04X2S006ONH0, where a verified item stuck in review was re-audited and blocked because no green full-suite run existed at HEAD. Remediation is unchanged: run the full suite once at the audited commit (``/skill:test`` or ``run_tests.py --force``) to populate the cache, or attest with ``--green-run HEAD``; a cache miss auto-executes the suite (F3) rather than hard-blocking.
 
@@ -297,6 +316,90 @@ effect on the output. It exists because the ship gates
 callers instead of failing with ``unrecognized arguments: --json``.
 
 **Child verdict reuse uses the same content gate (primary):** the content-based fingerprint gate is the PRIMARY freshness test for child verdict reuse in parent audits, not just item-level audits (LP-0MSQ32MF200675AR). Children use the **same simplified item-data-only fingerprint**: a child whose stored audit carries an unchanged v2 fingerprint AND a parseable verdict is reused — its persisted AC verdict table appears in the parent report (with a ``Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`` marker) and NO pi calls are issued for that child — no child Phase 1 screening, no child Phase 2 deep/batch entry. The time gate remains the legacy floor for fingerprint-less child reports. ``--force`` bypasses child reuse exactly as it bypasses the item-level gate.
+
+## Producer-review flag lifecycle (SA-0MVR9B1UH002BUST, Option B+)
+
+`needsProducerReview` is a bare boolean, so it cannot answer *"was this
+reviewed?"*. This section defines exactly when the audit runner writes it.
+
+### Truth table
+
+| Verdict | Item | Review signal | `needsProducerReview` after the run |
+|---|---|---|---|
+| `Yes` | top-level | prior passing audit whose v2 fingerprint == current, flag `false` | **preserved** (writes no flag) |
+| `Yes` | top-level | never reviewed / prior audit not passing / content changed / signal unavailable | **`yes`** |
+| `No` | top-level, independent | either | **`yes`** |
+| `No` | top-level, cascade-demotion-suppressed | either | **untouched** (producer decision Q2) |
+| `No` | child (has a parent) | either | **untouched** (SA-0MSSVKYEW008PJ9H) |
+| any | any | infrastructure failure / unparseable verdict / tainted `No` | **untouched** (producer decision Q3) |
+
+The runner **never** writes `--needs-producer-review no` on any path: it may
+preserve a stored `false`, but it never clears a review.
+
+### Where the signal comes from
+
+At audit start the runner captures the item's stored audit record
+(`_fetch_prior_audit` / the freshness gate's own fetch via
+`_check_audit_freshness(..., audit_sink=...)`) and normalises it with
+`_summarise_prior_audit` to
+`{readyToClose, fingerprint, auditedAt}`. The current (pre-audit) content
+fingerprint is attached with `_compute_content_fingerprint` using the
+already-fetched work item.
+
+The pure predicate `_producer_review_preserved(wi, prior_audit)` returns `True`
+only when **all** of the following hold: the item is top-level, its
+`needsProducerReview` is falsy, the stored audit passed, and its v2 content
+fingerprint equals the current one. That combination can only mean a producer
+cleared the flag after a passing audit of identical content.
+
+Because the v2 fingerprint hashes only the item's own `title` + `description`
+(SA-0MVIDI8E00063OOP), the signal is **content-scoped**: comments, lifecycle
+flips and unrelated commits never invalidate a review; a material content
+change does (a fresh review is then required).
+
+### Fail-safe direction
+
+Every ambiguous case resolves to **flag**, never to preserve: no prior audit, a
+prior non-passing audit, a legacy/fingerprint-less report, or a failed
+`wl audit-show`. A spurious review request is a nuisance; a silently discarded
+review gate is a release-safety defect.
+
+### Cost
+
+No new `wl` invocation on the hot path: the non-forced path reuses the
+freshness gate's `wl audit-show`. The forced path (`--force` /
+`--refresh-audits` / batch drains), which bypasses that gate, adds exactly one
+`wl audit-show`.
+
+### Recording the decision (durable + auditable)
+
+`_resolve_producer_review_decision` resolves the action **once**, before
+persistence, and the terminal lifecycle (`_apply_terminal_lifecycle`) reuses
+it, so the flag write and the record can never disagree. The report that is
+persisted carries an explicit metadata line:
+
+```
+Producer review: preserved (content fingerprint <sha256>)
+Producer review: required (<reason>; previous content fingerprint <sha256>)
+Producer review: untouched (<reason>)
+```
+
+Inspect it with `wl audit-show <id> --json` (the line is inside the stored
+report), so a later run or a human can see *why* the flag was set or
+preserved. A `--do-not-persist` dry run still applies the flag rules but
+stores no report, so the line is not written.
+
+### Design note: why Option B+ (not a durable marker)
+
+Option A-lite (a `producer_reviewed_at` + fingerprint marker written on every
+`true → false` transition) was rejected by the producer: it requires a
+ContextHub schema + CLI migration, a cross-repo blocking dependency, and
+hooks on every clear path (`wl reviewed`, `wl update --needs-producer-review
+false`, the ship remediation/override paths). Option B+ satisfies the
+content-scoped requirement with existing state and no cross-repo change, and
+upgrades cleanly to Option A-lite later. Accepted edge: a flag cleared by an
+automated override is indistinguishable from a human review — both are
+intentional clears and preserving them is the correct outcome.
 
 ## Re-audit coordination check
 
@@ -616,11 +719,21 @@ synthetic id and mis-resolve the per-audit target root. Tests that exercise owne
 resolution (the launch-context suite) override the scan root and resolver with
 their own patches.
 
-**Timeout:** `CALL_PI_TIMEOUT`=1800s per Pi call (default). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 1800s default. Cumulative elapsed-time guard skips remaining child audits to prevent silent kill; the default scales with the number of active children (`110s` base + `1200s` per child — e.g. ~1,310s for a single child, ~12,110s for a 10-child parent), so multi-child audits with default settings attempt child auto-audits instead of silently degrading to parent-only. Override with an exact value via `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > child-count-scaled default. When the guard does trip, each remaining child is recorded as `partial (budget exceeded)` — never a bare skip — with a diagnostic naming the elapsed time, the computed budget and the `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` override, and a resumable checkpoint marker is written immediately (see the budget-exceeded contract below). On timeout, returns `unmet` with evidence "Pi model call timed out."
+**Timeout:** `CALL_PI_TIMEOUT`=2400s per Phase-2 Pi call (default; data-derived, see the Phase-2 budget contract below). Override with `--timeout SECONDS` or the `AUDIT_PI_TIMEOUT` env var (e.g. `AUDIT_PI_TIMEOUT=3600`). Precedence: `--timeout` flag > `AUDIT_PI_TIMEOUT` env var > 2400s default. Cumulative elapsed-time guard skips remaining child audits to prevent silent kill; the default scales with the number of active children (`110s` base + `1200s` per child — e.g. ~1,310s for a single child, ~12,110s for a 10-child parent), so multi-child audits with default settings attempt child auto-audits instead of silently degrading to parent-only. Override with an exact value via `--parent-timeout SECONDS` or the `AUDIT_PARENT_TIMEOUT` env var (e.g. `AUDIT_PARENT_TIMEOUT=3600`) to audit items with many children in one pass on harnesses whose bash tool allows longer runs. Precedence: `--parent-timeout` flag > `AUDIT_PARENT_TIMEOUT` env var > child-count-scaled default. When the guard does trip, each remaining child is recorded as `partial (budget exceeded)` — never a bare skip — with a diagnostic naming the elapsed time, the computed budget and the `--parent-timeout` / `AUDIT_PARENT_TIMEOUT` override, and a resumable checkpoint marker is written immediately (see the budget-exceeded contract below). On timeout, returns `unmet` with evidence "Pi model call timed out."
 
-**Child Phase-1 screen budget (LP-0MSQ32S2M001EA74, right-sized by SA-0MVI3608M0080QLW):** lightweight child Phase-1 AC-review screens use a short per-call budget — default **1080 s**, configurable via `--child-screen-timeout SECONDS` (flag wins) or the `AUDIT_CHILD_SCREEN_TIMEOUT` env var. The default is **derived from measurement, not guessed**: on the 2026-10-21 reference run eleven child screens split into six completions (258/336/337/394/463/506 s) and five that landed exactly on the old 600 s cap, i.e. the unconstrained p95 (~506 s) sat only ~15 % below the cap and 45 % of screens capped out. The budget is `ceil(p95 x safety_factor)` with a documented **safety factor of 2** → `ceil(506 x 2) = 1012`, rounded up to 1080 s (~2.1x headroom), still far below the 1800 s Phase-2 budget. Re-derive on a new corpus with `scripts/measure_audit_performance.py --root ~/.audit_debug` (child row, p95 column → `ceil(p95 x 2)`). `PARENT_TIMEOUT_PER_CHILD` is kept **≥ the child budget** (1200 s) so the parent's cumulative guard never becomes the new starvation point; verified against the corpus at ≤ 5 % of screens landing on the cap (was 45 %).
+**Child Phase-1 screen budget (LP-0MSQ32S2M001EA74, right-sized by SA-0MVI3608M0080QLW):** lightweight child Phase-1 AC-review screens use a short per-call budget — default **1080 s**, configurable via `--child-screen-timeout SECONDS` (flag wins) or the `AUDIT_CHILD_SCREEN_TIMEOUT` env var. The default is **derived from measurement, not guessed**: on the 2026-10-21 reference run eleven child screens split into six completions (258/336/337/394/463/506 s) and five that landed exactly on the old 600 s cap, i.e. the unconstrained p95 (~506 s) sat only ~15 % below the cap and 45 % of screens capped out. The budget is `ceil(p95 x safety_factor)` with a documented **safety factor of 2** → `ceil(506 x 2) = 1012`, rounded up to 1080 s (~2.1x headroom), still far below the 2400 s Phase-2 budget. Re-derive on a new corpus with `scripts/measure_audit_performance.py --root ~/.audit_debug` (child row, p95 column → `ceil(p95 x 2)`). `PARENT_TIMEOUT_PER_CHILD` is kept **≥ the child budget** (1200 s) so the parent's cumulative guard never becomes the new starvation point; verified against the corpus at ≤ 5 % of screens landing on the cap (was 45 %).
 
-**A capped screen is quarantined, never a silent judgement:** a screen that hits its budget returns the conservative `partial` verdict whose evidence names the budget and phase (*"Child screen reached its Phase 1 budget (1080 s, AUDIT_CHILD_SCREEN_TIMEOUT) before returning a verdict — QUARANTINED as partial (never met)"*), and the run increments `child_screen_timeouts` in `AUDIT_RELIABILITY_SUMMARY` so downstream consumers can exclude it rather than read a timeout as a model verdict. A screen that exceeds its budget never burns the full 1800 s. All Phase 2 calls (parent + child deep analysis) keep the 1800 s budget.
+**A capped screen is quarantined, never a silent judgement:** a screen that hits its budget returns the conservative `partial` verdict whose evidence names the budget and phase (*"Child screen reached its Phase 1 budget (1080 s, AUDIT_CHILD_SCREEN_TIMEOUT) before returning a verdict — QUARANTINED as partial (never met)"*), and the run increments `child_screen_timeouts` in `AUDIT_RELIABILITY_SUMMARY` so downstream consumers can exclude it rather than read a timeout as a model verdict. A screen that exceeds its budget never burns the full 2400 s. All Phase 2 calls (parent + child deep analysis) use the Phase-2 budget (2400 s).
+
+**Phase-2 deep-analysis budget, derived from measurement (WL-0MW32YZP7005LZ5B, parent AC2/AC3; absorbs SA-0MV9J471W002LCE1):** the Phase-2 per-call budget is **2400 s (40 min)**, not a placeholder. The 2026-11-05 corpus (`python3 scripts/measure_audit_performance.py --root ~/.audit_debug --json`; 934 logs, 2,456 timing lines) measured the Phase-2 family:
+
+| context | calls | p50 | p90 | max | calls at the 1800 s cap |
+|---|---|---|---|---|---|
+| `phase2_deep` | 476 | 288 s | 1085 s | 3600 s | 15 |
+| `phase2_child` | 454 | 341 s | 1116 s | 2071 s | 10 |
+| `verdict_reask` | 211 | 462 s | 1339 s | 2372 s | 6 |
+
+The Phase-2 p90 is 1085–1116 s and **25 Phase-2 calls landed exactly on the old 1800 s ceiling**: 1800 s was under-sized for this family, not merely a saturation artefact. Applying the repository's derivation discipline (`ceil(p90 x safety factor 2)`, rounded) to the family p90 — rounded up to the next 100 s bucket (1200 s) — gives `ceil(1200 x 2) = 2400` s. Re-derive on a new corpus with `python3 scripts/measure_audit_performance.py --root ~/.audit_debug --json` (`phase2_deep` / `phase2_child` p90 columns → round up to the next 100 s, then x 2). Phase-1 screen budgets (1080 s) and the in-process stall-abort threshold (600 s) are unchanged, and the timeout diagnostic reports the **resolved effective** budget (a `--timeout 2700` run reports `timed out after 2700s`), never a hardcoded constant.
 
 **Parent Phase-1 screen budget and quarantine (SA-0MVJ3Q662006RDJR):** the parent Phase-1 AC screen is the same structural *screening* call as a child screen (read the FILE SCOPE manifest, map each AC to a verdict), so it uses the same measured right-sized budget — default **1080 s**, configurable independently via `--parent-screen-timeout SECONDS` (flag wins) or the `AUDIT_PARENT_SCREEN_TIMEOUT` env var, with `--timeout` / `AUDIT_PI_TIMEOUT` still winning over both. Before this change the parent screen kept the full 1800 s Phase-2 budget, and the 2026-10-22 clean-room measurement (`SA-0MVI6VVC00029XO4`) showed it consuming the entire cap for a **single-item** audit and then driving a 1147 s `verdict_reask` — the `+1` of the N+1 structure that no child of the epic owned. On the 2026-10-23 corpus (482 parent screens) completions run p50 224.8 s / p90 906.3 s / p95 1232.9 s (contention-inclusive: the p95 is inflated by queue wait behind the saturated 2-slot proxy) with 16 calls landing exactly on the 1800 s cap, so the 1080 s screening budget covers ≥ 90 % of completions while converting the cap-bound remainder into fast quarantines. Re-derive with `scripts/measure_audit_performance.py --root ~/.audit_debug` (parent row, completions p95 → `ceil(p95 x 2)`; the screening-class value stays 1080 because parent and child screens are the same work).
 
@@ -692,6 +805,8 @@ Semantics:
 **Automatic full-suite verification (read-only test cache):** The runner can also verify execution-dependent criteria automatically — without any operator attestation — by consuming a green full-suite run from the per-repo test cache (`../test_cache.py`, SA-0MSGNUWQ9002LSMS / SA-0MSGN5OJ4002OZKY). When a full-suite run was cached green at the audited git state, the runner looks the cached result up **read-only** via `query_cached()` — which never executes anything — and, when EVERY suite command (pytest + the node suite dirs that exist in the target repo) has a cached entry with exit code 0, injects an **AUTO-VERIFIED GREEN RUN** block into the Phase 1 parent prompt, BOTH child Phase-1 screens (per-child and opt-in batched — so a child's execution-dependent AC is judged on the same verified evidence as the parent's, LP-0MVO35BF90021QY6), and ALL Phase 2 prompts. **The audit accepts GREEN cached evidence within its own 24h acceptance window (`AUDIT_CACHE_TTL_SECONDS`), not the generic 2h used elsewhere:** the dev-push pre-push hook and the `ship` release gate run the full suite at the exact pushed/merged git state, so the audit reuses that gate-produced evidence instead of re-running the suite — including for items pushed more than 2h earlier, re-audits, and audits at a HEAD that has since advanced (SA-0MVECQUGF0064U81). The git-state key guarantees the tree is byte-identical; the window only guards environmental drift. Non-zero-exit entries are never extended (short 5-min TTL, see below). The model MAY then mark execution-dependent criteria (e.g. "full test suite passes") met based on the verified cached result, and the sha is recorded in the persisted report as an `Automatic green run evidence: <sha> (cached full-suite run)` line near the `Ready to close:` header.
 
 **Suite-command set is repo-aware (SA-0MSJELL44009XYIL):** `full_suite_commands()` emits a node command only for suite dirs that exist under the target repo (`tests/node`, `tests/cli`, `tests/unit`; missing dirs are skipped). A repo without `tests/node` (e.g. ContextHub's vitest-only layout) is therefore never asked about a phantom `tests/node` command that could only fail — auto-verification works for any layout instead of being structurally impossible.
+
+**Herdr package-suite verification (WL-0MVHP5NTU009PA3I / SA-0MW133H3P008TNPQ):** the herdr package suite is deliberately **not** part of the canonical full suite (ContextHub producer decision WL-0MVFZVIA50062TJ8); it is a separate, opt-in profile recorded under independent cache keys (`run_tests.py --type herdr` → `test_type="herdr"`, `--group herdr` → `test_type="group:herdr"`). Before this change that made herdr-suite evidence invisible to the audit, so a herdr-only change always needed operator attestation. Now, when a work item's **resolved touched files include a `packages/herdr/**` path** (committed paths plus Key Files, `_resolve_touched_files`), the audit queries the cache read-only under **both** keys within the same 24h acceptance window (`AUDIT_CACHE_TTL_SECONDS`) and injects a **HERDR SUITE GREEN RUN** block when at least one profile is green at the audited HEAD (every command of the profile exits 0, every entry `scope="full"`). The block is appended to the same evidence text threaded into the parent Phase-1 screen, both child Phase-1 screens and every Phase 2 prompt, and states explicitly that it lets the model mark a criterion **about the herdr package suite** met but **never satisfies a "full test suite passes" AC** — that still requires a `--type full` / `scope: full` entry, and the full-suite classifier is unchanged (AC2). The path is read-only (it never executes the herdr suite); a miss, red, changed-scope, empty-profile or cache error yields no evidence with a diagnostic (fail-open partial), and a non-herdr item never queries the herdr keys. The sha is recorded in the persisted report as `Herdr suite evidence: <sha> (cached herdr package-suite run)`.
 
 Semantics:
 
@@ -775,6 +890,13 @@ Invalid values (0, negative, non-int) fail closed to the default with a warning 
 - **Separate-process mode (gate `false`):** the unchanged historical path — a `pi` subprocess session per child for Phase-1 screens and Phase-2 deep analysis with the slot-aware concurrency ceiling and parallel child deep analysis described here. Restore it with `AUDIT_CHILD_IN_MAIN_SLOT=false` or `--no-child-in-main-slot` (documented fallback when the main-slot mode misbehaves).
 
 **Child-audit execution contract (SA-0MU32TE120012T49):** in-main-slot mode never presents a pending child as a normal result. Whenever any child AC is still pending main-slot review, the assembled report emits `Child screens pending: N (main-slot) — <child ids>` immediately after the `Ready to close:` header, the summary gains a `Child-audit execution gate:` line naming the children and the remediation, and closure is forced to `Ready to close: No` (the JSON payload exposes `pending_child_screens` and `ready_to_close: false`). A resumable signal (`<issue_id>.pending-screens.json` in the checkpoint directory, default `.worklog/audit-checkpoints/`) records the outstanding child ids and is deleted automatically when none remain, so a subsequent run completes exactly those child screens via child-verdict reuse without re-running completed phases. Detection keys on the in-main-slot `partial` evidence (`_pending_main_slot_child_ids`); a pending screen can never be silently mistaken for a reviewed child.
+
+**Resume-cycle composition (SA-0MVSTZ71J001P67S):** the documented resume instruction — perform each emitted `[AUDIT_IN_MAIN_SLOT_WORK]` screen, persist the child audit, re-run the parent — is now reachable end to end, in both service cases:
+
+- **Same session (D1 + Phase 1 reuse).** The invoking session services the screens immediately after the first run and re-runs the parent. The first run succeeded, so its phase checkpoint was cleared; the re-run is not short-circuited by the content-fresh stored report because the pending-screens signal suppresses the freshness gate (see *Pending-screens exception* above), and the ordinary Phase 1 child-verdict pre-pass collects each serviced child (`reused_from`, `child_audit_ready`, **zero** child `pi` calls).
+- **Later session (D2 — checkpoint-resume re-resolution).** A previous session may die after completing the child orchestration (crash, in-process stall abort, bash-tool timeout), leaving a `phase1_children` (or `phase2`) checkpoint whose restored `child_results` still carry `MAIN_SLOT_PENDING_EVIDENCE`. Treating that phase as complete would replay the placeholders, re-derive the same pending list and rewrite the signal forever. `_run_phase_children` therefore calls `_re_resolve_pending_main_slot_children` after restoring the checkpoint state: a restored child carrying the pending marker is **not** resolved and is re-run through the same child-verdict reuse path (`_get_child_audit_verdict` → `_child_acs_from_own_audit`), so its freshly persisted audit is collected with zero `pi` calls. The refreshed `child_results` are written back with `mark_completed(PHASE_CHILDREN, …)` **before** Phase 2, so a later resume sees resolved children instead of replaying the placeholders again. Conservative by construction: a child with no stored audit, a stale stored audit (changed title/description) or under `--force` is left exactly as restored and stays pending, so the resume never fabricates a serviced state and `Ready to close: Yes` remains impossible while a genuine screen is outstanding.
+
+In both cases the composed outcome is identical: no `Child screens pending` gate, `pending_child_screens: []` in the JSON payload, the signal file removed and zero child-screening `pi` calls. Composed regression coverage lives in `skill/audit/tests/test_audit_runner_child_in_main_slot.py` (`TestResumeCycleEndToEnd`, both service cases) alongside the D1 gate tests in `test_audit_runner_freshness.py` and the checkpoint-resume tests in `TestCheckpointResumeReResolvesPendingChildren`.
 
 **Unserviced in-main-slot assessment (SA-0MVAWFUU0004VW45 / SA-0MVAWFYZE0040SQ3):** a child whose `[AUDIT_IN_MAIN_SLOT_WORK]` screens were emitted by a **previous** run and never serviced must not re-block the parent's readiness decision when the parent is re-audited. Detection is two-fold (`_is_unserviced_main_slot_child`): the child id appears in the *stale* pending-screens signal — the `<issue_id>.pending-screens.json` written by the PREVIOUS run, read via `_read_pending_screens_signal` (best-effort: missing/unreadable file ⇒ empty set) — AND its `ac_results` still carry the unserviced in-main-slot pending marker (`partial` verdict + `main-session review` evidence, `MAIN_SLOT_PENDING_EVIDENCE`). Screens freshly emitted in the CURRENT run never match (they are not yet in a stale signal) and keep the execution-contract behaviour above. For each unserviced child the parent applies, in both the markdown report and the JSON payload:
 
@@ -968,6 +1090,7 @@ Notes:
 
 - **Persistence + readback verification is an invariant of the runner.** Unless `--do-not-persist` is given, the runner ALWAYS persists the audit and then performs a readback verification via `wl audit-show --json` to confirm the stored audit is retrievable. If either step fails, the runner exits non-zero. Use `--do-not-persist` for dry runs. The `--require-persist` flag has been removed — persist+verify is now unconditional.
 - **Resilient audit persistence (P8):** the final `wl update <id> --audit-text <report>` step is the last write of the run. If it rejects the assembled verdict content (malformed JSON / validation error), `persist_audit()` never leaves the audit text field as the 43-char stub (`Audit result persisted via persist_audit.py`). It (1) runs a repair pass that salvages broken JSON fragments (valid JSON prefixes extracted; per-AC rows preserved; zero model calls) and retries once; (2) if the retry fails, persists a compact markdown fallback notice (with a clear failure notice naming the work item, so the identity/readback guards pass) and returns `PERSIST_CONTENT_INVALID` (4); (3) the runner then performs a *bounded* re-ask — at most **one** additional model call to re-emit the verdict array in valid JSON — reassembles the report and retries persistence. The repair never re-runs the full audit pipeline. If every attempt fails, `persist_audit()` returns non-zero and the run reports failure.
+- **Transient classification contract (WL-0MW2F2T1I001ZNH7):** a verdict-assembly or verdict-persistence failure is **never** stored as a bare `readyToClose: false` implying a model assessment. The persisted report always keeps the wl-required `Ready to close: <Yes|No>` first line and adds a machine-readable `Audit classification: transient (<cause>)` line, where `<cause>` is one of `verdict_persistence_failure` (the compact fallback notice persisted when the full report was rejected) or `verdict_assembly_failure: <cause>` with `cause` ∈ `timeout` \| `provider_error` \| `unparseable_output` \| `concurrency_cap` (a run whose verdicts came from an infrastructure fallback marker — Phase-2 timeout, provider error, unparseable output, concurrency cap). A clean run emits **no** classification line. `persist_audit()` mirrors the report's classification line into the `wl audit-set --summary` (`Audit result persisted; transient (…)`) so a summary-only consumer can distinguish the case. No new `wl` schema/CLI field is introduced — the classification is content in the existing `rawOutput`/`summary` fields.
 - **Priority normalization on 'Ready to close: Yes':** when the persisted report says `Ready to close: Yes` and the work item currently carries `critical` priority, `persist_audit.py` lowers it to `high` (via `wl update <id> --priority high`) before calling `wl audit-set`, so resolved items leave the critical queue. This is best-effort: a failed priority fetch/update logs a warning and never blocks persistence. It applies to both parent and child audit persistence (single `persist_audit()` entry point).
 - The persister (and the runner when persisting) call: `wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json` and return a non-zero exit code on failure. Every `wl` command built by `persist_audit` resolves the worklog store exactly like the runner's READ path (explicit `--worklog-dir` > prefix-to-sibling scan > cwd-chain > no flag) via the shared `skill.shared.status_lifecycle` helpers — the PERSIST path is cwd-independent by construction (SA-0MSKQERKH002IBLG), covering the runner parent/child path, the re-ask path, and the standalone CLI. After a successful return code, the runner calls `wl audit-show <issue-id> --json` and exits non-zero if the stored audit is null, has empty `rawOutput`/`summary`, **or the stored content does not reference the target work-item ID** (content identity check — catches a stale report persisted to the wrong item). The readback runs through the same resolved store, so it verifies against the store the audit was persisted to.
 - **Child item audit persistence:** When auditing a parent work item with children, the runner also persists an individual audit report to each child work item. Each child receives a focused report covering only its own acceptance criteria. Child persistence is controlled by the same `--do-not-persist` flag — if persistence is disabled for the parent, child persistence is also skipped. Child persist failures are logged as warnings to stderr but do not prevent the parent audit from succeeding. Child readback verification is out of scope for the current release.

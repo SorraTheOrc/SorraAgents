@@ -23,6 +23,7 @@ from test_cache import (
     FAILED_RUN_TTL_SECONDS,
     _default_runner,
     cache_dir,
+    cache_key,
     compute_git_state,
     compute_tree_state,
     lookup,
@@ -1187,3 +1188,247 @@ def test_tree_bound_entry_never_satisfies_a_loose_request(git_repo: Path) -> Non
         "pytest", loose_state, cwd=str(git_repo), fingerprint_kind="tree"
     )
     assert tree_hit is not None and tree_hit["cached"] is True
+
+
+# ---------------------------------------------------------------------------
+# Mid-run checkout movement: state_changed_during_run (regression harness)
+# ---------------------------------------------------------------------------
+#
+# TDD harness for SA-0MW3FF18I003KGZE (AC5), tracking child SA-0MW3GCHEL001G8CP.
+#
+# A full-suite run started in a shared checkout can be corrupted *mid-run* when
+# another session's ``implement.py finish`` fast-forwards that checkout: vitest
+# imports test files lazily, so the run executes the new test files against the
+# old sources and reports failures that exist in neither tree. ``run_cached()``
+# reconciles nothing today — it stores the mixed verdict under the *post-run*
+# state, so the corrupted result becomes the cached evidence for the incoming
+# commit (the 2026-11-03 entry: 13 failures cached against the new commit).
+#
+# The tests below reproduce the incident deterministically by injecting a
+# runner stub that moves the checkout while the call is in flight, and they pin
+# the contract the implementation children are being written against:
+#
+#   ``run_cached()`` returns ``state_changed_during_run=None`` normally; on a
+#   mid-run move it returns
+#   ``{"notice_code": "state_changed_during_run", "checkout": <abs path>,
+#      "before_commit": <sha>, "after_commit": <sha>, "message": <human text>}``,
+#   the run is non-green with the distinct exported
+#   ``test_cache.STATE_CHANGED_EXIT_CODE`` (75, ``EX_TEMPFAIL``) whatever the
+#   stub exited with, ``cached`` is ``False``, ``git_state`` is empty, and no
+#   cache entry is written under the pre-run *or* post-run fingerprint.
+#
+# Controls pin the boundaries: a stable run keeps today's store/hit behaviour
+# byte for byte, attributable foreign churn (a path that was already dirty when
+# the run started and another session commits it while the run is in flight) is
+# never flagged, and a tracked-file rewrite with an unchanged ``HEAD`` is a move
+# too (the Q2 = b dimension).
+#
+# ``xfail(strict=True)`` makes this harness a live red-first net: the tests are
+# expected to fail until the contract exists, and ``strict`` turns an
+# unexpectedly-passing test into a failure, so an implementation must remove
+# this marker (and the marker can never be forgotten).
+
+
+
+def _head(repo: Path) -> str:
+    """Return the full HEAD commit sha of *repo*."""
+    return gs.run_git(repo, ("rev-parse", "HEAD"), check=True).stdout.strip()
+
+
+def _entry_dir(repo: Path, git_state: str, command: str = "pytest") -> Path:
+    """Return the cache entry directory *command* would occupy at *git_state*."""
+    return cache_dir(repo) / cache_key(normalize_test_command(command), git_state)
+
+
+def _commit_tracked(repo: Path, content: str, message: str) -> str:
+    """Rewrite a tracked path and commit it, returning the new commit sha.
+
+    Stands in for another session's ``finish`` fast-forward: ``HEAD`` and the
+    tracked file move together, so ``git status`` is clean before and after.
+    """
+    (repo / "tracked.txt").write_text(content, encoding="utf-8")
+    return gs.commit_all(repo, message)
+
+
+@pytest.fixture
+def movable_checkout(tmp_path: Path) -> Path:
+    """A real checkout a runner stub can move mid-run (shared git_sandbox)."""
+    repo = gs.init_repo(tmp_path / "checkout", sandbox_root=tmp_path)
+    (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    return repo
+
+
+class TestStateChangedDuringRun:
+    """A checkout that moves mid-run is reported and its evidence quarantined."""
+
+    def test_mid_run_move_is_flagged_with_the_resolved_checkout_and_commits(
+        self, movable_checkout: Path
+    ) -> None:
+        """The notice names the code, the checkout and both commits."""
+        before_commit = _head(movable_checkout)
+        calls: list[str] = []
+
+        def runner(command: str, cwd: str | Path, timeout: int) -> SimpleNamespace:
+            calls.append(command)
+            _commit_tracked(
+                movable_checkout, "moved\n", "concurrent finish fast-forward"
+            )
+            return SimpleNamespace(stdout=SUCCESS_OUTPUT, stderr="", returncode=0)
+
+        result = run_cached("pytest", cwd=str(movable_checkout), runner=runner)
+
+        after_commit = _head(movable_checkout)
+        assert after_commit != before_commit, "the fixture must really move HEAD"
+        assert len(calls) == 1
+
+        notice = result["state_changed_during_run"]
+        assert notice is not None, "a mid-run checkout move must be reported"
+        assert notice["notice_code"] == "state_changed_during_run"
+        assert Path(notice["checkout"]) == movable_checkout.resolve()
+        assert notice["before_commit"] == before_commit
+        assert notice["after_commit"] == after_commit
+        assert notice["message"].strip(), "the notice carries a human message"
+
+    def test_mid_run_move_is_non_green_with_the_state_changed_exit_code(
+        self, movable_checkout: Path
+    ) -> None:
+        """A moved run is non-green and never a test failure, even on a red stub."""
+        assert test_cache.STATE_CHANGED_EXIT_CODE == 75, "EX_TEMPFAIL"
+        red_output = "FAILED tests/test_thing.py::test_thing - AssertionError\n"
+
+        def runner(command: str, cwd: str | Path, timeout: int) -> SimpleNamespace:
+            _commit_tracked(
+                movable_checkout, "moved\n", "concurrent finish fast-forward"
+            )
+            return SimpleNamespace(stdout=red_output, stderr="", returncode=1)
+
+        result = run_cached("pytest", cwd=str(movable_checkout), runner=runner)
+
+        assert result["state_changed_during_run"] is not None
+        assert result["exit_code"] == test_cache.STATE_CHANGED_EXIT_CODE, (
+            "the flagged run's exit code replaces the stub's parseable-failure "
+            "exit code, so no consumer can read it as a test verdict"
+        )
+        assert result["cached"] is False
+
+    def test_mid_run_move_writes_no_cache_entry_under_either_state(
+        self, movable_checkout: Path
+    ) -> None:
+        """Quarantine: neither the pre-run nor the post-run state is keyed."""
+        pre_state = compute_git_state(str(movable_checkout))
+        pre_commit = _head(movable_checkout)
+
+        def runner(command: str, cwd: str | Path, timeout: int) -> SimpleNamespace:
+            _commit_tracked(
+                movable_checkout, "moved\n", "concurrent finish fast-forward"
+            )
+            return SimpleNamespace(stdout=SUCCESS_OUTPUT, stderr="", returncode=0)
+
+        result = run_cached("pytest", cwd=str(movable_checkout), runner=runner)
+
+        assert _head(movable_checkout) != pre_commit, "the fixture must move HEAD"
+        post_state = compute_git_state(str(movable_checkout))
+        assert post_state != pre_state
+
+        assert lookup("pytest", pre_state, cwd=str(movable_checkout)) is None
+        assert lookup("pytest", post_state, cwd=str(movable_checkout)) is None
+        assert not _entry_dir(movable_checkout, pre_state).exists(), (
+            "no entry directory may exist for the pre-run state"
+        )
+        assert not _entry_dir(movable_checkout, post_state).exists(), (
+            "no entry directory may exist for the post-run state"
+        )
+        assert query_cached("pytest", cwd=str(movable_checkout)) is None
+        assert result["git_state"] == "", "a quarantined run keys no state"
+
+    def test_stable_run_stores_and_is_served_from_cache_without_a_flag(
+        self, movable_checkout: Path
+    ) -> None:
+        """Control (a): no movement keeps today's store/hit behaviour exactly."""
+        calls: list[str] = []
+        runner = make_runner(calls, output=SUCCESS_OUTPUT, exit_code=3)
+
+        first = run_cached("pytest", cwd=str(movable_checkout), runner=runner)
+        assert first["state_changed_during_run"] is None
+        assert first["cached"] is False
+        assert first["exit_code"] == 3, "the stub's exit code is preserved"
+        assert first["stdout"] == SUCCESS_OUTPUT, "the stub's output is preserved"
+        assert _entry_dir(movable_checkout, first["git_state"]).is_dir()
+
+        second = run_cached("pytest", cwd=str(movable_checkout), runner=runner)
+        assert second["state_changed_during_run"] is None
+        assert second["cached"] is True
+        assert second["exit_code"] == 3
+        assert second["stdout"] == SUCCESS_OUTPUT
+        assert second["completed_at"] == first["completed_at"]
+        assert len(calls) == 1, "the second call must be served from cache"
+
+    def test_attributed_foreign_churn_is_not_flagged_and_stores(
+        self, movable_checkout: Path
+    ) -> None:
+        """Control (b): churn another session resolves mid-run is not a move.
+
+        The tracked path was already dirty when the run started and another
+        session commits that same work while the run is in flight: the whole
+        difference is the start-dirty -> end-clean resolution, which the shared
+        attribution explains, so the run stores and is never flagged
+        (SA-0MUIJAHXS003M7BG false-positive class).
+        """
+        (movable_checkout / "tracked.txt").write_text(
+            "another session WIP\n", encoding="utf-8"
+        )
+        before_commit = _head(movable_checkout)
+        calls: list[str] = []
+
+        def runner(command: str, cwd: str | Path, timeout: int) -> SimpleNamespace:
+            calls.append(command)
+            gs.commit_all(movable_checkout, "another session commits its own WIP")
+            return SimpleNamespace(stdout=SUCCESS_OUTPUT, stderr="", returncode=0)
+
+        result = run_cached("pytest", cwd=str(movable_checkout), runner=runner)
+
+        assert _head(movable_checkout) != before_commit, (
+            "the fixture must really move HEAD (via the other session's commit)"
+        )
+        assert result["state_changed_during_run"] is None
+        assert result["cached"] is False
+        assert result["exit_code"] == 0
+        assert _entry_dir(movable_checkout, result["git_state"]).is_dir(), (
+            "attributed churn still stores its entry"
+        )
+        entry = query_cached("pytest", cwd=str(movable_checkout))
+        assert entry is not None
+        assert entry["stdout"] == SUCCESS_OUTPUT
+        assert len(calls) == 1
+
+    def test_tracked_rewrite_with_unchanged_head_is_flagged(
+        self, movable_checkout: Path
+    ) -> None:
+        """Control (c): the tracked tree moving without HEAD is a move too."""
+        before_commit = _head(movable_checkout)
+        pre_state = compute_git_state(str(movable_checkout))
+
+        def runner(command: str, cwd: str | Path, timeout: int) -> SimpleNamespace:
+            (movable_checkout / "tracked.txt").write_text(
+                "rewritten mid-run\n", encoding="utf-8"
+            )
+            return SimpleNamespace(stdout=SUCCESS_OUTPUT, stderr="", returncode=0)
+
+        result = run_cached("pytest", cwd=str(movable_checkout), runner=runner)
+
+        assert _head(movable_checkout) == before_commit, "HEAD must not move here"
+        notice = result["state_changed_during_run"]
+        assert notice is not None, "a HEAD-less tracked-tree rewrite is a move"
+        assert notice["notice_code"] == "state_changed_during_run"
+        assert notice["before_commit"] == before_commit
+        assert notice["after_commit"] == before_commit
+        assert result["exit_code"] == test_cache.STATE_CHANGED_EXIT_CODE
+        assert result["cached"] is False
+
+        post_state = compute_git_state(str(movable_checkout))
+        assert post_state != pre_state
+        assert lookup("pytest", pre_state, cwd=str(movable_checkout)) is None
+        assert lookup("pytest", post_state, cwd=str(movable_checkout)) is None
+        assert not _entry_dir(movable_checkout, pre_state).exists()
+        assert not _entry_dir(movable_checkout, post_state).exists()

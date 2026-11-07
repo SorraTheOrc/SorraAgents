@@ -43,18 +43,29 @@ Design constraints (SA-0MUG0WFP8008WN63 F3 AC1/N-L5):
   (``remote``/``merge``) — both derived from ``git worktree list --porcelain``
   and the retained-local-track config, never a ``wl-*`` name pattern. It is
   also **concurrency-based** (WL-0MV5MYBKJ0033P8U): the exact ref
-  ``refs/heads/dev`` (``CONCURRENCY_EXCLUDED_REF_EXACT``) and the whole
-  ``refs/remotes/origin/*`` namespace (``CONCURRENCY_EXCLUDED_REF_NAMESPACES``)
-  are excluded because concurrent collaborative movement of those refs (a
-  sibling finish fast-forward on the shared main checkout, concurrent
-  ``fetch``/``pull``/``push`` on a multi-agent host) is indistinguishable
-  from suite-caused movement; the exclusions are plumbing-derived ref
-  namespaces, never a ``wl-*`` name pattern. The guard's own root branch
-  stays monitored except for the concurrency-excluded ``refs/heads/dev``. The
-  GIT_DIR-leak incident class is still caught via config rewrites of any
+  ``refs/heads/dev`` (``CONCURRENCY_EXCLUDED_REF_EXACT``), the whole
+  ``refs/remotes/origin/*`` namespace and wl's own ``refs/heads/worklog/*``
+  branch namespace (``CONCURRENCY_EXCLUDED_REF_NAMESPACES``) are excluded
+  because concurrent collaborative movement of those refs (a sibling finish
+  fast-forward on the shared main checkout, concurrent
+  ``fetch``/``pull``/``push`` on a multi-agent host, a sibling session's
+  ``wl`` write / ``wl sync`` moving ``refs/heads/worklog/data``) is
+  indistinguishable from suite-caused movement; the exclusions are
+  plumbing-derived ref namespaces, never a ``wl-*`` name pattern. The
+  ``refs/heads/worklog/*`` movement is *noted* rather than silently filtered
+  (``EXCLUDED_REF_CHURN_NOTE_PREFIX``), because it is the direct signature of
+  the false positive that exclusion fixes (SA-0MVV2W9610002CLW). The guard's
+  own root branch stays monitored except for the concurrency-excluded
+  ``refs/heads/dev``. The GIT_DIR-leak incident class is still caught via
+  config rewrites of any
   non-excluded key, working-tree contamination, and moves of non-excluded
   refs (SA-0MUIA3OE40001QJX); a ``refs/heads/dev``-only ref move is no longer
-  a standalone incident signal (see ``docs/dev/test-isolation.md`` §8.4).
+  a standalone incident signal (see ``docs/dev/test-isolation.md`` §8.4),
+  and a *clean* own-checkout fast-forward of the shared integration branch is
+  only caught on the new own-checkout state surface
+  (``snapshot_own_checkout`` / ``compare_own_checkout_states``,
+  ``state_changed_during_run`` — SA-0MW3FF18I003KGZE), never through the
+  guard's ref/config/working-tree surfaces.
 
 **Working-tree attribution rule (SA-0MUIJAHXS003M7BG).** The working-tree
 surface is attributed by *start-of-run provenance*, derived only from git
@@ -75,10 +86,24 @@ that reverts or deletes another session's *uncommitted* work is masked (the
 path was pre-dirty, so its resolution is attributed), the clean→dirty
 false-positive direction is deliberately retained, and a content-only change
 to an already-dirty path is invisible to a status-code surface.
+
+**Own-checkout state surface (``state_changed_during_run``).**
+``snapshot_own_checkout`` / ``compare_own_checkout_states`` snapshot the
+*guarded root's own* HEAD commit plus a content fingerprint of the
+working-tree deltas the tree resolves to — never the ref surface.
+``refs/heads/dev``, ``refs/remotes/origin/*`` and
+``refs/heads/worklog/*`` therefore stay silent for this signal by
+construction (a sibling finish fast-forwarding the checkout's own HEAD is
+still caught, because HEAD and the tracked content it resolves to are the
+surface); differences fully explained by the start-of-run working-tree
+attribution above are reported as attributed, not as movement
+(SA-0MW3FF18I003KGZE AC3, Q2 = b). An unfingerprintable checkout is
+fail-closed and never reported as movement.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from collections.abc import Callable, Mapping
@@ -107,15 +132,28 @@ FIXTURE_AUTHOR_EMAIL = "git-sandbox@example.invalid"
 #: Worklog data namespace. These refs are managed by the ``wl`` tool (they can
 #: be fetched/reset during a test run) and are not part of the source checkout,
 #: so they are excluded from the mutation surface to avoid false positives.
+#: ``refs/heads/worklog/data`` (the worklog store's data branch) lives under
+#: ``refs/heads/`` and is matched by ``WORKLOG_HEADS_REF_NAMESPACE`` instead.
 WORKLOG_REF_PREFIX = "refs/worklog/"
+
+#: Local branch namespace owned by the ``wl`` tool: ``refs/heads/worklog/data``
+#: is moved by every ``wl`` write and every ``wl sync``, so a sibling agent
+#: session moves it while a full-suite run is in flight (SA-0MVV2W9610002CLW).
+#: Excluded as a ref-namespace prefix, matching the existing
+#: ``refs/remotes/origin/`` pattern — never a ``wl-*`` name heuristic.
+WORKLOG_HEADS_REF_NAMESPACE = "refs/heads/worklog/"
 
 #: Exact ref excluded because concurrent collaborative movement is
 #: indistinguishable from suite-caused movement (WL-0MV5MYBKJ0033P8U).
 #: ``refs/heads/dev`` is the shared integration branch: sibling agents'
 #: ``implement.py finish`` fast-forwards it on the shared main checkout while
-#: this suite runs, so its movement is never a hermetic-fixture signal. The
-#: incident class stays detectable through the config / working-tree /
-#: non-excluded-ref surfaces (see docs/dev/test-isolation.md §8).
+#: this suite runs, so its movement is never a hermetic-fixture signal. A
+#: *clean* own-checkout fast-forward of this branch is therefore never
+#: detected through the guard's ref/config/working-tree surfaces; that
+#: incident class is caught only on the new own-checkout state surface
+#: (``snapshot_own_checkout`` / ``compare_own_checkout_states``, the
+#: ``state_changed_during_run`` signal — SA-0MW3FF18I003KGZE, see
+#: docs/dev/test-isolation.md §8.4/§8.6).
 CONCURRENCY_EXCLUDED_REF_EXACT = "refs/heads/dev"
 
 #: Remote-tracking ref namespace excluded for the same reason: on a multi-agent
@@ -124,7 +162,21 @@ CONCURRENCY_EXCLUDED_REF_EXACT = "refs/heads/dev"
 #: ``push`` can ever move them, never a hermetic fixture. Derived from git
 #: plumbing namespaces (never a ``wl-*`` name pattern) so the incident's own
 #: fixture branches remain detectable.
-CONCURRENCY_EXCLUDED_REF_NAMESPACES: tuple[str, ...] = ("refs/remotes/origin/",)
+CONCURRENCY_EXCLUDED_REF_NAMESPACES: tuple[str, ...] = (
+    "refs/remotes/origin/",
+    WORKLOG_HEADS_REF_NAMESPACE,
+)
+
+#: Concurrency-excluded ref namespaces whose movement is **reported** as an
+#: informational note instead of being silently filtered (SA-0MVV2W9610002CLW
+#: AC1/Constraints). ``refs/heads/dev`` and ``refs/remotes/origin/*`` stay
+#: silent by design: their movement is routine multi-agent background churn
+#: and noting every one would flood the run report, so their existing
+#: behaviour is unchanged. The ``wl`` data branch is noted because its
+#: movement is the direct signature of the false positive this contract fixes.
+NOTED_CONCURRENCY_EXCLUDED_REF_NAMESPACES: tuple[str, ...] = (
+    WORKLOG_HEADS_REF_NAMESPACE,
+)
 
 #: Prefix of the informational note emitted when a working-tree difference is
 #: attributed to concurrent churn and therefore excluded from the verdict
@@ -132,17 +184,68 @@ CONCURRENCY_EXCLUDED_REF_NAMESPACES: tuple[str, ...] = ("refs/remotes/origin/",)
 #: an excluded foreign change from a clean run.
 EXCLUDED_CHURN_NOTE_PREFIX = "excluded: concurrently resolved working-tree change"
 
+#: Prefix of the informational note emitted when a ref difference is attributed
+#: to concurrent infrastructure churn and therefore excluded from the verdict
+#: (SA-0MVV2W9610002CLW AC1). Emitted — never silent — so a reviewer can tell
+#: an excluded ``wl`` ref movement from a clean run.
+EXCLUDED_REF_CHURN_NOTE_PREFIX = "excluded: concurrent infrastructure ref movement"
+
 
 def _is_concurrency_excluded_ref(ref: str) -> bool:
     """True when *ref* is a concurrency-excluded namespace (WL-0MV5MYBKJ0033P8U).
 
-    Applies to both the exact integration branch and the remote-tracking
-    namespace, so ``diff_snapshots`` and ``fingerprint`` filter the same set
-    and cannot drift.
+    Applies to the exact integration branch, the remote-tracking namespace and
+    wl's ``refs/heads/worklog/*`` namespace, so ``diff_snapshots`` and
+    ``fingerprint`` filter the same set and cannot drift.
     """
     if ref == CONCURRENCY_EXCLUDED_REF_EXACT:
         return True
     return any(ref.startswith(prefix) for prefix in CONCURRENCY_EXCLUDED_REF_NAMESPACES)
+
+
+def _is_noted_concurrency_excluded_ref(ref: str) -> bool:
+    """True when *ref*'s excluded movement must be reported as a note.
+
+    Only the namespaces in :data:`NOTED_CONCURRENCY_EXCLUDED_REF_NAMESPACES`
+    are reported (SA-0MVV2W9610002CLW AC1); ``refs/heads/dev`` and
+    ``refs/remotes/origin/*`` movement stays silent and unchanged.
+    """
+    return any(
+        ref.startswith(prefix) for prefix in NOTED_CONCURRENCY_EXCLUDED_REF_NAMESPACES
+    )
+
+
+def _noted_excluded_ref_churn(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    ownership_excluded: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Ref movements excluded by a *noted* concurrency namespace.
+
+    Computed from the raw snapshots (the verdict-bearing ``refs`` maps are
+    already filtered) and excludes ownership-excluded refs, whose churn stays
+    silent by design. The result uses the same ``added``/``removed``/``moved``
+    shape as ``diff_snapshots``'s ``refs`` so it renders and asserts uniformly.
+    """
+
+    def _noted(snapshot: dict[str, Any]) -> dict[str, str]:
+        return {
+            ref: sha
+            for ref, sha in snapshot.get("refs", {}).items()
+            if _is_noted_concurrency_excluded_ref(ref) and ref not in ownership_excluded
+        }
+
+    before_refs = _noted(before)
+    after_refs = _noted(after)
+    return {
+        "added": {k: v for k, v in after_refs.items() if k not in before_refs},
+        "removed": {k: v for k, v in before_refs.items() if k not in after_refs},
+        "moved": {
+            k: (before_refs[k], after_refs[k])
+            for k in before_refs
+            if k in after_refs and before_refs[k] != after_refs[k]
+        },
+    }
 
 
 class GitSandboxError(RuntimeError):
@@ -731,10 +834,11 @@ def snapshot_guarded_roots(
     Each entry carries the root's ``role`` (:data:`GUARDED_ROOT_ROLE` or
     :data:`MAIN_CHECKOUT_ROLE`), its ``path`` and the per-root
     :func:`snapshot_repo_state` result. The per-root exclusions (ownership-based
-    worktree refs, retained ``branch.<name>.*`` config, ``refs/heads/dev`` and
-    ``refs/remotes/origin/*``) therefore apply to **each** root independently,
-    so concurrent `dev`/`origin/*` movement or a worktree registered/removed
-    mid-run stays invisible on both sides.
+    worktree refs, retained ``branch.<name>.*`` config, ``refs/heads/dev``,
+    ``refs/remotes/origin/*`` and ``refs/heads/worklog/*``) therefore apply to
+    **each** root independently, so concurrent `dev`/`origin/*`/`wl` data-branch
+    movement or a worktree registered/removed mid-run stays invisible on both
+    sides.
 
     Cost is git plumbing only (one plumbing snapshot per checkout, no per-test
     work); ``include_status=False`` keeps the cheap refs+config fingerprint
@@ -1001,7 +1105,11 @@ def diff_snapshots(
     Returns ``{"changed": bool, "refs": ..., "config": ..., "status": ...,
     "excluded": ...}`` where ``status`` lists the verdict-bearing
     (``added``/``changed``) working-tree entries and each other category lists
-    ``added``/``removed``/``changed`` entries.
+    ``added``/``removed``/``changed`` entries. ``excluded`` carries what the
+    verdict ignores: attributed working-tree resolutions (``status.removed``)
+    and movement of a *noted* concurrency-excluded ref namespace
+    (``refs``, SA-0MVV2W9610002CLW) — both rendered by
+    :func:`excluded_churn_notes`, never dropped silently.
     """
     if not before.get("git", True) or not after.get("git", True):
         return {
@@ -1009,7 +1117,10 @@ def diff_snapshots(
             "refs": {},
             "config": {},
             "status": {},
-            "excluded": {"status": {"removed": {}}},
+            "excluded": {
+                "status": {"removed": {}},
+                "refs": {"added": {}, "removed": {}, "moved": {}},
+            },
         }
 
     excluded = set(before.get("excluded_refs", set())) | set(
@@ -1075,6 +1186,10 @@ def diff_snapshots(
     # Provenance is the start snapshot's own status codes (git plumbing), never
     # a path-name or `wl-*` pattern (AC4).
     excluded_status = {"removed": resolved_status}
+    # Noted concurrency ref churn (SA-0MVV2W9610002CLW): excluded from the
+    # verdict like every concurrency ref, but surfaced so the exclusion is
+    # auditable rather than silent.
+    excluded_refs = _noted_excluded_ref_churn(before, after, excluded)
 
     changed = bool(
         refs_added
@@ -1102,7 +1217,7 @@ def diff_snapshots(
             "added": status_added,
             "changed": status_changed,
         },
-        "excluded": {"status": excluded_status},
+        "excluded": {"status": excluded_status, "refs": excluded_refs},
     }
 
 
@@ -1118,14 +1233,47 @@ def excluded_working_tree_churn(diff: dict[str, Any]) -> dict[str, str]:
     return dict(diff.get("excluded", {}).get("status", {}).get("removed", {}))
 
 
+def excluded_ref_churn(diff: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Ref differences excluded by a *noted* concurrency namespace.
+
+    These never appear in ``diff["refs"]`` and therefore never set
+    ``diff["changed"]``, but they are not silent either:
+    :func:`excluded_churn_notes` renders them (SA-0MVV2W9610002CLW AC1). The
+    shape is ``{"added": {ref: sha}, "removed": {ref: sha},
+    "moved": {ref: (old, new)}}``; empty maps = nothing excluded.
+    """
+    return dict(diff.get("excluded", {}).get("refs", {}))
+
+
+def _excluded_ref_churn_notes(diff: dict[str, Any], where: str) -> list[str]:
+    """Render the excluded ref movements of *diff* (one line per movement)."""
+    refs = excluded_ref_churn(diff)
+    lines: list[str] = []
+    for ref, sha in sorted(refs.get("added", {}).items()):
+        lines.append(
+            f"{EXCLUDED_REF_CHURN_NOTE_PREFIX}{where}: added ref {ref} -> {sha}"
+        )
+    for ref, sha in sorted(refs.get("removed", {}).items()):
+        lines.append(
+            f"{EXCLUDED_REF_CHURN_NOTE_PREFIX}{where}: deleted ref {ref} ({sha})"
+        )
+    for ref, (old, new) in sorted(refs.get("moved", {}).items()):
+        lines.append(
+            f"{EXCLUDED_REF_CHURN_NOTE_PREFIX}{where}: moved ref {ref}: {old} -> {new}"
+        )
+    return lines
+
+
 def excluded_churn_notes(diff: dict[str, Any]) -> list[str]:
-    """Informational notes for working-tree churn excluded from the verdict.
+    """Informational notes for churn excluded from the verdict.
 
     Accepts either a :func:`diff_guarded_roots` result (``{"roots": [...]}``)
     or a bare :func:`diff_snapshots` result, so both guards — and the outer
     ``guarded_run_all`` consumer — share one renderer. Each note names the
-    checkout and every excluded path with its status code, prefixed by
-    :data:`EXCLUDED_CHURN_NOTE_PREFIX` (AC3). Empty list = nothing excluded.
+    checkout and the excluded path with its status code (prefixed by
+    :data:`EXCLUDED_CHURN_NOTE_PREFIX`, AC3) or the excluded ref movement
+    (prefixed by :data:`EXCLUDED_REF_CHURN_NOTE_PREFIX`, SA-0MVV2W9610002CLW
+    AC1). Empty list = nothing excluded.
     """
     entries: list[tuple[str, dict[str, Any]]] = []
     if "roots" in diff:
@@ -1139,6 +1287,7 @@ def excluded_churn_notes(diff: dict[str, Any]) -> list[str]:
         where = f" in {checkout}" if checkout else ""
         for path, code in sorted(excluded_working_tree_churn(root_diff).items()):
             notes.append(f"{EXCLUDED_CHURN_NOTE_PREFIX}{where}: {path} [{code}]")
+        notes.extend(_excluded_ref_churn_notes(root_diff, where))
     return notes
 
 
@@ -1173,3 +1322,169 @@ def describe_diff(diff: dict[str, Any]) -> str:
     for path, (old, new) in sorted(status.get("changed", {}).items()):
         lines.append(f"  changed path   [{old}->{new}] {path}")
     return "\n".join(lines) if lines else "  (no differences)"
+
+
+# ---------------------------------------------------------------------------
+# Own-checkout state snapshot + comparison (state_changed_during_run)
+# ---------------------------------------------------------------------------
+
+
+def snapshot_own_checkout(
+    root: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """Snapshot the guarded checkout's own state: HEAD + tracked-tree content.
+
+    The detection surface for ``state_changed_during_run``
+    (SA-0MW3FF18I003KGZE, Q2 = b): the checkout's own ``HEAD`` commit plus a
+    content fingerprint of the working-tree deltas the tree resolves to —
+    never the ref surface. ``refs/heads/dev``, ``refs/remotes/origin/*`` and
+    ``refs/heads/worklog/*`` therefore stay invisible to this signal by
+    construction (their movement only matters when it rewrites this
+    checkout's own HEAD/tree, which IS captured), matching the parent's
+    constraint that the shared integration branch never becomes
+    verdict-bearing.
+
+    Returns ``{"checkout": <abs path>, "git": bool, "ok": bool, "head": <sha>,
+    "tracked": <hex>, "status": {path: code}}``. ``ok`` is False for a non-git
+    root or when the state cannot be fingerprinted (fail closed: an
+    unfingerprintable checkout is never reported as movement, and the
+    ``run_cached`` consumer keeps today's no-lookup/no-store behaviour).
+    """
+    resolved = Path(root).resolve()
+    top = git_toplevel(resolved)
+    if top is None:
+        return {
+            "checkout": str(resolved),
+            "git": False,
+            "ok": False,
+            "head": "",
+            "tracked": "",
+            "status": {},
+        }
+    head_proc = run_git(resolved, ["rev-parse", "HEAD"])
+    status_proc = run_git(resolved, ["status", "--porcelain=v1", "-uall"])
+    if head_proc.returncode != 0 or status_proc.returncode != 0:
+        return {
+            "checkout": str(resolved),
+            "git": True,
+            "ok": False,
+            "head": "",
+            "tracked": "",
+            "status": {},
+        }
+    head = head_proc.stdout.strip()
+    status = _parse_status(status_proc.stdout)
+    tracked = _own_checkout_fingerprint(resolved, head, status)
+    if tracked is None:
+        return {
+            "checkout": str(resolved),
+            "git": True,
+            "ok": False,
+            "head": head,
+            "tracked": "",
+            "status": status,
+        }
+    return {
+        "checkout": str(resolved),
+        "git": True,
+        "ok": True,
+        "head": head,
+        "tracked": tracked,
+        "status": status,
+    }
+
+
+def _own_checkout_fingerprint(
+    root: Path, head: str, status: dict[str, str]
+) -> str | None:
+    """Content fingerprint of HEAD + the working-tree deltas in *status*.
+
+    Content (not just status codes) is hashed for every readable dirty path,
+    so a content-only rewrite of an already-dirty path is a move too (the Q2
+    = b dimension). Returns None when a path cannot be read (fail closed: an
+    unfingerprintable state is never treated as an unchanged one).
+    """
+    h = hashlib.sha256()
+    h.update(b"head\x00")
+    h.update(head.encode("utf-8"))
+    h.update(b"\n")
+    for path in sorted(status):
+        h.update(b"path\x00")
+        h.update(path.encode("utf-8"))
+        h.update(b"\x00code\x00")
+        h.update(status[path].encode("utf-8"))
+        h.update(b"\x00content\x00")
+        full = root / path
+        try:
+            if full.is_file():
+                h.update(full.read_bytes())
+        except OSError:
+            return None
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def compare_own_checkout_states(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    """Compare two :func:`snapshot_own_checkout` snapshots.
+
+    Returns ``{"moved": bool, "checkout": <path>, "before_commit": <sha>,
+    "after_commit": <sha>, "attributed": [<note>, ...]}``.
+
+    ``moved`` is True when the checkout's own state changed between the
+    snapshots AND the change is not fully explained by the existing
+    start-of-run working-tree attribution (:func:`diff_snapshots` /
+    :func:`excluded_churn_notes`, SA-0MUIJAHXS003M7BG): a difference that is
+    exactly a set of start-dirty → end-clean resolutions (a sibling session
+    committing work it had itself dirtied mid-run) is attributed, reported in
+    ``attributed`` and does NOT set ``moved``. Everything else — a
+    fast-forward of a clean checkout (HEAD-only move), a tracked-tree rewrite
+    with an unchanged HEAD, a path dirtying from a clean start, a
+    content-only change to an already-dirty path — is a move. A snapshot with
+    ``ok: False`` (non-git or unfingerprintable) never moves.
+    """
+    if not before.get("ok") or not after.get("ok"):
+        return {
+            "moved": False,
+            "checkout": str(after.get("checkout") or before.get("checkout") or ""),
+            "before_commit": before.get("head") or "",
+            "after_commit": after.get("head") or "",
+            "attributed": [],
+        }
+    checkout = str(after.get("checkout") or before.get("checkout") or "")
+    before_commit = before.get("head") or ""
+    after_commit = after.get("head") or ""
+    # Reuse diff_snapshots' start-of-run working-tree attribution verbatim on
+    # minimal snapshots: only the status surface is relevant to this signal
+    # (refs/config/worktrees are deliberately not part of it), and the shared
+    # note vocabulary (excluded_churn_notes) stays the single renderer.
+    diff = diff_snapshots(
+        {
+            "git": True,
+            "refs": {},
+            "config": {},
+            "status": before.get("status", {}),
+            "excluded_refs": set(),
+        },
+        {
+            "git": True,
+            "refs": {},
+            "config": {},
+            "status": after.get("status", {}),
+            "excluded_refs": set(),
+        },
+    )
+    attributed = excluded_churn_notes(diff)
+    verdict_clean = not diff["status"]["added"] and not diff["status"]["changed"]
+    resolved_any = bool(excluded_working_tree_churn(diff))
+    fully_attributed = verdict_clean and resolved_any
+    moved = before.get("tracked") != after.get("tracked") and not fully_attributed
+    return {
+        "moved": moved,
+        "checkout": checkout,
+        "before_commit": before_commit,
+        "after_commit": after_commit,
+        "attributed": attributed,
+    }

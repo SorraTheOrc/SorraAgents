@@ -24,6 +24,10 @@ Coverage:
   recovered end-to-end against a hermetic git sandbox.
 - AC3 — the committed work is not stranded: the rebased commit reaches
   ``origin/dev``.
+- SA-0MVTFMB7K002Y1F3 AC1/AC2 (test-first slice SA-0MVUTXILY003DVTE) — the
+  **retry push runs from the worktree that holds the rebased commit**, so the
+  dev-push gate's subject is the pushed tree. Enforced by
+  SA-0MVUTXJ4300301ZN (the marker was removed by that change set).
 """
 
 from __future__ import annotations
@@ -172,6 +176,14 @@ class TestRecoveryHelper:
             "git_push_to_dev",
             lambda *a, **k: pushes.append(a) or True,
         )
+        # This test stubs every ``run_cmd`` (a pure recorder), so the
+        # push-subject guard cannot resolve a real HEAD here; it is stubbed and
+        # its behaviour is pinned by
+        # ``test_retry_push_runs_from_the_worktree_holding_the_rebased_commit``
+        # (SA-0MVUTXJ4300301ZN).
+        monkeypatch.setattr(
+            implement_mod, "_assert_push_subject", lambda *a, **k: None
+        )
 
         exc = implement_mod.PushNonFastForwardError(
             "oldhash", "wl-branch", "rejected (non-fast-forward)", "retry",
@@ -196,7 +208,77 @@ class TestRecoveryHelper:
         assert fetch[0][1] == "/worktrees/wt", (
             f"fetch must run in the worktree; got cwd={fetch[0][1]!r}"
         )
-        assert pushes == [("/main/checkout", "wl-branch", "newhash123")]
+        # The retry push the helper issued is recorded here; *where* it must
+        # run (the worktree holding the rebased commit, never ``repo_root``)
+        # is pinned by
+        # ``test_retry_push_runs_from_the_worktree_holding_the_rebased_commit``
+        # below — the pre-fix push cwd is that test's documented baseline.
+        assert len(pushes) == 1, pushes
+
+    def test_retry_push_runs_from_the_worktree_holding_the_rebased_commit(
+        self, implement_mod, sandbox, monkeypatch, silent_comments
+    ):
+        """The retry push's cwd holds the rebased commit (the gate's subject).
+
+        After the recovery rebase rewrites the commit inside the worktree, the
+        retry push must run from that same checkout: the pre-push hook
+        resolves its project root with ``git rev-parse --show-toplevel`` in the
+        pushing directory, so pushing from the main checkout makes the gate
+        verify a tree the pushed commit does not describe.
+        """
+        work = sandbox["work"]
+        wt = sandbox["wt"]
+
+        # A sibling advances dev after our feature commit, so the first push
+        # genuinely fails non-fast-forward and the helper rebases.
+        _advance_remote_dev(sandbox, "sibling.txt", "sibling\n")
+        with pytest.raises(implement_mod.PushNonFastForwardError) as exc_info:
+            implement_mod.git_push_to_dev(
+                str(work), "wl-test-branch", sandbox["feature_hash"]
+            )
+
+        real_push = implement_mod.git_push_to_dev
+        pushes: list[dict] = []
+
+        def recording_push(cwd, branch, commit_hash=None, **kwargs):
+            pushes.append(
+                {
+                    "cwd": cwd,
+                    "branch": branch,
+                    "commit": commit_hash,
+                    "head": _rev(Path(cwd)),
+                }
+            )
+            return real_push(cwd, branch, commit_hash, **kwargs)
+
+        monkeypatch.setattr(implement_mod, "git_push_to_dev", recording_push)
+
+        result_hash = implement_mod._recover_non_fast_forward_push(
+            worktree_path=str(wt),
+            repo_root=str(work),
+            branch="wl-test-branch",
+            commit_hash=sandbox["feature_hash"],
+            exc=exc_info.value,
+            work_item_id="SA-TEST",
+        )
+
+        assert len(pushes) == 1, pushes
+        push = pushes[0]
+        assert push["cwd"] == str(wt), (
+            "the retry push must run from the worktree that holds the rebased "
+            f"commit; got cwd={push['cwd']!r}"
+        )
+        assert push["cwd"] != str(work)
+        assert push["branch"] == "wl-test-branch"
+        # The push cwd's HEAD is the pushed (rebased) commit: the gate subject
+        # and the pushed commit are the same tree.
+        for named in (push["commit"], result_hash):
+            assert push["head"].startswith(named) or named.startswith(push["head"]), (
+                f"push cwd HEAD {push['head']} must name the pushed commit {named}"
+            )
+        assert push["head"] != sandbox["feature_hash"], (
+            "the rebase must have rewritten the commit before the retry"
+        )
 
     def test_rebase_failure_preserves_state(
         self, implement_mod, monkeypatch
@@ -315,7 +397,12 @@ class TestFinishOrdering:
         """The push must run before the worktree is removed so the recovery
         rebase has a directory in which ``branch`` is checked out."""
         body = self._finish_body()
-        push_idx = body.index("git_push_to_dev(repo_root, branch")
+        # Match the call prefix only: *which checkout* the dev push runs from
+        # (the worktree holding the pushed commit, not ``repo_root``) is pinned
+        # by
+        # ``skill/implement/tests/test_implement_push_from_worktree.py``
+        # (SA-0MVUTXILY003DVTE); this guard is only about ordering.
+        push_idx = body.index("git_push_to_dev(")
         remove_idx = body.index("_remove_worktree(")
         assert push_idx < remove_idx, (
             "phase_finish must push to dev before removing the worktree"

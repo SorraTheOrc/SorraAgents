@@ -147,7 +147,10 @@ a run to a caller-supplied fingerprint (normally a would-be-commit tree SHA):
 - the supplied value is stored **as-is** after the run — it describes the tree
   the caller named and cannot be recomputed from a possibly-churned worktree;
 - callers that pass nothing keep the historical worktree keys byte for byte
-  (test-skill CLI, audit, pre-push).
+  (test-skill CLI, audit). The pre-push gate is the one worktree-kind caller
+  that *is* bound to a subject: it passes `--gate-commit <sha>` (see
+  *0.4 Pre-push gate subject binding* below) and its key is the pushed
+  commit's own clean worktree state.
 
 `lookup(..., fingerprint_kind=...)` and `store(..., fingerprint_kind=...)`
 expose the same distinction to callers that manage execution themselves.
@@ -168,6 +171,62 @@ TTL (and, for exactness, the recorded `scope`). Therefore:
 tree-bound entry is intentionally not visible to it (the audit's full-suite
 evidence is recorded at the pushed commit's loose state, not at a
 pre-commit staged tree).
+
+### 0.4. Pre-push gate subject binding (SA-0MVTRBT50005DUEH)
+
+SA-0MVTRBT50005DUEH. The dev-push pre-push gate is evidence about the commit
+it pushes. `git` hands the hook `<local_ref> <local_sha> <remote_ref>
+<remote_sha>` on stdin; `.githooks/pre-push` forwards `<local_sha>` as
+`run_tests.py --scope full --strict-git-env --gate-commit <sha>`, and the
+runner resolves **which checkout to measure** before anything else:
+
+1. the invocation's project root, when its `HEAD` is the pushed commit and it
+   has **no dirty paths** (`is_worktree_clean()` — the same
+   `git status --porcelain --untracked-files=all` call the fingerprint uses);
+2. else a checkout listed by `git worktree list --porcelain` whose `HEAD` is
+   the pushed commit and which is clean;
+3. else the push is **refused** (exit code 2) with the commit, every
+   candidate tried and why it was rejected, and `TEST_SCOPE_SKIP=1`.
+
+The resolved checkout replaces the project root for the whole run, so command
+resolution, the per-command timeout, the suite execution and the **cache key**
+all describe the pushed commit. A green entry recorded for any other state —
+including the main checkout's own `HEAD` plus its dirty `.worklog/` churn —
+is therefore a miss and the suite executes. No temporary worktree is
+materialised (a fresh checkout has no installed dependencies, so a suite
+failure there would not be about the pushed tree); pushing from a clean
+worktree of the commit, or from a clean checkout at it, is the supported
+remedy.
+
+The gate reports the state it validated on **stderr** (stable prefixes; the
+hook echoes them to the pusher):
+
+```text
+run_tests: gate-subject pushed=<sha> checkout=<in-place|worktree> fingerprint_kind=worktree
+run_tests: gate-root <absolute path of the resolved checkout>
+run_tests: gate-verdict verdict=<cached|executed> sha=<sha> git_state=<state> fingerprint_kind=worktree entries=<n> cached=<n>
+run_tests: gate-refused <actionable message including TEST_SCOPE_SKIP=1>
+```
+
+The `gate-root` line is a contract with `.githooks/pre-push`, which mirrors
+that checkout's cache entries into the main checkout's `.worklog/cache` —
+keys are content-addressed, so copying an entry the main cache lacks is
+always safe. Without `--gate-commit` the runner behaves exactly as before
+(no subject resolution, no refusal, no `gate-*` lines), so every other
+caller and every hook that does not forward the sha is unchanged.
+
+**Propagation is per project.** `core.hooksPath=.githooks` makes the hook a
+per-project file, so only a hook that forwards the sha is protected; the
+runner-side flag reaches every project through the global skill install but
+stays inert until its hook passes it. The verified inventory on this machine
+(2026-11-03): SorraAgents forwards `<local_sha>` (this change); llm-manager
+ships an independent v4 hook whose pushed-commit guard refuses any push whose
+cwd `HEAD` is not the pushed commit (strict in-place — a deliberate divergence
+that already binds the verdict to the commit, without the clean-worktree
+fallback); AI_Hell, ContextHub, dev-scripts and Tableau-Card-Engine ship the
+template v2 hook, which has **no** dev/main suite gate at all, so there is no
+verdict to bind until they adopt the v3-style gate. See
+`SA-0MVTRBT50005DUEH` for the recorded list.
 
 Consequence for the finish gate: no green verdict can be served for a tree
 whose suite never ran. A tree-keyed green exists only where the suite executed
@@ -315,6 +374,28 @@ silently reclassify a genuine test failure as infrastructure contention.
 The slot-busy notice text itself is anchored to the exported
 `SLOT_BUSY_NOTICE_PREFIX` constant.
 
+**The pre-push gate names its reason (SA-0MVSJX5HS002DJHI).**
+`.githooks/pre-push` no longer discards the runner's `--json` aggregate: on
+failure it prints a stable `gate_reason=<code>` line plus a distinct human
+diagnostic — `slot_contention`, `timeout`, `killed`, `unparsed`,
+`test_failure`, `infrastructure` or `unknown`. Classification is delegated to
+the shared `skill/test/scripts/gate_reason.py` classifier (the same one
+`implement.py`'s changed-scope gate uses), which maps the published
+`notice_codes` above onto those reasons — the codes are consumed, never
+re-defined. The classifier itself is resolved through a tiered search order
+(SA-0MVXEQE01008JW5R AC4): repo-local first (the runner's own directory,
+`skill/test/scripts/`), then the installed global skill
+(`$HOME/.pi/agent/skills/test/scripts/` — the same fallback the release gate
+uses for `run_tests.py`), so a consumer repo without its own copy still
+classifies from the installed skill. When no tier holds an importable copy
+the failure is conservatively reported as `gate_reason=infrastructure` — never
+`unknown`, never fail-open. The hook never fails open: an unparsable result is
+reported as `gate_reason=unknown` and the push still exits non-zero, and a red
+suite keeps `gate_reason=test_failure` with the unchanged "Full test suite
+failed" wording.
+`implement.py finish` reads the line from the push stderr and reports the
+reason with its remedy instead of a generic "git push to dev failed".
+
 **From codes to remedies.** The finish gate maps these codes onto the reasons it
 reports (`timeout`, `killed`, `unparsed`, `slot_contention`, `test_failure`,
 `infrastructure`) and attaches the deciding facts (`configured_timeout`,
@@ -333,12 +414,18 @@ consistency test keeps the three documents and the producing constants in step.
 | `suite_timeout` | The command exceeded `timeoutPerCommand` (`TimeoutExpired`). |
 | `killed` | The child was terminated by a signal (`returncode < 0`, e.g. an OOM kill or a worker crash) and produced no parsable failure. |
 | `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). |
+| `state_changed_during_run` | The guarded checkout moved while a command executed (HEAD and/or the tracked tree it resolves to changed mid-run, e.g. a concurrent `implement.py finish` fast-forward); the mixed-tree verdict is quarantined (no cache entry under either state), the command's parsed failures are dropped and the suite is reported non-green with the distinct exit status 75 (`EX_TEMPFAIL`). The result carries the detail (checkout path + before/after commits) on `state_changed_during_run` — a non-empty dict for the suite, a list under the `run_all` aggregate; the human output prints a `notice: [state_changed_during_run] …` line naming the checkout movement and the required re-run. Runs whose only difference is churn attributable to another session (start-of-run-dirty → end-clean resolutions) are never flagged (SA-0MW3FF18I003KGZE AC3). |
 
 **Precedence.** Structured (parsable) test failures always win: `killed` and
 `unparsed_failure` are set only when `failures` is empty, so a genuine code
-failure is never reclassified as an infrastructure condition. A non-zero
-result served **from cache** is classified too — its stored exit code and
-output are enough, and its elapsed time is reported as `null` (see below).
+failure is never reclassified as an infrastructure condition. The
+`state_changed_during_run` flag is the single exception, and it wins **before**
+the failure check: a moved checkout makes every parsed failure a mixed-tree
+artefact that exists at no single commit, so a flagged run is always classified
+as `infrastructure` (never `test_failure`) by the shared `gate_reason`
+classifier and by `implement.py`'s finish gate. A non-zero result served
+**from cache** is classified too — its stored exit code and output are enough,
+and its elapsed time is reported as `null` (see below).
 
 #### Diagnostic fact fields
 
@@ -385,6 +472,27 @@ bounded wait is staggered per waiter:
 (no stagger) for callers that prefer it. The jitter only affects the `"test"`
 semaphore namespace — audit/`audit-host` semaphores keep `jitter=0.0`
 byte-identical behaviour unless a caller opts in explicitly.
+
+**Arrival-ordered turnstile (SA-0MVSJX5HS002DJHI).** Jitter only staggers
+*deadlines*; it never orders arrivals. The slot pool alone grants a free slot
+to whichever waiter polls next, so under a herd a late arrival can overtake a
+waiter that has been queuing for hours (measured: one gate waited 2 h 9 min
+before expiring with `slot_busy`). `process_semaphore.Semaphore` therefore
+takes a monotonic ticket on every bounded/indefinite wait and only the waiter
+holding the **lowest outstanding ticket** may attempt a slot. Tickets are
+`flock`-held, so a waiter that acquires, times out, raises or dies (including
+`SIGKILL`) releases its turn automatically from the kernel — a killed waiter's
+turn is reclaimed within one retry cadence, with no stale tickets and no PID
+bookkeeping. The wait is bounded by queue position: a waiter at position *N*
+is served after at most *N* expected slot-hold times (plus one retry cadence).
+Two compatibility guarantees are preserved: `timeout=0` fail-fast callers
+(`audit_runner`) bypass the turnstile entirely (an immediate attempt still
+succeeds when a slot is free and raises at once when the pool is full), and a
+run isolated through `PI_SEMAPHORE_DIR` / `nested_semaphore_dir()` has its own
+namespace and never queues in the host-wide turnstile. `TEST_MAX_CONCURRENCY`
+is unchanged — fairness is about **ordering**, not capacity — and the fast path
+adds one counter `flock` per acquire plus a single non-blocking scan when no
+lower ticket is outstanding.
 
 **Cache hits never block:** the semaphore is acquired ONLY when an actual
 execution is about to happen (cache miss path). A cached result is served
@@ -949,3 +1057,111 @@ full-suite cache entry — the audit's read-only full-suite query
 full-suite verification always requires a genuine `full` run at the same
 git state.
 
+## 3. Disk-backed test temporary storage and the inode-exhaustion signature (SA-0MW2QED9M005FWOK)
+
+### Why this exists
+
+`/tmp` is frequently a small tmpfs whose **inode** budget — not its byte
+budget — is exhausted first under multi-agent load. Stale
+`pytest-of-<user>/pytest-*` roots (tens of thousands of tiny files each),
+Playwright/Chromium browser profiles and node compile caches pushed `df -i
+/tmp` to `IUse% 100` / `IFree 0` (~100 % of 1,048,576 inodes) while the byte
+budget was only ~24 % used, and every suite/build subprocess silently defaulted
+to that tmpfs because nothing set `TMPDIR`. The failure surfaced inside the
+Playwright browser provider — `ENOSPC no space left on device` in
+`PlaywrightBrowserProvider.createContext` — as a non-zero exit with no
+parsable test failure, so the gate reported it as `unparsed`
+(infrastructure-class). That classification was correct (the condition is host
+infrastructure, never a code failure) but it blocked green work that a host
+remedy, not a code fix, unblocks.
+
+Two framework-side mitigations close the gap (feature epic
+SA-0MW2QED9M005FWOK: F1 shared helper `skill/shared/test_tmpdir.py`, F2
+runner wiring, F3 `implement.py` parity). Both are **fail-open**: an error is
+logged with a reason string and the run proceeds unchanged.
+
+### TMPDIR resolution (precedence)
+
+`run_tests.py` resolves the test `TMPDIR` once per process
+(`_suite_command_env()` → `shared.test_tmpdir.resolve_test_tmpdir()`) and every
+suite command it spawns inherits it via the child environment. All suite
+command strings, cache keys and scope resolutions are byte-identical — the
+change is env-only.
+
+`implement.py finish` resolves the same helper and exports the result into its
+build, test and `git push` children, so the pre-push full-suite hook runs its
+`run_tests.py` child on the same disk-backed storage. The explicit
+`PI_TEST_TMPDIR` override therefore also steers the pre-push gate.
+
+Precedence (first usable candidate wins):
+
+1. **`PI_TEST_TMPDIR`** — explicit operator override. The directory is created
+   when absent and must be writable; an unusable override is noted and the
+   resolution falls through.
+2. **`PI_TEST_TMPDIR_DISK_ROOT`** (default `/var/tmp`) — the configured
+   disk-backed root; the candidate directory
+   **`<root>/pi-test-<uid>`** is created when absent. Skipped when the root
+   is missing, not a directory, or itself mounted tmpfs.
+3. **`tempfile.gettempdir()`** — the portable final fallback for macOS,
+   Windows and CI hosts without a usable disk-backed root.
+
+The chosen directory is logged at INFO — `Test TMPDIR=<path> (<reason>)` from
+the runner, `Finish TMPDIR=<path> …` from `implement.py` — so an operator can
+verify which storage is active (`ls <root>/pi-test-<uid>` or `df -i <path>`).
+Resolution failure is fail-open: the helper returns a last-resort path and
+logs a warning; it never raises and never changes a run's exit status, cache
+entry or scope resolution.
+
+### Stale pytest-root pruning
+
+Before a full-scope run, the runner calls
+`shared.test_tmpdir.prune_stale_test_roots()` and removes stale
+`pytest-of-<user>/pytest-*` roots under the resolved test TMPDIR *and* under
+`tempfile.gettempdir()`. Rules:
+
+- **user scope** — only the current user's `pytest-of-<user>` base is
+  considered; another user's roots are never touched;
+- **age threshold** — a root younger than `PI_TEST_TMPDIR_MAX_AGE_SECONDS`
+  (default `3600` seconds = 60 minutes) is kept;
+- **keep-current** — the `pytest-current` symlink target is always kept;
+- **keep-newest-N** — the newest `PI_TEST_TMPDIR_KEEP_RECENT` roots (default
+  `2`) are always kept, even when older than the threshold;
+- **in-use skip** — a root referenced by a live `pytest` process is skipped
+  (best-effort Linux `/proc` scan; a no-op elsewhere);
+- **absent base** — no `pytest-of-<user>` base directory is a no-op.
+
+The removed count and per-base outcome counts are logged at INFO; every error
+path is caught and reported in the returned reason string (fail-open — a
+prune problem never changes exit status, cache entry or scope resolution).
+
+### Failure signature — recognise inode exhaustion for what it is
+
+| Signal | Meaning |
+| --- | --- |
+| `ENOSPC: no space left on device` raised inside `PlaywrightBrowserProvider.createContext` (or another file-creation site) | The suite child hit the tmpfs inode (or byte) limit — host infrastructure, not a test failure. |
+| `df -i /tmp` → `IUse% 100`, `IFree 0` while the byte budget looks fine | The `/tmp` tmpfs inode budget is exhausted; stale pytest roots and browser/node caches are usually the cause. |
+| Gate `reason: unparsed` (runner notice code `unparsed_failure`) with no `failures` list | The gate correctly classifies the non-zero exit as infrastructure — never a code `test_failure`. |
+
+A regression pin asserts the captured signature keeps this classification:
+`skill/test/tests/test_gate_reason.py` (classifier) and
+`skill/test/tests/test_run_tests_failure_notices.py` (runner), driven by the
+shared fixtures in `skill/shared/tests/gate_failure_fixtures.py`.
+
+### Operator remedy
+
+1. **Prune stale pytest roots** — remove roots older than the threshold
+   (`/tmp/pytest-of-<user>/pytest-*`), keeping the `pytest-current` target and
+   the newest roots. The runner does this automatically before full-scope
+   runs; a manual prune (roots with `mtime` older than ~20 minutes in the
+   original incident) is the fastest intervention while a gate is blocked —
+   the incident freed ~679k inodes this way.
+2. **Free inodes** — inspect `df -i /tmp`; if pytest roots are not the cause,
+   delete other churn (Playwright/Chromium profiles, node compile caches).
+3. **Verify the disk-backed TMPDIR is active** — look for the runner's
+   `Test TMPDIR=<path> …` INFO log (or `implement.py finish`'s
+   `Finish TMPDIR=<path> …`) and confirm `df -i` on that path has inode
+   headroom. Set `PI_TEST_TMPDIR` explicitly when a host needs a specific
+   disk-backed location.
+
+Related: `docs/dev/test-isolation.md` §H2 discusses `TMPDIR`/`--basetemp` in
+the context of the live-repo-leak incident.

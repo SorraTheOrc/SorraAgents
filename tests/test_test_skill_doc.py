@@ -105,3 +105,26 @@ def test_test_skill_reference_documents_policy_and_conformance_gate() -> None:
     assert "Test execution policy" in content
     assert "tests/test_test_skill_directory.py" in content
     assert "SA-0MTYIMWQP0020ZUC" in content
+
+
+def test_readme_documents_disk_backed_tmpdir_remediation() -> None:
+    """README.md must document the disk-backed TMPDIR + stale pytest-root
+    prune remediation (SA-0MW2QED9M005FWOK AC8).
+
+    The audit flagged AC8 partial: the top-level README Release-Process
+    test-verification section described the suite/cache/gate but never told an
+    operator that suite subprocesses run on a disk-backed TMPDIR or why
+    (tmpfs `/tmp` inode exhaustion -> `ENOSPC` inside Playwright). This pin
+    keeps the README coverage in place (there is no docs-site in this repo,
+    so README is the top-level consumer surface for the §3 operator remedy).
+    """
+    readme = _REPO_ROOT / "README.md"
+    assert readme.exists(), f"README not found at {readme}"
+    content = readme.read_text(encoding="utf-8")
+    assert "disk-backed" in content
+    assert "TMPDIR" in content
+    assert "inode" in content
+    assert (
+        "docs/dev/test-skill-reference.md#3-disk-backed-test-temporary-storage-and-the-inode-exhaustion-signature-sa-0mw2qed9m005fwok"
+        in content
+    )

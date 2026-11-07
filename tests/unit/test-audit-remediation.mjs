@@ -153,3 +153,43 @@ describe('audit-remediation: RemediationBudget', () => {
     assert.equal(budget.remainingMs, 0);
   });
 });
+
+// ── C3 (WL-0MW32YGSY008GRQP): per-item timeout clamped to the remaining ────
+// budget — regression for the 1865s-of-1800s remediation overshoot incident.
+// Test-first pair with C4 (WL-0MW32YZP7005LZ5B); red against current HEAD.
+// C4 (WL-0MW32YZP7005LZ5B) implements `RemediationBudget.clampedTimeoutMs`
+// and makes the default per-item timeout differ from the total budget.
+
+describe('audit-remediation: per-item timeout clamped to remaining budget (C3)', () => {
+  test('default per-item timeout is no longer equal to the total budget', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.notEqual(
+      mod.DEFAULT_REMEDIATION_TIMEOUT_MS,
+      mod.DEFAULT_REMEDIATION_BUDGET_MS,
+      'one timed-out attempt must never be able to consume the whole gate budget' +
+      ' (the 1865s-of-1800s incident)',
+    );
+  });
+
+  test('clampedTimeoutMs clamps to the remaining budget with an injected clock', async () => {
+    const mod = await import(MODULE_PATH);
+    let now = 0;
+    const budget = new mod.RemediationBudget({
+      budgetMs: 1_800_000,
+      maxItems: 5,
+      now: () => now,
+    });
+    const perItem = mod.resolveRemediationTimeoutMs({});
+    // 90 s into a 1,800 s budget: 1,710 s remain.
+    now = 90_000;
+    assert.equal(budget.remainingMs, 1_710_000);
+    assert.equal(
+      budget.clampedTimeoutMs(perItem),
+      1_710_000,
+      'a per-item timeout larger than the remaining budget must be clamped down',
+    );
+    // Fresh budget: the full per-item timeout is allowed.
+    now = 0;
+    assert.equal(budget.clampedTimeoutMs(perItem), perItem);
+  });
+});

@@ -128,9 +128,11 @@ export async function refreshAudits(options = {}) {
       `wl audit-show ${workItemId} --json`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
-    runAuditCommand = (runnerPath, workItemId) => execSync(
+    runAuditCommand = (runnerPath, workItemId, timeoutMs) => execSync(
       `python3 "${runnerPath}" issue ${workItemId}`,
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: resolveRemediationTimeoutMs() },
+      // Per-item timeout, clamped to the remaining budget by the caller
+      // (WL-0MW32YZP7005LZ5B).
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs ?? resolveRemediationTimeoutMs() },
     ),
     resolveAuditRunnerFn = resolveAuditRunner,
     createRemediationBudgetFn = () => new RemediationBudget(),
@@ -174,9 +176,15 @@ export async function refreshAudits(options = {}) {
       continue;
     }
     console.log(`Pre-flight audit refresh: re-auditing ${item.title} (${item.id}, ${item.kind})...`);
+    // Per-attempt timeout clamped to the remaining budget
+    // (WL-0MW32YZP7005LZ5B).
     const remediation = await attemptAuditRemediation(item, {
       runAuditShow,
-      runAuditCommand,
+      runAuditCommand: (runnerPath, id) => runAuditCommand(
+        runnerPath,
+        id,
+        budget.clampedTimeoutMs(resolveRemediationTimeoutMs()),
+      ),
       resolveAuditRunnerFn,
       // Shared post-remediation resolution (SA-0MVTU22MB0057T2L): a
       // passing-but-time-stale audit is resolved by content freshness in the

@@ -31,6 +31,9 @@ import { fileURLToPath } from 'node:url';
 // Shared no-I/O notifier stub — never copy the real discord-notify.js into a
 // release harness (WL-0MUYA98Z8003HU8X / SA-0MU3VIW8C0035KKL).
 import { writeStubDiscordNotify } from '../helpers/release-notify-stub.mjs';
+// Hermetic git environment: a fixture git command must never stage into an
+// inherited GIT_INDEX_FILE (SA-0MW0V9PEP004EJYV / SA-0MVYS34QF000AWQX).
+import { hermeticGitEnv } from '../helpers/hermeticGitEnv.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const REPO_ROOT = join(dirname(__filename), '..', '..');
@@ -47,6 +50,15 @@ const TIMING_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'timing.js');
 const LLM_SRC = join(REPO_ROOT, 'skill', 'ship', 'scripts', 'llm.js');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Run git with the repository-override vars (incl. GIT_INDEX_FILE) scrubbed. */
+function git(args, opts = {}) {
+  return spawnSync('git', args, {
+    encoding: 'utf-8',
+    ...opts,
+    env: hermeticGitEnv(opts.env),
+  });
+}
 
 function makeTempSkillDir() {
   const tmpDir = mkdtempSync(join(tmpdir(), 'code-freeze-test-'));
@@ -90,6 +102,7 @@ function runRelease(args, cwd) {
     cwd,
     encoding: 'utf-8',
     timeout: 30_000,
+    env: hermeticGitEnv(),
   });
 }
 
@@ -150,13 +163,13 @@ describe('code-freeze marker: merge-dev-to-main.sh fallback (trap)', () => {
     writeFileSync(join(releaseDir, 'merge-dev-to-main.sh'), readFileSync(MERGE_SCRIPT_SRC, 'utf8'));
 
     // Set up a minimal git repo so the script's git checks pass.
-    spawnSync('git', ['init', '-b', 'dev'], { cwd: tmpDir, encoding: 'utf-8' });
-    spawnSync('git', ['config', 'user.email', 't@t.com'], { cwd: tmpDir, encoding: 'utf-8' });
-    spawnSync('git', ['config', 'user.name', 'T'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['init', '-b', 'dev'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['config', 'user.email', 't@t.com'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['config', 'user.name', 'T'], { cwd: tmpDir, encoding: 'utf-8' });
     writeFileSync(join(tmpDir, 'README.md'), '# repo');
-    spawnSync('git', ['add', '-A'], { cwd: tmpDir, encoding: 'utf-8' });
-    spawnSync('git', ['commit', '-m', 'init'], { cwd: tmpDir, encoding: 'utf-8' });
-    spawnSync('git', ['branch', 'main'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['add', '-A'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['commit', '-m', 'init'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['branch', 'main'], { cwd: tmpDir, encoding: 'utf-8' });
 
     // gh is required by the script before the marker is written; stub it.
     const binDir = join(tmpDir, 'bin');
@@ -168,7 +181,7 @@ describe('code-freeze marker: merge-dev-to-main.sh fallback (trap)', () => {
       cwd: tmpDir,
       encoding: 'utf-8',
       timeout: 30_000,
-      env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` },
+      env: { ...hermeticGitEnv(), PATH: `${binDir}:${process.env.PATH}` },
     });
 
     const markerPath = join(tmpDir, '.worklog', 'code-freeze.json');
@@ -223,17 +236,17 @@ describe('code-freeze marker: runRelease lifecycle', () => {
     writeFakeReleaseScript(skillScriptDir, 0);
     // Create a git repo in tmpDir with an unmerged feature branch so the
     // unmerged-branches gate fails (exit 3) BEFORE the release script runs.
-    spawnSync('git', ['init', '-b', 'dev'], { cwd: tmpDir, encoding: 'utf-8' });
-    spawnSync('git', ['config', 'user.email', 't@t.com'], { cwd: tmpDir, encoding: 'utf-8' });
-    spawnSync('git', ['config', 'user.name', 'T'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['init', '-b', 'dev'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['config', 'user.email', 't@t.com'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['config', 'user.name', 'T'], { cwd: tmpDir, encoding: 'utf-8' });
     writeFileSync(join(tmpDir, 'README.md'), '# repo');
-    spawnSync('git', ['add', '-A'], { cwd: tmpDir, encoding: 'utf-8' });
-    spawnSync('git', ['commit', '-m', 'init'], { cwd: tmpDir, encoding: 'utf-8' });
-    spawnSync('git', ['checkout', '-b', 'feature-x'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['add', '-A'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['commit', '-m', 'init'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['checkout', '-b', 'feature-x'], { cwd: tmpDir, encoding: 'utf-8' });
     writeFileSync(join(tmpDir, 'feature.txt'), 'x');
-    spawnSync('git', ['add', '-A'], { cwd: tmpDir, encoding: 'utf-8' });
-    spawnSync('git', ['commit', '-m', 'feature'], { cwd: tmpDir, encoding: 'utf-8' });
-    spawnSync('git', ['checkout', 'dev'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['add', '-A'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['commit', '-m', 'feature'], { cwd: tmpDir, encoding: 'utf-8' });
+    git(['checkout', 'dev'], { cwd: tmpDir, encoding: 'utf-8' });
 
     const res = runRelease([], tmpDir);
     assert.equal(res.status, 3, 'unmerged-branches gate must fail with exit 3');
@@ -276,7 +289,7 @@ test('release-script timeout: spawn is bounded, exit 10, marker cleared', () => 
     cwd: tmpDir,
     encoding: 'utf-8',
     timeout: 30_000,
-    env: { ...process.env, SHIP_RELEASE_TIMEOUT_MS: '500' },
+    env: { ...hermeticGitEnv(), SHIP_RELEASE_TIMEOUT_MS: '500' },
   });
 
   assert.equal(

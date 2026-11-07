@@ -192,13 +192,21 @@ def _cleanup_result() -> dict:
 
 
 @contextlib.contextmanager
-def _finish_harness(repo: Path, tmp_path: Path, build=None):
+def _finish_harness(repo: Path, tmp_path: Path, build=None, build_outcome=None):
     """Drive ``phase_finish`` with every external boundary stubbed.
 
     Unlike the F1 harness, the **build** (a project-supplied callable that
     performs the fixture's engine churn), the **finish gate**, the real-index
     staging (``stage_tested_tree``) and the real **``git_commit``** all run for
     real — the assertions in this module are about exactly those steps.
+
+    Args:
+        repo: The fixture worktree root.
+        tmp_path: Sandbox root (hosts the fake main checkout).
+        build: Side effect the stubbed build performs (the engine churn).
+        build_outcome: The ``run_build`` result to report; defaults to a
+            successful build. A failing outcome drives the build-failure
+            branch without changing anything else.
     """
     main_checkout = tmp_path / "main-checkout"
     (main_checkout / ".worklog").mkdir(parents=True, exist_ok=True)
@@ -212,6 +220,8 @@ def _finish_harness(repo: Path, tmp_path: Path, build=None):
     def _run_build(cwd):
         if build is not None:
             build(cwd)
+        if build_outcome is not None:
+            return dict(build_outcome)
         return _build_result()
 
     with contextlib.ExitStack() as stack:
@@ -260,6 +270,28 @@ def _finish_harness(repo: Path, tmp_path: Path, build=None):
         )
         stack.enter_context(patch.object(implement, "wl_add_comment", return_value=True))
         stack.enter_context(patch.object(implement, "_surface_postfix_prose"))
+        # The read-only post-push verification (SA-0MVXUSJ2P009T97H) models
+        # the pre-push gate's cached green full-suite entry; its own
+        # verdict/refusal semantics live in
+        # ``test_finish_finalisation_ordering.py``.
+        stack.enter_context(
+            patch.object(
+                implement,
+                "query_cached",
+                return_value={
+                    "stdout": "1 passed",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "completed_at": 1.0,
+                    "command": implement.PYTEST_CMD,
+                    "git_state": "stub-git-state",
+                    "fingerprint_kind": "worktree",
+                    "scope": "full",
+                    "test_type": "full",
+                    "cached": True,
+                },
+            )
+        )
         stack.enter_context(
             patch.object(implement.StatusLifecycle, "update_status", MagicMock())
         )

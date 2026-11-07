@@ -793,6 +793,9 @@ class TestRunFinishFailureThreading:
             captured.append({"args": args, "kwargs": kwargs})
             return parsed
 
+        # Hermetic: never let a release's Code Freeze marker leak into the
+        # test (phase_parent runs the freeze gate on entry).
+        monkeypatch.setattr(implement_mod, "is_code_freeze_active", lambda: False)
         monkeypatch.setattr(implement_mod, "wl_show",
                             lambda wid: {"id": wid, "status": "in_progress"})
         monkeypatch.setattr(implement_mod, "wl_show_children",
@@ -840,6 +843,9 @@ class TestRunFinishFailureThreading:
         """A finish subprocess that fails without a parseable report still
         yields the ``None`` sentinel and an ``unknown`` finish_failure."""
         child = _child("SA-CHILD1")
+        # Hermetic: never let a release's Code Freeze marker leak into the
+        # test (phase_parent runs the freeze gate on entry).
+        monkeypatch.setattr(implement_mod, "is_code_freeze_active", lambda: False)
         monkeypatch.setattr(implement_mod, "wl_show",
                             lambda wid: {"id": wid, "status": "in_progress"})
         monkeypatch.setattr(implement_mod, "wl_show_children",
@@ -876,6 +882,9 @@ class TestRunFinishFailureThreading:
         """A green finish keeps the pre-existing success semantics."""
         child = _child("SA-CHILD1")
         status_updates: list[dict] = []
+        # Hermetic: never let a release's Code Freeze marker leak into the
+        # test (phase_parent runs the freeze gate on entry).
+        monkeypatch.setattr(implement_mod, "is_code_freeze_active", lambda: False)
         monkeypatch.setattr(implement_mod, "wl_show",
                             lambda wid: {"id": wid, "status": "in_progress"})
         monkeypatch.setattr(implement_mod, "wl_show_children",

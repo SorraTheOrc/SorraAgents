@@ -1877,6 +1877,9 @@ class TestCascadeDescendantsTerminal:
         for _item_id, cmd in runner.updates:
             assert "--status" in cmd and cmd[cmd.index("--status") + 1] == "completed"
             assert "--stage" in cmd and cmd[cmd.index("--stage") + 1] == "done"
+            # A terminalised descendant must not keep a scheduling hold: the
+            # cascade write releases it (SA-0MW0F91KN004J06U).
+            assert "--assignee" in cmd and cmd[cmd.index("--assignee") + 1] == ""
         # Each cascaded child got exactly one explanatory comment naming the
         # authorising parent and the audit timestamp.
         commented = {item_id for item_id, _ in runner.comments}

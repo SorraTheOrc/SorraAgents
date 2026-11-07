@@ -46,6 +46,11 @@ Optional flags:
                             driving (default: 5; a separate budget, never
                             consumes --finish-attempt-limit, spawns no session)
   --child-timeout N         Per-child session timeout in seconds (default: 3600)
+  --pane-sessions / --no-pane-sessions
+                            Drive children in interactive Herdr panes when Herdr
+                            is detected (default: env-driven via
+                            IMPLEMENT_DRIVE_PANE_SESSIONS)
+  --focus / --no-focus      Focus each new child pane (default: --no-focus)
   --finalise-stranded       Finalise evidence-gated stranded children when driving
   -v, --verbose             Verbose logging
 
@@ -53,6 +58,8 @@ Environment:
   IMPLEMENT_TEST_COMMAND    Override the finish test-step command (shell string)
   IMPLEMENT_DRIVE_PI_BIN    Pi executable used to spawn child sessions (default: pi)
   IMPLEMENT_DRIVE_CHILD_TIMEOUT  Per-child session timeout in seconds
+  IMPLEMENT_DRIVE_PANE_SESSIONS  Opt in to the pane-driven transport (same as
+                            --pane-sessions); needs HERDR_ENV=1 + herdr binary
 
 Exit codes:
   0 – success
@@ -65,9 +72,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import errno
+import functools
 import json
 import logging
 import os
+import random
 import re
 import shlex
 import shutil
@@ -89,7 +98,7 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX
     fcntl = None
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +115,9 @@ from import_guard import guard_shared_import
 
 try:
     from shared.code_freeze import is_code_freeze_active
+    from shared.herdr_pane import resolve_herdr_bin as _resolve_herdr_bin_path
+    from shared.herdr_pane import update_pane_title as _update_pane_title
+    from shared.herdr_session import HerdrSessionClient, agent_name_for_child
     from shared.repo_lock import DEFAULT_LOCK_RELPATH as _REPO_LOCK_RELPATH
     from shared.repo_lock import RepoLock, release_repo_lock
     from shared.skill_extensions import (
@@ -135,8 +147,26 @@ try:
     from shared.self_referential_upstream import (
         detect_self_referential_upstreams as _detect_self_referential_upstreams,
     )
-except Exception:  # pragma: no cover - only partial installs hit this
-    _detect_self_referential_upstreams = None
+except Exception:  # noqa: BLE001 -- broad by design; see the comment below
+    # Broad by design (BLE001): a missing module, a missing runtime dependency
+    # or a module-level guard clause must ALL degrade to the logged skip below
+    # and never block a start. Pinned by
+    # skill/implement/tests/test_optional_import_fail_open.py.
+    _detect_self_referential_upstreams = None  # pragma: no cover - partial install
+
+try:
+    # Disk-backed TMPDIR resolution shared with the test runner (F1,
+    # SA-0MW3EN72O005BMIP). Deliberately OUTSIDE the hard-fail shared block:
+    # an older skill install without the module degrades to the ambient
+    # TMPDIR — logged and unchanged — instead of blocking the start
+    # (SA-0MW3ENQY0001RBSW AC4, fail-open).
+    from shared.test_tmpdir import resolve_test_tmpdir as _resolve_test_tmpdir
+except Exception:  # noqa: BLE001 -- broad by design; see the comment below
+    # Broad by design (BLE001): a partial skill install without the
+    # test_tmpdir module must degrade to the ambient TMPDIR — logged and
+    # unchanged — and must never block a start (SA-0MW3ENQY0001RBSW AC4,
+    # fail-open). Mirrors the self_referential_upstream guard above.
+    _resolve_test_tmpdir = None  # pragma: no cover - partial install
 
 try:
     # The shared changed-file → test selector (SA-0MT6CENPW004V2JN). Kept
@@ -203,7 +233,25 @@ except ImportError:
         "test concurrency slot busy:"
     )
 
-from test_cache import run_cached
+try:
+    # Single shared gate-failure classifier (SA-0MVSJX5HS002DJHI AC3): the
+    # pre-push hook and this module must never fork the reason vocabulary.
+    # Imported separately so an older test skill degrades to the local
+    # fallback body in ``_gate_failure_kind`` instead of breaking the import.
+    from test.scripts.gate_reason import (
+        GATE_REMEDIATION as _GATE_REMEDIATION,
+    )
+    from test.scripts.gate_reason import (
+        classify_gate_result as _classify_gate_result,
+    )
+    from test.scripts.gate_reason import (
+        state_changed_detail as _state_changed_detail,
+    )
+except ImportError:  # pragma: no cover - older test skill
+    _classify_gate_result = None  # type: ignore[assignment]
+    _GATE_REMEDIATION = {}  # type: ignore[assignment]
+
+from test_cache import query_cached, run_cached
 from test_runner import canonicalize_quiet_test_command
 
 # Canonical quiet full-suite commands — identical cache keys to the test
@@ -213,6 +261,94 @@ PYTEST_CMD = canonicalize_quiet_test_command("pytest")  # pytest -q -r a --disab
 NPM_TEST_CMD = canonicalize_quiet_test_command("npm test")  # npm --silent test
 
 LOG = logging.getLogger("implement.scripts.implement")
+
+
+#: Module-level cache for the disk-backed TMPDIR, resolved once per finish
+#: run (SA-0MW3ENQY0001RBSW). ``None`` means "not yet resolved"; the
+#: resolver never returns ``None`` once resolved (a failed resolution is
+#: recorded as ``_FINISH_TMPDIR_RESOLVED = True`` with ``None`` so callers
+#: leave the child env unchanged and no re-resolution/log spam occurs).
+_FINISH_TMPDIR_CACHE: str | None = None
+_FINISH_TMPDIR_RESOLVED = False
+
+
+def _resolved_finish_tmpdir() -> str | None:
+    """Return the disk-backed TMPDIR, resolved once per finish run.
+
+    Delegates to the shared F1 helper
+    (:func:`shared.test_tmpdir.resolve_test_tmpdir`, SA-0MW3EN72O005BMIP) so
+    the finish gate's build/test/push children share the exact same
+    disk-backed directory the test runner uses — closing the inode-exhausted
+    tmpfs failure end-to-end (SA-0MW3ENQY0001RBSW).
+
+    Fail-open (AC4): a resolver outage (partial skill install without the
+    F1 module, or any exception) is logged and ``None`` is returned once, so
+    the push/build proceed with the ambient environment and an unchanged
+    exit status. Callers only add ``TMPDIR`` when this returns a value.
+
+    Operator guidance (precedence, prune rules, failure signature, remedy):
+    ``docs/dev/test-skill-reference.md`` §3 (SA-0MW3ENVLU0097JRD).
+
+    Returns:
+        The resolved TMPDIR string, or ``None`` when the resolver is
+        unavailable or failed (use the ambient environment, unchanged).
+    """
+    global _FINISH_TMPDIR_CACHE, _FINISH_TMPDIR_RESOLVED
+    if _FINISH_TMPDIR_RESOLVED:
+        return _FINISH_TMPDIR_CACHE
+    _FINISH_TMPDIR_RESOLVED = True
+    if _resolve_test_tmpdir is None:
+        LOG.warning(
+            "Finish TMPDIR resolver unavailable (partial install); "
+            "using the ambient environment",
+        )
+        return None
+    try:
+        path, reason = _resolve_test_tmpdir()
+    except Exception as exc:  # noqa: BLE001 - documented fail-open contract
+        LOG.warning(
+            "Finish TMPDIR resolution failed (%s); using the ambient "
+            "environment",
+            exc,
+        )
+        return None
+    _FINISH_TMPDIR_CACHE = str(path)
+    if "disk-backed candidate" in reason or "explicit" in reason:
+        LOG.info("Finish TMPDIR=%s (%s)", path, reason)
+    else:
+        LOG.warning(
+            "Finish TMPDIR candidate unusable; using %s (%s)", path, reason
+        )
+    return _FINISH_TMPDIR_CACHE
+
+
+@contextlib.contextmanager
+def _scoped_test_tmpdir_export() -> Iterator[None]:
+    """Temporarily export the resolved disk-backed TMPDIR into ``os.environ``.
+
+    The in-process ``guarded_run_all`` test step has no Popen to pass an env
+    to (SA-0MW3ENQY0001RBSW AC2) — exporting around the call lets the test
+    runner's *own* process tempfile usage and any child it spawns without an
+    explicit env land on the disk-backed dir. Save/restore guarantees the
+    export never leaks into the operator's parent shell after the finish run
+    returns (AC3): the pre-existing value (or absence) is restored on exit.
+
+    Fail-open (AC4): when resolution failed the context is a transparent
+    no-op — nothing is exported, nothing is mutated.
+    """
+    tmpdir = _resolved_finish_tmpdir()
+    if tmpdir is None:
+        yield
+        return
+    previous = os.environ.get("TMPDIR")
+    os.environ["TMPDIR"] = tmpdir
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = previous
 
 
 def _emit_timing(timer: Timer) -> None:
@@ -231,6 +367,18 @@ REPO_ROOT = Path.cwd().resolve()
 DEFAULT_PARENT_BRANCH = "dev"
 DEFAULT_WORKTREE_DIR = ".worklog/worktrees"
 DEFAULT_MAX_RETRY = 3
+
+#: Stable marker carried by the completion comment. A re-run of ``finish``
+#: deduplicates on it (plus the commit hash) so an interrupted run converges
+#: without posting the same completion record twice
+#: (SA-0MVXUSJJY009HMQ0 AC4).
+COMPLETION_COMMENT_MARKER = "Implementation complete."
+
+#: Stable marker carried by an interruption comment. Every interruption path
+#: records the retained state once per commit and deduplicates on this marker
+#: (plus the commit hash), so a recovered interruption is never re-recorded
+#: (SA-0MVXUSJJY009HMQ0 AC2/AC4).
+INTERRUPTION_COMMENT_MARKER = "Run interrupted"
 
 #: Max fresh sessions spawned per child by ``phase_drive`` before it stops.
 DEFAULT_MAX_CHILD_SESSIONS = 1
@@ -263,10 +411,37 @@ KEEP_WORKTREE_ENV = "IMPLEMENT_KEEP_WORKTREE"
 #: so the child can verify its worktree root before its first edit — ``cwd``
 #: alone does not confine an agent (it can ``cd`` to the main checkout).
 WORKTREE_ENV = "IMPLEMENT_WORKTREE_PATH"
+#: Explicit opt-in for the Herdr pane-driven transport (``--pane-sessions`` is
+#: the CLI equivalent). Same ``"1"``-style convention as
+#: :data:`DRIVE_RECURSION_ENV`. Absent/off keeps the headless ``pi -p`` path,
+#: which automated callers (downtime worker, audit dispatch, CI) rely on.
+PANE_SESSIONS_ENV = "IMPLEMENT_DRIVE_PANE_SESSIONS"
+#: Default focus behaviour for pane-driven children: never steal the caller's
+#: focus. ``--focus`` switches to each new child pane instead.
+DEFAULT_PANE_FOCUS = False
+#: Environment keys a pane child must receive explicitly (the recursion guard,
+#: the worktree marker and — when present — the per-child lock token).
+#: Deliberately an allow-list: the whole inherited environment is never
+#: forwarded through ``pane split --env`` (leaked secrets in argv, noise).
+PANE_CHILD_ENV_KEYS = (DRIVE_RECURSION_ENV, WORKTREE_ENV, ENV_LOCK_TOKEN)
+#: The driving session's identity, which must never reach a child pane: the
+#: child starts its own clean session (``_child_session_env`` removes them).
+PANE_IDENTITY_ENV_KEYS = ("PI_SESSION_ID", "PI_SESSION_FILE")
 #: Report action for a child whose per-work-item lock is held by a live
 #: holder (another driver/session). The refused party performs no work and
 #: reports the holder identity instead of racing it (SA-0MVQ5AXLF002PAQ3).
 ACTION_SKIPPED_HELD = "skipped-held"
+#: Transport labels recorded on every ``children_driven`` entry, so a
+#: ``--json`` consumer can tell a pane-driven child from a headless one
+#: (SA-0MVPHZ1CI0045QR0 AC5). ``pane_id`` is ``None`` for the headless path.
+TRANSPORT_HEADLESS = "headless"
+TRANSPORT_PANE = "pane"
+#: Verdict title status (``herdr_pane`` vocabulary) for a pane drive retains:
+#: ``attention`` (🚫) when the child reported ``blocked`` and needs a human
+#: decision, ``note`` (⚠️) when its session failed but the pane is kept as
+#: debugging evidence (SA-0MVPHZ1CI0045QR0 AC2/AC3).
+PANE_VERDICT_BLOCKED = "attention"
+PANE_VERDICT_FAILED = "note"
 
 SLUG_MAX_LENGTH = 40
 WORK_ITEM_ID_PATTERN = re.compile(r"^[A-Z]+-\w+$")
@@ -365,6 +540,13 @@ _child_lock_global: WorkItemLock | None = None
 #: opted out of it (SA-0MVTE8XAJ002IUDR AC4).
 _keep_worktree_global = False
 _cleanup_done = False
+#: Progress of the running ``finish`` phase (work item, worktree, branch, the
+#: commit once it exists and whether it reached ``dev``). Kept module-level so
+#: the SIGTERM/SIGINT handler can name the retained state — including the
+#: pushed commit and the resume command — in its interruption comment instead
+#: of releasing the item unexplained (SA-0MVXUSJJY009HMQ0 AC1/AC2). Cleared at
+#: the start of every ``phase_finish`` and when its critical section is left.
+_finish_progress_global: dict[str, Any] = {}
 
 
 def _handle_signal_cleanup(signum: int) -> None:
@@ -376,6 +558,13 @@ def _handle_signal_cleanup(signum: int) -> None:
     state — is directly testable without terminating the interpreting
     process.
 
+    The item is never released silently once a finish is in flight: a signal
+    during ``phase_finish`` after the commit records the retained state —
+    the published (or local) commit, the branch, whether the worktree
+    survives and the command that resumes — through
+    :func:`_record_interruption_comment`, deduplicated per commit
+    (SA-0MVXUSJJY009HMQ0 AC1/AC2).
+
     Args:
         signum: The signal number that triggered the cleanup.
     """
@@ -384,6 +573,15 @@ def _handle_signal_cleanup(signum: int) -> None:
         wt = _worktree_path_global
         wid = _work_item_id_global
         rr = _repo_root_global
+
+        # A session that owns the worktree as its cwd must not lose it to an
+        # interrupt either: the same deferral predicate as ``finish`` applies
+        # (SA-0MVTE8XAJ002IUDR AC4). The item is released below regardless, so
+        # an interrupted run never leaves an orphaned ``in_progress`` claim.
+        # Resolved before the comment so the record names the tree's real fate.
+        deferred, defer_reason = _should_defer_worktree_removal(
+            bool(_keep_worktree_global)
+        )
 
         # Reset the work item status FIRST: this is the critical invariant.
         # A failure in later cleanup steps must not prevent the item from
@@ -413,14 +611,30 @@ def _handle_signal_cleanup(signum: int) -> None:
                         "Failed to record the %s interruption on %s: %s",
                         signame, wid, exc,
                     )
+            elif _finish_progress_global.get("work_item_id") == wid:
+                # An interrupted finish is never unexplained either: record
+                # the retained state — the pushed commit, the branch, whether
+                # the tree survives — and the command that resumes, so the
+                # released item is recoverable and the re-run converges
+                # (SA-0MVXUSJJY009HMQ0 AC1/AC2). ``_record_interruption_comment``
+                # deduplicates on the marker plus commit, so a repeat signal or
+                # a re-run never stacks records.
+                try:
+                    _record_interruption_comment(
+                        wid,
+                        f"{signame} during the finish phase",
+                        # The tree survives only under the deferral predicate:
+                        # the plain path removes it immediately below, and the
+                        # record must say so (the resume then recreates it).
+                        worktree_retained=bool(deferred),
+                        worktree_path=wt,
+                    )
+                except Exception as exc:  # noqa: BLE001 - never block cleanup
+                    LOG.error(
+                        "Failed to record the %s interruption on %s: %s",
+                        signame, wid, exc,
+                    )
 
-        # A session that owns the worktree as its cwd must not lose it to an
-        # interrupt either: the same deferral predicate as ``finish`` applies
-        # (SA-0MVTE8XAJ002IUDR AC4). The item is still released above, so an
-        # interrupted run never leaves an orphaned ``in_progress`` claim.
-        deferred, defer_reason = _should_defer_worktree_removal(
-            bool(_keep_worktree_global)
-        )
         if deferred:
             LOG.info(
                 "Signal cleanup: worktree removal deferred (%s); the session "
@@ -489,6 +703,30 @@ def _set_keep_worktree_global(enabled: bool) -> None:
     """Record the ``--keep-worktree`` decision for the signal handler."""
     global _keep_worktree_global
     _keep_worktree_global = bool(enabled)
+
+
+def _set_finish_progress(**fields: Any) -> None:
+    """Record finish-phase progress for the interruption comment.
+
+    Idempotent: each call merges the supplied fields into the module-level
+    context, so the phase can accumulate (worktree, branch) at the start and
+    the commit/push facts as they become true without re-stating the rest.
+
+    Args:
+        **fields: Progress facts (``work_item_id``, ``worktree_path``,
+            ``branch``, ``commit``, ``pushed``).
+    """
+    _finish_progress_global.update(fields)
+
+
+def _clear_finish_progress() -> None:
+    """Forget finish-phase progress once the phase leaves its critical section.
+
+    A cleared context means a later signal has no half-stated finish to
+    report: either the run had not reached the commit (nothing was published)
+    or the phase already converged.
+    """
+    _finish_progress_global.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +807,13 @@ def slug_from_title(title: str) -> str:
 
 def worktree_path_for(work_item_id: str, slug: str) -> str:
     """Compute the canonical worktree path.
+
+    The returned path is **relative to the main checkout root**, not to the
+    current working directory. Callers that need an absolute path must join
+    it onto the main checkout root (``_get_repo_root()``) rather than calling
+    ``Path(wt_path).resolve()`` while ``cwd`` may be inside a linked worktree
+    — otherwise the path nests under the worktree and the registered tree is
+    missed (SA-0MVXUGXS5006M3HF).
 
     Args:
         work_item_id: The work item ID.
@@ -794,6 +1039,182 @@ def _safety_reset_if_in_progress(work_item_id: str) -> None:
         LOG.info("Safety reset: %s status in-progress -> open", work_item_id)
     else:
         LOG.info("Safety reset skipped: %s status is %r", work_item_id, current)
+
+
+def _work_item_comment_bodies(work_item_id: str) -> list[str]:
+    """Return the comment bodies recorded on a work item (fail-open).
+
+    Read through :meth:`StatusLifecycle.show` (``wl show --json``), which
+    returns the full payload — ``workItem``, ``comments``, ``children`` — so
+    the idempotence checks below need no extra ``wl`` invocation. An
+    unreadable store, a malformed payload or a harness stub without comments
+    yields an empty list: the caller then records its comment rather than
+    silently skipping it (the safe direction for a recovery record).
+
+    Args:
+        work_item_id: The work item whose comments to read.
+
+    Returns:
+        The comment bodies, in store order (empty on any read failure).
+    """
+    try:
+        data = StatusLifecycle.show(work_item_id)
+    except RuntimeError as exc:
+        LOG.warning("Could not read the comments of %s: %s", work_item_id, exc)
+        return []
+    comments = data.get("comments") if isinstance(data, dict) else None
+    if not isinstance(comments, list):
+        return []
+    bodies: list[str] = []
+    for entry in comments:
+        if not isinstance(entry, dict):
+            continue
+        body = entry.get("comment")
+        if isinstance(body, str):
+            bodies.append(body)
+    return bodies
+
+
+def _comment_already_recorded(work_item_id: str, *needles: str) -> bool:
+    """Whether a comment containing **every** needle already exists.
+
+    The idempotence primitive for the re-run convergence path
+    (SA-0MVXUSJJY009HMQ0 AC4) and the interruption record (AC2): a stable
+    marker plus the commit hash identifies the record, so re-running ``finish``
+    in a fresh process never duplicates it.
+
+    Args:
+        work_item_id: The work item whose comments to search.
+        *needles: Substrings that must all appear in one comment body.
+
+    Returns:
+        True when such a comment exists; False otherwise (including an
+        unreadable store — never suppress a recovery record silently).
+    """
+    if not needles:
+        return False
+    for body in _work_item_comment_bodies(work_item_id):
+        if all(needle in body for needle in needles):
+            return True
+    return False
+
+
+def _interruption_state_comment(
+    work_item_id: str,
+    reason: str,
+    progress: dict[str, Any] | None = None,
+    *,
+    worktree_retained: bool = False,
+    worktree_path: str | None = None,
+) -> str:
+    """Build the comment that names an interruption's retained state.
+
+    The record answers the three questions an operator (or the next agent)
+    needs after an interrupted run (SA-0MVXUSJJY009HMQ0 AC1/AC2): what state
+    was retained, whether any work was published, and which command resumes.
+
+    Args:
+        work_item_id: The interrupted work item.
+        reason: Human-readable interruption reason (signal or failure).
+        progress: The finish-phase progress facts; defaults to the module-level
+            context.
+        worktree_retained: Whether the worktree survives the interruption.
+        worktree_path: The worktree path, when known.
+
+    Returns:
+        The comment body (starts with :data:`INTERRUPTION_COMMENT_MARKER`).
+    """
+    facts = _finish_progress_global if progress is None else progress
+    commit = str(facts.get("commit") or "")
+    pushed = bool(facts.get("pushed"))
+    branch = str(facts.get("branch") or "")
+    path = str(worktree_path or facts.get("worktree_path") or "")
+
+    lines = [
+        f"{INTERRUPTION_COMMENT_MARKER}: {reason}.",
+        "Retained state:",
+        (
+            "- Status: open, assignee cleared (the claim is released). The item "
+            "is not in_review, so it is not an audit-dispatch candidate."
+        ),
+        "- Stage: unchanged — the terminal transition never ran.",
+    ]
+    if commit:
+        published = "pushed to dev" if pushed else "committed locally, not pushed"
+        target = f" on branch {branch}" if branch else ""
+        lines.append(f"- Commit: {commit} ({published}{target}).")
+    else:
+        lines.append(
+            "- Commit: none — no commit was created before the interruption."
+        )
+    if path:
+        if worktree_retained:
+            lines.append(f"- Worktree: retained at {path} (resume onto it directly).")
+        else:
+            lines.append(
+                f"- Worktree: removed ({path}); the work that reached dev is "
+                "unaffected."
+            )
+    lines.append("Resume with:")
+    if path and not worktree_retained:
+        lines.append(
+            "  python3 skill/implement/scripts/implement.py start "
+            f"{work_item_id}"
+        )
+    lines.append(
+        "  python3 skill/implement/scripts/implement.py finish "
+        f"{work_item_id}"
+    )
+    lines.append(
+        "Re-running finish is idempotent: it converges to completed / "
+        "in_review, releases the assignee and does not duplicate this comment "
+        "or the completion comment."
+    )
+    return "\n".join(lines)
+
+
+def _record_interruption_comment(
+    work_item_id: str,
+    reason: str,
+    *,
+    worktree_retained: bool = False,
+    worktree_path: str | None = None,
+) -> dict[str, Any]:
+    """Record an interruption's retained state, at most once per commit.
+
+    Never raises: a comment failure must not pre-empt the status release that
+    precedes it. The outcome is returned so the caller can surface it in its
+    report.
+
+    Args:
+        work_item_id: The interrupted work item.
+        reason: Human-readable interruption reason.
+        worktree_retained: Whether the worktree survives the interruption.
+        worktree_path: The worktree path, when known.
+
+    Returns:
+        Dict with ``recorded`` (bool), ``deduplicated`` (bool) and ``commit``.
+    """
+    commit = str(_finish_progress_global.get("commit") or "")
+    commit_needle = f"Commit: {commit}" if commit else "Commit: none"
+    if _comment_already_recorded(
+        work_item_id, INTERRUPTION_COMMENT_MARKER, commit_needle
+    ):
+        LOG.info(
+            "Interruption comment for %s (commit %s) already recorded; not "
+            "duplicating it.",
+            work_item_id,
+            commit or "none",
+        )
+        return {"recorded": False, "deduplicated": True, "commit": commit}
+    body = _interruption_state_comment(
+        work_item_id,
+        reason,
+        worktree_retained=worktree_retained,
+        worktree_path=worktree_path,
+    )
+    recorded = wl_add_comment(work_item_id, body)
+    return {"recorded": bool(recorded), "deduplicated": False, "commit": commit}
 
 
 # ---------------------------------------------------------------------------
@@ -1055,8 +1476,10 @@ def _forward_child_lock_reclamation(
     forwarded = list(child_report.get("warnings") or [])
     if not forwarded:
         forwarded = [
-            f"Reclaimed a stale per-child lock for {child_id} from "
-            f"{_describe_child_lock_holder(child_report.get('reclaimed_from'))}."
+            (
+                f"Reclaimed a stale per-child lock for {child_id} from "
+                f"{_describe_child_lock_holder(child_report.get('reclaimed_from'))}."
+            )
         ]
     for warning in forwarded:
         if warning not in warnings:
@@ -2083,10 +2506,21 @@ def _main_checkout_guard_violations(
 
     *own_churn* is the file list of finish's own Step-5 fast-forward of the
     main checkout's ``dev`` branch: those working-tree changes are attributed
-    to finish and never abort. A deletion (``D`` in the code) is **never**
-    allow-listed, even when the path appears in *own_churn* — a fast-forward
-    cannot delete a file relative to the tracked tree, so a ``D`` entry is
-    foreign by construction (WL-0MVPADZ1Z000FOSG AC3).
+    to finish and never abort. It is deliberately narrow
+    (SA-0MVXVC03O0034A7V): :func:`_record_finish_own_churn` only ever returns
+    checkout-relative paths that were *observed dirty in this checkout* after
+    the advance, so a path belonging to another checkout or repository can
+    never be allow-listed here. A foreign spelling of a dirty path (absolute,
+    or a ``..`` escape) simply does not compare equal to the normalised
+    checkout-relative status path, so it never satisfies the allow-list and
+    the real path stays offending. A deletion (``D`` in the code) is **never**
+    allow-listed either, even when the path appears in *own_churn* — a
+    fast-forward cannot delete a file relative to the tracked tree, so a ``D``
+    entry is foreign by construction (WL-0MVPADZ1Z000FOSG AC3).
+
+    The operator-facing contract lives in
+    ``docs/dev/implement-skill-reference.md`` (§ Finish main-checkout guard →
+    Attribution contract (`own_churn`)).
 
     Args:
         baseline: The :func:`_snapshot_main_checkout` taken at run start.
@@ -2113,26 +2547,130 @@ def _main_checkout_guard_violations(
     return offending
 
 
-def _record_finish_own_churn(
-    repo_root: str, before_head: str, after_head: str
-) -> list[str]:
-    """File list of finish's own fast-forward of the main checkout.
+def _repository_root_mismatch(repo_root: str) -> str:
+    """Explain why *repo_root* is not a main working-tree root ("" when it is).
 
-    The diff between the main checkout's HEAD before the Step-5 fast-forward
-    and after covers every working-tree change the fast-forward itself
-    caused (branch checkout + commit merge), so those paths are attributable
-    to finish and excluded from the main-checkout guard's offending set.
+    Attribution helpers must never treat a path that merely *contains* a
+    repository as that repository: a subdirectory or a linked worktree's root
+    still answers ``git diff --name-only`` (relative to the repository), yet
+    the finish run does not own the files it names. The check therefore
+    requires
+
+    * ``git rev-parse --show-toplevel`` for *repo_root* to be *repo_root*
+      itself, and
+    * ``git rev-parse --git-common-dir`` (whose parent is the main working
+      tree root) to be inside *repo_root* — i.e. *repo_root* is the main
+      checkout, not a linked worktree of one.
 
     Args:
-        repo_root: Absolute path to the main checkout.
-        before_head: ``git rev-parse HEAD`` before the fast-forward.
-        after_head: The fast-forwarded HEAD (commit hash just merged).
+        repo_root: Candidate main-checkout root.
 
     Returns:
-        Sorted file list, or ``[]`` when either side is unavailable.
+        A human-readable reason, or ``""`` when *repo_root* is the root of a
+        non-linked working tree.
+    """
+    try:
+        root = Path(repo_root).resolve()
+    except OSError:
+        return f"{repo_root} cannot be resolved"
+    if not root.is_dir():
+        return f"{repo_root} is not a directory"
+    toplevel_result = run_cmd(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=repo_root,
+        check=False,
+    )
+    if toplevel_result.returncode != 0 or not toplevel_result.stdout.strip():
+        return f"{repo_root} is not inside a git working tree"
+    toplevel = Path(toplevel_result.stdout.strip()).resolve()
+    if toplevel != root:
+        return (
+            f"{repo_root} is not the repository root "
+            f"(git --show-toplevel is {toplevel})"
+        )
+    common_result = run_cmd(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=repo_root,
+        check=False,
+    )
+    if common_result.returncode != 0 or not common_result.stdout.strip():
+        return f"git --git-common-dir failed in {repo_root}"
+    common_dir = Path(common_result.stdout.strip())
+    if not common_dir.is_absolute():
+        common_dir = toplevel / common_dir
+    common_dir = common_dir.resolve()
+    main_root = common_dir.parent
+    if main_root != root:
+        return (
+            f"{repo_root} is a linked worktree, not its main checkout "
+            f"(git --git-common-dir is {common_dir}, whose parent is "
+            f"{main_root})"
+        )
+    return ""
+
+
+def _record_finish_own_churn(
+    repo_root: str,
+    before_head: str,
+    after_head: str,
+    *,
+    observed: dict[str, str] | None = None,
+    not_observed: list[str] | None = None,
+) -> list[str]:
+    """Paths of finish's own fast-forward that were *observed* dirty here.
+
+    The diff between the main checkout's HEAD before the Step-5 fast-forward
+    and after is **not** by itself churn: on 2026-10-31 a finish reported seven
+    paths (``docs/Game Design Document.md``, five ``src/powerups/*``, …) whose
+    ``baseline_paths`` was 0 — that was the file list of the commit local
+    ``dev`` was advanced to, i.e. other work items' work, not anything this
+    run touched in this checkout (SA-0MVXVC03O0034A7V).
+
+    So attribution is constrained three ways:
+
+    1. *repo_root* must be the root of the finished working tree **and** its
+       main checkout — a subdirectory or a linked worktree is refused loudly
+       (:func:`_repository_root_mismatch`), because the diff would then name
+       paths this run does not own;
+    2. every diff path must be checkout-relative (absolute and ``..``-escaping
+       entries are dropped) **and** resolve inside *repo_root*;
+    3. every surviving path must be *observed dirty in the finished checkout*
+       after the advance — the post-fast-forward status map, re-snapshotted
+       here unless supplied via *observed*.
+
+    Dropped paths are reported through *not_observed* so an operator sees what
+    the diff claimed and could not be attributed; they are a diagnostic only
+    and are **never** allow-listed by the main-checkout guard. A deletion is
+    likewise never allow-listed (the guard keeps that exclusion). The
+    operator-facing contract is
+    ``docs/dev/implement-skill-reference.md`` § Finish main-checkout guard →
+    Attribution contract (`own_churn`).
+
+    Args:
+        repo_root: Absolute path to the main checkout being finished.
+        before_head: ``git rev-parse HEAD`` before the fast-forward.
+        after_head: The fast-forwarded HEAD (commit hash just merged).
+        observed: Optional status map to intersect against; re-snapshotted from
+            *repo_root* when omitted.
+        not_observed: Optional list extended with a ``"<path> [<reason>]"``
+            entry for every dropped path.
+
+    Returns:
+        Sorted file list of attributable paths, or ``[]`` when the roots or
+        refs are unavailable or nothing was observed dirty.
     """
     if not before_head or not after_head:
         return []
+
+    mismatch = _repository_root_mismatch(repo_root)
+    if mismatch:
+        LOG.warning(
+            "Refusing to attribute finish's own fast-forward churn: %s. No "
+            "path is allow-listed; the main-checkout guard stays strict.",
+            mismatch,
+        )
+        return []
+
     result = run_cmd(
         ["git", "diff", "--name-only", before_head, after_head],
         cwd=repo_root,
@@ -2141,7 +2679,36 @@ def _record_finish_own_churn(
     )
     if result.returncode != 0:
         return []
-    return sorted(p for p in result.stdout.splitlines() if p.strip())
+
+    root = Path(repo_root).resolve()
+    if observed is None:
+        observed = _main_checkout_status_map(repo_root)
+    own: list[str] = []
+    dropped: list[str] = []
+    for raw in result.stdout.splitlines():
+        path = raw.strip()
+        if not path:
+            continue
+        candidate = Path(path)
+        reason = ""
+        if candidate.is_absolute():
+            reason = "absolute path"
+        elif ".." in candidate.parts:
+            reason = "path contains '..'"
+        else:
+            resolved = (root / candidate).resolve()
+            if resolved != root and root not in resolved.parents:
+                reason = f"resolves outside {root}"
+        if not reason and path not in observed:
+            reason = "not observed dirty in the finished checkout"
+        if reason:
+            dropped.append(f"{path} [{reason}]")
+            continue
+        own.append(path)
+
+    if not_observed is not None:
+        not_observed.extend(dropped)
+    return sorted(set(own))
 
 
 def _main_checkout_actor_evidence(
@@ -2231,6 +2798,25 @@ def _main_checkout_guard_message(
     )
 
 
+#: Every stage label the finish main-checkout guard can record in
+#: ``report["steps"]["main_checkout_guard"]["verifies"]``
+#: (SA-0MVXVBYXI000QMXM). ``pre_push`` and ``pre_worktree_removal`` are the
+#: push-path verifies; the failure-path stages are recorded when finish aborts
+#: before the push; ``refactor`` is advisory/report-only (it never aborts).
+#: Documented for operators in ``docs/dev/implement-skill-reference.md``
+#: (§ Finish main-checkout guard → Verify stages);
+#: ``skill/implement/tests/test_guard_docs.py`` fails when this tuple and the
+#: documented table drift apart, so add a stage in both places.
+VERIFY_STAGES: tuple[str, ...] = (
+    "refactor",
+    "build_failure",
+    "gate_failure",
+    "user_abort",
+    "pre_push",
+    "pre_worktree_removal",
+)
+
+
 def _verify_main_checkout(
     guard: dict[str, Any],
     baseline: dict[str, Any],
@@ -2255,7 +2841,7 @@ def _verify_main_checkout(
         worktree_path: This finish run's own worktree.
         own_churn: Paths changed by finish's own fast-forward.
         expected_dirty: Project-declared dirty path prefixes to exclude.
-        stage: Verify stage label (``pre_push`` / ``pre_worktree_removal``).
+        stage: Verify stage label — one of :data:`VERIFY_STAGES`.
 
     Returns:
         The offending paths (empty list on pass).
@@ -2469,7 +3055,13 @@ def warn_self_referential_upstream(repo_root: str) -> dict[str, Any]:
             for finding in _detect_self_referential_upstreams(repo_root)
             if finding.get("type") == "defect"
         ]
-    except Exception as exc:  # fail-open: never block a work item
+    except Exception as exc:  # noqa: BLE001 -- fail-open; see the comment below
+        # Broad by design (BLE001): the detector can raise not only
+        # ``NotARepositoryError`` but also a ``TypeError`` (a non-path repo),
+        # an ``OSError`` from the git subprocess or a broken-config failure.
+        # Every one of them must degrade to the logged skip below and never
+        # block a work item (SA-0MVX35AUC003CNUD AC2/AC3). Pinned by
+        # skill/implement/tests/test_self_upstream_wiring.py.
         LOG.warning("Self-referential-upstream check skipped: %s", exc)
         return {"status": "skipped", "reason": str(exc)}
     if not defects:
@@ -2645,6 +3237,17 @@ GITLINK_MODE = "160000"
 #: churn and is never restored by the build-churn stage.
 CHURN_EXEMPT_PREFIX = ".worklog/"
 
+#: Prefix of the ``engine:sync`` lines a game repo's build prints to stdout.
+#: They are the only record that the build advanced the engine before it
+#: compiled (SA-0MW06FLFR009F0P4).
+ENGINE_SYNC_LINE_PREFIX = "engine:sync"
+
+#: Maximum number of ``engine:sync`` lines quoted in a build-failure comment.
+ENGINE_SYNC_MAX_LINES = 20
+
+#: Characters of a build's stdout/stderr kept in a build-failure comment.
+BUILD_OUTPUT_TAIL_CHARS = 500
+
 
 def _parse_gitlink_entries(output: str, sha_field: int = 2) -> dict[str, str]:
     """Parse NUL-separated ``ls-tree``/``ls-files --stage`` output into a map.
@@ -2788,10 +3391,12 @@ def _build_churn_baseline(cwd: str) -> dict[str, Any]:
         cwd: Worktree root.
 
     Returns:
-        ``{taken_at, gitlinks, dirty_paths}`` where ``dirty_paths`` maps every
-        tracked dirty path to its :func:`_path_state_token` and ``gitlinks``
-        is ``HEAD``'s recorded composition. Outside a git work tree both are
-        empty (the churn stage is then a no-op).
+        ``{taken_at, gitlinks, index_gitlinks, dirty_paths}`` where
+        ``dirty_paths`` maps every tracked dirty path to its
+        :func:`_path_state_token`, ``gitlinks`` is ``HEAD``'s recorded
+        composition and ``index_gitlinks`` the composition staged at build
+        start (the item's own pin change, when it made one). Outside a git
+        work tree all three are empty (the churn stage is then a no-op).
     """
     gitlinks = _head_gitlinks(cwd)
     dirty = sorted(_tracked_dirty_paths(cwd))
@@ -2799,6 +3404,7 @@ def _build_churn_baseline(cwd: str) -> dict[str, Any]:
     return {
         "taken_at": datetime.now(timezone.utc).isoformat(),
         "gitlinks": gitlinks,
+        "index_gitlinks": _index_gitlinks(cwd),
         "dirty_paths": {
             path: _path_state_token(cwd, path, known) for path in dirty
         },
@@ -3073,6 +3679,159 @@ def _build_churn_refusal_message(churn: dict[str, Any]) -> str:
         "genuinely this item's, make it part of the change set *before* the "
         "build (stage or modify it yourself) so it is preserved."
     )
+
+
+def _engine_lag(cwd: str, baseline: dict[str, Any]) -> dict[str, Any]:
+    """Report a failed build's engine advance against the item's pinned engine.
+
+    A game repo's ``npm run build`` runs ``engine:sync`` first, which advances
+    the ``core`` submodule to the tracked-branch tip before the rest of the
+    build compiles the item's source. If the item predates a breaking engine
+    API change the build then fails with a compile error that has nothing to
+    do with the item's own change — and the failure message carried no trace
+    of the advance, so an engine-induced failure looked like a source failure
+    (SA-0MW06FLFR009F0P4).
+
+    The data was already available: :func:`_build_churn_baseline` records the
+    pre-build gitlink (the item's pinned engine) and the submodule checkout
+    ``HEAD`` is the engine the build actually compiled against. Comparing them
+    is additive reporting only — nothing is restored or staged here.
+
+    Args:
+        cwd: Worktree root.
+        baseline: The :func:`_build_churn_baseline` taken before the build.
+
+    Returns:
+        ``{submodules: [{submodule, pinned_sha, composed_sha, advanced}],
+        advanced}``. ``pinned_sha`` is the composition staged at build start —
+        the item's own pin when it changed the composition itself, else the
+        committed gitlink — so an item-originated composition change is never
+        reported as a build advance. A repo without a recorded submodule
+        composition reports an empty ``submodules`` list, and an unresolved
+        submodule checkout is reported with ``composed_sha: None`` and
+        ``advanced: false`` — a broken composition is never an advance.
+    """
+    gitlinks = dict(baseline.get("gitlinks") or {})
+    pins = {**gitlinks, **(baseline.get("index_gitlinks") or {})}
+    submodules: list[dict[str, Any]] = []
+    for path, recorded in sorted(gitlinks.items()):
+        pinned = pins.get(path, recorded)
+        proc = _run_git_plumbing(str(Path(cwd) / path), ["rev-parse", "HEAD"])
+        composed = proc.stdout.strip() if proc.returncode == 0 else ""
+        submodules.append(
+            {
+                "submodule": path,
+                "pinned_sha": pinned,
+                "composed_sha": composed or None,
+                "advanced": bool(composed) and composed != pinned,
+            }
+        )
+    return {
+        "submodules": submodules,
+        "advanced": any(entry["advanced"] for entry in submodules),
+    }
+
+
+def _engine_sync_lines(stdout: str, limit: int = ENGINE_SYNC_MAX_LINES) -> list[str]:
+    """The ``engine:sync`` lines a build printed to stdout.
+
+    ``engine:sync`` logs the advance (``engine:sync: core updated <from> →
+    <to>``) and the pin rewrite to **stdout**, where the old build-failure
+    comment — which posted only ``stderr`` — could never show them.
+
+    Args:
+        stdout: The build's captured stdout.
+        limit: Maximum number of lines kept.
+
+    Returns:
+        The matching lines, in order. Empty when the build produced no
+        ``engine:sync`` output at all (Python-only repos, a skipped build, or
+        a sync that failed before printing).
+    """
+    return [
+        line.strip()
+        for line in (stdout or "").splitlines()
+        if line.strip().lower().startswith(ENGINE_SYNC_LINE_PREFIX)
+    ][:limit]
+
+
+def _build_output_tail(output: str, limit: int = BUILD_OUTPUT_TAIL_CHARS) -> str:
+    """The last *limit* characters of a build output stream.
+
+    Args:
+        output: The captured stdout or stderr.
+        limit: Maximum number of characters kept.
+
+    Returns:
+        The tail, prefixed with an elision marker when truncated. Empty for
+        empty input.
+    """
+    text = (output or "").strip()
+    if len(text) <= limit:
+        return text
+    return "…(truncated)\n" + text[-limit:]
+
+
+def _engine_lag_diagnosis(engine_lag: dict[str, Any]) -> str:
+    """The operator-facing line(s) naming both SHAs of every advanced engine.
+
+    Args:
+        engine_lag: The :func:`_engine_lag` report.
+
+    Returns:
+        One bullet per advanced submodule, empty when nothing advanced.
+    """
+    return "\n".join(
+        f"- {entry['submodule']}: build ran against engine "
+        f"{entry['composed_sha']}; the item pinned {entry['pinned_sha']} — "
+        "the advance is not part of this item's commit"
+        for entry in engine_lag.get("submodules") or []
+        if entry.get("advanced")
+    )
+
+
+def _build_failure_message(
+    build_result: dict[str, Any], engine_lag: dict[str, Any]
+) -> str:
+    """The work-item comment a failed finish build posts.
+
+    Records the exit code, the engine diagnosis when the build advanced the
+    engine past the item's pin, the ``engine:sync`` lines and the tails of
+    **both** streams — stdout is where ``engine:sync`` reports the advance, so
+    stderr alone can leave the operator without the cause of a compile error
+    (SA-0MW06FLFR009F0P4).
+
+    Args:
+        build_result: The :func:`run_build` result.
+        engine_lag: The :func:`_engine_lag` report for the failed build.
+
+    Returns:
+        The comment body (Markdown).
+    """
+    sections = [
+        (
+            "Build failed during finish phase "
+            f"(exit code {build_result['exit_code']})."
+        )
+    ]
+    if engine_lag.get("advanced"):
+        sections.append(
+            "**Engine advanced past the item's pin during the build.** The "
+            "compile errors below may come from engine APIs this item "
+            "predates:\n" + _engine_lag_diagnosis(engine_lag)
+        )
+        sync_lines = _engine_sync_lines(build_result.get("stdout") or "")
+        if sync_lines:
+            sections.append(
+                "**engine:sync output**\n```\n" + "\n".join(sync_lines) + "\n```"
+            )
+    stdout_tail = _build_output_tail(build_result.get("stdout") or "")
+    if stdout_tail:
+        sections.append("**stdout (tail)**\n```\n" + stdout_tail + "\n```")
+    stderr_tail = _build_output_tail(build_result.get("stderr") or "")
+    if stderr_tail:
+        sections.append("**stderr (tail)**\n```\n" + stderr_tail + "\n```")
+    return "\n\n".join(sections)
 
 
 @dataclass
@@ -3520,6 +4279,45 @@ class PushNonFastForwardError(RuntimeError):
         )
 
 
+class PushSubjectMismatchError(RuntimeError):
+    """Raised when the dev push would gate a tree other than the pushed commit.
+
+    ``finish`` pushes from the worktree that holds its commit so the pre-push
+    full-suite gate measures the pushed tree. When that checkout cannot be the
+    subject (missing worktree, not a git working tree, its ``HEAD`` is a
+    different commit, or it has tracked uncommitted changes that a recovery
+    rebase cannot carry), pushing anyway would let the gate verify — and
+    cache — a tree the pushed commit does not describe. The guard therefore
+    refuses before any push, naming the commit, branch, worktree and the
+    actual ``HEAD`` so a human can recover (SA-0MVTFMB7K002Y1F3 AC2/AC3).
+    """
+
+    def __init__(
+        self,
+        commit_hash: str,
+        branch: str,
+        worktree_path: str,
+        actual_head: str | None,
+        reason: str,
+    ) -> None:
+        self.commit_hash = commit_hash
+        self.branch = branch
+        self.worktree_path = worktree_path
+        self.actual_head = actual_head
+        self.reason = reason
+        super().__init__(
+            f"Refusing to push commit {commit_hash} on branch {branch}: the "
+            f"worktree {worktree_path} does not hold the pushed commit "
+            f"(HEAD={actual_head or 'unresolved'}; {reason}). The dev-push "
+            f"gate's subject is the pushed commit and it resolves that commit "
+            f"from the push checkout, so pushing from a checkout holding a "
+            f"different commit would gate the wrong tree. Recovery: check out "
+            f"{commit_hash} in "
+            f"{worktree_path} (or recreate the worktree from {branch}) and "
+            f"re-run finish. The commit is local on branch {branch}."
+        )
+
+
 class AncestryAssertionError(RuntimeError):
     """Raised when finish's own commit did not reach the pushed dev tip.
 
@@ -3608,8 +4406,624 @@ def _assert_remote_name_only(remote: str) -> None:
         )
 
 
+def _full_suite_cache_present(cwd: str) -> bool:
+    """Whether a valid full-suite cache entry exists for *cwd*'s git state.
+
+    Read-only: queries the test cache for each full-suite command the repo
+    resolves and executes nothing. A missing suite, an unreadable command or
+    an indeterminate git state is a miss — never a silent green. Fail-soft:
+    evidence plumbing may never decide a push's outcome
+    (SA-0MVUTXJM8006PQY4 AC3/AC4).
+    """
+    try:
+        commands = _resolve_full_suite_commands(cwd) or []
+    except Exception:  # noqa: BLE001 - evidence must never break a push
+        return False
+    for command in commands:
+        try:
+            if query_cached(command, cwd=cwd) is not None:
+                return True
+        except Exception as exc:  # noqa: BLE001 - a corrupt entry is a miss
+            LOG.debug("Full-suite cache query failed for %r: %s", command, exc)
+            continue
+    return False
+
+
+def _dev_push_gate_evidence(
+    cwd: str, commit_hash: str | None, before_present: bool,
+) -> dict[str, Any]:
+    """Classify the dev-push gate's verdict for the pushed tree (evidence).
+
+    ``.githooks/pre-push`` runs the full suite before the push contacts the
+    remote, so a successful ``git push`` means the gate ran — but the captured
+    output is only visible if it is logged, and whether the run was
+    *executed* or served from the *cache* is only observable in the test
+    cache. This resolves the gate's tree (root + ``HEAD``), the pushed sha and
+    the classification from the read-only cache API:
+
+    * a valid full-suite entry already present before the push → ``cached``;
+    * no entry before but one after the push → ``executed``;
+    * still none after a successful push → ``no-evidence`` (warned — never
+      silently reported as green).
+
+    Args:
+        cwd: The push cwd (the pushed tree).
+        commit_hash: The pushed commit (short or full).
+        before_present: Whether a valid full-suite entry existed pre-push.
+
+    Returns:
+        Dict with ``root``, ``head``, ``pushed`` and ``full_suite``.
+    """
+    root = str(Path(cwd).resolve())
+    head = _resolve_full_commit(cwd, "HEAD") or "unknown"
+    pushed = (
+        _resolve_full_commit(cwd, commit_hash) if commit_hash else None
+    ) or (commit_hash or "unknown")
+    after_present = _full_suite_cache_present(cwd)
+    if before_present:
+        classification = "cached"
+    elif after_present:
+        classification = "executed"
+    else:
+        classification = "no-evidence"
+    evidence = {
+        "root": root,
+        "head": head,
+        "pushed": pushed,
+        "full_suite": classification,
+    }
+    line = (
+        f"dev-push gate evidence: root={root} head={head} "
+        f"pushed={pushed} full-suite={classification}"
+    )
+    if classification == "no-evidence":
+        LOG.warning(
+            "%s — no full-suite cache entry exists for the pushed tree, so "
+            "the dev-push gate produced no evidence that it ran",
+            line,
+        )
+    else:
+        LOG.info("%s", line)
+    return evidence
+
+
+#: Verdicts of the read-only post-push verification step
+#: (design A, SA-0MVXUSED6008J04R). ``green`` and ``not_applicable`` permit
+#: the terminal ``completed``/``in_review`` transition; ``red`` and
+#: ``missing`` refuse it (SA-0MVXUSJ2P009T97H AC4). Any unexpected value is
+#: treated as ``missing`` — the refusal is fail-closed.
+POST_PUSH_VERDICT_GREEN = "green"
+POST_PUSH_VERDICT_RED = "red"
+POST_PUSH_VERDICT_MISSING = "missing"
+POST_PUSH_VERDICT_NOT_APPLICABLE = "not_applicable"
+
+
+def _post_push_verification_commands(cwd: str) -> tuple[list[str], str]:
+    """Resolve the full-suite commands the post-push verification checks.
+
+    Resolution mirrors :func:`run_tests` (the test skill's
+    ``full_suite_commands`` first, implement.py's legacy convention detection
+    second) without executing anything, so the verification step can query
+    the cache for exactly the command the dev-push gate ran.
+
+    Args:
+        cwd: The pushed-commit checkout (the worktree).
+
+    Returns:
+        ``(commands, reason)`` — the resolved commands and, when nothing was
+        resolved, why (recorded as the ``not_applicable`` reason).
+    """
+    try:
+        commands = _resolve_full_suite_commands(cwd)
+    except Exception as exc:  # noqa: BLE001 - resolution must not break finish
+        LOG.warning(
+            "Post-push verification: full-suite resolution failed (%s)", exc
+        )
+        return [], f"full-suite resolution failed: {exc}"
+    if commands is not None:
+        if not commands:
+            return [], "the repository declares no full-suite command"
+        return list(commands), ""
+    # The test skill is unavailable (partial install) or resolved no suite:
+    # fall back to the legacy convention detection, limited to the two
+    # commands with a canonical cache key. Other legacy tooling (a repo-local
+    # runner script, Unity) has no canonical command to look up, so it is
+    # reported as ``not_applicable`` with that reason rather than a silent
+    # green (never invent a command that the gate may not have run).
+    tooling = _detect_test_tooling(cwd)
+    if tooling == "pytest":
+        return [PYTEST_CMD], ""
+    if tooling == "npm":
+        return [NPM_TEST_CMD], ""
+    if tooling is None:
+        return [], "no full-suite command detected"
+    return [], f"legacy tooling {tooling!r} has no canonical full-suite command"
+
+
+def _resolve_post_push_verification(
+    worktree_path: str, repo_root: str
+) -> dict[str, Any]:
+    """Read-only full-suite verdict for the just-pushed commit (design A).
+
+    Part of :func:`phase_finish`'s finalisation window
+    (SA-0MVXUSJ2P009T97H, design SA-0MVXUSED6008J04R): after a successful dev
+    push the run resolves the full-suite verdict for the pushed tree from the
+    test cache. It **never executes a suite** — the dev-push pre-push hook ran
+    the full suite against this exact commit and cached the result.
+
+    The pushed-commit checkout (``worktree_path``) is queried first, then the
+    main checkout's cache (``repo_root``) as the documented fallback: the
+    pre-push hook mirrors its entry into the main-checkout
+    ``.worklog/cache``, while a worktree's own cache directory is separate.
+    The cache lookup binds the verdict to the current git state (HEAD + dirty
+    content), so an entry recorded for another tree can never be served.
+
+    Verdict vocabulary:
+
+    - ``green`` — every resolved full-suite command has a valid entry with
+      ``exit_code == 0``. Transition permitted.
+    - ``not_applicable`` — the repository resolves no full-suite command at
+      all (or only legacy tooling with no canonical command). Transition
+      permitted, recorded explicitly so it is never a silent green.
+    - ``red`` — an entry exists but reports a non-zero exit. Transition
+      refused.
+    - ``missing`` — no valid entry: absent, expired, unkeyable or a bypassed
+      pre-push gate. Transition refused.
+
+    Args:
+        worktree_path: The checkout that holds the pushed commit.
+        repo_root: The main checkout (cache mirror location).
+
+    Returns:
+        A structured verdict dict (``verdict``, ``success``, ``executed``,
+        ``commands``, ``entries``, ``reason``, ``checked_at``).
+    """
+    commands, reason = _post_push_verification_commands(worktree_path)
+    verification: dict[str, Any] = {
+        "verdict": POST_PUSH_VERDICT_NOT_APPLICABLE,
+        "success": True,
+        "executed": False,
+        "commands": commands,
+        "entries": [],
+        "reason": reason,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "cache_roots": [worktree_path, repo_root],
+    }
+    if not commands:
+        LOG.info("Post-push verification: not applicable (%s)", reason)
+        return verification
+
+    verdicts: list[str] = []
+    for command in commands:
+        entry: dict[str, Any] | None = None
+        cached_at: str | None = None
+        for cwd in (worktree_path, repo_root):
+            try:
+                entry = query_cached(command, cwd=cwd)
+            except Exception as exc:  # noqa: BLE001 - a broken cache is a miss
+                LOG.warning(
+                    "Post-push verification: cache query failed for %s in "
+                    "%s (%s)",
+                    command,
+                    cwd,
+                    exc,
+                )
+                entry = None
+            if entry is not None:
+                cached_at = cwd
+                break
+        if entry is None:
+            verdicts.append(POST_PUSH_VERDICT_MISSING)
+            verification["entries"].append(
+                {
+                    "command": command,
+                    "verdict": POST_PUSH_VERDICT_MISSING,
+                    "cache_root": None,
+                }
+            )
+            continue
+        exit_code = entry.get("exit_code")
+        try:
+            ok = int(exit_code) == 0
+        except (TypeError, ValueError):
+            ok = False
+        verdict = (
+            POST_PUSH_VERDICT_GREEN if ok else POST_PUSH_VERDICT_RED
+        )
+        verdicts.append(verdict)
+        verification["entries"].append(
+            {
+                "command": command,
+                "verdict": verdict,
+                "cache_root": cached_at,
+                "exit_code": exit_code,
+                "completed_at": entry.get("completed_at"),
+                "scope": entry.get("scope"),
+                "git_state": entry.get("git_state"),
+                "fingerprint_kind": entry.get("fingerprint_kind"),
+                "stdout": (entry.get("stdout") or "")[:4000],
+                "stderr": (entry.get("stderr") or "")[:4000],
+            }
+        )
+
+    # Red wins over missing (a real failure is more actionable than a gap),
+    # and green requires every command to be green.
+    if POST_PUSH_VERDICT_RED in verdicts:
+        verdict = POST_PUSH_VERDICT_RED
+    elif POST_PUSH_VERDICT_MISSING in verdicts:
+        verdict = POST_PUSH_VERDICT_MISSING
+    else:
+        verdict = POST_PUSH_VERDICT_GREEN
+    verification["verdict"] = verdict
+    verification["success"] = verdict == POST_PUSH_VERDICT_GREEN
+    if verdict == POST_PUSH_VERDICT_GREEN:
+        LOG.info(
+            "Post-push verification: green (full-suite cache entry for the "
+            "pushed tree)"
+        )
+    else:
+        LOG.warning(
+            "Post-push verification: %s — refusing the terminal transition",
+            verdict,
+        )
+    return verification
+
+
+def _post_push_failure_test_name(verification: dict[str, Any]) -> str:
+    """Name the failure a red/missing verification reports to triage.
+
+    A red entry carries the failing suite's output, so the first ``FAILED``/
+    ``✕`` line names the real test; a missing entry has no failing test and is
+    named after the verification itself.
+    """
+    for entry in verification.get("entries") or []:
+        if entry.get("verdict") != POST_PUSH_VERDICT_RED:
+            continue
+        output = f"{entry.get('stdout') or ''}\n{entry.get('stderr') or ''}"
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("FAILED "):
+                return line[len("FAILED ") :].split()[0]
+            if line.startswith("✕ "):
+                return line[2:].strip()
+        return f"post-push full-suite verification ({entry.get('command')})"
+    return "post-push full-suite verification: no valid full-suite cache entry"
+
+
+def _route_post_push_failure_to_triage(
+    verification: dict[str, Any], commit_hash: str, work_item_id: str
+) -> dict[str, Any]:
+    """File a red/missing post-push verification through the triage helper.
+
+    Fail-soft by design: a triage hiccup must never mask the verification
+    refusal that is being reported. The helper is the skill's canonical
+    ``check_or_create.py``, so an existing matching critical ``test-failure``
+    item is enhanced instead of duplicated.
+    """
+    excerpt_parts: list[str] = []
+    stack_trace = ""
+    for entry in verification.get("entries") or []:
+        if entry.get("verdict") == POST_PUSH_VERDICT_MISSING:
+            excerpt_parts.append(
+                f"No valid full-suite cache entry for: {entry.get('command')}"
+            )
+            continue
+        excerpt_parts.append(f"$ {entry.get('command')}")
+        excerpt_parts.append((entry.get("stdout") or "")[:1500])
+        if entry.get("stderr"):
+            stack_trace = (entry.get("stderr") or "")[:1500]
+    payload = {
+        "test_name": _post_push_failure_test_name(verification),
+        "stdout_excerpt": "\n".join(excerpt_parts)[:3000],
+        "stack_trace": stack_trace,
+        "commit_hash": commit_hash,
+        "parent_work_item_id": work_item_id,
+    }
+    helper = _SKILLS_ROOT / "triage" / "scripts" / "check_or_create.py"
+    if not helper.exists():
+        LOG.warning(
+            "Post-push verification triage helper not found at %s", helper
+        )
+        return {"success": False, "reason": "helper_not_found"}
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(helper), json.dumps(payload)],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        LOG.warning("Post-push verification triage failed: %s", exc)
+        return {"success": False, "reason": f"triage_failed: {exc}"}
+    result: dict[str, Any] = {
+        "success": proc.returncode == 0,
+        "returncode": proc.returncode,
+    }
+    try:
+        result["report"] = json.loads(proc.stdout.strip() or "{}")
+    except (json.JSONDecodeError, ValueError):
+        result["stdout"] = proc.stdout[-2000:]
+    if proc.returncode != 0:
+        result["stderr"] = proc.stderr[-2000:]
+        LOG.warning(
+            "Post-push verification triage helper exited %d: %s",
+            proc.returncode,
+            proc.stderr[-500:],
+        )
+    return result
+
+
+def _post_push_verification_refusal(
+    verification: dict[str, Any],
+    work_item_id: str,
+    commit_hash: str,
+    branch: str,
+    worktree_path: str,
+) -> tuple[str, str]:
+    """Build the refusal message and the work-item comment (AC4).
+
+    The refused state is named exactly: the pushed commit, the branch, the
+    retained worktree, the verdict and the cache state checked. Nothing was
+    reverted — the commit stays on ``dev`` and on its feature branch.
+
+    Returns:
+        ``(message, comment)`` — the RuntimeError text and the comment body.
+    """
+    verdict = verification.get("verdict")
+    reason = verification.get("reason") or ""
+    lines = [
+        f"Finish refused: post-push verification is {verdict}.",
+        f"- Commit: {commit_hash} (pushed to dev, not reverted)",
+        f"- Branch: {branch} (retained)",
+        f"- Worktree: {worktree_path} (retained)",
+        "- Full-suite commands checked:",
+    ]
+    for entry in verification.get("entries") or []:
+        detail = entry.get("verdict")
+        if entry.get("exit_code") is not None:
+            detail += f", exit_code={entry.get('exit_code')}"
+        if entry.get("cache_root"):
+            detail += f", cache_root={entry.get('cache_root')}"
+        lines.append(f"  - {entry.get('command')}: {detail}")
+    if reason:
+        lines.append(f"- Reason: {reason}")
+    if verdict == POST_PUSH_VERDICT_RED:
+        lines.append(
+            "The cached full-suite verdict for the pushed tree is red, so the "
+            "item is not marked complete. The failure has been routed to "
+            "triage."
+        )
+    else:
+        lines.append(
+            "No valid full-suite cache entry exists for the pushed tree "
+            "(absent, expired, unkeyable, or the pre-push gate was bypassed), "
+            "so a green verdict cannot be proven."
+        )
+    lines.extend(
+        [
+            (
+                "The work item was released to `open` with no assignee; the "
+                "pushed commit is neither reverted nor force-removed."
+            ),
+            (
+                "Remediation: run the full suite through the test skill, then "
+                "re-run finish (idempotent — the no-diff path converges):"
+            ),
+            "  python3 skill/test/scripts/run_tests.py --scope full",
+            (
+                f"  python3 skill/implement/scripts/implement.py finish "
+                f"{work_item_id}"
+            ),
+        ]
+    )
+    comment = "\n".join(lines)
+    message = (
+        f"Post-push verification refused the terminal transition for "
+        f"{work_item_id}: verdict={verdict}, commit={commit_hash}. The commit "
+        f"stays on dev and on branch {branch}; the worktree is retained. "
+        f"Run the full suite through the test skill and re-run finish."
+    )
+    return message, comment
+
+
+PUSH_TRANSPORT_RETRY_PATTERNS: tuple[str, ...] = (
+    "closed by remote host",
+    "connection reset by peer",
+    "remote end hung up unexpectedly",
+    "kex_exchange_identification",
+)
+#: Bounded retry policy (AC4): the initial attempt plus two retries with
+#: jittered exponential backoff. A retry re-runs the identical argv/cwd/env, so
+#: the pre-push gate runs again and serves its cached full-suite entry.
+PUSH_RETRY_MAX_ATTEMPTS = 3
+PUSH_RETRY_BASE_SECONDS = 2.0
+PUSH_RETRY_CAP_SECONDS = 30.0
+
+_GATE_REASON_LINE_RE = re.compile(r"^gate_reason=([a-z_]+)\s*$", re.MULTILINE)
+
+#: Reason reported when the repo-local pre-push **pushed-commit guard** refuses
+#: (§3a, LP-0MVSJUM3O003C0H9). The guard exits *before* the suite runs, so it
+#: emits no ``gate_reason=`` line; the refusal is recognised from its stable
+#: diagnostic instead, which makes it distinguishable from a generic push
+#: failure (SA-0MW3H07A8004Q54C AC3).
+PUSHED_COMMIT_GUARD_REASON = "refused_by_pushed_commit_guard"
+_PUSHED_COMMIT_GUARD_MARKER = "pre-push gate refuses this push"
+_PUSHED_COMMIT_GUARD_PUSHED_RE = re.compile(
+    r"pushed commit[^\n:]*:\s*([0-9a-f]{6,40})"
+)
+_PUSHED_COMMIT_GUARD_HEAD_RE = re.compile(
+    r"checked-out HEAD:\s*([0-9a-f]{6,40})"
+)
+_PUSHED_COMMIT_GUARD_TREE_RE = re.compile(r"gate tree:\s*(\S+)")
+
+
+class PushGateFailureError(RuntimeError):
+    """A dev push refused by the pre-push gate, carrying its reason code.
+
+    Carries the hook's stable ``gate_reason=<code>`` so ``phase_finish`` can
+    report *why* the push failed (slot contention / timeout / killed / red
+    suite) instead of a generic "git push to dev failed"
+    (SA-0MVSJX5HS002DJHI AC2).
+    """
+
+    def __init__(
+        self,
+        gate_reason: str,
+        stderr_tail: str,
+        commit_hash: str,
+        branch: str,
+    ) -> None:
+        self.gate_reason = gate_reason
+        self.stderr_tail = stderr_tail
+        self.commit_hash = commit_hash
+        self.branch = branch
+        super().__init__(
+            f"Push to dev refused by the gate ({gate_reason}): {stderr_tail}. "
+            f"Commit {commit_hash} on branch {branch} is local."
+        )
+
+
+def _is_retryable_push_transport(stderr: str) -> bool:
+    """Whether *stderr* names a transient transport close (retryable).
+
+    Only the recognised transport patterns retry. Auth failures, branch-policy
+    refusals and non-fast-forward errors must fail as they do today — masking
+    them behind a retry would turn a real error into a slow one.
+    """
+    lower = (stderr or "").lower()
+    return any(pattern in lower for pattern in PUSH_TRANSPORT_RETRY_PATTERNS)
+
+
+def _push_transport_backoff(
+    attempt: int, rng: random.Random | None = None
+) -> float:
+    """Jittered exponential backoff (seconds) for the *attempt*-th retry.
+
+    *attempt* is 1-based (1 = the delay after the first failed push). The base
+    doubles per retry and is capped, with +/-25% jitter so concurrent pushers do
+    not retry in lockstep.
+    """
+    rng = rng if rng is not None else random
+    base = PUSH_RETRY_BASE_SECONDS * (2 ** (max(1, attempt) - 1))
+    capped = min(base, PUSH_RETRY_CAP_SECONDS)
+    return capped * (0.75 + rng.random() * 0.5)
+
+
+def _push_retry_sleep(seconds: float) -> None:
+    """Sleep seam for the transport backoff (monkeypatched in tests)."""
+    time.sleep(seconds)
+
+
+def _parse_gate_reason(stderr: str) -> str | None:
+    """The last stable ``gate_reason=<code>`` line the hook printed, if any."""
+    matches = _GATE_REASON_LINE_RE.findall(stderr or "")
+    return matches[-1] if matches else None
+
+
+def _parse_pushed_commit_guard_refusal(stderr: str) -> dict[str, str] | None:
+    """Return the pushed-commit guard's refusal details, or ``None``.
+
+    §3a of ``.githooks/pre-push`` refuses a dev/main push *before* the suite
+    runs, so it prints no ``gate_reason=`` line. Its refusal is recognised from
+    the stable marker and the ``pushed commit`` / ``checked-out HEAD`` /
+    ``gate tree`` values it names — the same three the operator needs to act
+    (SA-0MW3H07A8004Q54C AC3). Missing fields are omitted, never fabricated.
+    """
+    text = stderr or ""
+    if _PUSHED_COMMIT_GUARD_MARKER not in text.lower():
+        return None
+    details: dict[str, str] = {}
+    pushed = _PUSHED_COMMIT_GUARD_PUSHED_RE.search(text)
+    if pushed:
+        details["pushed_sha"] = pushed.group(1)
+    head = _PUSHED_COMMIT_GUARD_HEAD_RE.search(text)
+    if head:
+        details["gate_head"] = head.group(1)
+    tree = _PUSHED_COMMIT_GUARD_TREE_RE.search(text)
+    if tree:
+        details["gate_tree"] = tree.group(1)
+    return details
+
+
+def _stderr_tail(text: str, limit: int = 20) -> str:
+    """The last *limit* lines of a push/gate stderr (bounded for comments)."""
+    lines = (text or "").strip().splitlines()
+    return "\n".join(lines[-limit:])
+
+
+def _push_gate_remediation(gate_reason: str | None) -> str:
+    """The operator remedy for a dev-push gate reason (never empty)."""
+    if gate_reason == PUSHED_COMMIT_GUARD_REASON:
+        # AC3: the recovery is the guard's own documented alternative — push
+        # from a checkout that *is* the pushed commit.
+        return (
+            "The pre-push pushed-commit guard refused: the gate tree was not "
+            "the pushed commit, or was dirty at it. Push from the worktree "
+            "that holds the pushed commit (git push origin "
+            "HEAD:refs/heads/dev from that worktree), or bring the main "
+            "checkout to the pushed commit and re-run finish."
+        )
+    if gate_reason and _GATE_REMEDIATION.get(gate_reason):
+        return str(_GATE_REMEDIATION[gate_reason])
+    return (
+        "Read the gate output above, resolve the condition, then re-run "
+        "finish (idempotent — a no-diff push converges)."
+    )
+
+
+def _push_retry_trail_fields(evidence: dict[str, Any] | None) -> dict[str, Any]:
+    """The attempt-trail keys to expose on ``report["steps"]["push"]`` (AC3).
+
+    ``git_push_to_dev`` records every transport retry (the failed attempt
+    number, the backoff actually slept and the reason) plus the total attempt
+    count in its ``evidence_out``. Finish carries them onto the push step so a
+    ``--json`` report exposes the retry trail instead of leaving it in the log
+    only (SA-0MVXEQEI500641SJ AC3). Absent keys are omitted, never fabricated.
+    """
+    if not evidence:
+        return {}
+    fields: dict[str, Any] = {}
+    trail = evidence.get("retry_trail")
+    if trail:
+        fields["retry_trail"] = list(trail)
+    attempts = evidence.get("attempts")
+    if attempts:
+        fields["attempts"] = attempts
+    return fields
+
+
+def _dev_push_gate_failure_comment(
+    gate_reason: str,
+    stderr_tail: str,
+    commit_hash: str,
+    branch: str,
+    worktree_path: str,
+) -> str:
+    """Build the work-item comment for a dev push refused by the gate (AC2)."""
+    lines = [
+        f"Dev push failed (gate reason: {gate_reason}).",
+        _push_gate_remediation(gate_reason),
+        "",
+        f"Commit: {commit_hash}",
+        f"Branch: {branch}",
+        f"Worktree: {worktree_path}",
+        (
+            "Local dev was restored to origin/dev (the commit stays on its "
+            "feature branch)."
+        ),
+    ]
+    if stderr_tail:
+        lines.extend(["", "Gate output (tail):", stderr_tail])
+    return "\n".join(lines)
+
+
 def git_push_to_dev(
-    cwd: str, branch: str, commit_hash: str | None = None, timeout: int | None = None,
+    cwd: str,
+    branch: str,
+    commit_hash: str | None = None,
+    timeout: int | None = None,
+    evidence_out: dict[str, Any] | None = None,
 ) -> bool:
     """Push the current branch into the dev branch on origin.
 
@@ -3620,11 +5034,29 @@ def git_push_to_dev(
     carrying the commit hash and branch so the caller can post a
     manual-push comment and leave recoverable state (AC3).
 
+    A **transient transport close** (``Connection ... closed by remote
+    host``, ``Connection reset by peer``, ``remote end hung up
+    unexpectedly``, ``kex_exchange_identification``) is retried up to
+    ``PUSH_RETRY_MAX_ATTEMPTS`` attempts with jittered exponential
+    backoff from the *same cwd*, so the gate runs again and serves its
+    cached full-suite entry (SA-0MVSJX5HS002DJHI AC4). Auth, branch-policy
+    and non-fast-forward failures are never retried.
+
     Args:
-        cwd: Working directory (worktree root).
+        cwd: The checkout that holds the pushed commit — the worktree. The
+            pre-push hook resolves its project root with
+            ``git rev-parse --show-toplevel`` in this directory, so the
+            dev-push full-suite gate measures the pushed tree
+            (SA-0MVTFMB7K002Y1F3). Never the main checkout unless the commit
+            is checked out there.
         branch: Local branch name to push.
         commit_hash: The commit hash being pushed (used in recovery).
         timeout: Override timeout in seconds (defaults to resolved config).
+        evidence_out: Optional dict populated with the gate's ``root``,
+            ``head``, ``pushed`` and ``full_suite`` classification on success
+            (SA-0MVUTXJM8006PQY4 AC5), or with ``success: False``,
+            ``gate_reason`` and ``stderr_tail`` on failure
+            (SA-0MVSJX5HS002DJHI — additive; the success keys are unchanged).
 
     Returns:
         True if the push succeeded.
@@ -3632,6 +5064,8 @@ def git_push_to_dev(
     Raises:
         ``PushTimeoutError``: push timed out — carries commit_hash/branch
             so the caller can produce a recovery comment.
+        ``PushNonFastForwardError``: dev advanced concurrently — the caller
+            rebases and retries.
     """
     if timeout is None:
         timeout = _resolve_test_timeout(cwd)
@@ -3644,41 +5078,86 @@ def git_push_to_dev(
     # the constant pins the name that carries dev-push integration.
     _assert_remote_name_only(PUSH_REMOTE_NAME)
 
-    # Spawn the push in its own process group so that a timeout kills the
-    # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
-    try:
-        proc = subprocess.Popen(
-            ["git", "push", PUSH_REMOTE_NAME, f"{branch}:refs/heads/dev"],
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,  # new process group
-            env={**os.environ},
-        )
+    # Snapshot the full-suite cache before the FIRST push attempt so the gate's
+    # executed-vs-cached verdict is observable afterwards (AC3). Read-only and
+    # fail-soft: it never decides the push. Taken once so a transport retry is
+    # never misreported as "cached" merely because the first attempt executed.
+    before_present = _full_suite_cache_present(cwd)
+
+    #: Every transport retry this push made, in order. Carried into
+    #: ``evidence_out`` (and from there onto ``report["steps"]["push"]``) so a
+    #: ``--json`` finish report shows the attempt trail, not only a log line
+    #: (SA-0MVXEQEI500641SJ AC3).
+    retry_trail: list[dict[str, Any]] = []
+
+    def _attach_trail(out: dict[str, Any] | None, attempts: int) -> None:
+        """Record the attempt count and retry trail on *out* (additive)."""
+        if out is None:
+            return
+        out["attempts"] = attempts
+        out["retry_trail"] = [dict(entry) for entry in retry_trail]
+
+    for attempt in range(1, PUSH_RETRY_MAX_ATTEMPTS + 1):
+        # Spawn the push in its own process group so that a timeout kills the
+        # entire tree of children (e.g. the pre-push hook's ``run_tests.py``).
         try:
-            _stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # Kill the entire process group so orphaned hook children don't
-            # survive and deadlock subsequent push attempts.
-            _kill_process_group(proc.pid)
-            proc.wait()
-            LOG.error(
-                "git push to dev timed out after %d s (pre-push hook still "
-                "running).",
-                timeout,
+            # Augment the push child env with the resolved disk-backed TMPDIR
+            # so the pre-push hook's ``run_tests.py`` inherits it (fail-open:
+            # a resolution failure leaves the ambient env unchanged). Neither
+            # this export nor the resolution mutates the parent shell env
+            # (SA-0MW3ENQY0001RBSW AC1/AC3).
+            child_env = dict(os.environ)
+            _finish_tmpdir = _resolved_finish_tmpdir()
+            if _finish_tmpdir is not None:
+                child_env["TMPDIR"] = _finish_tmpdir
+            proc = subprocess.Popen(
+                ["git", "push", PUSH_REMOTE_NAME, f"{branch}:refs/heads/dev"],
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,  # new process group
+                env=child_env,
             )
-            # Raise with recoverable-state info (AC3)
-            raise PushTimeoutError(
-                commit_hash or "unknown", branch, timeout,
-            ) from None
-        if proc.returncode != 0:
+            try:
+                _stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Kill the entire process group so orphaned hook children don't
+                # survive and deadlock subsequent push attempts.
+                _kill_process_group(proc.pid)
+                proc.wait()
+                LOG.error(
+                    "git push to dev timed out after %d s (pre-push hook still "
+                    "running).",
+                    timeout,
+                )
+                # Raise with recoverable-state info (AC3). A timeout is a bound,
+                # not a transport close: never retried here.
+                raise PushTimeoutError(
+                    commit_hash or "unknown", branch, timeout,
+                ) from None
             stderr_str = stderr.decode(errors="replace").strip()
-            # Detect non-fast-forward errors (dev advanced concurrently).
-            # AC1/AC2: raise a recoverable exception so the caller can rebase
-            # and retry instead of failing with information loss.  Remotes
-            # word this differently: SSH/HTTPS report "non-fast-forward",
-            # while local/file remotes report "fetch first" /
-            # "remote contains work that you do not have locally".
+            if proc.returncode == 0:
+                # Success: surface the pre-push hook's output (AC3). It was
+                # previously captured and dropped, so "the gate ran" and "the
+                # gate never ran" were indistinguishable. Then classify
+                # executed-vs-cached from the read-only test cache for the
+                # pushed tree.
+                if stderr_str:
+                    for hook_line in stderr_str.splitlines():
+                        LOG.info("git push to dev hook: %s", hook_line)
+                evidence = _dev_push_gate_evidence(cwd, commit_hash, before_present)
+                if evidence_out is not None:
+                    evidence_out.clear()
+                    evidence_out.update(evidence)
+                    _attach_trail(evidence_out, attempt)
+                return True
+
+            # Failure: detect non-fast-forward errors (dev advanced
+            # concurrently). AC1/AC2: raise a recoverable exception so the
+            # caller can rebase and retry instead of failing with information
+            # loss. Remotes word this differently: SSH/HTTPS report
+            # "non-fast-forward", while local/file remotes report "fetch
+            # first" / "remote contains work that you do not have locally".
             lower = stderr_str.lower()
             if (
                 "non-fast-forward" in lower
@@ -3692,14 +5171,78 @@ def git_push_to_dev(
                 raise PushNonFastForwardError(
                     commit_hash or "unknown", branch, stderr_str, rebase_cmd,
                 )
-            LOG.error("git push to dev failed: %s", stderr_str)
+
+            # Transient transport close: retry from the SAME cwd (the worktree
+            # that holds the pushed commit), so the gate re-runs against the
+            # identical tree and serves its cached entry.
+            if (
+                _is_retryable_push_transport(stderr_str)
+                and attempt < PUSH_RETRY_MAX_ATTEMPTS
+            ):
+                delay = _push_transport_backoff(attempt)
+                retry_trail.append(
+                    {
+                        "attempt": attempt,
+                        "delay_seconds": round(delay, 3),
+                        "reason": "transport_close",
+                    }
+                )
+                LOG.warning(
+                    "git push to dev attempt %d/%d failed with a transient "
+                    "transport error; retrying in %.1fs from the same cwd %s. "
+                    "stderr: %s",
+                    attempt,
+                    PUSH_RETRY_MAX_ATTEMPTS,
+                    delay,
+                    cwd,
+                    _stderr_tail(stderr_str),
+                )
+                _push_retry_sleep(delay)
+                continue
+
+            # The pushed-commit guard (§3a) refuses before the suite runs and
+            # prints no ``gate_reason=`` line: recognise its stable diagnostic
+            # so a guard refusal is reported distinctly, with the pushed sha /
+            # gate HEAD / gate tree it names (SA-0MW3H07A8004Q54C AC3).
+            pushed_commit_guard = _parse_pushed_commit_guard_refusal(stderr_str)
+            gate_reason = (
+                PUSHED_COMMIT_GUARD_REASON
+                if pushed_commit_guard is not None
+                else _parse_gate_reason(stderr_str)
+            )
+            if evidence_out is not None:
+                evidence_out.clear()
+                failure: dict[str, Any] = {
+                    "success": False,
+                    "gate_reason": gate_reason,
+                    "stderr_tail": _stderr_tail(stderr_str),
+                }
+                if pushed_commit_guard is not None:
+                    failure["pushed_commit_guard"] = pushed_commit_guard
+                evidence_out.update(failure)
+                _attach_trail(evidence_out, attempt)
+            LOG.error(
+                "git push to dev failed (attempt %d/%d, gate_reason=%s): %s",
+                attempt,
+                PUSH_RETRY_MAX_ATTEMPTS,
+                gate_reason or "none",
+                stderr_str,
+            )
             return False
-        return True
-    except Exception as exc:
-        if isinstance(exc, (PushTimeoutError, PushNonFastForwardError)):
-            raise
-        LOG.error("git push to dev error: %s", exc)
-        return False
+        except Exception as exc:
+            if isinstance(
+                exc,
+                (
+                    PushTimeoutError,
+                    PushNonFastForwardError,
+                    PushGateFailureError,
+                ),
+            ):
+                raise
+            LOG.error("git push to dev error: %s", exc)
+            return False
+
+    return False
 
 
 def git_get_commit_hash(cwd: str) -> str:
@@ -3772,110 +5315,752 @@ def _get_repo_root(cwd: str | None = None) -> str | None:
     return toplevel.as_posix()
 
 
+def _is_working_tree_root(root: str | None) -> bool:
+    """True when *root* is an existing directory holding a ``.git`` marker.
+
+    Used to validate a **derived** main checkout root before it is trusted:
+    every legitimate answer (:func:`_get_repo_root`) is a working-tree root,
+    so a value without the marker means derivation effectively failed and the
+    documented fallback must apply instead. Returning such a path would make
+    finish snapshot, fast-forward and lock a directory that is not a checkout
+    at all (SA-0MVXVC03O0034A7V).
+
+    Args:
+        root: Candidate root path (``None``/empty means "not derivable").
+    """
+    if not root:
+        return False
+    try:
+        candidate = Path(root)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
+    marker = candidate / ".git"
+    return candidate.is_dir() and (marker.is_dir() or marker.is_file())
+
+
 def _resolve_main_repo_root(
     worktree_path: str | None = None,
     state: ImplementState | None = None,
 ) -> str:
     """Resolve the MAIN checkout root for a worktree-scoped phase.
 
-    The implement state file's ``repo_root`` is authoritative **except** when
-    it points at the worktree itself or somewhere inside it: that is stale
-    state written by ``phase_start`` when it resumed from inside a linked
-    worktree, and trusting it makes ``phase_finish`` refuse to remove "the
-    repository root" and ``phase_abort`` restore the wrong checkout
-    (MS-0MVM7NJF70037YU4).
+    The main root is **derived**, never trusted from state alone. A state
+    file's ``repo_root`` is accepted only when it resolves to the same main
+    checkout that :func:`_get_repo_root` derives from *worktree_path* (via
+    ``git rev-parse --git-common-dir``, whose parent is the main working-tree
+    root). Two defects are closed by that requirement
+    (SA-0MVXVC03O0034A7V):
 
-    A stale value is rejected with a WARNING naming both the rejected and the
-    derived value, then the main root is derived from *worktree_path* via
-    :func:`_get_repo_root` (which resolves ``--git-common-dir``'s parent),
-    falling back to discovery from the current directory.
+    * a **stale** value written by ``phase_start`` when it resumed from inside
+      a linked worktree — the worktree itself, or a path inside it — which
+      made ``phase_finish`` refuse to remove "the repository root" and
+      ``phase_abort`` restore the wrong checkout (MS-0MVM7NJF70037YU4);
+    * a value naming a **sibling checkout** (another repository), which made
+      finish snapshot, fast-forward and push that foreign repository — the
+      2026-10-31 AI_Hell cross-checkout attribution incident.
+
+    Both are rejected with a WARNING naming the rejected and the derived root,
+    and the **derived** root is used. Derivation counts as impossible either
+    when ``git`` cannot answer for the worktree **or** when the answer is not a
+    real working-tree root (:func:`_is_working_tree_root`); then the documented
+    fallback applies — the stated root, else discovery from the current
+    directory, which is the last resort only (a finish run's cwd may be an
+    unrelated checkout) — and it is logged too, so a silently trusted value
+    cannot exist. The rule is documented for operators in
+    ``docs/dev/implement-skill-reference.md`` § Finish main-checkout guard →
+    Fail-closed `repo_root` resolution.
 
     Args:
         worktree_path: Absolute path to the phase's worktree, if known.
         state: The implement state read for this worktree, if available.
 
     Returns:
-        Absolute main checkout root — never the worktree or a path inside it
-        (unless the worktree *is* the main checkout, which the callers'
-        removal safety gates then refuse on their own terms).
+        Absolute main checkout root. Whenever the repository owning
+        *worktree_path* is derivable this is never a path outside it (the
+        worktree itself and paths inside it are rejected too, unless the
+        worktree *is* the main checkout — the callers' removal safety gates
+        then refuse on their own terms).
     """
     worktree = Path(worktree_path).resolve() if worktree_path else None
-
-    def _inside_worktree(candidate: str) -> bool:
-        if worktree is None:
-            return False
-        resolved = Path(candidate).resolve()
-        return resolved == worktree or worktree in resolved.parents
-
     stated = (state.repo_root if state else "") or ""
-    if stated and not _inside_worktree(stated):
-        return str(Path(stated).resolve())
 
-    derived = (
-        (_get_repo_root(str(worktree)) if worktree else None)
-        or _get_repo_root()
-        or str(Path.cwd().resolve())
+    # Derive from the worktree only while it exists: an already-removed
+    # worktree makes derivation impossible (``git`` cannot run in it) rather
+    # than an error, which keeps ``cleanup``/``abort`` idempotent.
+    derived: str | None = None
+    if worktree is not None and worktree.is_dir():
+        derived = _get_repo_root(str(worktree))
+        if derived and not _is_working_tree_root(derived):
+            LOG.warning(
+                "Ignoring derived main checkout root %s for worktree %s: it "
+                "is not a git working tree, so the derivation is treated as "
+                "impossible.",
+                derived,
+                worktree,
+            )
+            derived = None
+
+    if derived:
+        if stated:
+            resolved_stated = Path(stated).resolve()
+            if resolved_stated != Path(derived).resolve():
+                inside_worktree = bool(
+                    worktree is not None
+                    and (
+                        resolved_stated == worktree
+                        or worktree in resolved_stated.parents
+                    )
+                )
+                if inside_worktree:
+                    LOG.warning(
+                        "Ignoring stale state repo_root=%s (it is the "
+                        "worktree or inside it); using the main checkout "
+                        "root %s instead.",
+                        stated,
+                        derived,
+                    )
+                else:
+                    LOG.warning(
+                        "Rejecting state repo_root=%s: it is not the main "
+                        "checkout that owns worktree %s (derived main "
+                        "checkout root %s). Using the derived root — finish "
+                        "never acts on another checkout.",
+                        stated,
+                        worktree_path,
+                        derived,
+                    )
+        return derived
+
+    # Derivation impossible: the documented fallback is the only answer left,
+    # and it is surfaced rather than trusted. Discovery from the current
+    # directory is the last resort — never preferred over a stated root, since
+    # the cwd of a finish run may be an unrelated checkout entirely.
+    fallback = (
+        str(Path(stated).resolve())
+        if stated
+        else (_get_repo_root() or str(Path.cwd().resolve()))
     )
-    if stated:
-        LOG.warning(
-            "Ignoring stale state repo_root=%s (it is the worktree or inside "
-            "it); using the main checkout root %s instead.",
-            stated,
-            derived,
+    LOG.warning(
+        "Cannot derive the main checkout root for worktree %s from git; "
+        "falling back to %s.",
+        worktree_path or Path.cwd(),
+        fallback,
+    )
+    return fallback
+
+
+#: Workspace package consumed by path whose resolution a worktree must own
+#: (the reference case: a package that the main checkout's dependency tree
+#: links back into its own ``packages/`` tree).
+SHARED_WORKSPACE_PACKAGE_NAME = "@worklog/shared"
+
+#: Workspace-relative location of the shared package above.
+SHARED_WORKSPACE_PACKAGE_DIR = Path("packages") / "shared"
+
+
+def _read_package_json(package_dir: Path) -> dict[str, Any]:
+    """Read ``<package_dir>/package.json`` as a dict ({} when unreadable)."""
+    try:
+        with open(package_dir / "package.json", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _workspace_glob_patterns(checkout_root: Path) -> list[str]:
+    """Return the checkout's npm ``workspaces`` glob patterns.
+
+    Accepts both the array form (``"workspaces": ["packages/*"]``) and the
+    object form (``{"packages": [...]}``). Anything else is treated as "no
+    workspaces", which keeps the step a no-op for plain repositories.
+    """
+    workspaces = _read_package_json(checkout_root).get("workspaces")
+    if isinstance(workspaces, dict):
+        workspaces = workspaces.get("packages")
+    if isinstance(workspaces, str):
+        workspaces = [workspaces]
+    if not isinstance(workspaces, list):
+        return []
+    return [pattern for pattern in workspaces if isinstance(pattern, str) and pattern]
+
+
+def _workspace_packages(checkout_root: Path) -> dict[str, Path]:
+    """Map workspace package name -> package directory inside *checkout_root*.
+
+    Discovery is workspace-aware (the ``workspaces`` globs of the checkout's
+    own ``package.json``), never hard-coded to one package name. Patterns that
+    escape the checkout (``../*``) and symlinked package directories are
+    ignored so the farm can only point at real in-tree sources.
+    """
+    root = checkout_root.resolve()
+    packages: dict[str, Path] = {}
+    for pattern in _workspace_glob_patterns(checkout_root):
+        try:
+            candidates = sorted(checkout_root.glob(pattern))
+        except (OSError, ValueError) as exc:  # pragma: no cover - defensive
+            LOG.warning("Ignoring invalid workspaces pattern %r: %s", pattern, exc)
+            continue
+        for candidate in candidates:
+            if not candidate.is_dir() or candidate.is_symlink():
+                continue
+            try:
+                resolved = candidate.resolve()
+            except OSError:  # pragma: no cover - defensive
+                continue
+            if resolved != root and root not in resolved.parents:
+                continue
+            name = _read_package_json(candidate).get("name")
+            if isinstance(name, str) and name and name not in packages:
+                packages[name] = resolved
+    return packages
+
+
+def _workspace_link_overrides(
+    worktree_path: Path, main_node_modules: Path
+) -> dict[str, Path]:
+    """Return ``node_modules``-relative package paths that must point at the worktree.
+
+    A workspace package is only overridden when the main checkout actually
+    materialises it in ``node_modules`` (a package consumed by path); repos
+    without such a package therefore keep the whole-directory symlink
+    degradation path.
+    """
+    overrides: dict[str, Path] = {}
+    for name, package_dir in _workspace_packages(worktree_path).items():
+        rel = Path(*name.split("/"))
+        if os.path.lexists(main_node_modules / rel):
+            overrides[name] = package_dir
+    return overrides
+
+
+def _create_farm_link(target: Path, link_path: Path, *, is_dir: bool) -> None:
+    """Create *link_path* pointing at *target* (junction fallback on Windows)."""
+    try:
+        os.symlink(str(target), str(link_path), target_is_directory=is_dir)
+        return
+    except (OSError, NotImplementedError) as exc:
+        if not (os.name == "nt" and is_dir):
+            raise
+        # ContextHub ``packages/herdr/scripts/link-shared.mjs`` precedent:
+        # directory symlinks need privileges on Windows, junctions do not.
+        junction = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link_path), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
         )
-    return derived
+        if junction.returncode != 0:
+            detail = junction.stderr.strip() or junction.stdout.strip()
+            raise OSError(f"symlink failed ({exc}); junction failed: {detail}") from exc
+
+
+def _remove_farm_entry(entry: Path) -> None:
+    """Remove one farm entry (link, file or directory); never fatal."""
+    try:
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+        elif entry.is_dir():
+            shutil.rmtree(entry)
+    except OSError as exc:  # pragma: no cover - defensive
+        LOG.warning("Failed to remove stale link-farm entry %s: %s", entry, exc)
+
+
+def _ensure_farm_link(link_path: Path, target: Path) -> bool:
+    """Make *link_path* a link to *target*, replacing a wrong/stale entry."""
+    target_str = str(target)
+    if link_path.is_symlink():
+        try:
+            if os.readlink(link_path) == target_str:
+                return True
+        except OSError:  # pragma: no cover - defensive
+            pass
+        _remove_farm_entry(link_path)
+    elif os.path.lexists(link_path):
+        # The farm is fully managed (``npm install`` in a worktree is
+        # forbidden), so a stale real entry is replaced rather than shadowing
+        # the main checkout's dependency.
+        _remove_farm_entry(link_path)
+    try:
+        _create_farm_link(target, link_path, is_dir=target.is_dir())
+    except (OSError, NotImplementedError) as exc:
+        LOG.warning("Failed to link %s -> %s: %s", link_path, target, exc)
+        return False
+    return True
+
+
+def _is_link_farm(wt_node_modules: Path) -> bool:
+    """True when *wt_node_modules* looks like a farm created by this helper.
+
+    A farm is a real directory whose root entries are links, except scope
+    directories (``@scope``), which are real directories holding only links.
+    A real ``npm install`` (package directories) is therefore never mistaken
+    for a farm and is left untouched.
+    """
+    if wt_node_modules.is_symlink() or not wt_node_modules.is_dir():
+        return False
+    try:
+        entries = list(os.listdir(wt_node_modules))
+    except OSError:  # pragma: no cover - defensive
+        return False
+    for name in entries:
+        entry = wt_node_modules / name
+        if entry.is_symlink():
+            continue
+        if name.startswith("@") and entry.is_dir():
+            try:
+                children = list(os.listdir(entry))
+            except OSError:  # pragma: no cover - defensive
+                return False
+            if all((entry / child).is_symlink() for child in children):
+                continue
+        return False
+    return True
+
+
+def _reconcile_scope(
+    wt_scope: Path,
+    main_scope: Path,
+    overrides: dict[str, Path],
+    scope_name: str,
+) -> bool:
+    """Materialise one scope directory of per-package links; return success."""
+    if os.path.lexists(wt_scope) and (
+        wt_scope.is_symlink() or not wt_scope.is_dir()
+    ):
+        _remove_farm_entry(wt_scope)
+    if not os.path.lexists(wt_scope):
+        try:
+            wt_scope.mkdir()
+        except OSError as exc:
+            LOG.warning("Failed to create scope directory %s: %s", wt_scope, exc)
+            return False
+    try:
+        main_children = sorted(os.listdir(main_scope))
+    except OSError as exc:  # pragma: no cover - defensive
+        LOG.warning("Failed to read scope %s: %s", main_scope, exc)
+        return False
+
+    ok = True
+    for child in main_children:
+        package_name = f"{scope_name}/{child}"
+        target = overrides.get(package_name, main_scope / child)
+        if not _ensure_farm_link(wt_scope / child, target):
+            ok = False
+    try:
+        existing = list(os.listdir(wt_scope))
+    except OSError:  # pragma: no cover - defensive
+        existing = []
+    for child in existing:
+        if child not in main_children:
+            _remove_farm_entry(wt_scope / child)
+    return ok
+
+
+def _reconcile_link_farm(
+    wt_node_modules: Path,
+    main_node_modules: Path,
+    overrides: dict[str, Path],
+) -> bool:
+    """Bring an existing farm in line with the main checkout's entry set.
+
+    New dependencies are linked in, removed ones are pruned, every workspace
+    override keeps pointing at the worktree's own package, and no dependency
+    tree is ever descended into (one level, plus one scope level).
+    """
+    try:
+        main_entries = sorted(os.listdir(main_node_modules))
+    except OSError as exc:  # pragma: no cover - defensive
+        LOG.warning("Failed to read %s: %s", main_node_modules, exc)
+        return False
+
+    ok = True
+    for name in main_entries:
+        main_entry = main_node_modules / name
+        is_scope = (
+            name.startswith("@") and main_entry.is_dir() and not main_entry.is_symlink()
+        )
+        if is_scope:
+            if not _reconcile_scope(
+                wt_node_modules / name, main_entry, overrides, name
+            ):
+                ok = False
+        else:
+            target = overrides.get(name, main_entry)
+            if not _ensure_farm_link(wt_node_modules / name, target):
+                ok = False
+
+    try:
+        existing = list(os.listdir(wt_node_modules))
+    except OSError:  # pragma: no cover - defensive
+        existing = []
+    for name in existing:
+        if name not in main_entries:
+            _remove_farm_entry(wt_node_modules / name)
+    return ok
+
+
+def _materialise_link_farm(
+    wt_node_modules: Path,
+    main_node_modules: Path,
+    overrides: dict[str, Path],
+) -> bool:
+    """Create (or refresh/migrate) the worktree-local ``node_modules`` farm.
+
+    A whole-directory symlink left by the previous implementation is replaced;
+    an idempotent re-run only reconciles entries. A real ``node_modules`` the
+    helper did not create is preserved (never destroyed).
+    """
+    if wt_node_modules.is_symlink():
+        LOG.info(
+            "Replacing whole-directory node_modules symlink %s with a link farm.",
+            wt_node_modules,
+        )
+        _remove_farm_entry(wt_node_modules)
+    elif os.path.lexists(wt_node_modules):
+        if not wt_node_modules.is_dir():
+            LOG.warning(
+                "Worktree node_modules %s is not a directory; skipping link farm.",
+                wt_node_modules,
+            )
+            return False
+        if not _is_link_farm(wt_node_modules):
+            LOG.info(
+                "Worktree has a real node_modules (%s) not created by "
+                "implement.py; leaving it untouched.",
+                wt_node_modules,
+            )
+            return False
+
+    if not os.path.lexists(wt_node_modules):
+        try:
+            wt_node_modules.mkdir(parents=True)
+        except OSError as exc:
+            LOG.warning(
+                "Failed to create link farm directory %s: %s", wt_node_modules, exc
+            )
+            return False
+
+    return _reconcile_link_farm(wt_node_modules, main_node_modules, overrides)
+
+
+def _ensure_directory_symlink(wt_node_modules: Path, main_node_modules: Path) -> bool:
+    """Degradation path: the previous whole-directory ``node_modules`` symlink.
+
+    Used for repositories without a workspace package consumed by path, and
+    kept idempotent/skip-when-present exactly as before.
+    """
+    if os.path.lexists(wt_node_modules):
+        LOG.info(
+            "Worktree already has node_modules (%s); skipping symlink.",
+            wt_node_modules,
+        )
+        return False
+    try:
+        os.symlink(
+            str(main_node_modules), str(wt_node_modules), target_is_directory=True
+        )
+    except (OSError, NotImplementedError) as exc:
+        LOG.warning(
+            "Failed to symlink node_modules into worktree %s: %s",
+            wt_node_modules.parent,
+            exc,
+        )
+        return False
+    LOG.info("Symlinked %s -> %s", wt_node_modules, main_node_modules)
+    return True
 
 
 def _ensure_node_modules_symlink(worktree_path: str, repo_root: str | None) -> bool:
-    """Auto-symlink the main checkout's node_modules into a worktree.
+    """Materialise the worktree's ``node_modules`` as a worktree-local link farm.
 
-    Git worktrees do not include gitignored directories, so tests that spawn
-    a real subprocess via an absolute worktree-relative path (e.g. CLI e2e
-    tests invoking ``<worktree>/node_modules/.bin/tsx``) fail with
-    MODULE_NOT_FOUND. Symlinking the main checkout's node_modules resolves
-    them without manual setup.
+    Git worktrees do not include gitignored directories, so tools spawned from
+    the worktree (``<worktree>/node_modules/.bin/tsx``, vitest, tsx, …) fail
+    with MODULE_NOT_FOUND. A whole-directory symlink to the main checkout's
+    ``node_modules`` fixes that but resolves workspace packages consumed by
+    path (``@worklog/shared`` → ``../../packages/shared``) back to the **main
+    checkout's** package — so a worktree's ``packages/*/src`` change is
+    invisible to its own build/test gate (false red / false green).
 
-    The symlink is created only when BOTH conditions hold:
-    - the worktree does not already have a node_modules entry (dir or
-      symlink), AND
-    - the main checkout has a node_modules directory.
+    The farm is a real ``<worktree>/node_modules`` directory holding:
 
-    Failures are logged, never fatal: the worktree remains usable and
-    dependencies can be installed inside it normally.
+    - one symlink per main-checkout entry (``.bin`` linked as a whole
+      directory),
+    - a real directory per scope (``@types``, ``@worklog``, …) holding one
+      symlink per scoped package,
+    - for every workspace package the main checkout consumes by path, a link
+      to the **worktree's own** package directory instead (discovered via the
+      ``workspaces`` field of the worktree's ``package.json``).
+
+    It never descends into a dependency tree, never writes through the farm,
+    and never installs anything. Re-running reconciles the farm with the main
+    checkout's current dependency set (refresh path), migration from the old
+    whole-directory symlink is automatic, and a real ``node_modules`` the
+    helper did not create is preserved. Repositories without a workspace
+    package consumed by path keep the previous whole-directory symlink.
+
+    Failures are logged, never fatal: the worktree stays usable.
 
     Args:
         worktree_path: Absolute path to the worktree directory.
         repo_root: Absolute path to the main checkout, or None if unknown.
 
     Returns:
-        True if the symlink was created, False otherwise (skipped/failed).
+        True if the farm (or degradation symlink) was created/refreshed, False
+        otherwise (skipped/failed).
     """
-    wt_nm = Path(worktree_path) / "node_modules"
-    if os.path.lexists(wt_nm):
-        LOG.info(
-            "Worktree already has node_modules (%s); skipping symlink.", wt_nm
-        )
-        return False
     if not repo_root:
-        LOG.info("No repo root known; skipping node_modules symlink.")
+        LOG.info("No repo root known; skipping node_modules link step.")
         return False
-    root_nm = Path(repo_root) / "node_modules"
-    if not root_nm.is_dir():
+    main_node_modules = Path(repo_root) / "node_modules"
+    if not main_node_modules.is_dir():
         LOG.info(
-            "Main checkout has no node_modules (%s); skipping symlink.", root_nm
+            "Main checkout has no node_modules (%s); skipping link step.",
+            main_node_modules,
         )
         return False
-    try:
-        os.symlink(str(root_nm), str(wt_nm), target_is_directory=True)
-    except (OSError, NotImplementedError) as exc:
+
+    wt_node_modules = Path(worktree_path) / "node_modules"
+    overrides = _workspace_link_overrides(Path(worktree_path), main_node_modules)
+    if not overrides:
+        return _ensure_directory_symlink(wt_node_modules, main_node_modules)
+
+    return _materialise_link_farm(wt_node_modules, main_node_modules, overrides)
+
+
+def _shared_resolution_check(
+    worktree_path: str, repo_root: str | None
+) -> dict[str, Any]:
+    """Report whether the worktree resolves the shared workspace package locally.
+
+    The reference case is ``@worklog/shared`` consumed by path: the main
+    checkout's ``node_modules/@worklog/shared`` is a relative symlink to its
+    own ``packages/shared``, so only a worktree-local override makes the
+    worktree's package (and its ``dist``) visible to its gate.
+
+    Single source of truth for both phases: ``start`` reports the result in
+    its JSON report (best-effort, warning only) and ``finish`` hard-fails on
+    it when the worktree's change set touches the shared source
+    (SA-0MVPI41SR008JYXL). The launch-and-read-back contract is therefore
+    identical in both places.
+
+    Returns a dict with ``applicable``, ``ok``, ``package``,
+    ``expected_root``, ``resolved_root`` and ``stale_dist`` keys. ``applicable``
+    is False (``ok`` None) when the main checkout does not declare the shared
+    workspace package — the degradation path, where the check is a no-op. A
+    missing ``node_modules`` is *stale*, not "not applicable".
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout, or None if unknown.
+    """
+    main = Path(repo_root) if repo_root else None
+    main_package = main / SHARED_WORKSPACE_PACKAGE_DIR if main else None
+    main_package_json = _read_package_json(main_package) if main_package else {}
+    if (
+        not main_package
+        or main_package_json.get("name") != SHARED_WORKSPACE_PACKAGE_NAME
+    ):
+        return {
+            "applicable": False,
+            "ok": None,
+            "package": SHARED_WORKSPACE_PACKAGE_NAME,
+            "expected_root": None,
+            "resolved_root": None,
+            "stale_dist": None,
+        }
+
+    wt = Path(worktree_path)
+    expected_root = (wt / SHARED_WORKSPACE_PACKAGE_DIR).resolve()
+    resolved_link = wt / "node_modules" / Path(
+        *SHARED_WORKSPACE_PACKAGE_NAME.split("/")
+    )
+    resolved_root = (
+        Path(os.path.realpath(resolved_link))
+        if os.path.lexists(resolved_link)
+        else None
+    )
+    ok = resolved_root is not None and resolved_root == expected_root
+    return {
+        "applicable": True,
+        "ok": ok,
+        "package": SHARED_WORKSPACE_PACKAGE_NAME,
+        "expected_root": str(expected_root),
+        "resolved_root": str(resolved_root) if resolved_root else None,
+        "stale_dist": (
+            None
+            if ok
+            else str((main_package / "dist").resolve())
+        ),
+    }
+
+
+def _prepare_node_modules(
+    worktree_path: str, repo_root: str | None
+) -> dict[str, Any]:
+    """Run the node_modules link step and the shared-resolution check.
+
+    Returns the ``start`` report block: ``link_created`` (whether this run
+    materialised/refreshed the farm) and ``shared_resolution`` (the
+    :func:`_shared_resolution_check` result), with ``shared_resolution_ok``
+    mirrored for convenient JSON consumption (SA-0MVPI400Y001FOM1 AC2).
+    """
+    link_created = _ensure_node_modules_symlink(worktree_path, repo_root)
+    resolution = _shared_resolution_check(worktree_path, repo_root)
+    return {
+        "link_created": link_created,
+        "shared_resolution": resolution,
+        "shared_resolution_ok": resolution["ok"],
+    }
+
+
+def _worktree_change_set_paths(
+    worktree_path: str, parent_branch: str = DEFAULT_PARENT_BRANCH
+) -> list[str] | None:
+    """List the worktree's repository-relative change-set paths (read-only).
+
+    The change set is what ``finish`` would commit: uncommitted files
+    (``git status --porcelain=v1 --untracked-files=all``) plus committed
+    changes since the parent branch's merge-base
+    (``git diff --name-only <parent_branch>...HEAD``). A rename is reported by
+    its destination path.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        parent_branch: Branch the worktree forked from (``dev``).
+
+    Returns:
+        A sorted, de-duplicated list of repository-relative paths, or ``None``
+        when the change set cannot be read (undecidable). Callers must not
+        interpret ``None`` as "no changes": the stale-resolution gate no-ops
+        on it rather than blocking every finish in a worktree whose git state
+        it cannot read.
+    """
+    status = run_cmd(
+        [
+            "git", "-C", str(worktree_path), "status", "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+        check=False,
+        timeout=60,
+    )
+    if status.returncode != 0:
         LOG.warning(
-            "Failed to symlink node_modules into worktree %s: %s",
+            "Cannot read the change set of %s (git status exit %s): %s",
             worktree_path,
-            exc,
+            status.returncode,
+            (status.stderr or "").strip()[:500],
         )
-        return False
-    LOG.info("Symlinked %s -> %s", wt_nm, root_nm)
-    return True
+        return None
+
+    paths: set[str] = set()
+    for line in (status.stdout or "").splitlines():
+        if len(line) < 4:
+            continue
+        entry = line[3:].strip()
+        if not entry:
+            continue
+        if " -> " in entry:
+            entry = entry.split(" -> ", 1)[1]
+        paths.add(entry.strip('"'))
+
+    committed = run_cmd(
+        [
+            "git", "-C", str(worktree_path), "diff", "--name-only",
+            "--no-renames", f"{parent_branch}...HEAD",
+        ],
+        check=False,
+        timeout=60,
+    )
+    if committed.returncode == 0:
+        paths.update(
+            path.strip()
+            for path in (committed.stdout or "").splitlines()
+            if path.strip()
+        )
+    else:
+        LOG.debug(
+            "Cannot diff %s against %s (exit %s); relying on the dirty set only",
+            worktree_path,
+            parent_branch,
+            committed.returncode,
+        )
+    return sorted(paths)
+
+
+def _touches_shared_source(paths: list[str]) -> bool:
+    """Whether any repository-relative path is under ``packages/shared/src/``."""
+    source_prefix = SHARED_WORKSPACE_PACKAGE_DIR / "src"
+    prefix = source_prefix.as_posix().rstrip("/") + "/"
+    return any(
+        path.replace("\\", "/").startswith(prefix) for path in paths
+    )
+
+
+def _stale_shared_resolution(
+    worktree_path: str,
+    repo_root: str | None,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> str | None:
+    """Refusal message when shared source changed while resolution is stale.
+
+    The ``finish`` gate's detector (SA-0MVPI41SR008JYXL, parent
+    SA-0MVMZBJGT00718ZO). It fires **only** when both hold:
+
+    1. the worktree's change set touches ``packages/shared/src/**`` — a
+       committed change (ahead of the parent branch's merge-base) or an
+       uncommitted one — and
+    2. :func:`_shared_resolution_check` is applicable and not ``ok``, i.e.
+       ``@worklog/shared`` still resolves outside this worktree (typically the
+       main checkout's stale ``packages/shared/dist``).
+
+    Either condition alone is a no-op: an unchanged shared package never
+    blocks a worktree, and a stale resolution is only a hazard for a change
+    that the gate could not see. Repositories without a workspace shared
+    package take the degradation path and are never refused.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout, or None if unknown.
+        parent_branch: Branch the worktree forked from (``dev``).
+
+    Returns:
+        An actionable multi-line message naming the stale
+        ``<main-checkout>/packages/shared/dist`` path and the remediation, or
+        ``None`` when the gate must not fire.
+    """
+    check = _shared_resolution_check(worktree_path, repo_root)
+    if not check["applicable"] or check["ok"]:
+        return None
+
+    changed = _worktree_change_set_paths(worktree_path, parent_branch)
+    if changed is None or not _touches_shared_source(changed):
+        return None
+
+    source_rel = (SHARED_WORKSPACE_PACKAGE_DIR / "src").as_posix()
+    expected_root = check["expected_root"] or (
+        "<worktree>/" + SHARED_WORKSPACE_PACKAGE_DIR.as_posix()
+    )
+    resolved_root = check["resolved_root"] or "<unresolved: no node_modules entry>"
+    stale_dist = check["stale_dist"] or str(
+        (Path(repo_root) / SHARED_WORKSPACE_PACKAGE_DIR / "dist")
+        if repo_root
+        else SHARED_WORKSPACE_PACKAGE_DIR / "dist"
+    )
+    return (
+        f"Stale {SHARED_WORKSPACE_PACKAGE_NAME} resolution: this worktree "
+        f"changes {source_rel}/** but the package resolves outside it, so the "
+        f"test gate would validate the main checkout's stale build instead of "
+        f"the worktree's source.\n"
+        f"  resolved:    {resolved_root}\n"
+        f"  expected:    {expected_root}\n"
+        f"  stale dist:  {stale_dist}\n"
+        f"Refusing to run the gate on the wrong code — no commit was made.\n"
+        f"Remediation: re-run `python3 skill/implement/scripts/implement.py "
+        f"start <work-item-id>` from the main checkout to refresh this "
+        f"worktree's node_modules link farm (the link step is idempotent), "
+        f"then rebuild and run `implement.py finish` again."
+    )
 
 
 # Directories pruned by the nested node_modules discovery walk. ``.git`` and
@@ -3928,8 +6113,9 @@ def _ensure_nested_node_modules_symlinks(
 ) -> int:
     """Auto-symlink the main checkout's *nested* node_modules into a worktree.
 
-    Companion to :func:`_ensure_node_modules_symlink`, which only links the
-    repository-root ``node_modules``. On checkouts whose dependencies live in a
+    Companion to :func:`_ensure_node_modules_symlink`, which materialises the
+    repository-root ``node_modules`` (link farm, or the degradation
+    whole-directory symlink). On checkouts whose dependencies live in a
     nested/workspace package (for example a pi package under
     ``.pi/packages/<pkg>/node_modules``) the worktree would otherwise have no
     dependencies at all, so tools run from the worktree (``pi``, ``tsx``) fail
@@ -4120,6 +6306,47 @@ def _worktree_cleanup_command(work_item_id: str) -> str:
     )
 
 
+def _registered_worktree_paths(repo_root: str | None) -> set[str] | None:
+    """Return the resolved paths git registers as worktrees of *repo_root*.
+
+    This is the ownership record a removal surface must be confined to: a
+    directory git does not list as a worktree of this repository is not ours
+    to delete, however it was named (SA-0MVXVC0KB004XDH0). The list includes
+    the main working tree itself, which the callers refuse separately.
+
+    Args:
+        repo_root: The main checkout root to ask git about, or ``None`` when
+            no root could be resolved.
+
+    Returns:
+        The set of resolved absolute worktree paths, or ``None`` when the
+        registry cannot be read (no root, not a git working tree, or git
+        unavailable) — callers treat ``None`` as "cannot prove ownership"
+        and fail closed.
+    """
+    if not repo_root:
+        return None
+    result = run_cmd(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo_root,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    paths: set[str] = set()
+    for line in result.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        candidate = line[len("worktree "):].strip()
+        if not candidate:
+            continue
+        try:
+            paths.add(str(Path(candidate).resolve()))
+        except OSError:
+            continue
+    return paths
+
+
 def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
     """Remove a worktree directory gracefully.
 
@@ -4130,7 +6357,13 @@ def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
        otherwise it is derived from the current directory, resolving to the
        MAIN checkout root even when the current directory is inside a linked
        worktree (see ``_get_repo_root``).
-    2. Before manual (shutil) removal, checks that the target does
+    2. Refuses any target git does not register as a worktree of that root
+       (:func:`_registered_worktree_paths`) — the surface is confined to the
+       named worktree, so a mistyped/stale path can never delete an unrelated
+       directory that merely happens to be outside the repository and free of
+       a ``.git/`` directory (SA-0MVXVC0KB004XDH0). A target that no longer
+       exists is a no-op success (nothing to remove), preserving idempotency.
+    3. Before manual (shutil) removal, checks that the target does
        NOT contain a ``.git/`` directory (which would mean it's the
        main working tree).
 
@@ -4143,8 +6376,9 @@ def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
         True if removal succeeded.
 
     Raises:
-        RuntimeError: If the target path matches the repo root or
-            contains a ``.git`` directory (main working tree).
+        RuntimeError: If the target path matches the repo root, is not a
+            worktree registered with that root, or contains a ``.git``
+            directory (main working tree).
     """
     resolved_path = str(Path(worktree_path).resolve())
 
@@ -4158,6 +6392,34 @@ def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
         )
         LOG.critical(msg)
         raise RuntimeError(msg)
+
+    # ── Safety gate 2: refuse anything this repository does not own ──
+    # ``git worktree remove`` refuses a non-worktree on its own, but the
+    # manual ``shutil.rmtree`` fallback below ran unconditionally — so a
+    # path outside the repository with no ``.git/`` directory was deleted
+    # outright. Confine the surface to the worktrees git registers here.
+    if Path(resolved_path).exists():
+        registered = _registered_worktree_paths(repo_root)
+        if registered is None or resolved_path not in registered:
+            owner = repo_root or "the resolved repository root"
+            msg = (
+                f"REFUSE to remove {resolved_path}: it is not a worktree "
+                f"registered with {owner}. Removal is confined to the named "
+                f"worktree; an unregistered directory is never deleted. If "
+                f"the worktree registration is stale, run `git worktree "
+                f"prune` first."
+            )
+            LOG.critical(msg)
+            raise RuntimeError(msg)
+    else:
+        # Nothing to delete, but the registration may still be stale: prune
+        # (from the resolved root only) so the registry matches reality.
+        if repo_root:
+            run_cmd(["git", "worktree", "prune"], cwd=repo_root, check=False)
+        LOG.info(
+            "Worktree already absent, nothing to remove: %s", resolved_path
+        )
+        return True
 
     # If the current directory is inside the worktree being removed, step
     # out to the repo root first. A deleted cwd breaks os.getcwd() and
@@ -4186,7 +6448,7 @@ def _remove_worktree(worktree_path: str, repo_root: str | None = None) -> bool:
             result.stderr.strip(),
         )
 
-        # ── Safety gate 2: refuse if target has a .git/ directory ──
+        # ── Safety gate 3: refuse if target has a .git/ directory ──
         target = Path(resolved_path)
         git_dir = target / ".git"
         if git_dir.is_dir():
@@ -4488,6 +6750,96 @@ def _resolve_origin_parent_tip(
     )
 
 
+def _push_cwd_has_tracked_changes(cwd: str) -> bool:
+    """Whether *cwd* has tracked files modified or staged (untracked ignored).
+
+    A tracked change in the push checkout means the worktree's tree is not the
+    pushed commit's tree, and a recovery rebase cannot carry it safely, so the
+    subject guard refuses rather than let the gate verify (and cache) a tree
+    the pushed commit does not describe. Untracked files are ignored because a
+    rebase can usually proceed with them present. Fail-closed: an unreadable
+    status is treated as dirty.
+    """
+    try:
+        result = run_cmd(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=cwd,
+            check=False,
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        LOG.debug("Push-subject status check failed for %s: %s", cwd, exc)
+        return True
+    if result.returncode != 0:
+        return True
+    return bool(result.stdout.strip())
+
+
+def _assert_push_subject(
+    push_cwd: str,
+    commit_hash: str,
+    branch: str,
+    worktree_path: str,
+) -> None:
+    """Assert *push_cwd* holds *commit_hash* before the dev push.
+
+    ``.githooks/pre-push`` resolves the pushed commit as the gate's subject
+    (``run_tests.py --gate-commit``) and runs the full suite against a clean
+    checkout holding it. ``finish`` therefore pushes from the worktree that
+    has the commit checked out, so the gate always measures the pushed commit;
+    this guard proves that invariant **before** ``git push`` runs and fails
+    closed when the push directory cannot be the subject: it does not exist,
+    is not a git working tree, does not contain the commit, its ``HEAD`` is a
+    different commit, or it has tracked uncommitted changes that a recovery
+    rebase cannot carry. Pushing anyway would let the gate verify (and cache)
+    a tree the pushed commit does not describe
+    (SA-0MVTFMB7K002Y1F3 AC1/AC2).
+
+    Args:
+        push_cwd: Directory the push will run from (the worktree).
+        commit_hash: The commit being pushed (short or full hash).
+        branch: Feature branch being pushed (for the refusal message).
+        worktree_path: The worktree the push requires (for the refusal
+            message; normally equal to *push_cwd*).
+
+    Raises:
+        PushSubjectMismatchError: when *push_cwd* does not hold *commit_hash*.
+    """
+    reason = ""
+    actual_head: str | None = None
+    if not push_cwd or not Path(push_cwd).is_dir():
+        reason = "the push directory does not exist"
+    else:
+        actual_head = _resolve_full_commit(push_cwd, "HEAD")
+        if actual_head is None:
+            reason = "the push directory is not a git working tree"
+        else:
+            pushed = _resolve_full_commit(push_cwd, commit_hash)
+            if pushed is None:
+                reason = (
+                    f"the push directory does not contain commit {commit_hash}"
+                )
+            elif pushed != actual_head:
+                reason = (
+                    f"the push directory's HEAD ({actual_head}) is not the "
+                    f"pushed commit ({pushed})"
+                )
+            elif _push_cwd_has_tracked_changes(push_cwd):
+                reason = (
+                    "the push directory has tracked uncommitted changes that "
+                    "a recovery rebase cannot carry"
+                )
+    if not reason:
+        return
+    raise PushSubjectMismatchError(
+        commit_hash=commit_hash,
+        branch=branch,
+        worktree_path=worktree_path,
+        actual_head=actual_head,
+        reason=reason,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Finish-failure classification vocabulary (LP-0MVWEP1MM0097RAT)
 # ---------------------------------------------------------------------------
@@ -4716,13 +7068,13 @@ def _fast_forward_local_dev_for_push(
 ) -> dict[str, Any]:
     """Advance the main checkout's local parent branch to *commit_hash*.
 
-    The pre-push fast-forward exists so the dev-push integration gate measures
-    the **main checkout** with the new files already present (commits touching
-    ``AGENTS.md`` and friends would otherwise be rejected against a stale
-    checkout — SA-0MVECQUGF0064U81). The advance is therefore inherently
-    unverified: the commit is by definition not on ``origin/<parent_branch>``
-    yet. Instead of the previous silent best-effort (a broad ``except`` that
-    disabled the whole fast-forward), it is made **loud and reversible**:
+    This fast-forward is **main-checkout hygiene only**: the dev-push gate's
+    subject is the pushed commit (resolved from the worktree that holds it),
+    so it does not measure this checkout. The advance merely keeps the main
+    checkout's local branch up to date so the next worktree forks from a
+    current base and the checkout does not lag ``dev`` (the historical reason
+    — a pre-push gate that measured the main checkout — no longer applies; see
+    SA-0MVTFMB7K002Y1F3). It is still made **loud and reversible**:
 
     * local ``dev`` is only ever advanced with ``git merge --ff-only`` — its
       history is never rewritten;
@@ -4736,6 +7088,13 @@ def _fast_forward_local_dev_for_push(
     * it never fails the finish: the push (with its rebase-and-retry
       recovery) and the post-push ancestry assertion
       (:func:`_assert_commit_on_origin_dev`) remain authoritative.
+
+    ``own_churn`` is recorded **only** when the advance happened
+    (``method == "advanced"``): a refused or no-op fast-forward mutated nothing,
+    so it contributes no attributable churn. Paths the commit diff claims but
+    that were not observed dirty in this checkout are surfaced as
+    ``not_observed`` — visible to the operator, never allow-listed
+    (SA-0MVXVC03O0034A7V).
 
     Args:
         repo_root: Absolute path to the main checkout.
@@ -4801,8 +7160,10 @@ def _fast_forward_local_dev_for_push(
             f"commit {commit_hash} is verified after it.",
         )
 
-    # 2. Ensure the main checkout is on the parent branch: the pre-push gate
-    #    measures this working tree, so the new files must be checked out.
+    # 2. Ensure the main checkout is on the parent branch. This is hygiene
+    #    only: the dev-push gate's subject is the pushed commit (resolved from
+    #    the worktree), never this checkout, so the fast-forward just keeps the
+    #    main checkout current for the next worktree.
     checkout_result = run_cmd(
         ["git", "checkout", parent_branch], cwd=repo_root, check=False
     )
@@ -4879,11 +7240,19 @@ def _fast_forward_local_dev_for_push(
     result["advanced"] = True
     result["pre_advance_tip"] = local_tip
     result["advanced_to"] = _resolve_full_commit(repo_root, commit_hash)
-    # The fast-forward's own file churn is expected — record it so the
-    # main-checkout guard never aborts on it (WL-0MVPADZ1Z000FOSG AC3/AC4).
+    # The advance's own churn is expected and never aborts — but only paths
+    # *observed dirty* in this checkout after the advance are attributable
+    # (WL-0MVPADZ1Z000FOSG AC3/AC4, SA-0MVXVC03O0034A7V).
+    not_observed: list[str] = []
     result["own_churn"] = _record_finish_own_churn(
-        repo_root, before_head, commit_hash
+        repo_root,
+        before_head,
+        commit_hash,
+        not_observed=not_observed,
     )
+    # Diagnostic surface: every path the diff named that could not be
+    # attributed to this checkout. Visible, never allow-listed.
+    result["not_observed"] = not_observed
     LOG.info(
         "Fast-forwarded local %s to %s (was %s)",
         parent_branch,
@@ -5432,12 +7801,21 @@ def run_build(cwd: str) -> dict[str, Any]:
             "exit_code": 0,
             "skipped": True,
         }
+    # Inject the resolved disk-backed TMPDIR into the build child env so the
+    # build (and anything it spawns) never lands on the inode-starved tmpfs.
+    # Fail-open: a resolution failure leaves the ambient env unchanged and the
+    # build proceeds (SA-0MW3ENQY0001RBSW AC2/AC4).
+    build_env = None
+    _finish_tmpdir = _resolved_finish_tmpdir()
+    if _finish_tmpdir is not None:
+        build_env = {"TMPDIR": _finish_tmpdir}
     result = run_cmd(
         ["npm", "run", "build"],
         cwd=cwd,
         check=False,
         timeout=300,
         capture=True,
+        env=build_env,
     )
     return {
         "success": result.returncode == 0,
@@ -5964,6 +8342,12 @@ def _adapt_guarded_result(
         for c in guarded.get("notice_codes", [])
         if str(c).strip()
     ]
+    state_changed_flags = guarded.get("state_changed_during_run") or []
+    if isinstance(state_changed_flags, dict):
+        state_changed_flags = [state_changed_flags]
+    state_changed_flags = [
+        f for f in state_changed_flags if isinstance(f, dict) and f
+    ]
     exit_code = _guarded_exit_code(guarded)
     result: dict[str, Any] = {
         "success": bool(guarded.get("success")) and exit_code == 0,
@@ -5976,6 +8360,11 @@ def _adapt_guarded_result(
         "failures": failures,
         "notices": notices,
         "notice_codes": notice_codes,
+        # Moved-checkout flags (SA-0MW3FF18I003KGZE AC4): carried through
+        # additively so the gate classification consults the flag before any
+        # failure-based branch, and the operator message can name the checkout
+        # movement and both commits.
+        "state_changed_during_run": state_changed_flags,
         "skipped": False,
         "tooling": tooling,
         "scope": guarded.get("scope", scope),
@@ -6093,8 +8482,16 @@ def _gate_failure_kind(test_result: dict[str, Any]) -> str:
     failure with no structured failure, no notice and no executed command —
     never for a timed-out, killed or non-zero run.
     """
+    if test_result.get("state_changed_during_run"):
+        return GATE_FAILURE_INFRASTRUCTURE
     if test_result.get("failures"):
         return GATE_FAILURE_TESTS
+    # Single shared classifier (SA-0MVSJX5HS002DJHI): the pre-push hook and
+    # this gate must never fork the reason vocabulary. The local body below is
+    # a compatibility fallback for an older test skill that predates the
+    # shared module.
+    if _classify_gate_result is not None:
+        return _classify_gate_result(test_result)
     notice_codes = [str(c) for c in (test_result.get("notice_codes") or [])]
     if _NOTICE_SLOT_BUSY in notice_codes:
         return GATE_FAILURE_SLOT_CONTENTION
@@ -6131,6 +8528,31 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
     failures = [str(f) for f in (test_result.get("failures") or [])]
     if failures:
         return "Failures:\n" + "\n".join(failures[:20])
+
+    state_changed_flags = test_result.get("state_changed_during_run") or []
+    if isinstance(state_changed_flags, dict):
+        state_changed_flags = [state_changed_flags]
+    if state_changed_flags:
+        movement = "\n".join(
+            "- " + _state_changed_detail(f)
+            for f in state_changed_flags
+            if isinstance(f, dict)
+        )
+        sections: list[str] = [
+            "Checkout moved during the run (infrastructure, not a code "
+            "failure); the result was discarded:\n" + movement
+        ]
+        notices = [
+            str(n).strip()
+            for n in (test_result.get("notices") or [])
+            if str(n).strip()
+        ]
+        if notices:
+            # A more specific gate notice (e.g. "gate evidence invalid: the
+            # temporary index changed") stays visible: the movement explains
+            # the symptom, the notice names the mechanism.
+            sections.append("Runner notices:\n" + "\n".join(notices))
+        return "\n\n".join(sections)
 
     sections: list[str] = []
     notices = [
@@ -6225,7 +8647,17 @@ def _gate_failure_message(
     kind = _gate_failure_kind(test_result)
     detail = _gate_failure_detail(test_result)
     facts = _gate_facts(test_result, _gate_exit_code(test_result))
-    if kind == GATE_FAILURE_SLOT_CONTENTION:
+    state_changed_flags = test_result.get("state_changed_during_run") or []
+    if isinstance(state_changed_flags, dict):
+        state_changed_flags = [state_changed_flags]
+    if state_changed_flags:
+        headline = (
+            f"Test run {attempt}/{max_retry} was invalidated: the checkout "
+            "moved while the suite executed (infrastructure, not a code "
+            "failure). Nothing ran against one single tree, so the verdict "
+            "is discarded; re-running below executes from a stable checkout."
+        )
+    elif kind == GATE_FAILURE_SLOT_CONTENTION:
         waited = (
             f" after waiting {_render_seconds(facts['slot_wait_seconds'])} "
             "for one"
@@ -6329,28 +8761,42 @@ def _run_guarded_suite(
     if _guarded_run_all is None or _full_suite_commands is None:
         # Partial install, or the legacy convention path: only the inner
         # conftest guard is armed, so run directly (no delegation).
-        return _run_commands_direct(
-            commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
-        )
+        with _scoped_test_tmpdir_export():
+            return _run_commands_direct(
+                commands,
+                cwd,
+                tooling=tooling,
+                scope=scope,
+                fingerprint=fingerprint,
+            )
     try:
-        guarded = _guarded_run_all(
-            cwd=Path(cwd),
-            timeout=_resolve_test_timeout(cwd),
-            commands=commands,
-            scope=scope,
-            base_ref=base_ref or "origin/dev",
-            use_cache=True,
-            fingerprint=fingerprint,
-        )
+        # The in-process runner has no env to pass, so the resolved
+        # disk-backed TMPDIR is exported into ``os.environ`` for the duration
+        # of the call (save/restore — never mutates the parent shell). The
+        # suite subprocesses the runner spawns also carry ``TMPDIR`` from
+        # ``test.scripts.run_tests._suite_command_env``; the export here
+        # additionally covers the runner's own tempfile usage and the direct
+        # fallback path (SA-0MW3ENQY0001RBSW AC2/AC3).
+        with _scoped_test_tmpdir_export():
+            guarded = _guarded_run_all(
+                cwd=Path(cwd),
+                timeout=_resolve_test_timeout(cwd),
+                commands=commands,
+                scope=scope,
+                base_ref=base_ref or "origin/dev",
+                use_cache=True,
+                fingerprint=fingerprint,
+            )
     except Exception as exc:  # noqa: BLE001 - degrade to the direct path
         LOG.warning(
             "Implement run_tests: guarded_run_all failed (%s) — falling "
             "back to the direct cached runner (inner guard only).",
             exc,
         )
-        return _run_commands_direct(
-            commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
-        )
+        with _scoped_test_tmpdir_export():
+            return _run_commands_direct(
+                commands, cwd, tooling=tooling, scope=scope, fingerprint=fingerprint
+            )
     return _adapt_guarded_result(guarded, tooling=tooling, scope=scope)
 
 
@@ -7743,9 +10189,27 @@ def _phase_start_locked(
         LOG.info("Parent-branch refresh: %s", refresh_result["warning"])
 
     # ── Step 7: Create (or resume) worktree ────────────────────────
-    wt_path = worktree_path_override or worktree_path_for(work_item_id, slug)
+    # The default worktree path is repository-root-relative
+    # (``worktree_path_for`` returns ``.worklog/worktrees/wl-<id>-<slug>``).
+    # Resolve it against the **main checkout root** (``repo_root``, which
+    # already falls back to cwd when ``_get_repo_root()`` returns ``None``),
+    # never against cwd: when ``start`` is invoked from inside the item's own
+    # linked worktree (a driven child resuming its pre-created tree, or a
+    # human resuming after a crash) ``Path(wt_path).resolve()`` would
+    # otherwise nest the path under the worktree root, ``_is_worktree()``
+    # would miss the registered tree, and ``git worktree add`` would attempt
+    # a nested creation that fails (SA-0MVXUGXS5006M3HF).
+    #
+    # ``--worktree-path`` stays authoritative with unchanged semantics: an
+    # absolute override is used as given and a relative override resolves
+    # against cwd (the historical behaviour, documented in SKILL.md).
+    if worktree_path_override:
+        wt_path = worktree_path_override
+        abs_wt_path = str(Path(worktree_path_override).resolve())
+    else:
+        wt_path = worktree_path_for(work_item_id, slug)
+        abs_wt_path = str((Path(repo_root) / wt_path).resolve())
     branch = branch_name_for(work_item_id, slug)
-    abs_wt_path = str(Path(wt_path).resolve())
     # Idempotent start (SA-0MUWNHKQH0034DW9): when the worktree already
     # exists — e.g. the parent phase created it, or a driven session is
     # resuming — reuse it instead of failing on `git worktree add`. This lets
@@ -7758,7 +10222,7 @@ def _phase_start_locked(
             abs_wt_path,
         )
     else:
-        LOG.info("Creating worktree at %s from branch %s...", wt_path, parent_branch)
+        LOG.info("Creating worktree at %s from branch %s...", abs_wt_path, parent_branch)
         # Snapshot the parent's tracking config BEFORE the registration so the
         # post-add guard can distinguish "this registration poisoned the
         # parent" (a hard failure) from a pre-existing defect (detection's
@@ -7768,8 +10232,8 @@ def _phase_start_locked(
             _git_config_get(repo_root, f"branch.{parent_branch}.remote"),
             _git_config_get(repo_root, f"branch.{parent_branch}.merge"),
         )
-        if not git_worktree_add(branch, wt_path, parent_branch):
-            msg = f"Failed to create worktree at {wt_path} from {parent_branch}"
+        if not git_worktree_add(branch, abs_wt_path, parent_branch):
+            msg = f"Failed to create worktree at {abs_wt_path} from {parent_branch}"
             LOG.error(msg)
             report["success"] = False
             report["message"] = msg
@@ -7801,10 +10265,28 @@ def _phase_start_locked(
                 print(format_json_output(report))
             return report
 
-    # Auto-symlink the main checkout's node_modules into the worktree so
-    # dist-spawning tests resolve dependencies without manual setup. Never
-    # fatal: skip when either side lacks node_modules (SA-0MSGS763C006SM1B).
-    _ensure_node_modules_symlink(abs_wt_path, _get_repo_root())
+    # Materialise the worktree-local node_modules link farm (or, for repos
+    # without a workspace package consumed by path, the previous
+    # whole-directory symlink) so dist-spawning tests resolve dependencies
+    # without manual setup, and report whether the shared workspace package
+    # resolves inside the worktree. Never fatal: the link step stays
+    # best-effort (SA-0MSGS763C006SM1B, SA-0MVPI400Y001FOM1).
+    node_modules_report = _prepare_node_modules(abs_wt_path, _get_repo_root())
+    report["steps"]["node_modules"] = node_modules_report
+    report["shared_resolution_ok"] = node_modules_report["shared_resolution_ok"]
+    report["shared_resolution"] = node_modules_report["shared_resolution"]
+    resolution_check = node_modules_report["shared_resolution"]
+    if resolution_check["applicable"] and not resolution_check["ok"]:
+        LOG.warning(
+            "Worktree %s does not resolve %s to its own %s (resolved: %s). "
+            "A change under that package will be refused by the finish gate "
+            "until the link step is refreshed (re-run `implement.py start` "
+            "from the main checkout).",
+            abs_wt_path,
+            SHARED_WORKSPACE_PACKAGE_NAME,
+            SHARED_WORKSPACE_PACKAGE_DIR.as_posix(),
+            resolution_check["resolved_root"] or "<missing>",
+        )
 
     # Nested/workspace packages keep their own node_modules (e.g. a pi package
     # under .pi/packages/<pkg>); symlink those too so tools run from the
@@ -7884,6 +10366,9 @@ def _recover_non_fast_forward_push(
     commit_hash: str,
     exc: PushNonFastForwardError,
     work_item_id: str,
+    evidence_out: dict[str, Any] | None = None,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    ff_retry_out: dict[str, Any] | None = None,
 ) -> str:
     """Recover from a non-fast-forward push by rebasing and retrying.
 
@@ -7897,12 +10382,22 @@ def _recover_non_fast_forward_push(
     stale ref would just produce another non-fast-forward push.
 
     Args:
-        worktree_path: Worktree where *branch* is checked out.
-        repo_root: Main checkout used to push to ``refs/heads/dev``.
+        worktree_path: Worktree where *branch* is checked out and where the
+            rebased commit lives — the checkout the retry push runs from, so
+            the dev-push gate's subject is the pushed tree.
+        repo_root: Main checkout. Retained for call-site compatibility; the
+            retry push itself runs from *worktree_path* (never from here).
         branch: Feature branch to rebase and push.
         commit_hash: Commit being pushed (pre-rebase).
         exc: The original :class:`PushNonFastForwardError`.
         work_item_id: Work item to comment on for the recovery audit trail.
+        evidence_out: Optional dict populated on a successful retry with the
+            gate evidence (passed through to :func:`git_push_to_dev`).
+        parent_branch: Shared parent branch whose local checkout is retried
+            after the rebase (default: ``dev``).
+        ff_retry_out: Optional dict populated with the post-rebase
+            fast-forward retry result, recorded by ``finish``
+            (SA-0MW3H07A8004Q54C AC1).
 
     Returns:
         The (possibly rewritten) commit hash that was pushed.
@@ -7948,8 +10443,47 @@ def _recover_non_fast_forward_push(
     # the completion comment reference the commit that actually lands.
     new_commit = git_get_commit_hash(worktree_path) or commit_hash
 
-    # 2. Retry the push.
-    if not git_push_to_dev(repo_root, branch, new_commit):
+    # AC1 (SA-0MW3H07A8004Q54C): Step 5's fast-forward was refused (or pointed
+    # at the pre-rebase commit) because dev had moved. The rebase now yields a
+    # commit based on origin/dev, so retry the fast-forward *here* — the main
+    # checkout's dev (and its HEAD when dev is checked out) then tracks the
+    # pushed commit. Best-effort by contract: a second refusal is recorded and
+    # never fails the finish, exactly like Step 5.
+    ff_retry = _fast_forward_local_dev_for_push(
+        repo_root, new_commit, parent_branch
+    )
+    if ff_retry_out is not None:
+        ff_retry_out.clear()
+        ff_retry_out.update(ff_retry)
+    LOG.info(
+        "Post-rebase local %s fast-forward retry: method=%s advanced=%s",
+        parent_branch,
+        ff_retry.get("method"),
+        ff_retry.get("advanced"),
+    )
+
+    # 2. Retry the push from the worktree that now holds the rebased commit —
+    #    never from the main checkout, which still holds the pre-rebase commit
+    #    and would make the dev-push gate validate the wrong tree
+    #    (SA-0MVTFMB7K002Y1F3 AC1/AC2). The subject guard fails closed when
+    #    the worktree cannot hold the rebased commit.
+    try:
+        _assert_push_subject(worktree_path, new_commit, branch, worktree_path)
+    except PushSubjectMismatchError as mismatch:
+        wl_add_comment(
+            work_item_id,
+            f"Retry dev push refused after the recovery rebase "
+            f"(push-subject mismatch): {mismatch}\n"
+            f"Branch: {branch}\nCommit: {new_commit}\n"
+            f"Worktree: {worktree_path}",
+        )
+        raise RuntimeError(
+            f"git push to dev failed after rebase (push-subject mismatch): "
+            f"{mismatch}"
+        ) from mismatch
+    if not git_push_to_dev(
+        worktree_path, branch, new_commit, evidence_out=evidence_out
+    ):
         # Retry failed — preserve state for manual recovery.
         wl_add_comment(
             work_item_id,
@@ -7989,6 +10523,9 @@ def phase_finish(
     1. Read state to find worktree
     2. Refactor step (unless --no-refactor)
     3. Build
+    3b. Stale shared-resolution gate: refuse when the change set touches
+        ``packages/shared/src/**`` while ``@worklog/shared`` still resolves
+        outside this worktree (SA-0MVPI41SR008JYXL)
     4. Test (with fix-and-re-run loop)
     5. Commit
     6. Verified, reversible fast-forward of dev in the main checkout
@@ -7997,21 +10534,54 @@ def phase_finish(
     8. Post-push ancestry assertion: the pushed commit must be an ancestor
        of refs/remotes/origin/dev or finish fails loudly naming the hash
        (SA-0MVPZG7A0000N66U AC2)
-    9. Clean up worktree processes (post-push, before removal —
+    9. Post-push full-suite verification (**read-only** — it never starts a
+       suite): resolve the full-suite verdict for the pushed tree from the
+       test cache. ``green`` / ``not_applicable`` permit the terminal
+       transition; ``red`` / ``missing`` refuse it — the item is released to
+       ``open`` with the pushed commit named, retained and never reverted,
+       and the failure is routed to triage (SA-0MVXUSJ2P009T97H AC4)
+    10. Clean up worktree processes (post-push, before removal —
        self-exclusion-safe, SA-0MVJC5KNT0044L2B)
-    10. Remove worktree — **deferred** when the finishing process belongs to
+    11. Remove worktree — **deferred** when the finishing process belongs to
         a driven child session (``IMPLEMENT_DRIVE_ACTIVE=1``) or when the
         caller opted in with ``--keep-worktree`` /
         ``IMPLEMENT_KEEP_WORKTREE=1``. Deferral keeps the tree, its branch
         and ``.implement_state.json`` so the session that owns the tree as
         its cwd keeps working after finish returns; the driver (or the
         caller, via ``implement.py cleanup <id>`` as its **last** bash
-        command, SA-0MVTHJ7QX005PXRG) removes it afterwards. Recorded in
-        ``report["steps"]["worktree_removal"]`` (SA-0MVTE8XAJ002IUDR)
-    11. Sync local parent branch (post-push, AC1/AC2)
-    12. Mark in_review
-    13. Read back the terminal status from the main-checkout store and
+        command, SA-0MVTHJ7QX005PXRG) removes it afterwards. That cleanup
+        is explicitly **not** a remaining lifecycle step of this run —
+        ownership passed to the driver/caller, and it can no longer change
+        the work item. Recorded in ``report["steps"]["worktree_removal"]``
+        (SA-0MVTE8XAJ002IUDR)
+    12. Sync local parent branch (post-push, AC1/AC2)
+    13. Completion comment (commit hash, branch, gate provenance, retained
+        tree) — **before** the terminal write, so no comment follows it and
+        the audit-freshness ordering rule is preserved (SA-0MTHC710X003ORZM)
+    14. Terminal write (``completed``/``in_review`` + assignee release) issued
+        by ``StatusLifecycle.__exit__`` — the run's **last lifecycle
+        action** (design A, SA-0MVXUSED6008J04R)
+    15. Read back the terminal status from the main-checkout store and
         fail loudly if it did not stick (OSL-0MVME1PI5005WU58)
+
+    Every step that can still change the work item — including the
+    verification, the completion comment and the (non-deferred) worktree
+    removal — runs inside the held, non-terminal ``StatusLifecycle`` window,
+    so the item never becomes an audit-dispatch candidate while the run is
+    unfinished (parent SA-0MVWFPI31000HP3H AC1/AC2; documented by
+    SA-0MVXUSK02003ZMDN, pinned by
+    ``tests/test_finish_finalisation_ordering.py``).
+
+    **Interruption and re-run (SA-0MVXUSJJY009HMQ0).** Every exit that fails
+    after the commit — the classified ``RuntimeError`` branches, the
+    unexpected-exception branch and the SIGTERM/SIGINT cleanup — releases the
+    item (``open``, empty assignee) and records the retained state once per
+    commit: the published (or local) commit, the branch, whether the worktree
+    survives and the resume command. Re-running ``finish`` then converges to
+    ``completed`` / ``in_review`` through the ordinary no-diff/no-op-push
+    path, and the completion comment (Step 9) is deduplicated on the marker
+    plus commit hash — so a recovered interruption never leaves a duplicate
+    completion comment or a second terminal transition in one run.
 
     All implementation work MUST be done inside the worktree created by
     ``phase_start``. If the current directory is outside the worktree and the
@@ -8037,6 +10607,9 @@ def phase_finish(
         "steps": {},
         "message": "",
     }
+    # A stale context from an earlier run in this process must never be used to
+    # describe this run's interruption (SA-0MVXUSJJY009HMQ0 AC2).
+    _clear_finish_progress()
 
     # ── Step 0: Find worktree (from state or directory scan) ──────
     worktree_path = _discover_worktree(work_item_id)
@@ -8164,13 +10737,74 @@ def phase_finish(
         wl_add_comment(work_item_id, msg)
         raise RuntimeError(msg)
 
+    def _record_main_checkout_verify(
+        stage: str, *, aborting: bool
+    ) -> list[str]:
+        """Record a guard verify on a pre-push abort or advisory path.
+
+        ``finish`` snapshots the main checkout at Step 0.75 but originally
+        verified only at ``pre_push`` and ``pre_worktree_removal``. Every
+        pre-push abort (build failure, gate failure in JSON mode, retries
+        exhausted, interactive user abort) returned before either point, so
+        ``verifies`` stayed ``[]`` and foreign deletions in the main checkout
+        went unreported (2026-10-31: 37 deletions, ``verifies: []``). This
+        runs the verify at *stage* (one of :data:`VERIFY_STAGES`) and, on a
+        violation, posts the loud guard message — naming every offending path,
+        the actor evidence and the recovery command — **in addition to** any
+        pre-existing failure comment, never instead of it (fail loud, never
+        silent).
+
+        ``aborting=False`` is the report-only refactor path: ``run_refactor``
+        failure is advisory today (``LOG.warning`` + continue), so a violation
+        is surfaced in the report and a wl comment but the run is **not**
+        aborted. Turning a pre-existing advisory step into a new abort source
+        would risk the SA-0MUIJAHXS003M7BG false-positive class.
+
+        The operator-facing contract — stage table, report fields, the
+        both-comments ordering and the advisory refactor status — is
+        documented in ``docs/dev/implement-skill-reference.md``
+        (§ Finish main-checkout guard), and
+        ``skill/implement/tests/test_guard_docs.py`` keeps the two in sync.
+
+        Returns:
+            The offending paths (empty list on pass).
+        """
+        violations = _verify_main_checkout(
+            main_checkout_guard,
+            main_checkout_baseline,
+            repo_root=repo_root,
+            worktree_path=worktree_path,
+            own_churn=main_checkout_guard["own_churn"],
+            expected_dirty=expected_dirty_paths(repo_root),
+            stage=stage,
+        )
+        if not violations:
+            return violations
+        actor = main_checkout_guard["verifies"][-1].get(
+            "actor_evidence", "unknown"
+        )
+        msg = _main_checkout_guard_message(repo_root, violations, actor, stage)
+        if not aborting:
+            msg = (
+                "Advisory only — this guard verify does not abort the run "
+                "(refactor step):\n\n" + msg
+            )
+        wl_add_comment(work_item_id, msg)
+        return violations
+
     # ── Step 1: Refactor step ──────────────────────────────────────
     if not no_refactor:
         LOG.info("Running refactor step...")
         refactor_result = run_refactor(work_item_id, worktree_path)
         report["steps"]["refactor"] = refactor_result
         if not refactor_result["success"]:
+            # Report-only guard verify (SA-0MVXVBYXI000QMXM): refactor
+            # failure is advisory (warning + continue), so the guard observes
+            # the main checkout here but never aborts on it. Keeps the guard
+            # honest without making a pre-existing advisory step a new abort
+            # source (false-positive risk under parent AC5).
             LOG.warning("Refactor step reported issues; continuing workflow")
+            _record_main_checkout_verify("refactor", aborting=False)
     else:
         report["steps"]["refactor"] = {"skipped": True, "reason": "no_refactor_flag"}
         LOG.info("Refactor step skipped (--no-refactor)")
@@ -8184,18 +10818,35 @@ def phase_finish(
     build_churn_baseline = _build_churn_baseline(worktree_path)
     LOG.info("Running build...")
     build_result = run_build(worktree_path)
+    if not build_result["success"]:
+        # A failed build may itself have advanced the engine past the item's
+        # pin (``engine:sync`` runs first), so the compile errors may come
+        # from engine APIs this item predates. The lag is reported — additively
+        # — in the report and the failure comment (SA-0MW06FLFR009F0P4).
+        build_result["engine_lag"] = _engine_lag(
+            worktree_path, build_churn_baseline
+        )
     report["steps"]["build"] = build_result
     if not build_result["success"]:
         msg = f"Build failed (exit code {build_result['exit_code']})"
         LOG.error(msg)
         if build_result["stderr"]:
             LOG.error("Build stderr:\n%s", build_result["stderr"][:2000])
+        if build_result["engine_lag"].get("advanced"):
+            LOG.error(
+                "Build engine lag:\n%s",
+                _engine_lag_diagnosis(build_result["engine_lag"]),
+            )
         report["success"] = False
         report["message"] = msg
         wl_add_comment(
             work_item_id,
-            f"Build failed during finish phase.\n```\n{build_result['stderr'][:500]}\n```",
+            _build_failure_message(build_result, build_result["engine_lag"]),
         )
+        # The failure comment is posted above; this appends the failure-path
+        # guard verify (and, on foreign churn, its own loud comment) so a
+        # pre-push abort never leaves ``verifies`` empty (SA-0MVXVBYXI000QMXM).
+        _record_main_checkout_verify("build_failure", aborting=True)
         try:
             StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
@@ -8228,6 +10879,39 @@ def phase_finish(
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if json_output:
             print(format_json_output(report))
+        return report
+
+    # ── Step 2c: Stale shared-resolution gate ─────────────────────
+    # The gate runs against the worktree but `@worklog/shared` (and every
+    # other path-consumed workspace package) resolves through the worktree's
+    # `node_modules` link farm. When that farm is missing or stale, the
+    # package resolves to the MAIN CHECKOUT's build output: a correct shared
+    # change false-reds (WL-0MVK6S4HM005GBCO) and a broken one can
+    # false-green. Once the change set touches `packages/shared/src/**` a
+    # stale resolution means the gate cannot see the change at all, so it
+    # fails closed here (before the test gate, after the build) rather than
+    # reporting a verdict about the wrong code (SA-0MVPI41SR008JYXL, parent
+    # AC4). Repos without a workspace shared package are a no-op.
+    stale_resolution = _stale_shared_resolution(
+        worktree_path, repo_root, parent_branch=parent_branch
+    )
+    report["steps"]["shared_resolution"] = {
+        **_shared_resolution_check(worktree_path, repo_root),
+        "refused": stale_resolution is not None,
+    }
+    if stale_resolution:
+        LOG.error("Stale shared resolution — refusing to run the gate")
+        report["success"] = False
+        report["message"] = stale_resolution
+        wl_add_comment(work_item_id, stale_resolution)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        else:
+            print(f"\n⛔ {stale_resolution}\n")
         return report
 
     # ── Step 3: Test with fix-and-re-run loop ──────────────────────
@@ -8280,6 +10964,12 @@ def phase_finish(
                 "reason": failure_reason,
                 **_gate_facts(test_result, _gate_exit_code(test_result)),
             }
+            # Failure-path guard verify: the JSON-mode early return aborts
+            # before the push, so record the verify (and, on foreign churn,
+            # post the loud guard comment) before reporting
+            # (SA-0MVXVBYXI000QMXM). The gate failure itself stays in the
+            # report — the guard comment never replaces it.
+            _record_main_checkout_verify("gate_failure", aborting=True)
             print(format_json_output(report))
             return report
 
@@ -8303,6 +10993,9 @@ def phase_finish(
             report["success"] = False
             report["message"] = msg
             wl_add_comment(work_item_id, msg)
+            # Failure-path guard verify after the pre-existing abort comment
+            # (both comments, in order) — SA-0MVXVBYXI000QMXM.
+            _record_main_checkout_verify("user_abort", aborting=True)
             try:
                 StatusLifecycle.update_status(work_item_id, "open", assignee="")
             except RuntimeError:
@@ -8337,6 +11030,9 @@ def phase_finish(
         report["success"] = False
         report["message"] = msg
         wl_add_comment(work_item_id, msg)
+        # Failure-path guard verify after the pre-existing retries-exhausted
+        # comment (both comments, in order) — SA-0MVXVBYXI000QMXM.
+        _record_main_checkout_verify("gate_failure", aborting=True)
         try:
             StatusLifecycle.update_status(work_item_id, "open", assignee="")
         except RuntimeError:
@@ -8476,14 +11172,25 @@ def phase_finish(
                 "message": commit_msg,
             }
             LOG.info("Committed at %s", commit_hash)
+            # Interruption context (SA-0MVXUSJJY009HMQ0 AC2): a signal from
+            # here on names the committed (and, after Step 6, published) work
+            # in its retained-state record instead of releasing the item
+            # unexplained. ``pushed`` is set once Step 6 confirms the push.
+            _set_finish_progress(
+                work_item_id=work_item_id,
+                worktree_path=worktree_path,
+                branch=branch,
+                commit=commit_hash,
+                pushed=False,
+            )
 
             # ── Step 5: Verified, reversible local-dev fast-forward ───────
-            # Before removing the worktree, bring the main checkout's local
-            # dev branch up to the new commit. This ensures that when the
-            # pre-push hook measures the working tree (which is the main
-            # checkout at push time), it sees the updated files — so
-            # context-budget compliant commits that modify AGENTS.md etc. no
-            # longer trigger the stale-checkout failure.
+            # Main-checkout hygiene only — never the dev-push gate's subject.
+            # Bring the main checkout's local dev branch up to the new commit
+            # so the next worktree forks from an up-to-date base. The dev push
+            # itself runs from the worktree holding the commit (Step 6), so
+            # the pre-push hook measures the pushed tree, not this checkout
+            # (SA-0MVTFMB7K002Y1F3 AC5).
             # ``repo_root`` was resolved (stale state rejected) at Step 0.75.
             #
             # The advance is *loud and reversible* (SA-0MVPZG7A0000N66U AC1):
@@ -8522,10 +11229,69 @@ def phase_finish(
             # the worktree in place for manual recovery
             # (WL-0MV533YSW004D1E1).
             # repo_root was resolved in Step 5 (fast-forward) above.
-            LOG.info("Pushing to dev...")
+            LOG.info(
+                "Pushing to dev from the worktree that holds the pushed "
+                "commit (%s)...",
+                worktree_path,
+            )
+            # Evidence captured by the push (AC3/AC5): the gate's resolved
+            # tree and executed-vs-cached verdict, exposed in --json output.
+            push_evidence: dict[str, Any] = {}
             try:
-                if not git_push_to_dev(repo_root, branch, commit_hash):
+                # AC1/AC2: the dev push runs from the checkout that holds the
+                # pushed commit (the worktree), so ``.githooks/pre-push``
+                # resolves its ``--project-root`` to the pushed tree. The
+                # guard refuses before any push when that checkout cannot be
+                # the subject, instead of silently gating a different tree.
+                _assert_push_subject(
+                    worktree_path, commit_hash, branch, worktree_path
+                )
+                if not git_push_to_dev(
+                    worktree_path,
+                    branch,
+                    commit_hash,
+                    evidence_out=push_evidence,
+                ):
+                    gate_reason = push_evidence.get("gate_reason")
+                    if gate_reason:
+                        # AC2: the hook named *why* (slot contention, timeout,
+                        # killed, red suite, ...); report that reason rather
+                        # than a generic push failure.
+                        raise PushGateFailureError(
+                            str(gate_reason),
+                            str(push_evidence.get("stderr_tail") or ""),
+                            commit_hash,
+                            branch,
+                        )
                     raise RuntimeError("git push to dev failed.")
+            except PushSubjectMismatchError as exc:
+                # Fail closed (AC2): nothing was pushed. Restore local dev off
+                # the unpushed commit and preserve recovery state in a comment
+                # so a human can materialise the pushed tree and retry.
+                report["steps"]["push"] = {
+                    "success": False,
+                    "reason": "subject_mismatch",
+                    "hash": commit_hash,
+                    "worktree_path": worktree_path,
+                    "actual_head": exc.actual_head,
+                }
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
+                wl_add_comment(
+                    work_item_id,
+                    f"Dev push refused (push-subject mismatch): {exc}\n"
+                    f"Commit: {commit_hash}\nBranch: {branch}\n"
+                    f"Worktree: {worktree_path}\n"
+                    f"Actual HEAD: {exc.actual_head or 'unresolved'}\n"
+                    f"Local dev was restored to origin/dev. The commit stays "
+                    f"on its feature branch {branch}.",
+                )
+                raise RuntimeError(
+                    f"git push to dev failed (push-subject mismatch): {exc}"
+                ) from exc
             except PushTimeoutError as exc:
                 # AC3: recoverable state — commit is safe, branch info retained.
                 # Restore local dev off the unpushed commit (AC1) so the next
@@ -8572,6 +11338,7 @@ def phase_finish(
                     "Push failed (non-fast-forward); attempting rebase and retry "
                     "...",
                 )
+                ff_retry: dict[str, Any] = {}
                 commit_hash = _recover_non_fast_forward_push(
                     worktree_path=worktree_path,
                     repo_root=repo_root,
@@ -8579,14 +11346,73 @@ def phase_finish(
                     commit_hash=commit_hash,
                     exc=exc,
                     work_item_id=work_item_id,
+                    evidence_out=push_evidence,
+                    parent_branch=parent_branch,
+                    ff_retry_out=ff_retry,
                 )
+                # AC1 (SA-0MW3H07A8004Q54C): record the post-rebase
+                # fast-forward retry, and treat its own churn as finish's
+                # (never as a foreign mutation).
+                if ff_retry:
+                    local_dev_fast_forward["retry"] = ff_retry
+                    report["steps"]["local_dev_fast_forward"] = (
+                        local_dev_fast_forward
+                    )
+                    main_checkout_guard["own_churn"] = list(
+                        main_checkout_guard.get("own_churn") or []
+                    ) + list(ff_retry.get("own_churn") or [])
                 # The rebase rewrote HEAD; keep the reported commit in sync.
                 report["steps"]["commit"]["hash"] = commit_hash
                 report["steps"]["push"] = {
                     "success": True,
                     "recovered": "non_fast_forward",
                     "hash": commit_hash,
+                    "gate_evidence": push_evidence,
                 }
+                report["steps"]["push"].update(
+                    _push_retry_trail_fields(push_evidence)
+                )
+                # An interruption from here on names the rebased replacement
+                # hash, which is the commit that actually landed.
+                _set_finish_progress(commit=commit_hash, pushed=True)
+            except PushGateFailureError as exc:
+                # AC2: the pre-push gate said *why* the push failed. Report the
+                # machine-readable reason in the finish report and post it on
+                # the work item with the matching remediation, instead of the
+                # generic "git push to dev failed".
+                push_step: dict[str, Any] = {
+                    "success": False,
+                    "reason": exc.gate_reason,
+                    "hash": commit_hash,
+                    "gate_stderr_tail": exc.stderr_tail,
+                }
+                guard_details = push_evidence.get("pushed_commit_guard")
+                if guard_details:
+                    push_step["refused_by_pushed_commit_guard"] = guard_details
+                # AC3: expose the transport retry trail (attempt count, the
+                # backoff slept and the reason) on the push step, not only in
+                # the log.
+                push_step.update(_push_retry_trail_fields(push_evidence))
+                report["steps"]["push"] = push_step
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
+                wl_add_comment(
+                    work_item_id,
+                    _dev_push_gate_failure_comment(
+                        exc.gate_reason,
+                        exc.stderr_tail,
+                        commit_hash,
+                        branch,
+                        worktree_path,
+                    ),
+                )
+                raise RuntimeError(
+                    f"git push to dev failed (gate reason: {exc.gate_reason}). "
+                    f"{_push_gate_remediation(exc.gate_reason)}"
+                ) from exc
             except RuntimeError:
                 # A generic push failure: nothing reached origin. Undo our own
                 # fast-forward so local dev never stays on the unpushed commit
@@ -8607,7 +11433,15 @@ def phase_finish(
                 report["steps"]["push"] = {
                     "success": True,
                     "hash": commit_hash,
+                    "gate_evidence": push_evidence,
                 }
+                report["steps"]["push"].update(
+                    _push_retry_trail_fields(push_evidence)
+                )
+                # The commit is now on dev: the interruption record must say
+                # so (AC2), so a released item is never mistaken for
+                # unpublished work.
+                _set_finish_progress(commit=commit_hash, pushed=True)
             LOG.info("Push to dev succeeded")
 
             # ── Step 6a: Post-push ancestry assertion (AC2) ───────────────
@@ -8626,6 +11460,53 @@ def phase_finish(
                 worktree_path=worktree_path,
             )
 
+            # ── Step 6a.5: Post-push full-suite verification (read-only) ──
+            # Design A (SA-0MVXUSED6008J04R): after a successful push the run
+            # resolves the full-suite verdict for the pushed tree from the
+            # test cache — the dev-push pre-push hook already ran it against
+            # exactly this commit. Nothing is executed here. A ``red`` or
+            # ``missing`` verdict **refuses the terminal transition here**,
+            # before any terminal state is observable, so the item is never
+            # briefly audit-dispatchable on a run that cannot prove green
+            # (SA-0MVXUSJ2P009T97H AC4). The pushed commit is never reverted
+            # or force-removed: the refusal releases the item to ``open`` and
+            # names the commit, the retained branch/worktree and the
+            # remediation.
+            #
+            # Ordering invariant (SA-0MVXUSK02003ZMDN): this verification is a
+            # *finalisation* step, not a post-``in_review`` session step — it
+            # runs inside the held, non-terminal ``StatusLifecycle`` window so
+            # the item is never an audit-dispatch candidate while it runs.
+            post_push_verification = _resolve_post_push_verification(
+                worktree_path, repo_root
+            )
+            report["steps"]["post_push_verification"] = post_push_verification
+            if post_push_verification["verdict"] not in (
+                POST_PUSH_VERDICT_GREEN,
+                POST_PUSH_VERDICT_NOT_APPLICABLE,
+            ):
+                refusal_message, refusal_comment = (
+                    _post_push_verification_refusal(
+                        post_push_verification,
+                        work_item_id,
+                        commit_hash,
+                        branch,
+                        worktree_path,
+                    )
+                )
+                # AC4: the refusal is routed through the triage helper for
+                # BOTH unprovable verdicts — a red entry files the real
+                # failing test, a missing entry files the verification gap
+                # itself — so the failure is never only a prose comment.
+                post_push_verification["triage"] = (
+                    _route_post_push_failure_to_triage(
+                        post_push_verification, commit_hash, work_item_id
+                    )
+                )
+                report["hash"] = commit_hash
+                wl_add_comment(work_item_id, refusal_comment)
+                raise RuntimeError(refusal_message)
+
             # ── Step 6b: Worktree removal ownership ───────────────────────
             # One owner per worktree (SA-0MVTE8XAJ002IUDR): a driven child
             # session's worktree belongs to the driver (removed once that
@@ -8633,6 +11514,11 @@ def phase_finish(
             # ``IMPLEMENT_KEEP_WORKTREE=1`` hands ownership to the caller.
             # Removing it here would delete the finishing session's own cwd
             # and leave it unable to run any later command.
+            #
+            # Ordering invariant (SA-0MVXUSK02003ZMDN): a *deferred* removal
+            # is not a remaining lifecycle step — ownership has passed to the
+            # driver/caller and it can no longer change the work item. Only
+            # the non-deferred removal runs here, before the terminal write.
             defer_removal, defer_reason = _should_defer_worktree_removal(
                 keep_worktree
             )
@@ -8707,13 +11593,23 @@ def phase_finish(
             if not defer_removal:
                 LOG.info("Removing worktree...")
                 remove_state(worktree_path)
-                report["steps"]["worktree_removed"] = bool(
-                    _remove_worktree(
-                        worktree_path,
-                        repo_root=repo_root,
+                try:
+                    removed = bool(
+                        _remove_worktree(
+                            worktree_path,
+                            repo_root=repo_root,
+                        )
                     )
-                )
-                if not report["steps"]["worktree_removed"]:
+                except RuntimeError as exc:
+                    # A confinement refusal (the path is not a worktree this
+                    # repository registers) must never turn a successful,
+                    # already-pushed finish into a failure: the tree is
+                    # retained and reported instead (SA-0MVXVC0KB004XDH0).
+                    removed = False
+                    report["steps"]["worktree_removal"]["refused"] = str(exc)
+                    LOG.warning("Worktree removal refused: %s", exc)
+                report["steps"]["worktree_removed"] = removed
+                if not removed:
                     LOG.warning(
                         "Failed to remove worktree at %s", worktree_path
                     )
@@ -8729,7 +11625,91 @@ def phase_finish(
             if sync_result.get("warning"):
                 LOG.info("Parent-branch sync: %s", sync_result["warning"])
 
+            # ── Step 9: Completion comment (BEFORE the terminal write) ────
+            # Design A (SA-0MVXUSED6008J04R AC3): the comment carries the
+            # pushed commit hash and runs inside the held, non-terminal
+            # window, so no comment follows the terminal write — which also
+            # preserves the audit-freshness ordering rule
+            # (SA-0MTHC710X003ORZM: a post-audit comment can invalidate a
+            # passed audit's freshness window). Verdict provenance is included
+            # so the accepted green is attributable from the work item alone
+            # (SA-0MVQHVJEX0071R7G).
+            #
+            # Ordering invariant (SA-0MVXUSK02003ZMDN): the completion comment
+            # is the last store write *before* the terminal transition; posting
+            # it after the terminal write would bump ``updatedAt`` on an
+            # already audit-ready item (and race the dispatcher).
+            verdict_lines = "\n".join(_verdict_provenance_lines(report))
+            completion_comment = (
+                f"Implementation complete.\n- Commit: {commit_hash}\n"
+                f"- Branch: {branch}\n- Worktree: {worktree_path}\n"
+                f"{verdict_lines}"
+            )
+            verification_step = report["steps"].get(
+                "post_push_verification") or {}
+            verification_verdict = verification_step.get("verdict")
+            if verification_verdict:
+                # Never a silent green: name the read-only post-push verdict
+                # (and why, when it is not applicable) in the comment.
+                completion_comment += (
+                    f"\n- Post-push verification: {verification_verdict}"
+                )
+                if verification_step.get("reason"):
+                    completion_comment += (
+                        f" ({verification_step['reason']})"
+                    )
+            removal_step = report["steps"].get("worktree_removal") or {}
+            if removal_step.get("deferred"):
+                # Never let a deferred cleanup disappear: name the retained
+                # tree, the reason and the exact remedy on the work item
+                # itself (SA-0MVTE8XAJ002IUDR AC2). Ownership of this cleanup
+                # has passed to the driver/caller, so it is not a remaining
+                # lifecycle step of this run (SA-0MVXUSJ2P009T97H AC1).
+                completion_comment += (
+                    f"\n- Worktree retained (deferred removal: "
+                    f"{removal_step.get('reason', 'unknown')}).\n"
+                    f"  A driven child session's worktree is removed by "
+                    f"`implement.py drive` once the session exits. Otherwise "
+                    f"remove it as the LAST command, once this session no "
+                    f"longer needs its cwd:\n"
+                    f"  {_worktree_cleanup_command(work_item_id)}\n"
+                    f"  manual fallback: git worktree remove {worktree_path} "
+                    f"&& git worktree prune"
+                )
+            # AC4 (SA-0MVXUSJJY009HMQ0): a re-run after an interruption
+            # converges without duplicating this record. A prior run may have
+            # posted it before its terminal write was lost; the stable marker
+            # plus the commit hash identifies that record, so the re-run only
+            # completes the lifecycle instead of stacking a second completion
+            # comment.
+            completion_already_recorded = _comment_already_recorded(
+                work_item_id,
+                COMPLETION_COMMENT_MARKER,
+                f"Commit: {commit_hash}",
+            )
+            report["steps"]["completion_comment"] = {
+                "posted": not completion_already_recorded,
+                "deduplicated": completion_already_recorded,
+                "commit": commit_hash,
+            }
+            if completion_already_recorded:
+                LOG.info(
+                    "Completion comment for %s (commit %s) is already "
+                    "recorded; skipping the duplicate on the re-run.",
+                    work_item_id,
+                    commit_hash,
+                )
+            else:
+                wl_add_comment(work_item_id, completion_comment)
+
             # StatusLifecycle.__exit__ sets status=completed, stage=in_review
+            # — the run's LAST lifecycle action (assignee released with it).
+            # Ordering invariant (SA-0MVXUSK02003ZMDN): the terminal write and
+            # the assignee release are inseparable and last; every step that
+            # can still change the work item (the read-only post-push
+            # verification, the completion comment, the non-deferred worktree
+            # removal) has already run above, so the item becomes an
+            # audit-dispatch candidate only when the run is fully complete.
 
         # ── Step 8b: Terminal-status read-back assertion ──────────────
         # (OSL-0MVME1PI5005WU58) The terminal write above must have stuck
@@ -8738,6 +11718,11 @@ def phase_finish(
         # still non-terminal is a silent lifecycle lie (recorded on
         # OSL-0MVMB44C9008IXZX). Runs only after the confirmed successful
         # push (Step 6) — a genuine push failure can never reach here.
+        #
+        # Ordering invariant (SA-0MVXUSK02003ZMDN): this read-only read-back
+        # is the phase's last action. It observes the terminal state but never
+        # changes it, so it cannot reopen the audit-dispatch window the
+        # terminal write just closed.
         report["steps"]["status_readback"] = _assert_terminal_status(
             work_item_id
         )
@@ -8802,6 +11787,33 @@ def phase_finish(
                 "pushed (rebase onto the remote branch if the push is "
                 "rejected).",
             )
+        # AC2 (SA-0MVXUSJJY009HMQ0): once a commit exists, every failure exit
+        # records the retained state — status open, assignee cleared, the
+        # commit (published or local) and the resume command — so an
+        # interrupted run is never released without an explanation. It runs
+        # after the specific comments above and deduplicates on the marker
+        # plus commit, so it is recorded once per commit however many times
+        # finish is retried.
+        if (
+            _finish_progress_global.get("work_item_id") == work_item_id
+            and _finish_progress_global.get("commit")
+        ):
+            try:
+                report["steps"]["interruption_comment"] = (
+                    _record_interruption_comment(
+                        work_item_id,
+                        f"finish failed ({msg.splitlines()[0][:200]})",
+                        worktree_retained=bool(
+                            worktree_path and Path(worktree_path).exists()
+                        ),
+                        worktree_path=worktree_path,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - never mask the failure
+                LOG.error(
+                    "Failed to record the interruption on %s: %s",
+                    work_item_id, exc,
+                )
         if json_output:
             print(format_json_output(report))
         else:
@@ -8829,6 +11841,29 @@ def phase_finish(
                 "error",
                 work_item_id,
             )
+        # AC2 (SA-0MVXUSJJY009HMQ0): the same retained-state record as the
+        # classified path — an unexpected crash after the commit/push must
+        # still name what survived and how to resume.
+        if (
+            _finish_progress_global.get("work_item_id") == work_item_id
+            and _finish_progress_global.get("commit")
+        ):
+            try:
+                report["steps"]["interruption_comment"] = (
+                    _record_interruption_comment(
+                        work_item_id,
+                        f"unexpected error ({type(exc).__name__})",
+                        worktree_retained=bool(
+                            worktree_path and Path(worktree_path).exists()
+                        ),
+                        worktree_path=worktree_path,
+                    )
+                )
+            except Exception as record_exc:  # noqa: BLE001 - never mask it
+                LOG.error(
+                    "Failed to record the interruption on %s: %s",
+                    work_item_id, record_exc,
+                )
         if json_output:
             print(format_json_output(report))
         return report
@@ -8837,34 +11872,16 @@ def phase_finish(
         # RuntimeError, or an escaping exception): the kernel also releases
         # the flock if this process dies.
         _release_main_checkout_lock(lock_fd)
+        # The interruption context only ever describes a half-finished run:
+        # clear it so a later signal cannot misreport a converged phase
+        # (SA-0MVXUSJJY009HMQ0 AC2).
+        _clear_finish_progress()
 
-    # ── Step 9: Add completion comment ─────────────────────────────
-    # The comment carries the gate's verdict provenance (tree path, tree
-    # fingerprint, cache flag and, for a cache-served verdict, the entry
-    # metadata) so the accepted green is attributable from the work item alone
-    # (SA-0MVQHVJEX0071R7G).
-    verdict_lines = "\n".join(_verdict_provenance_lines(report))
-    completion_comment = (
-        f"Implementation complete.\n- Commit: {commit_hash}\n"
-        f"- Branch: {branch}\n- Worktree: {worktree_path}\n{verdict_lines}"
-    )
+    # ── Step 10: Success reporting ───────────────────────────────
+    # The completion comment already ran inside the lifecycle window
+    # (Step 9, before the terminal write) — nothing lifecycle-relevant is
+    # left here, so the item is already audit-ready.
     removal_step = report["steps"].get("worktree_removal") or {}
-    if removal_step.get("deferred"):
-        # Never let a deferred cleanup disappear: name the retained tree, the
-        # reason and the exact remedy on the work item itself
-        # (SA-0MVTE8XAJ002IUDR AC2).
-        completion_comment += (
-            f"\n- Worktree retained (deferred removal: "
-            f"{removal_step.get('reason', 'unknown')}).\n"
-            f"  A driven child session's worktree is removed by "
-            f"`implement.py drive` once the session exits. Otherwise remove "
-            f"it as the LAST command, once this session no longer needs its "
-            f"cwd:\n"
-            f"  {_worktree_cleanup_command(work_item_id)}\n"
-            f"  manual fallback: git worktree remove {worktree_path} && "
-            f"git worktree prune"
-        )
-    wl_add_comment(work_item_id, completion_comment)
 
     report["success"] = True
     report["hash"] = commit_hash
@@ -8969,7 +11986,13 @@ def phase_abort(
         LOG.info("Cleaning up worktree at %s...", worktree_path)
         cleanup_worktree_processes(worktree_path)
         remove_state(worktree_path)
-        _remove_worktree(worktree_path)
+        try:
+            _remove_worktree(worktree_path)
+        except RuntimeError as exc:
+            # A confinement refusal retains the tree; an abort never fails
+            # because of it (SA-0MVXVC0KB004XDH0).
+            report["worktree_refused"] = str(exc)
+            LOG.warning("Worktree removal refused during abort: %s", exc)
         report["worktree_path"] = worktree_path
 
     # ── Step 3: Restore repo state ─────────────────────────────────
@@ -9056,9 +12079,11 @@ def phase_cleanup(
     **Ordering contract: run this as the session's LAST bash command.**
     Removal deletes the tree the invoking session stands in (the plain leaf
     flow's cwd *is* the worktree), so nothing that needs the worktree cwd may
-    follow it: every later command would fail with a deleted cwd. Write the
-    worklog comment, render the report and run any post-push verification
-    first, then call this action last.
+    follow it: every later command would fail with a deleted cwd. Render the
+    end-of-session report first, then call this action last. The completion
+    comment and the read-only post-push verification are **not** session
+    steps: they already ran inside ``finish``, before the terminal write
+    (SA-0MVXUSK02003ZMDN).
 
     Gates, in order — a failure at any of them **retains** the tree and is
     reported (never forced past, never silent):
@@ -9971,7 +12996,30 @@ def phase_parent(
 
     parent_status = str(parent.get("status", ""))
     already_terminal = _is_terminal_status(parent_status)
+    summary = "\n".join(
+        f"- {c['id']} ({c['status']})" for c in classifications
+    )
+    child_summary = "\n".join(
+        f"- {r.get('id', '?')}: {r.get('action', '?')} "
+        f"({r.get('status', '')})"
+        for r in child_results
+    )
+    # ── Comment BEFORE the terminal write ─────────────────────────
+    # Design A (SA-0MVXUSED6008J04R §3): in **every** implement path the
+    # terminal ``completed``/``in_review`` write is the last lifecycle action,
+    # so the per-child summary is posted first. A comment bumps
+    # ``updatedAt``, so posting it after the transition would make the newly
+    # audit-ready parent churn once more (and can invalidate a fresh audit's
+    # window, SA-0MTHC710X003ORZM). No persisted audit can exist on a
+    # non-terminal parent, so this reordering is behaviour-neutral.
     if not already_terminal:
+        wl_add_comment(
+            work_item_id,
+            f"All children of {work_item_id} are in a terminal stage. "
+            f"Advancing the parent to in_review.\n\n"
+            f"Children processed:\n{child_summary}\n\n"
+            f"Per-child summary:\n{summary}",
+        )
         try:
             # Direct terminal durable write (phase_parent is not wrapped in a
             # StatusLifecycle context manager): the release must stay explicit
@@ -9982,6 +13030,14 @@ def phase_parent(
             )
         except RuntimeError:
             msg = f"Failed to advance parent {work_item_id}"
+            # The summary above promised an advance this write could not
+            # deliver: correct the record rather than leave a false claim.
+            wl_add_comment(
+                work_item_id,
+                f"Parent advancement failed: the terminal status write did "
+                f"not stick. {work_item_id} was left non-terminal — re-run "
+                f"`implement.py parent {work_item_id}`.",
+            )
             report["success"] = False
             report["message"] = msg
             if json_output:
@@ -9989,21 +13045,16 @@ def phase_parent(
             else:
                 LOG.error(msg)
             return report
-    summary = "\n".join(
-        f"- {c['id']} ({c['status']})" for c in classifications
-    )
-    child_summary = "\n".join(
-        f"- {r.get('id', '?')}: {r.get('action', '?')} "
-        f"({r.get('status', '')})"
-        for r in child_results
-    )
-    wl_add_comment(
-        work_item_id,
-        f"All children of {work_item_id} are in a terminal stage. "
-        f"Parent advanced to in_review.\n\n"
-        f"Children processed:\n{child_summary}\n\n"
-        f"Per-child summary:\n{summary}",
-    )
+    else:
+        # Already terminal: no lifecycle write follows, so the summary is
+        # posted here without promising another transition.
+        wl_add_comment(
+            work_item_id,
+            f"All children of {work_item_id} are in a terminal stage. "
+            f"Parent is already in a terminal state ({parent_status}).\n\n"
+            f"Children processed:\n{child_summary}\n\n"
+            f"Per-child summary:\n{summary}",
+        )
     report["parent_advanced"] = True
     report["message"] = (
         f"All children of {work_item_id} are terminal; parent advanced "
@@ -10240,6 +13291,519 @@ def _default_session_spawner(
         return result
     result["success"] = True
     return result
+
+
+def _env_flag(env: Mapping | None, name: str) -> bool:
+    """True when *name* is set to a truthy value (``1``/``true``/``yes``/``on``).
+
+    Args:
+        env: Environment mapping (defaults to ``os.environ``).
+        name: Environment variable name.
+
+    Returns:
+        True when the variable holds a truthy string, else False.
+    """
+    value = (env if env is not None else os.environ).get(name)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _pane_sessions_opted_in(
+    flag: bool | None = None,
+    env: Mapping | None = None,
+) -> bool:
+    """Whether the operator opted in to the pane-driven transport.
+
+    An explicit ``--pane-sessions`` / ``--no-pane-sessions`` flag always wins
+    (``--no-pane-sessions`` is an opt-out even when the env var is set). When
+    the flag is absent the decision is env-driven via
+    :data:`PANE_SESSIONS_ENV`.
+
+    Args:
+        flag: Parsed CLI flag (``None`` = not given).
+        env: Environment mapping (defaults to ``os.environ``).
+
+    Returns:
+        True when pane driving is opted in.
+    """
+    if flag is not None:
+        return bool(flag)
+    return _env_flag(env, PANE_SESSIONS_ENV)
+
+
+def _herdr_available(env: Mapping | None = None) -> bool:
+    """Whether a live Herdr session with a resolvable CLI is present.
+
+    Detection is deliberately two-part (AC5): ``HERDR_ENV=1`` (Herdr exports it
+    into every managed pane) **and** a resolvable herdr binary (reusing
+    :func:`shared.herdr_pane.resolve_herdr_bin`, so ``HERDR_BIN_PATH`` wins
+    over ``PATH`` exactly as it does for pane titles). Anything else falls
+    back to the headless spawner.
+
+    Args:
+        env: Environment mapping (defaults to ``os.environ``).
+
+    Returns:
+        True when pane driving *can* work in this environment.
+    """
+    env_map = dict(env if env is not None else os.environ)
+    if env_map.get("HERDR_ENV") != "1":
+        return False
+    return bool(_resolve_herdr_bin_path(env_map))
+
+
+def _select_session_spawner(
+    pane_sessions: bool | None = None,
+    focus: bool = DEFAULT_PANE_FOCUS,
+    env: Mapping | None = None,
+    default: Callable[..., dict[str, Any]] | None = None,
+    client: Any | None = None,
+) -> Callable[..., dict[str, Any]]:
+    """Choose the child-session transport for this ``drive`` invocation.
+
+    Pane driving is selected only when the operator opted in **and** Herdr is
+    detected; every other combination returns *default* (the headless
+    ``pi -p`` spawner) unchanged. This fail-open rule is what keeps automated
+    callers — the downtime worker, audit dispatch and CI, none of which have a
+    Herdr session — on the headless path even if a stray flag is passed.
+
+    Args:
+        pane_sessions: Parsed ``--pane-sessions``/``--no-pane-sessions`` flag
+            (``None`` = env-driven via :data:`PANE_SESSIONS_ENV`).
+        focus: Whether each new child pane takes focus (``--focus``).
+        env: Environment mapping used for detection (defaults to
+            ``os.environ``).
+        default: The headless spawner to fall back to (tests may inject one).
+        client: Injectable herdr session client bound into the pane spawner
+            (tests); ignored by the headless path.
+
+    Returns:
+        A spawner callable with the ``_default_session_spawner`` signature.
+    """
+    base = default or _default_session_spawner
+    if not _pane_sessions_opted_in(pane_sessions, env):
+        return base
+    if not _herdr_available(env):
+        LOG.info(
+            "Pane-driven sessions requested but Herdr is not available "
+            "(HERDR_ENV=1 and a resolvable herdr binary are required); "
+            "falling back to the headless `pi -p` spawner."
+        )
+        return base
+    return functools.partial(
+        _pane_session_spawner, focus=bool(focus), client=client,
+    )
+
+
+def _pane_child_env(env: Mapping | None) -> dict[str, str]:
+    """The explicit environment a pane child receives via ``pane split --env``.
+
+    Only the deliberate markers (:data:`PANE_CHILD_ENV_KEYS`) are forwarded —
+    never the whole inherited environment (which would leak secrets into the
+    recorded argv) and never the driving session's identity
+    (:data:`PANE_IDENTITY_ENV_KEYS`).
+
+    Args:
+        env: The child environment built by :func:`_child_session_env`.
+
+    Returns:
+        Ordered ``{KEY: value}`` pairs, empty entries omitted.
+    """
+    env_map = env if env is not None else os.environ
+    pairs: dict[str, str] = {}
+    for key in PANE_CHILD_ENV_KEYS:
+        if key in PANE_IDENTITY_ENV_KEYS:
+            continue
+        value = env_map.get(key)
+        if value:
+            pairs[key] = str(value)
+    return pairs
+
+
+def _pane_session_spawner(
+    child_id: str,
+    worktree_path: str,
+    timeout: int,
+    env: dict[str, str],
+    verbose: bool = False,
+    *,
+    focus: bool = DEFAULT_PANE_FOCUS,
+    client: Any | None = None,
+) -> dict[str, Any]:
+    """Drive *child_id* as an interactive Pi TUI agent in a sibling pane.
+
+    The pane-driven counterpart of :func:`_default_session_spawner`
+    (SA-0MVPHYIIE002OBC8):
+
+    1. ``pane split --current --cwd <worktree> --env K=V… [--focus|--no-focus]``
+       — a sibling pane in the caller's tab, never a new tab/workspace.
+    2. ``agent start drive-<child> --kind pi --pane <id> -- --approve
+       --no-extensions`` — the same extensions-disabled child session shape
+       as the headless path.
+    3. ``agent prompt <name> "/skill:implement <child>" --wait --until done
+       --until blocked`` — the interactive turn that runs the leaf workflow.
+
+    The child environment is the one built by :func:`_child_session_env`: the
+    pane receives the recursion guard, the worktree marker and the lock token,
+    but not the driving session's ``PI_SESSION_ID`` / ``PI_SESSION_FILE``.
+    Because ``herdr agent start`` has no unset-environment option, the same
+    scrubbed environment is handed to the herdr CLI itself (the ``env -u
+    PI_SESSION_ID -u PI_SESSION_FILE`` equivalent), so the launched TUI cannot
+    inherit the driving session's identity from this process either.
+
+    Every herdr call is fail-open: a split/start/prompt failure is reported as
+    ``success: False`` with the herdr reason, never raised, and the chain stops
+    cleanly. When the pane was created the returned ``pane_id`` lets the caller
+    retain (or close) it — pane lifecycle handling is the next slice's job.
+
+    Args:
+        child_id: The child work item ID.
+        worktree_path: The child's pre-created worktree (the pane's cwd).
+        timeout: Per-child session budget in seconds (bounds readiness and the
+            prompt wait).
+        env: The child environment (already scrubbed by
+            :func:`_child_session_env`).
+        verbose: Accepted for signature parity with the headless spawner.
+        focus: Whether the new pane takes focus (default: do not steal focus).
+        client: Injectable herdr session client (tests); defaults to a
+            :class:`shared.herdr_session.HerdrSessionClient` over *env*.
+
+    Returns:
+        ``{"success", "returncode", "reason", "pane_id", "transport"}`` —
+        a superset of :func:`_default_session_spawner`'s result, so existing
+        ``phase_drive`` success handling is unchanged.
+    """
+    # Accepted for signature parity with ``_default_session_spawner``; the
+    # pane transport logs its own argv.
+    del verbose
+    result: dict[str, Any] = {
+        "success": False,
+        "returncode": None,
+        "reason": "",
+        "pane_id": None,
+        "transport": "pane",
+    }
+
+    herdr = client or HerdrSessionClient(env=env)
+
+    split = herdr.split_pane(worktree_path, env=_pane_child_env(env), focus=focus)
+    if not split.get("success"):
+        result["reason"] = (
+            f"Failed to split a Herdr pane for {child_id}: "
+            f"{split.get('reason') or 'unknown herdr failure'}"
+        )
+        return result
+
+    pane_id = str(split["pane_id"])
+    result["pane_id"] = pane_id
+    agent_name = agent_name_for_child(child_id)
+    result["agent_name"] = agent_name
+
+    LOG.info(
+        "Driving child %s in Herdr pane %s as agent %s (cwd=%s)",
+        child_id, pane_id, agent_name, worktree_path,
+    )
+
+    # herdr caps the readiness wait at 300s; a larger child budget must not be
+    # clamped into an invalid CLI argument.
+    readiness_ms = min(max(int(timeout), 1) * 1000, 300_000)
+    start = herdr.start_agent(
+        agent_name,
+        pane_id,
+        args=["--approve", "--no-extensions"],
+        timeout_ms=readiness_ms,
+        ready_budget_seconds=min(float(max(int(timeout), 1)), 30.0),
+    )
+    if not start.get("success"):
+        result["returncode"] = start.get("returncode")
+        result["reason"] = (
+            f"Failed to start the pane agent for {child_id}: "
+            f"{start.get('reason') or 'unknown herdr failure'}"
+        )
+        return result
+
+    prompt = herdr.prompt_agent(
+        agent_name,
+        f"/skill:implement {child_id}",
+        wait=True,
+        until=("done", "blocked"),
+        timeout_ms=max(int(timeout), 1) * 1000,
+    )
+    result["returncode"] = prompt.get("returncode")
+    result["agent_status"] = prompt.get("agent_status")
+    if not prompt.get("success"):
+        reason = prompt.get("reason") or "unknown herdr failure"
+        if prompt.get("code") == "timeout":
+            # Wording matters: ``_reconcile_spawn_failure`` classifies a
+            # timeout by the phrase and reconciles against the child's real
+            # state, so a child that finished before the wait expired is
+            # reported as completed-late, not failed.
+            reason = (
+                f"Pane agent for {child_id} timed out after {timeout}s: "
+                f"{reason}"
+            )
+        else:
+            reason = f"Pane agent for {child_id} did not complete: {reason}"
+        result["reason"] = reason
+        return result
+
+    LOG.info(
+        "Pane agent %s for %s settled with status %s",
+        agent_name, child_id, result["agent_status"],
+    )
+    result["success"] = True
+    result["returncode"] = prompt.get("returncode") or 0
+    return result
+
+
+def _pane_lifecycle_client(client: Any | None = None) -> Any:
+    """The herdr client the driver uses to close/title panes it created.
+
+    The pane spawner builds its own client from the scrubbed child
+    environment; the driver only needs the *caller's* environment (the pane id
+    and binary are ambient there). Tests inject a recording client, which is
+    returned unchanged.
+
+    Args:
+        client: Injectable client (tests); ``None`` builds a default one.
+
+    Returns:
+        A ``HerdrSessionClient``-compatible object.
+    """
+    return client if client is not None else HerdrSessionClient()
+
+
+def _driven_pane_fields(spawn_result: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``transport``/``pane_id`` report fields for a driven child entry.
+
+    Report parity (AC5): every ``children_driven`` entry carries both keys, so
+    a pane-driven child is distinguishable from a headless one in the human
+    summary and in ``--json``. A spawner that predates the pane transport (or
+    a test double) reports neither: the transport then defaults to
+    ``headless`` and ``pane_id`` is ``None``.
+
+    Args:
+        spawn_result: The spawner's result dict.
+
+    Returns:
+        ``{"transport": str, "pane_id": str | None}``.
+    """
+    transport = str(spawn_result.get("transport") or TRANSPORT_HEADLESS)
+    pane_id = spawn_result.get("pane_id")
+    return {
+        "transport": transport,
+        "pane_id": str(pane_id) if pane_id else None,
+    }
+
+
+def _pane_inspect_remedy(pane_id: str) -> str:
+    """The copy-pasteable command that inspects a retained pane."""
+    return f"herdr pane read {pane_id}"
+
+
+def _retain_driven_pane(
+    child_id: str,
+    pane_id: str,
+    verdict: str,
+    entry: dict[str, Any],
+    report: dict[str, Any],
+    reason: str,
+    *,
+    title: bool = True,
+) -> dict[str, Any]:
+    """Keep a drive-created pane open, report it and title its verdict.
+
+    A pane the driver created is never leaked silently: it is either closed
+    once its child reached a terminal stage
+    (:func:`_close_driven_pane`) or listed in ``report["retained_panes"]``
+    with an actionable inspection remedy (AC3). The title is set through
+    ``herdr_pane.update_pane_title`` (fail-open), so an operator watching the
+    pane grid sees the ``⚠️``/``🚫`` verdict without opening the child's log.
+
+    Args:
+        child_id: The child work item the pane belongs to.
+        pane_id: The pane to retain.
+        verdict: ``herdr_pane`` status (``attention`` / ``note``).
+        entry: The ``children_driven`` entry to annotate.
+        report: The drive report (receives ``retained_panes``).
+        reason: Why the pane is retained.
+        title: Whether to apply the verdict title. ``False`` for a pane the
+            drive ends without a verdict for (nothing to announce).
+
+    Returns:
+        The ``retained_panes`` entry that was recorded.
+    """
+    pane = str(pane_id)
+    entry["pane_id"] = pane
+    entry["pane_retained"] = pane
+    entry["pane_closed"] = False
+    if title:
+        try:
+            entry["pane_title"] = _update_pane_title(verdict, pane_id=pane)
+        except Exception as exc:  # noqa: BLE001 - pane updates are fail-open
+            LOG.debug("Pane title update for %s failed: %s", pane, exc)
+            entry["pane_title"] = {"updated": False, "reason": str(exc)}
+    retained = {
+        "id": child_id,
+        "pane_id": pane,
+        "verdict": verdict,
+        "reason": reason,
+        "remedy": _pane_inspect_remedy(pane),
+    }
+    report.setdefault("retained_panes", []).append(retained)
+    LOG.warning(
+        "Retained pane %s for %s (%s): %s",
+        pane, child_id, verdict, reason,
+    )
+    return retained
+
+
+def _close_driven_pane(
+    child_id: str,
+    pane_id: str,
+    entry: dict[str, Any],
+    report: dict[str, Any],
+    client: Any | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Close a drive-created pane whose child reached a terminal stage.
+
+    Fail-open: a refused/failed close retains the pane and reports it (with
+    its remedy) instead of raising, so a herdr hiccup never breaks the drive
+    chain — and the pane is never leaked silently (AC3).
+
+    Args:
+        child_id: The child work item the pane belongs to.
+        pane_id: The pane to close.
+        entry: The ``children_driven`` entry to annotate.
+        report: The drive report (receives ``retained_panes`` on failure).
+        client: Injectable herdr client (tests); defaults to the ambient one.
+        reason: Why the pane is closed (recorded in the report entry).
+
+    Returns:
+        The ``pane_cleanup`` outcome recorded on *entry*.
+    """
+    pane = str(pane_id)
+    close_reason = reason or "child reached a terminal stage"
+    try:
+        outcome = _pane_lifecycle_client(client).close_pane(pane)
+    except Exception as exc:  # noqa: BLE001 - never break the drive chain
+        outcome = {"success": False, "reason": f"close failed: {exc}"}
+
+    entry["pane_id"] = pane
+    if outcome.get("success"):
+        entry["pane_closed"] = True
+        entry["pane_cleanup"] = {
+            "pane_id": pane,
+            "closed": True,
+            "reason": close_reason,
+        }
+        LOG.info("Driver closed pane %s for %s (%s)", pane, child_id, close_reason)
+        return entry["pane_cleanup"]
+
+    failure = str(outcome.get("reason") or "unknown herdr failure")
+    entry["pane_cleanup"] = {
+        "pane_id": pane,
+        "closed": False,
+        "reason": failure,
+    }
+    _retain_driven_pane(
+        child_id,
+        pane,
+        PANE_VERDICT_FAILED,
+        entry,
+        report,
+        reason=f"pane close failed: {failure}",
+    )
+    return entry["pane_cleanup"]
+
+
+def _resolve_pending_pane_closes(
+    parent_report: dict[str, Any] | None,
+    pending: dict[str, str],
+    report: dict[str, Any],
+    client: Any | None = None,
+) -> None:
+    """Close queued child panes once the parent reports their state.
+
+    The spawn-success path queues the child's pane instead of re-fetching the
+    child: the next ``phase_parent`` report's ``children_processed`` entry is
+    the terminality signal (the same contract the deferred worktree removal
+    uses). A terminal child's pane is closed; a child the parent still sees
+    non-terminal keeps its pane open and is reported as retained (AC3).
+
+    Args:
+        parent_report: The latest ``phase_parent`` report.
+        pending: ``{child_id: pane_id}`` awaiting a terminal verdict.
+        report: The drive report (receives ``retained_panes``).
+        client: Injectable herdr client (tests).
+    """
+    processed: dict[str, dict[str, Any]] = {}
+    for item in (parent_report or {}).get("children_processed") or []:
+        cid = str(item.get("id") or "")
+        if cid:
+            processed[cid] = item
+
+    for child_id in list(pending):
+        info = processed.get(child_id)
+        if info is None:
+            continue  # the parent has not reported this child yet
+        status = str(info.get("status") or "")
+        action = str(info.get("action") or "")
+        pane_id = pending.pop(child_id)
+        entry = next(
+            (e for e in report.get("children_driven", []) if e.get("id") == child_id),
+            None,
+        )
+        if entry is None:  # pragma: no cover - defensive
+            entry = {}
+        if not (_is_terminal_status(status) or action in ("finished", "skipped-terminal")):
+            _retain_driven_pane(
+                child_id,
+                pane_id,
+                PANE_VERDICT_FAILED,
+                entry,
+                report,
+                reason="child is not terminal; pane kept open for inspection",
+            )
+            continue
+        _close_driven_pane(
+            child_id,
+            pane_id,
+            entry,
+            report,
+            client,
+            reason="child reached a terminal stage",
+        )
+
+
+def _retain_pending_panes(pending: dict[str, str], report: dict[str, Any]) -> None:
+    """Report queued panes the drive ended before resolving.
+
+    A drive that stops (failure, blocked child, advanced parent) before the
+    follow-up ``parent`` report named a child must not forget the pane it
+    created: it is listed in ``retained_panes`` with its inspection remedy so
+    the operator can find it (AC3). No verdict title is applied — the drive
+    has nothing to announce about the session yet.
+    """
+    for child_id, pane_id in pending.items():
+        entry = next(
+            (e for e in report.get("children_driven", []) if e.get("id") == child_id),
+            None,
+        )
+        if entry is None:  # pragma: no cover - defensive
+            entry = {}
+        _retain_driven_pane(
+            child_id,
+            pane_id,
+            PANE_VERDICT_FAILED,
+            entry,
+            report,
+            reason=(
+                "drive ended before the parent reported this child's state; "
+                "inspect or close the pane"
+            ),
+            title=False,
+        )
 
 
 def _reconcile_spawn_failure(
@@ -11054,18 +14618,22 @@ def _preserved_ref_comment(
         f"- Failing `finish` step: `{step}` (reason: `{reason}`)"
     )
     lines = [
-        f"Drive refused to reset this child's worktree (`{child_id}`) "
-        "because it carries commits.",
+        (
+            f"Drive refused to reset this child's worktree (`{child_id}`) "
+            "because it carries commits."
+        ),
         "",
         f"- Worktree tip preserved at: `{preserved.get('ref')}`",
         f"- Preserved commit: `{preserved.get('commit')}`",
         f"- Child state: {reconciliation.get('evidence') or 'unknown'}",
         step_line,
         "",
-        "No `git reset --hard` or `git clean -fd` was run, so no committed "
-        "work was discarded. Recover the slice from the preserved ref "
-        f"(`git branch <name> {preserved.get('ref')}`), or delete it once it "
-        f"is no longer needed (`git update-ref -d {preserved.get('ref')}`).",
+        (
+            "No `git reset --hard` or `git clean -fd` was run, so no committed "
+            "work was discarded. Recover the slice from the preserved ref "
+            f"(`git branch <name> {preserved.get('ref')}`), or delete it once it "
+            f"is no longer needed (`git update-ref -d {preserved.get('ref')}`)."
+        ),
     ]
     return "\n".join(lines)
 
@@ -11109,12 +14677,26 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
             # A transient infrastructure refusal retried on its own bounded
             # budget with backoff (LP-0MVWEP292000ODBS).
             icon = "🔁"
+        elif result == "blocked":
+            # The driven agent settled in `blocked` and needs a human
+            # decision; its pane was left open (SA-0MVPHZ1CI0045QR0 AC2).
+            icon = "🚫"
         else:
             icon = "❌"
         print(
             f"  {icon} {entry.get('id')} "
             f"(attempt {entry.get('attempt')}): {result}"
         )
+        # Report parity (AC5): the transport and, for pane-driven children,
+        # the pane the session ran in.
+        transport = entry.get("transport")
+        pane_id = entry.get("pane_id")
+        if transport or pane_id:
+            pane_note = f", pane {pane_id}" if pane_id else ""
+            print(
+                f"     transport: {transport or TRANSPORT_HEADLESS}"
+                f"{pane_note}"
+            )
         evidence = _format_timeout_evidence(entry)
         if evidence:
             print(f"     {evidence}")
@@ -11146,6 +14728,18 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
         print(f"  Finalised stranded: {len(report['finalised_children'])}")
     if report.get("stranded_children"):
         print(f"  Stranded (needs finalising): {len(report['stranded_children'])}")
+    if report.get("retained_panes"):
+        print(
+            "  Panes retained for inspection: "
+            f"{len(report['retained_panes'])}"
+        )
+        for pane in report["retained_panes"]:
+            print(
+                f"     {pane.get('id')}: pane {pane.get('pane_id')} "
+                f"({pane.get('verdict')}) — {pane.get('reason', '')}"
+            )
+            if pane.get("remedy"):
+                print(f"       inspect with: {pane['remedy']}")
     print(f"  {report.get('message', '')}")
     print()
 
@@ -11724,19 +15318,6 @@ def _finalise_stranded_child(
         }
 
     commit = str(evidence.get("commit", ""))
-    try:
-        # Direct terminal durable write — the finaliser is not a StatusLifecycle
-        # exit, so the stranded child's hold is released explicitly.
-        StatusLifecycle.update_status(
-            child_id, "completed", stage="in_review", assignee=""
-        )
-    except RuntimeError as exc:
-        return {
-            "finalised": False,
-            "commit": commit,
-            "reason": f"status update failed: {exc}",
-        }
-
     reason = (
         f"Automatically finalised by `implement.py drive --finalise-stranded`: "
         f"the child session failed after its work was pushed "
@@ -11744,7 +15325,31 @@ def _finalise_stranded_child(
         f"in-progress, and its worktree held no uncommitted work. "
         f"Status set to completed / stage in_review."
     )
+    # The finalisation comment is posted BEFORE the terminal write, so the
+    # write is this path's last lifecycle action (design A,
+    # SA-0MVXUSED6008J04R §3: comment before the transition in every implement
+    # path). No persisted audit can exist on a non-terminal item, so this
+    # reordering is behaviour-neutral.
     wl_add_comment(child_id, reason)
+    try:
+        # Direct terminal durable write — the finaliser is not a StatusLifecycle
+        # exit, so the stranded child's hold is released explicitly.
+        StatusLifecycle.update_status(
+            child_id, "completed", stage="in_review", assignee=""
+        )
+    except RuntimeError as exc:
+        # The comment above claimed the finalisation; correct the record when
+        # the terminal write does not stick rather than leave a false claim.
+        wl_add_comment(
+            child_id,
+            f"Stranded-child finalisation failed: the terminal status write "
+            f"did not stick ({exc}). The item was left non-terminal.",
+        )
+        return {
+            "finalised": False,
+            "commit": commit,
+            "reason": f"status update failed: {exc}",
+        }
     LOG.info("Finalised stranded child %s (%s)", child_id, evidence.get(
         "evidence", commit,
     ))
@@ -11823,8 +15428,11 @@ def phase_drive(
     child_timeout: int | None = None,
     finish_attempt_limit: int | None = None,
     infra_retry_limit: int = DEFAULT_INFRA_RETRY_LIMIT,
+    pane_sessions: bool | None = None,
+    focus: bool = DEFAULT_PANE_FOCUS,
     delay: Callable[[float], None] | None = None,
     spawn_session: Callable[..., dict[str, Any]] | None = None,
+    pane_client: Any | None = None,
     parent_runner: Callable[..., dict[str, Any] | None] | None = None,
     commit_evidence: Callable[[str], str | None] | None = None,
     finalise_stranded: bool = False,
@@ -11914,10 +15522,23 @@ def phase_drive(
             refusal that clears within the budget lets the same ``finish``
             succeed and the chain continue (LP-0MVWEP292000ODBS). A
             non-positive value is clamped to 1.
+        pane_sessions: Opt in to the Herdr pane-driven transport
+            (``--pane-sessions`` / ``--no-pane-sessions``). ``None`` (the
+            default) is env-driven via ``IMPLEMENT_DRIVE_PANE_SESSIONS``.
+            Pane driving additionally requires Herdr to be detected
+            (``HERDR_ENV=1`` and a resolvable herdr binary); otherwise the
+            headless ``pi -p`` spawner is used unchanged
+            (SA-0MVPHYIIE002OBC8).
+        focus: Whether each new child pane takes focus (``--focus``).
+            Default False so the caller's focus is never stolen.
         delay: Injectable backoff sleeper for infrastructure retries (tests
             pass a zero-cost recorder; default ``time.sleep``).
-        spawn_session: Injectable spawner (tests); defaults to
-            :func:`_default_session_spawner`.
+        spawn_session: Injectable spawner (tests); defaults to the transport
+            chosen by :func:`_select_session_spawner`
+            (:func:`_pane_session_spawner` when Herdr is detected and the
+            operator opted in, else :func:`_default_session_spawner`).
+        pane_client: Injectable ``HerdrSessionClient`` for the pane transport
+            (tests); forwarded to :func:`_pane_session_spawner`.
         parent_runner: Injectable ``parent`` runner (tests); defaults to
             :func:`_invoke_implement`.
         commit_evidence: Injectable pushed-commit evidence provider (tests)
@@ -11965,7 +15586,15 @@ def phase_drive(
         records ``worktree_removed`` plus its ``worktree_cleanup`` outcome;
         ``retained_worktrees`` lists every tree that was kept (with a
         remedy) and ``worktree_sweep`` records the start-of-run sweep of
-        terminal children's leftover trees (SA-0MVTE8XAJ002IUDR).
+        terminal children's leftover trees (SA-0MVTE8XAJ002IUDR). Every
+        ``children_driven`` entry additionally carries ``transport`` and
+        ``pane_id`` (``None`` for the headless transport); a child whose pane
+        was closed once its terminal stage was confirmed records
+        ``pane_closed``/``pane_cleanup``, while a pane kept open is named in
+        ``retained_panes`` with its verdict and inspection remedy. A child
+        whose driven agent reported ``blocked`` sets ``blocked_child`` /
+        ``blocked_pane``, stops the chain and leaves its pane open
+        (SA-0MVPHZ1CI0045QR0 AC2/AC3/AC4/AC5).
     """
     report: dict[str, Any] = {
         "phase": "drive",
@@ -12036,7 +15665,12 @@ def phase_drive(
             )
     else:
         runner = parent_runner
-    spawner = spawn_session or _default_session_spawner
+    spawner = spawn_session or _select_session_spawner(
+        pane_sessions=pane_sessions,
+        focus=focus,
+        env=os.environ,
+        client=pane_client,
+    )
     timeout = child_timeout or _resolve_child_session_timeout()
     max_child_sessions = max(1, int(max_child_sessions))
     finish_attempt_limit = (
@@ -12064,6 +15698,11 @@ def phase_drive(
     #: ``phase_parent`` report (the success path performs no extra store
     #: fetch — SA-0MVHXWLPG007OQVN risk R1).
     pending_cleanup: dict[str, str] = {}
+    #: Panes created by this drive whose child is still awaiting the parent's
+    #: terminality verdict; resolved to a close (terminal) or a reported
+    #: retention (still non-terminal) by the next parent report
+    #: (SA-0MVPHZ1CI0045QR0 AC3).
+    pending_panes: dict[str, str] = {}
     stranded_comment_posted = False
     finaliser = finalise_child or _finalise_stranded_child
     # Hard bound on the loop: each child may consume at most
@@ -12101,6 +15740,12 @@ def phase_drive(
         # statuses before acting on anything else (SA-0MVTE8XAJ002IUDR AC5).
         _resolve_pending_worktree_cleanups(
             parent_report, pending_cleanup, report
+        )
+        # Same signal for panes: a child the parent now reports terminal has
+        # its pane closed, a still-non-terminal child keeps its pane open and
+        # is reported as retained (SA-0MVPHZ1CI0045QR0 AC3).
+        _resolve_pending_pane_closes(
+            parent_report, pending_panes, report, pane_client
         )
 
         if parent_report.get("parent_advanced"):
@@ -12553,14 +16198,70 @@ def phase_drive(
             "attempt": attempts[child_id],
             "result": "finished" if spawn_result.get("success") else "failed",
             "reason": spawn_result.get("reason", ""),
+            # Report parity (AC5): every driven child names its transport and
+            # the pane it ran in (``None`` for the headless transport).
+            **_driven_pane_fields(spawn_result),
         }
         driven.append(entry)
+        pane_id = entry.get("pane_id")
+
+        if (
+            spawn_result.get("success")
+            and spawn_result.get("agent_status") == "blocked"
+        ):
+            # The driven agent settled in ``blocked``: it needs a human
+            # decision, so the drive stops instead of re-spawning a session
+            # that would immediately block again. The pane is deliberately
+            # LEFT OPEN and named, never silently closed or abandoned
+            # (AC2).
+            entry["result"] = "blocked"
+            entry["agent_status"] = "blocked"
+            report["blocked_child"] = child_id
+            report["blocked_pane"] = pane_id
+            if pane_id:
+                _retain_driven_pane(
+                    child_id,
+                    pane_id,
+                    PANE_VERDICT_BLOCKED,
+                    entry,
+                    report,
+                    reason=(
+                        "the driven agent reported `blocked`; a human "
+                        "decision is needed"
+                    ),
+                )
+            inspect = (
+                f"its pane {pane_id} was left open for inspection "
+                f"(`{_pane_inspect_remedy(pane_id)}`)"
+                if pane_id
+                else "no pane is attached (headless transport)"
+            )
+            report["message"] = (
+                f"Child {child_id} reported `blocked`; the drive chain "
+                f"stopped — {inspect}. Resolve the blocker, then re-run drive."
+            )
+            wl_add_comment(
+                child_id,
+                f"Drive stopped: the driven session for this child reported "
+                f"`blocked` (a human decision is needed). The drive chain "
+                f"stopped and {inspect}. Resolve the blocker and re-run "
+                f"`implement.py drive`.",
+            )
+            LOG.warning(
+                "Child %s reported blocked; stopping the drive chain (pane=%s)",
+                child_id, pane_id,
+            )
+            break
 
         if spawn_result.get("success"):
             # Queue the tree for removal: the follow-up `parent` report names
             # the child's terminal state, which is the signal to remove it
             # without an extra store fetch on the hot path.
             pending_cleanup[child_id] = worktree_path
+            # The pane follows the same terminality signal: close on the
+            # confirmed terminal stage, retain (and report) otherwise (AC3).
+            if pane_id:
+                pending_panes[child_id] = pane_id
 
         if not spawn_result.get("success"):
             # A failed spawn is a bound, not a verdict: reconcile against the
@@ -12584,6 +16285,15 @@ def phase_drive(
                     "Child %s completed late (%s); continuing the drive loop.",
                     child_id, reconciliation["evidence"],
                 )
+                # Terminality is confirmed, so the pane this session ran in is
+                # no longer needed: close it (fail-open — a failed close is
+                # retained and reported, never leaked) before the deferred
+                # worktree removal (AC3/AC4).
+                if pane_id:
+                    _close_driven_pane(
+                        child_id, pane_id, entry, report, pane_client,
+                        reason="child completed late (terminal confirmed)",
+                    )
                 # This is the exact path the production incident took: the
                 # session was killed after its push, so the deferred worktree
                 # must be released here too — a hook on the success path only
@@ -12593,6 +16303,33 @@ def phase_drive(
                     child_id, worktree_path, entry, report
                 )
                 continue
+
+            # Not terminal: dispose of the pane this session created. A
+            # timeout means the wait expired and the session is gone, so its
+            # pane is closed (AC4: the timeout bound closes the pane and stops
+            # the chain). Any other failure keeps the pane open as debugging
+            # evidence and titles it with the ⚠️ verdict (AC3).
+            if pane_id:
+                if reconciliation["timed_out"]:
+                    _close_driven_pane(
+                        child_id, pane_id, entry, report, pane_client,
+                        reason=(
+                            "session timed out after "
+                            f"{reconciliation['timeout_seconds']}s"
+                        ),
+                    )
+                else:
+                    _retain_driven_pane(
+                        child_id,
+                        pane_id,
+                        PANE_VERDICT_FAILED,
+                        entry,
+                        report,
+                        reason=(
+                            "child session failed and the child is not "
+                            "terminal; pane kept open for inspection"
+                        ),
+                    )
 
             # Not terminal: the hard failure stands. The killed session could
             # not release the claim it held (a timeout kill is a SIGKILL, so
@@ -12716,6 +16453,10 @@ def phase_drive(
     # A drive that ended before the follow-up parent report resolved a child's
     # queued worktree never strands it silently (SA-0MVTE8XAJ002IUDR AC7).
     _retain_pending_worktree_cleanups(pending_cleanup, report)
+    # Panes are never leaked either: anything the terminality signal did not
+    # resolve is reported as retained with its inspection remedy
+    # (SA-0MVPHZ1CI0045QR0 AC3).
+    _retain_pending_panes(pending_panes, report)
     _emit_phase_report(report, json_output)
     return report
 
@@ -13088,6 +16829,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pane-sessions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Drive each child as an interactive Pi TUI in a sibling Herdr "
+            "pane of the calling tab. Requires Herdr to be detected "
+            "(HERDR_ENV=1 and a resolvable herdr binary); otherwise the "
+            "headless `pi -p` spawner is used unchanged. ``--no-pane-sessions`` "
+            "forces the headless path. Default: env-driven via "
+            f"{PANE_SESSIONS_ENV}."
+        ),
+    )
+    parser.add_argument(
+        "--focus",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_PANE_FOCUS,
+        help=(
+            "With pane sessions, focus each new child pane. Default "
+            "--no-focus so the caller's focus is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--finalise-stranded",
         action="store_true",
         default=False,
@@ -13211,6 +16974,8 @@ def _main(argv: list[str] | None = None) -> int:
                 finish_attempt_limit=args.finish_attempt_limit,
                 infra_retry_limit=args.infra_retry_limit,
                 finalise_stranded=args.finalise_stranded,
+                pane_sessions=args.pane_sessions,
+                focus=args.focus,
             )
             _emit_timing(_root_timer)
     else:

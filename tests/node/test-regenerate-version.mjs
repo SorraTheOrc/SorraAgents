@@ -151,11 +151,23 @@ function mkSubmoduleFixtureRepo({ version, buildScript = 'node build.js', derive
     `export const WORKLOG_VERSION = '${derivedVersion}';\n`,
   );
 
+  /** The gitlink (mode 160000 entry) recorded for `core` in the index. */
+  const gitlink = () => gitFile(game, ['ls-files', '-s', 'core']).split(/\s+/)[1] ?? '';
+
+  // A tracked pin file recording the submodule commit, mirroring main-street's
+  // `configs/engine-pin.json`. A build that advances the submodule checkout
+  // rewrites it — the exact coupling this fixture exercises (SA-0MW6LOXBO0008706).
+  const pinPath = join(game, 'configs', 'engine-pin.json');
+  mkdirSync(join(game, 'configs'), { recursive: true });
+  writeFileSync(pinPath, JSON.stringify({ core: gitlink() }, null, 2) + '\n');
+
   gitFile(game, ['add', '-A']);
   gitFile(game, ['commit', '-q', '-m', 'init']);
 
-  /** The gitlink (mode 160000 entry) recorded for `core` in the index. */
-  const gitlink = () => gitFile(game, ['ls-files', '-s', 'core']).split(/\s+/)[1] ?? '';
+  /** Read the tracked pin file (records the submodule SHA). */
+  const readPin = () => readFileSync(pinPath, 'utf-8');
+  /** Rewrite the pin file to *sha* (the build does this as it advances). */
+  const writePin = (sha) => writeFileSync(pinPath, JSON.stringify({ core: sha }, null, 2) + '\n');
 
   /** Advance the engine tip and move the worktree `core` checkout after it. */
   const advanceEngine = () => {
@@ -172,7 +184,7 @@ function mkSubmoduleFixtureRepo({ version, buildScript = 'node build.js', derive
     writeFileSync(p, readFileSync(p, 'utf-8') + 'wip\n');
   };
 
-  return { root, game, engine, gitlink, advanceEngine, dirtyCore };
+  return { root, game, engine, gitlink, advanceEngine, dirtyCore, pinPath, readPin, writePin };
 }
 
 /** Collect log calls into a simple record for assertions. */
@@ -440,6 +452,106 @@ describe('regenerateDerivedFiles — submodule pointer (gitlink) exclusion', () 
       true,
       'uncommitted submodule content stays on disk, untracked by the commit',
     );
+  });
+});
+
+// ── regenerateDerivedFiles — submodule pin restoration (SA-0MW6LOXBO0008706) ─
+//
+// Excluding the submodule pointer is not enough when the build also rewrites a
+// tracked pin file that records the submodule SHA: the derived-files commit
+// would carry a pin pointing at the advanced commit while the gitlink stayed at
+// the recorded one. The step must restore the build-rewritten pin alongside the
+// gitlink — derived generically from the recorded/advanced SHA pair.
+
+describe('regenerateDerivedFiles — submodule pin restoration', () => {
+  it('restores a build-rewritten pin file alongside the restored gitlink', () => {
+    const f = mkSubmoduleFixtureRepo({ version: '5.1.0', derivedVersion: '1.0.0' });
+    fixtures.push(f.root);
+    const gitlinkBefore = f.gitlink();
+    const pinBefore = f.readPin();
+    const { logger } = makeLogger();
+
+    const result = regenerateDerivedFiles({
+      repoRoot: f.game,
+      version: '5.1.0',
+      runBuild: () => {
+        f.advanceEngine(); // build advances the checkout…
+        f.writePin(gitFile(join(f.game, 'core'), ['rev-parse', 'HEAD'])); // …and rewrites the pin
+        writeDerivedVersion(f.game);
+      },
+      logger,
+    });
+
+    assert.equal(result.committed, true);
+    assert.deepEqual(result.files, ['src/version.ts']);
+    const committed = git(f.game, ['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean);
+    assert.deepEqual(committed, ['src/version.ts'], 'the commit must contain only the genuinely derived file');
+    assert.equal(f.gitlink(), gitlinkBefore, 'the recorded gitlink is unchanged');
+    assert.equal(f.readPin(), pinBefore, 'the pin file is restored to the recorded SHA');
+    assert.deepEqual(result.restoredGitlinks, ['core']);
+    assert.deepEqual(result.restoredPins, ['configs/engine-pin.json']);
+  });
+
+  it('a pin the release bumped itself survives regeneration', () => {
+    const f = mkSubmoduleFixtureRepo({ version: '8.0.0', derivedVersion: '1.0.0' });
+    fixtures.push(f.root);
+
+    // The release deliberately advances the engine (gitlink + pin) in a prior
+    // commit. That is the recorded state regeneration must preserve — the
+    // restore returns to HEAD, never to an earlier pre-release commit.
+    f.advanceEngine();
+    const releasedSha = gitFile(join(f.game, 'core'), ['rev-parse', 'HEAD']);
+    f.writePin(releasedSha);
+    git(f.game, ['add', '-A']);
+    git(f.game, ['commit', '-q', '-m', 'release: deliberate engine advance']);
+    assert.equal(f.gitlink(), releasedSha);
+
+    const { logger } = makeLogger();
+    const result = regenerateDerivedFiles({
+      repoRoot: f.game,
+      version: '8.0.0',
+      runBuild: () => {
+        f.advanceEngine(); // the build advances the checkout further…
+        f.writePin(gitFile(join(f.game, 'core'), ['rev-parse', 'HEAD'])); // …and rewrites the pin
+        writeDerivedVersion(f.game);
+      },
+      logger,
+    });
+
+    assert.equal(result.committed, true);
+    const committed = git(f.game, ['show', '--name-only', '--format=', 'HEAD']).split('\n').filter(Boolean);
+    assert.deepEqual(committed, ['src/version.ts']);
+    assert.equal(f.gitlink(), releasedSha, "the release's deliberate gitlink survives");
+    assert.ok(f.readPin().includes(releasedSha), "the release's deliberate pin survives");
+    assert.deepEqual(result.restoredPins, ['configs/engine-pin.json']);
+  });
+
+  it('matches abbreviated SHAs in the pin (minimum prefix)', () => {
+    const f = mkSubmoduleFixtureRepo({ version: '9.0.0', derivedVersion: '1.0.0' });
+    fixtures.push(f.root);
+    const gitlinkBefore = f.gitlink();
+    // A pin may store an abbreviation; record the 7-char form of the gitlink.
+    f.writePin(gitlinkBefore.slice(0, 7));
+    git(f.game, ['add', '-A']);
+    git(f.game, ['commit', '-q', '-m', 'abbreviate pin']);
+    const pinBefore = f.readPin();
+
+    const { logger } = makeLogger();
+    const result = regenerateDerivedFiles({
+      repoRoot: f.game,
+      version: '9.0.0',
+      runBuild: () => {
+        f.advanceEngine();
+        f.writePin(gitFile(join(f.game, 'core'), ['rev-parse', 'HEAD']).slice(0, 7));
+        writeDerivedVersion(f.game);
+      },
+      logger,
+    });
+
+    assert.equal(result.committed, true);
+    assert.equal(f.gitlink(), gitlinkBefore, 'the recorded gitlink is unchanged');
+    assert.equal(f.readPin(), pinBefore, 'an abbreviated pin is restored too');
+    assert.deepEqual(result.restoredPins, ['configs/engine-pin.json']);
   });
 });
 

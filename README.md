@@ -66,6 +66,32 @@ cache entry. See [`skill/test/SKILL.md`](skill/test/SKILL.md),
 [`skill/test_cache.py`](skill/test_cache.py) and
 [`docs/dev/release-tests.md`](docs/dev/release-tests.md).
 
+Suite and build subprocesses run on a **disk-backed `TMPDIR`** (resolved in
+the precedence order documented in
+[`docs/dev/test-skill-reference.md` §3](docs/dev/test-skill-reference.md#3-disk-backed-test-temporary-storage-and-the-inode-exhaustion-signature-sa-0mw2qed9m005fwok)),
+so a host with many concurrent agents cannot exhaust the small tmpfs `/tmp`
+inode budget (`ENOSPC` inside Playwright `createContext`, reported by the
+gate as `reason: unparsed` / infrastructure). Stale
+`pytest-of-<user>/pytest-*` roots are pruned automatically before full-scope
+runs; see the same section for the operator remedy. The `TMPDIR`/prune work is
+env-only and never changes suite command strings or cache keys.
+
+Every push to `dev`/`main` is also gated by the pre-push hook, which runs the
+full suite against **the pushed commit** rather than the main checkout's
+working tree. The hook forwards git's `<local_sha>` as
+`run_tests.py --gate-commit <sha>`; the runner resolves a clean checkout that
+holds that commit (the pusher's worktree when possible) and keys the cache on
+that state, so a green `scope: full` entry computed for any other state —
+including the main checkout's own `HEAD` plus its dirty `.worklog/` churn —
+cannot satisfy the gate. If no clean checkout holds the commit, the push is
+refused and the message names the commit, the remote ref, the remedy and the
+`TEST_SCOPE_SKIP=1` escape hatch. The gate prints the state it validated
+(`gate-subject` / `gate-root` / `gate-verdict` on `stderr`), and the hook
+mirrors the resulting cache entry into the main checkout so Step-9
+`--summary` and audit F3 can consume it. See
+[`docs/dev/test-skill-reference.md`](docs/dev/test-skill-reference.md#04-pre-push-gate-subject-binding-sa-0mvtrbt50005dueh)
+and [`docs/dev/test-isolation.md`](docs/dev/test-isolation.md).
+
 ### For Release Managers
 
 Running a release does not require a work item — the `/skill:ship release`

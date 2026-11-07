@@ -268,6 +268,26 @@ class TestPoisonedIndexIsReported:
         assert watch.poll() is not None
         assert watch.poll() is None
 
+    def test_unreadable_inherited_index_is_reported(self, tmp_path):
+        """A corrupt inherited index is a violation, never silent (AC2).
+
+        ``git write-tree`` fails on an unreadable index, so ``poll()`` must
+        fall back to reporting (naming the offender) rather than returning
+        ``None`` — the observed failure mode where the gate could not attribute
+        its verdict and reported it anonymously.
+        """
+        repo, index = _project_with_inherited_index(tmp_path)
+        watch = guard.IndexWatch.capture(repo, env={"GIT_INDEX_FILE": str(index)})
+        assert watch is not None
+
+        # Truncate/corrupt the inherited index so ``git write-tree`` fails.
+        index.write_bytes(b"DIRC\x00\x00\x00\x02corrupt-index")
+
+        report = watch.poll()
+        assert report is not None
+        assert guard.VIOLATION_HEADLINE in report
+        assert "unreadable" in report
+
 
 # ---------------------------------------------------------------------------
 # End to end — the real conftest wiring in a simulated gate run

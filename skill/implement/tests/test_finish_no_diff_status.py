@@ -168,6 +168,12 @@ def _mocked_phase_finish(*, update_status=None, store_show=None, tmp_path=None):
         stack.enter_context(
             patch.object(implement, "git_push_to_dev", return_value=True)
         )
+        # The dev push now runs from the worktree and its subject guard reads
+        # the real git HEAD (SA-0MVUTXJ4300301ZN); this harness uses a
+        # placeholder, non-git worktree, so the guard is stubbed like the push
+        # itself. The guard has dedicated coverage in
+        # ``skill/implement/tests/test_implement_push_from_worktree.py``.
+        stack.enter_context(patch.object(implement, "_assert_push_subject"))
         stack.enter_context(patch.object(implement, "run_cmd", side_effect=_fake_run_cmd))
         stack.enter_context(
             patch.object(implement, "cleanup_worktree_processes", return_value=_cleanup_result())

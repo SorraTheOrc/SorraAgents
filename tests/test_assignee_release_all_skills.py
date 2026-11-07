@@ -412,6 +412,12 @@ class ReleaseExercise:
     exercise: Callable[[FakeWorklogStore], None] = field(compare=False)
     classification: str = "must-release-on-terminal"
     target_id: str = "SA-MATRIXAUDIT"
+    #: Optional assertion replacing the default "target assignee is empty".
+    #: Used by a helper that releases a *different* item (the cascade releases
+    #: the descendants, not the audited parent).
+    verify: Callable[[FakeWorklogStore], None] | None = field(
+        default=None, compare=False
+    )
 
 
 @dataclass(frozen=True)
@@ -588,6 +594,12 @@ def _phase_finish_env(
         stack.enter_context(
             patch.object(implement, "git_push_to_dev", return_value=True)
         )
+        # The dev push now runs from the worktree and its subject guard reads
+        # the real git HEAD (SA-0MVUTXJ4300301ZN); this harness uses a
+        # placeholder, non-git worktree, so the guard is stubbed like the push
+        # itself. The guard has dedicated coverage in
+        # ``skill/implement/tests/test_implement_push_from_worktree.py``.
+        stack.enter_context(patch.object(implement, "_assert_push_subject"))
         stack.enter_context(
             patch.object(
                 implement, "_assert_commit_on_origin_dev", return_value={"success": True}
@@ -1051,15 +1063,16 @@ RELEASE_ROWS: tuple[ReleaseRow, ...] = (
             label="plan-complete",
             target_id="SA-MATRIXPLAN",
             run=_run_plan_complete,
-            # Plan's documented claim carries no assignee, so the row pins
-            # that the claim never introduces a hold in the first place.
-            seed_assignee="",
+            # Plan's documented claim carries no assignee, so the exercise
+            # seeds the workflow pre-claim an agent makes *before* the skill
+            # runs — the hold the skip must release (SA-0MW0F91KN004J06U).
+            seed_assignee=_AGENT,
         ),
         failure=Invocation(
             label="plan-error-reset",
             target_id="SA-MATRIXPLAN",
             run=_run_plan_abort,
-            seed_assignee="",
+            seed_assignee=_AGENT,
         ),
     ),
 )
@@ -1312,6 +1325,67 @@ def test_read_only_callers_never_touch_an_assignee(
 
 
 # ---------------------------------------------------------------------------
+# Externally pre-claimed rows: an agent pre-claim must not survive the run
+# ---------------------------------------------------------------------------
+
+#: The read-only callers whose lifecycle can *release* a pre-existing claim.
+#: All four run a terminal status transition: the two ``restore_on_exit``
+#: lifecycles through the context manager, and ``effort-and-risk`` /
+#: ``tree-coverage`` through the direct ``update_status`` choke point
+#: (SA-0MW0F91KN004J06U).
+EXTERNALLY_PRE_CLAIMED_ROWS: tuple[ReadOnlyCaller, ...] = (
+    ReadOnlyCaller(
+        name="find-related read-only analysis (externally pre-claimed)",
+        source="find-related/scripts/find_related.py",
+        exercise=_exercise_find_related,
+    ),
+    ReadOnlyCaller(
+        name="refactor read-only analysis (externally pre-claimed)",
+        source="refactor/scripts/refactor.py",
+        exercise=_exercise_refactor,
+    ),
+    ReadOnlyCaller(
+        name="effort-and-risk estimate wrapper (externally pre-claimed)",
+        source="effort-and-risk/scripts/run_skill.py",
+        exercise=_exercise_effort_and_risk,
+    ),
+    ReadOnlyCaller(
+        name="tree-coverage stage advance (externally pre-claimed)",
+        source="shared/tree_coverage.py",
+        exercise=_exercise_tree_coverage,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "case",
+    EXTERNALLY_PRE_CLAIMED_ROWS,
+    ids=[case.name for case in EXTERNALLY_PRE_CLAIMED_ROWS],
+)
+def test_read_only_caller_releases_an_externally_set_agent_claim(
+    case: ReadOnlyCaller, tmp_path: Path
+) -> None:
+    """The workflow pre-claim is released on the run's terminal transition.
+
+    ``AGENTS_GLOBAL.md`` step 1 claims the item *before* the skill runs, so the
+    helper only clearing a hold it set itself left the agent's pre-claim behind
+    (SA-0MW0F91KN004J06U AC1). The widened rule releases any non-producer claim
+    observed on entry, while the producer ``Map`` hold stays untouched (asserted
+    by ``test_read_only_callers_never_touch_an_assignee``).
+    """
+    store = FakeWorklogStore.with_item(
+        "SA-MATRIXRO", status="open", stage="plan_complete", assignee=_AGENT
+    )
+    assert store.assignee("SA-MATRIXRO") == _AGENT
+
+    case.exercise(store, tmp_path)
+
+    assert store.assignee("SA-MATRIXRO") == "", (
+        f"{case.name}: the externally pre-set agent claim survived the run"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Release-only entry points: exercised, never assumed
 # ---------------------------------------------------------------------------
 
@@ -1325,6 +1399,34 @@ def _exercise_audit_pre_audit_restore(store: FakeWorklogStore) -> None:
         original_status="in-progress",
     )
     audit_runner._restore_pre_audit_state_on_failure(ctx)
+
+
+def _exercise_audit_cascade_release(store: FakeWorklogStore) -> None:
+    """The descendant cascade terminalises a held child and releases it."""
+    store.add_item(
+        {
+            "id": "SA-MATRIXCASCADE",
+            "title": "cascaded child",
+            "status": "in-progress",
+            "stage": "plan_complete",
+            "assignee": _AGENT,
+            "parentId": "SA-MATRIXAUDIT",
+        }
+    )
+    cascaded = audit_runner._cascade_descendants_terminal(
+        "SA-MATRIXAUDIT", "2026-11-05T00:00:00Z", store.runner
+    )
+    assert cascaded == 1, "the cascade did not terminalise the child"
+
+
+def _verify_audit_cascade_release(store: FakeWorklogStore) -> None:
+    """A cascaded child is ``completed``/``done`` and off its agent hold."""
+    persisted = store.show("SA-MATRIXCASCADE")
+    assert persisted["status"] == "completed"
+    assert persisted["stage"] == "done"
+    assert persisted["assignee"] == "", (
+        "the cascaded child kept a lingering agent claim"
+    )
 
 
 def _exercise_implement_orphaned_claim_release(store: FakeWorklogStore) -> None:
@@ -1359,6 +1461,13 @@ RELEASE_EXERCISES: tuple[ReleaseExercise, ...] = (
         exercise=_exercise_audit_pre_audit_restore,
     ),
     ReleaseExercise(
+        name="audit descendant cascade (terminalised children)",
+        source="audit/scripts/audit_runner.py",
+        entry_points=("_cascade_descendants_terminal",),
+        exercise=_exercise_audit_cascade_release,
+        verify=_verify_audit_cascade_release,
+    ),
+    ReleaseExercise(
         name="implement orphaned-claim release (timeout/signal kill)",
         source="implement/scripts/implement.py",
         entry_points=("_release_orphaned_child_claim",),
@@ -1378,6 +1487,10 @@ def test_release_only_entry_point_clears_the_assignee(case: ReleaseExercise) -> 
     assert store.assignee(case.target_id) == _AGENT
 
     case.exercise(store)
+
+    if case.verify is not None:
+        case.verify(store)
+        return
 
     assert store.assignee(case.target_id) == ""
     assert any(
@@ -1503,8 +1616,10 @@ def uncovered_entry_points(
 
 def _uncovered_message(uncovered: dict[str, set[str]]) -> str:
     lines = [
-        "Assignee-mutating skill entry point(s) are not covered by the "
-        "assignee-release regression matrix:",
+        (
+            "Assignee-mutating skill entry point(s) are not covered by the "
+            "assignee-release regression matrix:"
+        ),
     ]
     for source, entry_points in sorted(uncovered.items()):
         for entry_point in sorted(entry_points):

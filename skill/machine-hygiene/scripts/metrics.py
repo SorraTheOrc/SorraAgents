@@ -17,6 +17,7 @@ Usage
 
 import importlib.util
 import os
+import time
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -87,6 +88,55 @@ def _multiplier_thresholds(base_cfg: dict[str, float], cores: int) -> dict[str, 
     warn = cores * base_cfg.get("warning_multiplier", float("inf"))
     crit = cores * base_cfg.get("critical_multiplier", float("inf"))
     return {"low": 0, "warning": warn, "critical": crit}
+
+
+def _classify_swap_usage(
+    swap_pct: float,
+    memory_used_pct: float,
+    memory_pressure: float | None,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Classify swap occupancy gated on *current* memory pressure.
+
+    Swap occupancy is a historical figure: pages accumulate over days of
+    paging and stay in swap after pressure has passed. It is therefore only
+    allowed to warn when memory is under current pressure — either
+    ``memory_usage`` (capacity) or the PSI ``memory_pressure`` ``full`` line
+    (stall percentage) sits at/above its own warning threshold. When PSI
+    memory data is unavailable the capacity figure is the sole signal
+    (graceful degradation).
+
+    Returns ``{status, gated, escalated}``:
+
+    - ``gated`` — swap was downgraded to ``low`` because memory is not under
+      pressure (historical accumulation);
+    - ``escalated`` — ``memory_usage`` is critical, so a warning-level swap
+      reading is escalated to ``critical``.
+    """
+    swap_level = classify_metric(swap_pct, cfg["swap_usage"])["status"]
+    mem_level = classify_metric(memory_used_pct, cfg["memory_usage"])["status"]
+    if memory_pressure is None:
+        pressure_level = None
+    else:
+        pressure_level = classify_metric(
+            memory_pressure, cfg["memory_pressure"]
+        )["status"]
+
+    memory_under_pressure = mem_level != "low" or (
+        pressure_level is not None and pressure_level != "low"
+    )
+    if not memory_under_pressure:
+        # Swap occupancy without current pressure is not actionable.
+        return {"status": "low", "gated": True, "escalated": False}
+    if swap_level == "low":
+        return {"status": "low", "gated": False, "escalated": False}
+    if mem_level == "critical":
+        return {
+            "status": "critical",
+            "gated": False,
+            "escalated": swap_level != "critical",
+        }
+    return {"status": swap_level, "gated": False, "escalated": False}
 
 
 # ---------------------------------------------------------------------------
@@ -303,13 +353,163 @@ def _get_rss_top10() -> list[dict[str, Any]]:
     ]
 
 
-def _detect_stale_devices() -> dict[str, Any]:
-    """Detect zombie processes and stale lock files.
+#: Lock files created by the ALSA kernel driver at boot. They are permanently
+#: present, root-owned and never stale — they must never be reported or pruned.
+KERNEL_LOCK_FILES = frozenset({
+    "asound.state.lock",
+    "card0.lock",
+    "card1.lock",
+    "card2.lock",
+})
 
-    Returns ``{zombie_count, zombie_details, lock_files}``.
+#: Minimum age before an unheld, non-root, non-kernel lock file is stale.
+DEFAULT_STALE_LOCK_AGE_SECONDS = 24 * 60 * 60
+
+
+def _scan_lock_files(lock_dir: str) -> list[str]:
+    """Return the regular-file paths directly inside *lock_dir*.
+
+    Best effort: a missing or unreadable directory yields an empty list.
+    """
+    paths: list[str] = []
+    try:
+        with os.scandir(lock_dir) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file():
+                        paths.append(entry.path)
+                except OSError:
+                    continue
+    except (FileNotFoundError, PermissionError, OSError):
+        return []
+    return paths
+
+
+def _lock_file_pid(path: str) -> int | None:
+    """Return the PID recorded in a lock file, when its content is one.
+
+    Many lock files hold a bare PID (optionally newline-terminated). Only a
+    short, wholly numeric payload is treated as a PID — binary lock payloads
+    (e.g. ALSA's) must not be misread as an owner.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(64)
+    except OSError:
+        return None
+    token = text.strip()
+    if not token or len(token) > 10 or not token.isdigit():
+        return None
+    pid = int(token)
+    return pid if pid > 0 else None
+
+
+def _pid_is_alive(pid: int, proc_root: str = "/proc") -> bool:
+    """Return True when *pid* still has a ``/proc/<pid>`` entry."""
+    return os.path.isdir(os.path.join(proc_root, str(pid)))
+
+
+def _classify_lock_file(
+    path: str,
+    *,
+    now: float | None = None,
+    min_age_seconds: float = DEFAULT_STALE_LOCK_AGE_SECONDS,
+    proc_root: str = "/proc",
+    stat_fn=os.stat,
+    pid_alive_fn=None,
+) -> dict[str, Any]:
+    """Decide whether a ``/var/lock`` entry is genuinely stale.
+
+    A lock is stale only when it is **not** a known kernel boot lock, **not**
+    root-owned, **older** than *min_age_seconds*, and its recorded owning PID
+    (when present) is no longer running. Each rejection carries a ``reason``.
+
+    Returns ``{path, stale, reason, age_seconds, uid, pid}``.
+    """
+    alive = pid_alive_fn or (
+        lambda candidate: _pid_is_alive(candidate, proc_root)
+    )
+    if now is None:
+        now = time.time()
+
+    name = os.path.basename(path)
+    detail: dict[str, Any] = {
+        "path": path, "stale": False, "reason": "",
+        "age_seconds": None, "uid": None, "pid": None,
+    }
+    try:
+        st = stat_fn(path)
+        uid = st.st_uid
+        age = max(0.0, now - st.st_mtime)
+    except OSError as exc:
+        detail["reason"] = f"unreadable: {exc}"
+        return detail
+
+    pid = _lock_file_pid(path)
+    detail.update(uid=uid, pid=pid, age_seconds=round(age, 1))
+
+    if name in KERNEL_LOCK_FILES:
+        detail["reason"] = "known kernel-owned boot lock (ALSA)"
+        return detail
+    if uid == 0:
+        detail["reason"] = "root-owned (operator/system-managed)"
+        return detail
+    if age < min_age_seconds:
+        detail["reason"] = f"recent (age {age:.0f}s < {min_age_seconds:.0f}s)"
+        return detail
+    if pid is not None and alive(pid):
+        detail["reason"] = f"owning process {pid} is alive"
+        return detail
+
+    detail["stale"] = True
+    if pid is not None:
+        detail["reason"] = f"age {age:.0f}s and owning process {pid} is dead"
+    else:
+        detail["reason"] = f"age {age:.0f}s with no owning PID"
+    return detail
+
+
+def _inspect_lock_files(
+    lock_dir: str = "/var/lock",
+    *,
+    now: float | None = None,
+    min_age_seconds: float = DEFAULT_STALE_LOCK_AGE_SECONDS,
+    proc_root: str = "/proc",
+    stat_fn=os.stat,
+    pid_alive_fn=None,
+) -> list[dict[str, Any]]:
+    """Classify every regular file in *lock_dir* (stale and non-stale)."""
+    if now is None:
+        now = time.time()
+    return [
+        _classify_lock_file(
+            path, now=now, min_age_seconds=min_age_seconds,
+            proc_root=proc_root, stat_fn=stat_fn, pid_alive_fn=pid_alive_fn,
+        )
+        for path in _scan_lock_files(lock_dir)
+    ]
+
+
+def _find_stale_lock_files(
+    lock_dir: str = "/var/lock",
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Return only the genuinely stale entries in *lock_dir*."""
+    return [
+        detail for detail in _inspect_lock_files(lock_dir, **kwargs)
+        if detail["stale"]
+    ]
+
+
+def _detect_stale_devices(lock_dir: str = "/var/lock") -> dict[str, Any]:
+    """Detect zombie processes and *genuinely* stale lock files.
+
+    Returns ``{zombie_count, zombie_details, lock_files,
+    lock_file_details, lock_files_inspected}``. ``lock_files`` contains only
+    stale entries — kernel-owned boot locks, root-owned locks, recently
+    touched files and locks whose recorded owner is alive are excluded.
     """
     zombies: list[tuple[int, str]] = []
-    lock_files: list[str] = []
 
     try:
         for entry in os.listdir("/proc"):
@@ -330,20 +530,15 @@ def _detect_stale_devices() -> dict[str, Any]:
     except (PermissionError, OSError):
         pass
 
-    lock_dir = "/var/lock"
-    if os.path.isdir(lock_dir):
-        try:
-            for name in os.listdir(lock_dir):
-                full_path = os.path.join(lock_dir, name)
-                if os.path.isfile(full_path):
-                    lock_files.append(full_path)
-        except PermissionError:
-            pass
+    inspections = _inspect_lock_files(lock_dir) if os.path.isdir(lock_dir) else []
+    stale_details = [detail for detail in inspections if detail["stale"]]
 
     return {
         "zombie_count": len(zombies),
         "zombie_details": zombies,
-        "lock_files": lock_files,
+        "lock_files": [detail["path"] for detail in stale_details],
+        "lock_file_details": stale_details,
+        "lock_files_inspected": len(inspections),
     }
 
 
@@ -386,6 +581,8 @@ def collect_metrics() -> dict[str, Any]:
 
     load_thresholds = _multiplier_thresholds(cfg["load_average"], cores)
     runnable_thresholds = _multiplier_thresholds(cfg["runnable_processes"], cores)
+    process_thresholds = _multiplier_thresholds(cfg["process_count"], cores)
+    thread_thresholds = _multiplier_thresholds(cfg["thread_count"], cores)
 
     # --- Load average ---
     load = _get_load_average()
@@ -445,37 +642,56 @@ def collect_metrics() -> dict[str, Any]:
         ),
     }
 
-    # --- Swap usage ---
+    # --- Swap usage (gated on current memory pressure) ---
     swap_pct = 0.0
     if mem_info["swap_total_mb"] > 0:
         swap_pct = (
             (mem_info["swap_total_mb"] - mem_info["swap_free_mb"])
             / mem_info["swap_total_mb"]
         ) * 100
+    swap_result = _classify_swap_usage(
+        swap_pct,
+        metrics["memory_usage"]["value"],
+        metrics["memory_pressure"]["value"],
+        cfg,
+    )
+    swap_desc = (
+        f"Swap used: {round(mem_info['swap_total_mb'] - mem_info['swap_free_mb'], 0)} MB / "
+        f"{round(mem_info['swap_total_mb'], 0)} MB; memory usage "
+        f"{metrics['memory_usage']['value']}%"
+    )
+    if swap_result["gated"]:
+        swap_desc += (
+            " (no current memory pressure — historical accumulation, "
+            "not actionable)"
+        )
+    elif swap_result["escalated"]:
+        swap_desc += " (escalated: memory usage is critical)"
     metrics["swap_usage"] = {
         "value": round(swap_pct, 1),
-        "status": classify_metric(swap_pct, cfg["swap_usage"])["status"],
-        "description": (
-            f"Swap used: {round(mem_info['swap_total_mb'] - mem_info['swap_free_mb'], 0)} MB / "
-            f"{round(mem_info['swap_total_mb'], 0)} MB"
-        ),
+        "status": swap_result["status"],
+        "description": swap_desc,
     }
 
-    # --- Process / thread counts ---
+    # --- Process / thread counts (dedicated core-derived blocks) ---
     proc_count, thread_count = _get_process_counts()
     metrics["process_count"] = {
         "value": proc_count,
-        "status": classify_metric(proc_count, runnable_thresholds)["status"],
+        "status": classify_metric(proc_count, process_thresholds)["status"],
         "description": (
             f"Total processes (threads: {thread_count}; "
-            f"warn: {runnable_thresholds['warning']:.0f}, "
-            f"crit: {runnable_thresholds['critical']:.0f})"
+            f"warn: {process_thresholds['warning']:.0f}, "
+            f"crit: {process_thresholds['critical']:.0f})"
         ),
     }
     metrics["thread_count"] = {
         "value": thread_count,
-        "status": classify_metric(thread_count, runnable_thresholds)["status"],
-        "description": "Total threads across all processes",
+        "status": classify_metric(thread_count, thread_thresholds)["status"],
+        "description": (
+            f"Total threads across all processes (cores: {cores}, "
+            f"warn: {thread_thresholds['warning']:.0f}, "
+            f"crit: {thread_thresholds['critical']:.0f})"
+        ),
     }
 
     # --- Runnable processes ---
@@ -525,7 +741,11 @@ def collect_metrics() -> dict[str, Any]:
     metrics["stale_lock_files"] = {
         "value": len(stale["lock_files"]),
         "status": "low",
-        "description": f"Lock files in /var/lock: {len(stale['lock_files'])}",
+        "description": (
+            f"Stale lock files in /var/lock: {len(stale['lock_files'])} "
+            f"(inspected {stale.get('lock_files_inspected', 0)}; kernel-owned, "
+            "root-owned, recent and live-PID locks excluded)"
+        ),
     }
 
     for info in metrics.values():

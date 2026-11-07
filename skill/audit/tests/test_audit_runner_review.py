@@ -384,7 +384,9 @@ class TestCascadeNoSideEffectDemotion:
     def test_independent_no_verdict_demotes_in_review_child(self):
         """AC3: an audit NOT triggered by a parent cascade keeps the normal
         demotion — an explicit independent 'No' still returns the item to the
-        actionable queue."""
+        actionable queue — and now also flags it for producer review
+        (SA-0MVR9B1UH002BUST AC3).
+        """
         updates = []
         # Ensure no stale cascade marker leaks in from the environment.
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -397,12 +399,15 @@ class TestCascadeNoSideEffectDemotion:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "open", "--stage", "plan_complete",
-            "--assignee", "", "--json",
+            "--assignee", "", "--needs-producer-review", "yes", "--json",
         ]
 
     def test_cascade_no_verdict_demotes_pre_review_child(self):
         """AC3: a cascade-triggered 'No' on a child that was already
-        pre-review is still a genuine block — it demotes as before."""
+        pre-review is still a genuine block — it demotes as before, and the
+        demotion is not suppressed so the independent-failure flag applies
+        (SA-0MVR9B1UH002BUST AC3).
+        """
         updates = []
         with mock.patch.dict(
             os.environ, {audit_runner.AUDIT_CASCADE_AUDIT_ENV: "1"}, clear=False,
@@ -415,7 +420,7 @@ class TestCascadeNoSideEffectDemotion:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "open", "--stage", "plan_complete",
-            "--assignee", "", "--json",
+            "--assignee", "", "--needs-producer-review", "yes", "--json",
         ]
 
     def test_cascade_yes_verdict_still_advances(self):

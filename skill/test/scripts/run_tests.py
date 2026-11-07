@@ -97,11 +97,13 @@ import argparse
 import configparser
 import contextvars
 import json
+import logging
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -130,11 +132,17 @@ from shared.skill_extensions import (
     SkillExtensionError,
     load_extension,
 )
+from shared.test_tmpdir import prune_stale_test_roots, resolve_test_tmpdir
 from shared.timing import Timer
 from test_cache import (
     DEFAULT_TTL_SECONDS,
+    STATE_CHANGED_EXIT_CODE,
+    STATE_CHANGED_NOTICE_CODE,
+    GitStateUnavailable,
     Runner,
     _default_runner,
+    compute_git_state,
+    is_worktree_clean,
     query_cached,
     run_cached,
     summary_lines,
@@ -150,6 +158,11 @@ from test_runner import (
 )
 
 REPO_ROOT = _SKILLS_ROOT.parent
+
+#: Runner diagnostics logger (SA-0MW3ENF32006BGN1): TMPDIR choice / prune
+#: outcomes are emitted here so operators can see the disk-backed TMPDIR and
+#: stale-root pruning from one place.
+LOG = logging.getLogger("skill.test.run_tests")
 
 # Cache TTL exposed as a module constant so CLI tests can backdate entries.
 CACHE_TTL_SECONDS = DEFAULT_TTL_SECONDS
@@ -210,6 +223,12 @@ TEST_LOCK_JITTER_DEFAULT = 0.1
 NOTICE_SLOT_BUSY = "slot_busy"
 NOTICE_COMMAND_NOT_FOUND = "command_not_found"
 NOTICE_SUITE_TIMEOUT = "suite_timeout"
+#: A command's guarded checkout moved while it executed (SA-0MW3FF18I003KGZE
+#: AC1): the mixed-tree verdict is quarantined and reported non-green with the
+#: distinct ``STATE_CHANGED_EXIT_CODE``, never parsed as a code failure. The
+#: code is the cache's stable notice (:data:`test_cache.STATE_CHANGED_NOTICE_CODE`)
+#: so the runner and the cache cannot drift.
+NOTICE_STATE_CHANGED_DURING_RUN = STATE_CHANGED_NOTICE_CODE
 
 #: Stable code for the **non-fatal** resolution notice that a pinned
 #: ``.pi/test-config.json`` ``suiteCommands`` list does not cover some of the
@@ -1482,13 +1501,13 @@ def select_group_from_changed_files(
     changed_files: set[str] | None = None,
     project_root: Path | None = None,
 ) -> str | None:
-    """Select the smallest sufficient group from changed files.
+    """Select the most relevant group from changed files.
 
     Maps touched paths to groups via the ``paths`` spec in each group's
-    definition.  The **smallest** (most specific, fewest commands) group
-    wins.  When multiple groups match, the one with the fewest commands is
-    selected.  When no group matches, returns ``None`` so the caller falls
-    back to ``full``.
+    definition.  The group that covers the **most changed files** wins.
+    When multiple groups tie on changed-file count, the one with the
+    fewest commands (most specific) breaks the tie.  When no group matches,
+    returns ``None`` so the caller falls back to ``full``.
 
     Args:
         changed_files: Changed file set (default: computed from repo).
@@ -1508,20 +1527,28 @@ def select_group_from_changed_files(
     if groups is None:
         return None
 
-    # Find all groups that match any changed file.
-    matching: dict[str, int] = {}
+    # Count how many changed files match each group's paths spec.
+    file_count: dict[str, int] = {}
+    # Also track command count for tie-breaking.
+    cmd_count: dict[str, int] = {}
+    for group_name, spec in groups.items():
+        if group_name == "full":
+            continue
+        cmd_count[group_name] = len(spec["commands"])
+
     for changed_file in changed_files:
         for group_name, spec in groups.items():
             if group_name == "full":
                 continue
             if _paths_match_spec(changed_file, spec["paths"]):
-                matching[group_name] = matching.get(group_name, 0) + len(spec["commands"])
+                file_count[group_name] = file_count.get(group_name, 0) + 1
 
-    if not matching:
+    if not file_count:
         return None
 
-    # Return the group with the fewest commands (most specific).
-    return min(matching, key=matching.get)
+    # Prefer the group covering the most changed files; command count
+    # (fewest) breaks ties.
+    return min(file_count, key=lambda g: (-file_count[g], cmd_count.get(g, 0)))
 
 
 def group_scope_commands(
@@ -2221,13 +2248,73 @@ def _suite_command_env() -> dict[str, str]:
        (SA-0MVE98T1M006A17T). An ambient value wins (it is re-exported
        normalised); otherwise the calibrated default applies. This is the
        only mutation, and it never leaks back into ``os.environ``.
+    3. A disk-backed ``TMPDIR`` resolved by the shared helper
+       (:func:`shared.test_tmpdir.resolve_test_tmpdir`, F1
+       SA-0MW3EN72O005BMIP) so a suite subprocess never exhausts a tiny
+       tmpfs ``/tmp`` inode budget (SA-0MW2QED9M005FWOK). Resolved once per
+       process (module-level cache); fail-open — any resolver error is
+       logged and the run proceeds with the ambient TMPDIR
+       (SA-0MW3ENF32006BGN1 AC3).
 
     ``NODE_OPTIONS`` and every other unrelated variable are preserved, so
-    consumer-provided vitest/NODE_OPTIONS plumbing keeps working.
+    consumer-provided vitest/NODE_OPTIONS plumbing keeps working. The
+    TMPDIR/VITEST changes are env-only — command strings and therefore cache
+    keys are byte-identical (SA-0MW3ENF32006BGN1 AC4).
     """
     env = subprocess_env_with_scrubbed_overrides()
     env[TEST_VITEST_MAX_WORKERS_ENV] = str(_test_vitest_max_workers())
+    env["TMPDIR"] = _resolved_test_tmpdir()
     return env
+
+
+#: Module-level cache for the disk-backed test TMPDIR (resolved once per
+#: process on first use; SA-0MW3ENF32006BGN1). ``None`` means "not yet
+#: resolved".
+_TEST_TMPDIR_CACHE: str | None = None
+
+
+def _resolved_test_tmpdir() -> str:
+    """Return the disk-backed test TMPDIR, resolving it once per process.
+
+    Delegates to the shared F1 helper (:func:`shared.test_tmpdir.resolve_test_tmpdir`)
+    which picks an explicit ``PI_TEST_TMPDIR`` override, else a disk-backed
+    candidate under the configured root, else ``tempfile.gettempdir()`` — and
+    never raises. The result is cached module-wide so every suite command of
+    a run shares one TMPDIR (resolving repeatedly for each spawned command
+    would be wasteful and could pick a different dir mid-run).
+
+    Fail-open (AC3): the F1 helper has a documented never-raise contract, but
+    a defensive guard mirrors the same contract here — if resolution ever
+    does raise (e.g. a patched/test stub), the error is logged and the
+    ambient ``TMPDIR`` (or the portable fallback) is used instead, so a
+    TMPDIR problem can never change the run's exit status, cache entry or
+    scope resolution.
+
+    Operator guidance (precedence, prune rules, failure signature, remedy):
+    ``docs/dev/test-skill-reference.md`` §3 (SA-0MW3ENVLU0097JRD).
+    """
+    global _TEST_TMPDIR_CACHE
+    if _TEST_TMPDIR_CACHE is None:
+        try:
+            path, reason = resolve_test_tmpdir()
+        except Exception as exc:  # noqa: BLE001 - documented fail-open contract
+            LOG.warning(
+                "Test TMPDIR resolution failed (%s); falling back to ambient TMPDIR",
+                exc,
+            )
+            _TEST_TMPDIR_CACHE = os.environ.get("TMPDIR") or tempfile.gettempdir()
+            return _TEST_TMPDIR_CACHE
+        _TEST_TMPDIR_CACHE = str(path)
+        # AC5: INFO when a disk-backed (or explicit-override) dir is chosen;
+        # WARNING when the resolver had to fall back because every candidate
+        # was unusable.
+        if "disk-backed candidate" in reason or "explicit" in reason:
+            LOG.info("Test TMPDIR=%s (%s)", path, reason)
+        else:
+            LOG.warning(
+                "Test TMPDIR candidate unusable; using %s (%s)", path, reason
+            )
+    return _TEST_TMPDIR_CACHE
 
 
 def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.CompletedProcess:
@@ -2606,6 +2693,11 @@ def run_suite(
             # entries were reused.
             "cached": use_cache and all(cached_flags) if cached_flags else False,
             "cache_entries": cache_entries,
+            # Mid-run checkout movement (SA-0MW3FF18I003KGZE): None on every
+            # stable path; the flag dict {notice_code, checkout, before_commit,
+            # after_commit, message} when the guarded checkout moved while a
+            # command executed.
+            "state_changed_during_run": None,
         }
         result.update(overrides)
         return result
@@ -2613,6 +2705,9 @@ def run_suite(
     for cmd in commands:
         command_waits: list[float] = []
         command_elapsed: list[float] = []
+        # Set when run_cached reports the guarded checkout moved while this
+        # command executed (SA-0MW3FF18I003KGZE).
+        state_changed_flag: dict[str, Any] | None = None
 
         def _record_wait(
             _queued_at: float,
@@ -2648,6 +2743,7 @@ def run_suite(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
                 )
                 cached_flags.append(run["cached"])
+                state_changed_flag = run.get("state_changed_during_run")
                 if run["cached"]:
                     cache_entries.append(_cache_entry_metadata(run, cmd))
                 if run.get("interpreter"):
@@ -2685,6 +2781,18 @@ def run_suite(
         output = f"{proc.stdout}\n{proc.stderr}"
         stdout_parts.append(proc.stdout or "")
         stderr_parts.append(proc.stderr or "")
+        # A checkout that moved mid-run (SA-0MW3FF18I003KGZE) makes this
+        # command's output a mixed-tree verdict: its content is evidence for
+        # no single commit. No failure is parsed from it (the parser would
+        # happily match failures that exist in neither tree), the suite is
+        # forced non-green with the distinct STATE_CHANGED_EXIT_CODE, and the
+        # detail is carried on the result for consumers.
+        if state_changed_flag:
+            overall_returncode = STATE_CHANGED_EXIT_CODE
+            # One moved command invalidates the whole suite: the remaining
+            # commands would run against the same unstable checkout and
+            # contribute nothing usable.
+            break
         if "pytest" in cmd:
             failures = parse_pytest_failures(output)
         else:
@@ -2693,13 +2801,33 @@ def run_suite(
         if proc.returncode != 0:
             overall_returncode = proc.returncode
 
+    state_changed_detail = (
+        state_changed_flag if state_changed_flag is not None else None
+    )
+    flagged_notice = ""
+    flagged_notice_code = ""
+    if state_changed_detail is not None:
+        flagged_notice_code = NOTICE_STATE_CHANGED_DURING_RUN
+        flagged_notice = (
+            f"[{NOTICE_STATE_CHANGED_DURING_RUN}] "
+            f"checkout {state_changed_detail.get('checkout')} changed while "
+            f"the test suite executed (HEAD "
+            f"{state_changed_detail.get('before_commit') or '<none>'} -> "
+            f"{state_changed_detail.get('after_commit') or '<none>'}): the "
+            f"mixed tree exists at no single commit, so the verdict is "
+            f"discarded — re-run the suite from a stable checkout."
+        )
+
     result = _result(
         success=overall_returncode == 0 and not all_failures,
         returncode=overall_returncode,
         exit_code=overall_returncode,
         command=command,
         failures=all_failures,
+        notice=flagged_notice,
+        notice_code=flagged_notice_code,
         cached=use_cache and all(cached_flags) if cached_flags else False,
+        state_changed_during_run=state_changed_detail,
     )
     # Classification precedence (SA-0MVU8XRBQ000DG9D): a parsable failure is
     # always a code failure. Only a non-zero suite with NO parsable failure is
@@ -2707,7 +2835,13 @@ def run_suite(
     # (negative return code — OOM kill, worker crash) is distinguished from a
     # plain non-zero exit. Cache-served non-zero results are classified from
     # their stored exit code and output too (their elapsed time is ``None``).
-    if not all_failures and overall_returncode != 0:
+    # A flagged (moved-checkout) run is never given a failure-style
+    # classification: its notice code already names the movement.
+    if (
+        not all_failures
+        and overall_returncode != 0
+        and state_changed_detail is None
+    ):
         if overall_returncode < 0:
             signal_number = abs(overall_returncode)
             result["signal"] = signal_number
@@ -2799,6 +2933,19 @@ def run_all(
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
+
+    # Full-scope runs are the churn-heavy path behind the /tmp-inode defect
+    # (SA-0MW2QED9M005FWOK): prune stale pytest roots once before executing so
+    # thousands of tiny pytest-of-<user> roots cannot exhaust the inode budget
+    # inside a suite subprocess. Gated on the REQUESTED scope AND the
+    # commands-is-None (canonical full-resolution) branch so an explicit
+    # command override (typed profiles, finish-gate changed scope, the
+    # guarded-run E2E fixtures) is untouched (SA-0MW3ENF32006BGN1 AC2;
+    # mirror of the ``if commands is None`` full-resolution branch).
+    # Fail-open (AC3): any prune error is logged and swallowed; the run's
+    # exit status, cache entry and scope resolution are unchanged.
+    if scope == "full" and commands is None:
+        _prune_stale_roots_before_run()
     notices: list[str] = []
     notice_codes: list[str] = []
     stdout_parts: list[str] = []
@@ -2816,6 +2963,10 @@ def run_all(
     resolution_notices = full_suite_notices(Path(cwd or REPO_ROOT).resolve())
     for notice in resolution_notices:
         print(f"run_tests: notice [{notice['code']}] {notice['message']}", file=sys.stderr)
+    #: Moved-checkout flags (SA-0MW3FF18I003KGZE): carried through the
+    #: aggregate so a consumer never loses the detail a suite-level notice
+    #: references by code alone.
+    state_changed_flags: list[dict[str, Any]] = []
     with Timer("run_all") as _all_timer:
         for name in suites:
             with Timer(f"suite:{name}"):
@@ -2834,6 +2985,9 @@ def run_all(
                     fingerprint=fingerprint,
                 )
             results[name] = result
+            suite_flag = result.get("state_changed_during_run")
+            if suite_flag:
+                state_changed_flags.append(suite_flag)
             resolved_scopes.append(result["scope"])
             suite_elapsed = result.get("elapsed_seconds")
             if suite_elapsed is not None:
@@ -2856,6 +3010,9 @@ def run_all(
         "failures": all_failures,
         "notices": notices,
         "notice_codes": notice_codes,
+        # Moved-checkout flags (SA-0MW3FF18I003KGZE): the detail behind each
+        # ``state_changed_during_run`` notice code.
+        "state_changed_during_run": state_changed_flags,
         # Resolution notices are informational and carry a stable machine-
         # readable shape (code/directories/source); they are deliberately kept
         # out of ``notices``/``notice_codes`` so a consumer classifying a
@@ -2940,6 +3097,191 @@ def rerun_failures(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+#: Stable prefixes of the gate-subject provenance lines ``run_tests.py``
+#: prints on **stderr** when ``--gate-commit`` is used (SA-0MVTRBT50005DUEH).
+#: The pre-push hook echoes the ``gate-*`` lines to the pusher and parses
+#: :data:`GATE_ROOT_PREFIX` to mirror the cache of the checkout the gate
+#: actually resolved — so the format is a contract with `.githooks/pre-push`.
+GATE_SUBJECT_PREFIX = "run_tests: gate-subject "
+GATE_ROOT_PREFIX = "run_tests: gate-root "
+GATE_VERDICT_PREFIX = "run_tests: gate-verdict "
+GATE_REFUSED_PREFIX = "run_tests: gate-refused "
+
+
+class GateSubjectError(RuntimeError):
+    """The pushed commit cannot be bound to a clean checkout it can be gated in.
+
+    Raised by :func:`resolve_gate_subject` when ``--gate-commit`` names a commit
+    that is not present locally, that no checkout holds, or whose only
+    candidate checkouts are dirty. The caller refuses the push (exit code 2)
+    instead of measuring a different tree.
+    """
+
+
+def _git_output(cwd: Path, *args: str) -> str | None:
+    """Run a read-only git command in *cwd*; ``None`` when it cannot answer.
+
+    Uses :func:`shared.git_sandbox.git_env_for_repo` so a leaked ``GIT_DIR`` /
+    ``GIT_WORK_TREE`` cannot make the subject resolution describe a different
+    repository (the same scrub the fingerprint uses).
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            env=git_env_for_repo(str(cwd)),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def parse_worktree_listing(output: str) -> list[tuple[Path, str]]:
+    """Return ``(path, HEAD)`` for each checkout in ``git worktree list --porcelain``.
+
+    A bare entry (``bare`` line, no ``HEAD``) is skipped: it has no working
+    tree to run a suite in. Order is git's own (the main checkout first), so a
+    deterministic candidate is picked without an arbitrary sort.
+    """
+    entries: list[tuple[Path, str]] = []
+    path: str | None = None
+    sha: str | None = None
+    for line in output.splitlines():
+        if line.startswith("worktree "):
+            if path and sha:
+                entries.append((Path(path), sha))
+            path, sha = line[len("worktree "):], None
+        elif line.startswith("HEAD "):
+            sha = line[len("HEAD "):].strip()
+    if path and sha:
+        entries.append((Path(path), sha))
+    return entries
+
+
+def resolve_gate_subject(
+    gate_commit: str, project_root: Path
+) -> tuple[Path, dict[str, Any]]:
+    """Resolve the pushed commit to a clean checkout the gate can measure.
+
+    The gate's verdict is only evidence about the pushed commit when the tree
+    it fingerprints *is* that commit with no dirty paths folded in
+    (SA-0MVTRBT50005DUEH). Candidates, in order:
+
+    1. *project_root* itself, when its ``HEAD`` is the pushed commit and it has
+       no dirty paths (the normal ``implement.py finish`` push from the
+       worktree that holds the commit — a cheap in-place run);
+    2. a checkout listed by ``git worktree list`` whose ``HEAD`` is the pushed
+       commit and which is clean (a manual push from a dirty main checkout
+       still gates the commit, in the pusher's own clean worktree);
+    3. otherwise refuse: :class:`GateSubjectError` naming the commit, every
+       candidate tried (and why it was rejected) and the escape hatch.
+
+    Materialising a throwaway detached worktree is deliberately *not* done: a
+    fresh checkout has no installed dependencies, so suite commands could fail
+    for reasons unrelated to the pushed tree.
+
+    Returns:
+        ``(root, evidence)`` where *root* is the checkout to run/cache against
+        and *evidence* carries ``pushed`` (full sha), ``root`` and ``checkout``
+        (``"in-place"`` or ``"worktree"``).
+
+    Raises:
+        GateSubjectError: when the commit is not present locally, or no clean
+            checkout holds it.
+    """
+    root = Path(project_root).resolve()
+    commit = (gate_commit or "").strip()
+    escape = (
+        "Set TEST_SCOPE_SKIP=1 to bypass the full-suite gate "
+        "(not recommended)."
+    )
+    if not re.fullmatch(r"[0-9a-fA-F]{4,40}", commit):
+        raise GateSubjectError(
+            f"--gate-commit expects a git commit sha, got {gate_commit!r}. {escape}"
+        )
+
+    full = (
+        _git_output(root, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}")
+        or ""
+    ).strip()
+    if not full:
+        raise GateSubjectError(
+            f"pushed commit {commit[:12]} is not present in this repository, so it "
+            f"cannot be gated locally (fetch it and retry from a checkout that "
+            f"holds it). {escape}"
+        )
+
+    rejected: list[str] = []
+    head = (_git_output(root, "rev-parse", "HEAD") or "").strip()
+    if head == full:
+        if is_worktree_clean(root):
+            return root, {"pushed": full, "root": str(root), "checkout": "in-place"}
+        rejected.append(f"{root} (HEAD matches, but the checkout has uncommitted changes)")
+    else:
+        rejected.append(f"{root} (HEAD is {head[:12] or 'unknown'})")
+
+    listing = _git_output(root, "worktree", "list", "--porcelain") or ""
+    for candidate, candidate_head in parse_worktree_listing(listing):
+        if candidate_head != full or candidate.resolve() == root:
+            continue
+        if not candidate.is_dir():
+            rejected.append(f"{candidate} (HEAD matches, but the checkout is missing)")
+            continue
+        if is_worktree_clean(candidate):
+            return candidate.resolve(), {
+                "pushed": full,
+                "root": str(candidate.resolve()),
+                "checkout": "worktree",
+            }
+        rejected.append(
+            f"{candidate} (HEAD matches, but the checkout has uncommitted changes)"
+        )
+
+    tried = "; ".join(rejected) if rejected else "no checkout of this repository holds it"
+    raise GateSubjectError(
+        f"no clean checkout holds pushed commit {full[:12]}: {tried}. The full-suite "
+        "gate only measures a checkout of the pushed commit, so it refuses instead "
+        f"of reporting a verdict about a different tree. {escape}"
+    )
+
+
+def _emit_gate_subject(evidence: dict[str, Any]) -> None:
+    """Print the state about to be validated (AC3 provenance), one fact per line.
+
+    The root goes on its own line so a path containing spaces survives the
+    hook's parse (`.githooks/pre-push` takes the rest of the line verbatim).
+    """
+    print(
+        f"{GATE_SUBJECT_PREFIX}pushed={evidence['pushed']} "
+        f"checkout={evidence['checkout']} fingerprint_kind=worktree",
+        file=sys.stderr,
+    )
+    print(f"{GATE_ROOT_PREFIX}{evidence['root']}", file=sys.stderr)
+
+
+def _emit_gate_verdict(evidence: dict[str, Any], result: dict[str, Any]) -> None:
+    """Print executed-vs-cached plus the cache state the verdict belongs to."""
+    try:
+        state = compute_git_state(evidence["root"], strict=True)
+    except GitStateUnavailable:
+        state = "unavailable"
+    entries = result.get("cache_entries") or []
+    kinds = sorted({entry.get("fingerprint_kind") or "" for entry in entries} - {""})
+    print(
+        f"{GATE_VERDICT_PREFIX}verdict={'cached' if result.get('cached') else 'executed'} "
+        f"sha={evidence['pushed']} git_state={state} "
+        f"fingerprint_kind={','.join(kinds) or 'worktree'} "
+        f"entries={len(entries)} cached={len(entries)}",
+        file=sys.stderr,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3046,6 +3388,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Base branch for changed-file detection (default: origin/dev, "
         "falling back to local 'dev' then HEAD~1).",
+    )
+    parser.add_argument(
+        "--gate-commit",
+        default=None,
+        metavar="SHA",
+        help="Release-gate subject binding (SA-0MVTRBT50005DUEH): the commit "
+        "being pushed. The gate resolves a checkout whose HEAD is SHA with no "
+        "dirty paths (in place, else a clean `git worktree list` checkout) and "
+        "runs/caches the suite there, so a cache entry computed from any other "
+        "state can never satisfy it. Refuses (exit 2) when no clean checkout "
+        "holds SHA. Omitted: historical behaviour, unchanged.",
     )
     return parser
 
@@ -3293,6 +3646,27 @@ def guarded_run_all(
     return result
 
 
+def _prune_stale_roots_before_run() -> None:
+    """Prune stale pytest roots ahead of a full-scope run; never raises.
+
+    Delegates to the shared F1 helper
+    (:func:`shared.test_tmpdir.prune_stale_test_roots`, SA-0MW3EN72O005BMIP)
+    and logs the removed count and freed paths at INFO (SA-0MW3ENF32006BGN1
+    AC5). Fail-open (AC3): any error is caught, logged and swallowed, and the
+    run proceeds unchanged — a prune problem must never change the exit
+    status, cache entry or scope resolution.
+    """
+    try:
+        removed, reason = prune_stale_test_roots()
+    except Exception as exc:  # noqa: BLE001 - documented fail-open contract
+        LOG.warning("Stale pytest-root prune failed (%s); continuing", exc)
+        return
+    if removed:
+        LOG.info("Pruned %d stale pytest root(s): %s", removed, reason)
+    else:
+        LOG.debug("No stale pytest roots to prune (%s)", reason)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     suites = (args.suite,)
@@ -3335,6 +3709,23 @@ def main(argv: list[str] | None = None) -> int:
             for g in groups:
                 print(g)
         return 0
+
+    # --gate-commit: bind the gate to the pushed commit (SA-0MVTRBT50005DUEH)
+    # before anything is resolved from the tree. The resolved checkout replaces
+    # *project_root*, so every downstream step — command resolution, timeout,
+    # suite execution and the cache key — describes the pushed commit rather
+    # than whichever checkout git happened to run the hook in. A subject that
+    # cannot be bound fails closed (exit 2, nothing executes).
+    gate_evidence: dict[str, Any] | None = None
+    if args.gate_commit:
+        try:
+            project_root, gate_evidence = resolve_gate_subject(
+                args.gate_commit, project_root
+            )
+        except GateSubjectError as exc:
+            print(f"{GATE_REFUSED_PREFIX}{exc}", file=sys.stderr)
+            return 2
+        _emit_gate_subject(gate_evidence)
 
     # --group: validate group name and route to group-based execution
     group_name = args.group
@@ -3467,6 +3858,9 @@ def main(argv: list[str] | None = None) -> int:
             test_type=test_type,
             group=group_name,
         )
+
+        if gate_evidence is not None:
+            _emit_gate_verdict(gate_evidence, result)
 
         if args.rerun_failures and result["failures"]:
             with Timer("rerun_failures"):

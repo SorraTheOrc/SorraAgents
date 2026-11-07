@@ -108,6 +108,14 @@ Startup static-context budget (bytes / tokens):
 > canonical, deterministic measurement; subsequent features (F2–F6) and the
 > final verification gate use it exclusively.
 
+> **Assignee-release update (2026-11-03, SA-0MW0F91KN004J06U):** the canonical
+> [Assignee release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)
+> section was widened to state that **any non-producer claim** is released on
+> a terminal outcome and to name the session backstop and the TTL-bounded
+> stale-claim reaper. That added 880 B to `AGENTS_GLOBAL.md` (14,346 B →
+> 15,226 B; total 19,970 B → 20,850 B); the committed thresholds below pin the
+> new approved budget.
+
 ## Thresholds / regression gate
 
 `docs/dev/context-budget.thresholds.json` ships the committed regression gate
@@ -116,10 +124,10 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 14346,
-  "project_agents": 3285,
+  "global_agents": 15843,
+  "project_agents": 3875,
   "skills_prose": 2339,
-  "total": 19970
+  "total": 22057
 }
 ```
 
@@ -232,6 +240,15 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > link returns, so the thresholds were regenerated to the accepted surface
 > rather than compacting normative wording.
 >
+> **Impact completion convention bump (2026-11-07, SA-0MW6EUWCF005W16Z):**
+> the `## Impact` work-item completion convention added ~617 B to
+> `AGENTS_GLOBAL.md` (`global_agents 15226` → `15843`) and ~590 B to
+> `AGENTS.md` (`project_agents 3285` → `3875`; `skills_prose` unchanged;
+> `total 20850` → `22057`). The addition is deliberate completion guidance —
+> the standup report quotes each item's `## Impact` sentence — so the
+> thresholds were regenerated to the new measured surface rather than
+> compacting the convention.
+>
 > ### Enforcement (committed gate)
 >
 > The regression gate is enforced in two places:
@@ -245,6 +262,19 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 >    drives the hook end-to-end with a simulated `dev` push and asserts that a
 >    threshold exceed blocks the push. Both run on every test-suite execution,
 >    so CI and pre-`in_review` runs fail on regression.
+>
+> **Subject of the gate:** the context-budget gate's subject is the pushed
+> commit (`run_tests.py --gate-commit`). `implement.py finish` pushes from the
+> **worktree** that holds the pushed commit (SA-0MVTFMB7K002Y1F3), so the gate
+> materialises and measures the pushed files, not a stale main checkout;
+> `finish` also fails closed (naming the commit, branch, worktree and actual
+> `HEAD`) when the worktree cannot hold the pushed commit, and its
+> `dev-push gate evidence` line records the resolved `root`/`head`/`pushed` and
+> whether the full-suite entry was `cached`, `executed` or `no-evidence`.
+> Because a worktree's test cache is private to it, the hook's
+> `mirror_suite_cache` copies its entries into the main checkout's
+> `.worklog/cache` so post-push verification and the audit skill (F3) still see
+> the pushed commit's green full-suite entry.
 >
 > The hook is only **active** when git dispatches to it. Two supported
 > mechanisms satisfy this: (a) `core.hooksPath` points at `.githooks`
@@ -292,7 +322,7 @@ committed per-project thresholds file
 
 | Project | Hook | `core.hooksPath` | Thresholds file |
 |---|---|---|---|
-| SorraAgents | v3 (context-budget gate + sync + branch policy + full-suite gate) | `.git/hooks` | `docs/dev/context-budget.thresholds.json` |
+| SorraAgents | v4 (context-budget gate + sync + branch policy + full-suite gate) | `.git/hooks` | `docs/dev/context-budget.thresholds.json` |
 | ContextHub | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |
 | dev-scripts | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |
 | llm-manager | v2 | `.githooks` | `docs/dev/context-budget.thresholds.json` |

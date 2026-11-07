@@ -317,7 +317,9 @@ class TestVerdictDrivenStatusLifecycle:
         """AC2: Ready to close: No → status=open, stage=plan_complete.
 
         Applies regardless of the pre-audit status (here: completed/in_review,
-        i.e. a failing re-audit demotes the item).
+        i.e. a failing re-audit demotes the item). An independent top-level
+        ``No`` also flags the item for producer review (SA-0MVR9B1UH002BUST
+        AC3).
         """
         updates = []
         self._run_issue(
@@ -328,7 +330,7 @@ class TestVerdictDrivenStatusLifecycle:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "open", "--stage", "plan_complete",
-            "--assignee", "", "--json",
+            "--assignee", "", "--needs-producer-review", "yes", "--json",
         ]
 
     def test_ready_no_moves_open_item_to_plan_complete(self):
@@ -342,7 +344,7 @@ class TestVerdictDrivenStatusLifecycle:
         assert self._last_update(updates) == [
             "wl", "update", "TEST-1",
             "--status", "open", "--stage", "plan_complete",
-            "--assignee", "", "--json",
+            "--assignee", "", "--needs-producer-review", "yes", "--json",
         ]
 
     # ------------------------------------------------------------------

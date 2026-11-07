@@ -1468,9 +1468,229 @@ class TestFullSuiteCacheClassification:
         assert sha is None
         mock_q.assert_not_called()
 
+
+class TestHerdrSuiteEvidence:
+    """Herdr package-suite cache evidence (WL-0MVHP5NTU009PA3I AC1/AC2).
+
+    The audit consults the ``herdr`` / ``group:herdr`` cache entries for an
+    item whose resolved touched files include ``packages/herdr/**``. A green
+    cached herdr run injects a HERDR SUITE GREEN RUN block; the block never
+    claims to satisfy the full-suite AC, and the full-suite classifier stays
+    untouched (a herdr entry is never full-suite evidence).
+    """
+
+    HERDR_CMD = "npm --silent test -- packages/herdr/src"
+    HERDR_FILE = "packages/herdr/src/foo.test.ts"
+
+    def _candidates(self, *test_types: str) -> list[tuple[str, list[str]]]:
+        return [(test_type, [self.HERDR_CMD]) for test_type in test_types]
+
+    def test_touches_herdr_suite_matches_only_packages_herdr(self):
+        """AC1: only a packages/herdr/** path makes herdr evidence applicable."""
+        assert audit_runner._touches_herdr_suite([self.HERDR_FILE])
+        assert audit_runner._touches_herdr_suite(
+            ["README.md", "packages/herdr/src/a.ts"]
+        )
+        assert not audit_runner._touches_herdr_suite(
+            ["packages/tui/extensions/x.ts"]
+        )
+        assert not audit_runner._touches_herdr_suite(None)
+        assert not audit_runner._touches_herdr_suite([])
+        # A lookalike sibling prefix must not match.
+        assert not audit_runner._touches_herdr_suite(["packages/herdr-tools/x.ts"])
+
+    def test_not_applicable_never_queries_cache(self, tmp_path):
+        """AC1: a non-herdr item never consults the herdr cache."""
+        with mock.patch.object(audit_runner, "query_cached") as mock_q:
+            status, sha, problems, keys = audit_runner._classify_herdr_suite_cache(
+                _green_run_git_runner(), ["src/main.ts"], cwd=str(tmp_path),
+            )
+        assert status == "not_applicable"
+        assert sha is None
+        assert problems == []
+        assert keys == []
+        mock_q.assert_not_called()
+
+    def test_green_herdr_type_entry_yields_evidence(self, tmp_path):
+        """AC1: a green `herdr` type entry auto-verifies herdr evidence."""
+        with mock.patch.object(
+            audit_runner, "_resolve_herdr_suite_commands",
+            return_value=self._candidates("herdr"),
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY,
+        ) as mock_q:
+            block, sha, status = audit_runner._auto_herdr_green_run_outcome(
+                _green_run_git_runner(), [self.HERDR_FILE], cwd=str(tmp_path),
+            )
+        assert status == "green"
+        assert sha == _GREEN_RUN_HEAD
+        assert block is not None
+        assert "HERDR SUITE GREEN RUN" in block
+        assert _GREEN_RUN_HEAD in block
+        assert "`herdr`" in block
+        assert mock_q.call_args.kwargs["test_type"] == "herdr"
+        assert (
+            mock_q.call_args.kwargs["ttl"]
+            == audit_runner.AUDIT_CACHE_TTL_SECONDS
+        )
+
+    def test_green_group_herdr_entry_yields_evidence(self, tmp_path):
+        """AC1: a green `group:herdr` entry also auto-verifies herdr evidence."""
+        with mock.patch.object(
+            audit_runner, "_resolve_herdr_suite_commands",
+            return_value=self._candidates("group:herdr"),
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY,
+        ) as mock_q:
+            block, sha, status = audit_runner._auto_herdr_green_run_outcome(
+                _green_run_git_runner(), [self.HERDR_FILE], cwd=str(tmp_path),
+            )
+        assert status == "green"
+        assert sha == _GREEN_RUN_HEAD
+        assert block is not None
+        assert "`group:herdr`" in block
+        assert mock_q.call_args.kwargs["test_type"] == "group:herdr"
+
+    def test_one_green_key_suffices_when_other_is_missing(self, tmp_path):
+        """AC1: either independent cache key is acceptable herdr evidence."""
+        def _side_effect(command, **kwargs):
+            return (
+                _AUTO_GREEN_ENTRY
+                if kwargs.get("test_type") == "herdr"
+                else None
+            )
+
+        with mock.patch.object(
+            audit_runner, "_resolve_herdr_suite_commands",
+            return_value=self._candidates("herdr", "group:herdr"),
+        ), mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            status, sha, problems, keys = audit_runner._classify_herdr_suite_cache(
+                _green_run_git_runner(), [self.HERDR_FILE], cwd=str(tmp_path),
+            )
+        assert status == "green"
+        assert sha == _GREEN_RUN_HEAD
+        assert keys == ["herdr"]
+
+    def test_herdr_block_never_claims_to_satisfy_full_suite(self, tmp_path):
+        """AC2: the injected block explicitly disclaims the full-suite AC."""
+        with mock.patch.object(
+            audit_runner, "_resolve_herdr_suite_commands",
+            return_value=self._candidates("herdr"),
+        ), mock.patch.object(
+            audit_runner, "query_cached", return_value=_AUTO_GREEN_ENTRY,
+        ):
+            block, _, _ = audit_runner._auto_herdr_green_run_outcome(
+                _green_run_git_runner(), [self.HERDR_FILE], cwd=str(tmp_path),
+            )
+        assert block is not None
+        assert "does NOT satisfy a 'full test suite passes' criterion" in block
+        assert "type 'full', scope 'full'" in block
+
+    def test_herdr_entry_never_satisfies_full_suite(self, tmp_path):
+        """AC2: the full-suite classifier only accepts a `full` cache key."""
+        _with_pytest_config(tmp_path)
+        _make_suite_dirs(tmp_path)
+
+        def _side_effect(command, **kwargs):
+            # A green entry exists ONLY under the herdr key.
+            if kwargs.get("test_type") in (None, "full"):
+                return None
+            return _AUTO_GREEN_ENTRY
+
+        with mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
+            status, _, _ = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == "miss"
+
+    def test_missing_herdr_entry_no_evidence(self, tmp_path, capsys):
+        """Fail-closed: a herdr cache miss yields no evidence and a diagnostic."""
+        with mock.patch.object(
+            audit_runner, "_resolve_herdr_suite_commands",
+            return_value=self._candidates("herdr", "group:herdr"),
+        ), mock.patch.object(audit_runner, "query_cached", return_value=None):
+            block, sha, status = audit_runner._auto_herdr_green_run_outcome(
+                _green_run_git_runner(), [self.HERDR_FILE], cwd=str(tmp_path),
+            )
+        assert status == "miss"
+        assert block is None
+        assert sha is None
+        err = capsys.readouterr().err
+        assert "Automatic herdr suite verification unavailable" in err
+        assert "--type herdr" in err
+
+    def test_red_herdr_entry_no_evidence(self, tmp_path):
+        """Fail-closed: a non-zero cached herdr run is never green evidence."""
+        red = dict(_AUTO_GREEN_ENTRY, exit_code=2)
+        with mock.patch.object(
+            audit_runner, "_resolve_herdr_suite_commands",
+            return_value=self._candidates("herdr"),
+        ), mock.patch.object(audit_runner, "query_cached", return_value=red):
+            block, sha, status = audit_runner._auto_herdr_green_run_outcome(
+                _green_run_git_runner(), [self.HERDR_FILE], cwd=str(tmp_path),
+            )
+        assert status == "red"
+        assert block is None
+        assert sha is None
+
+    def test_changed_scope_herdr_entry_rejected(self, tmp_path):
+        """A changed-scope herdr entry is not full-scope evidence."""
+        changed = dict(_AUTO_GREEN_ENTRY, scope="changed")
+        with mock.patch.object(
+            audit_runner, "_resolve_herdr_suite_commands",
+            return_value=self._candidates("herdr"),
+        ), mock.patch.object(audit_runner, "query_cached", return_value=changed):
+            status, _, problems, keys = audit_runner._classify_herdr_suite_cache(
+                _green_run_git_runner(), [self.HERDR_FILE], cwd=str(tmp_path),
+            )
+        assert status == "miss"
+        assert keys == []
+        assert any("changed-scope" in p for p in problems)
+
+    def test_no_herdr_profile_no_evidence(self, tmp_path):
+        """Herdr-touching but no profile defined → 'empty' (fail-open)."""
+        with mock.patch.object(
+            audit_runner, "_resolve_herdr_suite_commands", return_value=[]
+        ):
+            status, sha, problems, keys = audit_runner._classify_herdr_suite_cache(
+                _green_run_git_runner(), [self.HERDR_FILE], cwd=str(tmp_path),
+            )
+        assert status == "empty"
+        assert sha == _GREEN_RUN_HEAD
+        assert keys == []
+        assert problems
+
+    def test_error_when_head_unresolvable(self, tmp_path):
+        """Fail-closed: an unresolvable HEAD means no herdr evidence."""
+        with mock.patch.object(audit_runner, "query_cached") as mock_q:
+            status, sha, _, _ = audit_runner._classify_herdr_suite_cache(
+                _green_run_git_runner(head_sha=None),
+                [self.HERDR_FILE], cwd=str(tmp_path),
+            )
+        assert status == "error"
+        assert sha is None
+        mock_q.assert_not_called()
+
+    def test_cache_error_fail_closed(self, tmp_path, capsys):
+        """Fail-closed: a cache/infra error never crashes the audit."""
+        with mock.patch.object(
+            audit_runner, "_resolve_herdr_suite_commands",
+            return_value=self._candidates("herdr"),
+        ), mock.patch.object(
+            audit_runner, "query_cached", side_effect=RuntimeError("cache corrupt")
+        ):
+            block, sha, status = audit_runner._auto_herdr_green_run_outcome(
+                _green_run_git_runner(), [self.HERDR_FILE], cwd=str(tmp_path),
+            )
+        assert status == "error"
+        assert block is None
+        assert sha is None
+        err = capsys.readouterr().err
+        assert "cache corrupt" in err
+
+
 class TestEffectiveSuiteCommands:
     """Repo-aware command set (AC3): no phantom pytest for no-pytest repos.
-
     Pytest-suite detection is the shared ``repo_has_pytest_suite`` from the
     test skill runner (single source of truth, F2 AC4); the effective command
     set is ``full_suite_commands`` directly (F4, SA-0MSTN8CWM003AAU9:
@@ -2299,3 +2519,80 @@ class TestNestedSuiteRecursionGuard:
         err = capsys.readouterr().err
         assert "F3 auto-execution stand-down" in err
         assert "SA-0MUG47DYG006TV40" in err
+
+
+class TestStateChangedDuringRunAuditTriage:
+    """A moved-checkout command is reported, never triaged (SA-0MW3FF18I003KGZE AC4)."""
+
+    def _flagged_run(self, checkout: str = "/shared/checkout") -> dict:
+        """A ``run_cached`` result whose stdout would parse as failures."""
+        return {
+            "stdout": "FAILED tests/test_x.py::test_x - AssertionError\n"
+            "FAILED tests/test_y.py::test_y - AssertionError\n",
+            "stderr": "",
+            "exit_code": 75,
+            "completed_at": 1.0,
+            "command": "pytest -q",
+            "git_state": "",
+            "fingerprint_kind": "worktree",
+            "scope": "full",
+            "test_type": "full",
+            "interpreter": "",
+            "cached": False,
+            "state_changed_during_run": {
+                "notice_code": "state_changed_during_run",
+                "checkout": checkout,
+                "before_commit": "a" * 40,
+                "after_commit": "b" * 40,
+                "message": "checkout moved while the suite executed",
+            },
+        }
+
+    def test_flagged_command_is_not_triaged_and_fails_the_run(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        """No parse, no check_or_create, non-green, notice names movement."""
+        monkeypatch.setattr(
+            audit_runner, "full_suite_commands", lambda root: ["pytest -q"]
+        )
+        monkeypatch.setattr(
+            audit_runner, "run_cached", lambda *a, **k: self._flagged_run()
+        )
+        with mock.patch(
+            "triage.scripts.check_or_create.check_or_create"
+        ) as spied:
+            result = audit_runner._run_tests_via_test_skill(tmp_path)
+
+        spied.assert_not_called()
+        assert result["success"] is False
+        assert result["failures"] == []
+        assert result["state_changed_during_run"] == [
+            {**self._flagged_run()["state_changed_during_run"],
+             "suite_command": "pytest -q"}
+        ]
+        assert "state_changed_during_run" in result["notice"]
+        err = capsys.readouterr().err
+        assert "state_changed_during_run" in err
+        assert "/shared/checkout" in err
+
+    def test_stable_red_run_still_triages_failures(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Control: a stable red run keeps today's parse + triage behaviour."""
+        red = self._flagged_run()
+        red["exit_code"] = 1
+        red["state_changed_during_run"] = None
+        red["stdout"] = "FAILED tests/test_real.py::test_real - AssertionError\n"
+        monkeypatch.setattr(
+            audit_runner, "full_suite_commands", lambda root: ["pytest -q"]
+        )
+        monkeypatch.setattr(audit_runner, "run_cached", lambda *a, **k: red)
+        with mock.patch(
+            "triage.scripts.check_or_create.check_or_create"
+        ) as spied:
+            result = audit_runner._run_tests_via_test_skill(tmp_path)
+
+        assert spied.call_count == 1
+        assert result["failures"], "the real failure must still be parsed"
+        assert result["success"] is False
+        assert result["state_changed_during_run"] == []

@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# <!-- REFACTOR-SA-0MW0V3SJK006SV3F
+# smell: formatting
+# severity: low
+# description: Shebang is present but file is not executable
+# -->
+# <!-- REFACTOR-SA-0MW0UKRB5004PZNH
+# smell: simplification
+# severity: medium
+# description: Use a single `with` statement with multiple contexts instead of nested `with` statements
+# -->
 """Refactor orchestration script.
 
 Runs the refactor pipeline: file discovery → auto-fix → hybrid smell
@@ -26,7 +36,7 @@ Use `--no-sync` for offline/deterministic runs.
 Exit codes:
   0 – success (no smells or all handled)
   1 – error during execution
-"""  # noqa: EXE001
+"""
 
 from __future__ import annotations
 
@@ -50,6 +60,7 @@ from import_guard import guard_shared_import
 from scripts.failure_notice import FailureNotice
 
 try:
+    from shared.claim_release import signal_release
     from shared.project_name import resolve_project_name
     from shared.status_lifecycle import StatusLifecycle
     from shared.timing import Timer
@@ -727,7 +738,16 @@ def _build_pipeline_runner(args: argparse.Namespace) -> Callable[[], dict[str, A
             # restore_on_exit: this is a read-only analysis skill — the item's
             # status is restored to its pre-run value on exit (never advanced
             # to `completed`, which wl only allows for in_review/done stages).
-            with StatusLifecycle(args.work_item_id, restore_on_exit=True):
+            #
+            # signal_release is the session-end backstop for an interrupted
+            # run: a read-only analysis that is killed never reaches the
+            # lifecycle exit, so without it the item's claim (including the
+            # workflow pre-claim the run did not set itself) survives the
+            # session (SA-0MW0F91KN004J06U).
+            with (
+                signal_release(args.work_item_id, reason="refactor-signal"),
+                StatusLifecycle(args.work_item_id, restore_on_exit=True),
+            ):
                 return _run()
         return _wrapped
 

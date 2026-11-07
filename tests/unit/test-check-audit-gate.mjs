@@ -246,6 +246,144 @@ describe('isTimeoutOrTransientAudit', () => {
 });
 
 // ---------------------------------------------------------------------------
+// getAuditStatus / isTimeoutOrTransientAudit — transient classification markers
+// (C1, WL-0MW32Y8E90092TIM: verdict-assembly / verdict-persistence failures
+// must be distinguishable from a genuine "not ready to close" verdict).
+// Red against current HEAD; green after C2 (WL-0MW32YQ29001ZN66) adds the
+// classification-token pattern and the runner-marker parity patterns.
+// ---------------------------------------------------------------------------
+describe('getAuditStatus - transient classification markers (C1)', () => {
+  const markerCases = [
+    {
+      name: 'persistence-failure classification marker',
+      marker: 'Audit classification: transient (verdict_persistence_failure)',
+    },
+    {
+      name: 'assembly-failure (timeout) classification marker',
+      marker: 'Audit classification: transient (verdict_assembly_failure: timeout)',
+    },
+    {
+      name: 'assembly-failure (provider error) classification marker',
+      marker: 'Audit classification: transient (verdict_assembly_failure: provider_error)',
+    },
+    {
+      name: 'assembly-failure (unparseable output) classification marker',
+      marker: 'Audit classification: transient (verdict_assembly_failure: unparseable_output)',
+    },
+    {
+      name: 'assembly-failure (concurrency cap) classification marker',
+      marker: 'Audit classification: transient (verdict_assembly_failure: concurrency_cap)',
+    },
+    {
+      name: 'unparseable-output descriptor',
+      marker: 'Pi model output could not be parsed',
+    },
+    {
+      name: 'concurrency-cap descriptor',
+      marker: 'Audit concurrency limit reached',
+    },
+  ];
+
+  for (const { name, marker } of markerCases) {
+    test(`treats readyToClose:false with ${name} as transient non-blocking`, async () => {
+      const mod = await import(MODULE_PATH);
+      const auditData = {
+        success: true,
+        workItemId: 'SA-901',
+        audit: {
+          readyToClose: false,
+          summary: 'Some summary',
+          rawOutput: `Ready to close: No\n${marker}`,
+        },
+      };
+      const result = mod.getAuditStatus(
+        { id: 'SA-901', title: 'Transient classified item' },
+        auditData,
+      );
+      assert.equal(result.transient, true, `${name} must be flagged transient`);
+      assert.equal(result.isBlocking, false, `${name} must not hard-block`);
+      // AC4: reported with a transient/remediable reason (re-audit
+      // recommended), never with the genuine-verdict reason.
+      assert.match(result.reason, /re-audit recommended/i);
+      assert.notEqual(result.reason, 'Audit verdict: not ready to close');
+    });
+  }
+
+  test('treats the persistence classification in summary (no rawOutput) as transient', async () => {
+    const mod = await import(MODULE_PATH);
+    const auditData = {
+      success: true,
+      workItemId: 'SA-902',
+      audit: {
+        readyToClose: false,
+        summary: 'Audit result persisted; transient (verdict_persistence_failure)',
+        rawOutput: null,
+      },
+    };
+    const result = mod.getAuditStatus(
+      { id: 'SA-902', title: 'Summary persistence marker' },
+      auditData,
+    );
+    assert.equal(result.transient, true);
+    assert.equal(result.isBlocking, false);
+  });
+
+  test('genuine not-ready report without a transient marker still blocks', async () => {
+    const mod = await import(MODULE_PATH);
+    const auditData = {
+      success: true,
+      workItemId: 'SA-903',
+      audit: {
+        readyToClose: false,
+        summary: '2 of 3 acceptance criteria not met.',
+        rawOutput: 'Ready to close: No\n\n2 of 3 acceptance criteria for work item SA-903 are not met.',
+      },
+    };
+    const result = mod.getAuditStatus(
+      { id: 'SA-903', title: 'Genuinely Not Ready' },
+      auditData,
+    );
+    assert.equal(result.isBlocking, true, 'genuine not-ready audit should hard-block');
+    assert.equal(result.transient, false);
+    assert.equal(result.reason, 'Audit verdict: not ready to close');
+  });
+});
+
+describe('isTimeoutOrTransientAudit - classification markers (C1)', () => {
+  test('detects the persistence-failure classification marker in rawOutput', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({
+        rawOutput: 'Ready to close: No\nAudit classification: transient (verdict_persistence_failure)',
+      }),
+      true,
+    );
+  });
+
+  test('detects the assembly-failure classification marker in rawOutput', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({
+        rawOutput: 'Ready to close: No\nAudit classification: transient (verdict_assembly_failure: provider_error)',
+      }),
+      true,
+    );
+  });
+
+  test('detects the runner infra markers (parity with _INFRA_FALLBACK_MARKERS)', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({ rawOutput: 'Pi model output could not be parsed.' }),
+      true,
+    );
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({ rawOutput: 'Audit concurrency limit reached.' }),
+      true,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // getAuditStatus / checkAuditReadyToClose — staleness awareness
 // (SA-0MUOO5UEB008RXBP: Step 2 must share the Step-3.7 staleness semantics;
 // a stale failing verdict must not hard-block the release)
@@ -1247,6 +1385,77 @@ describe('checkAuditReadyToClose - remediation runner failure', () => {
     assert.equal(report.hasBlockingItems, true);
     assert.equal(report.blockingItems.length, 1);
     assert.match(report.blockingItems[0].reason, /Failed to re-check audit after remediation/);
+  });
+});
+
+describe('checkAuditReadyToClose - remediation timeout clamped to the remaining budget (WL-0MW32YZP7005LZ5B)', () => {
+  const ITEM = {
+    id: 'SA-TO',
+    title: 'Timeout Item',
+    needsProducerReview: false,
+    parentId: null,
+    updatedAt: '2026-09-04T10:00:00Z',
+  };
+
+  function runWithBudget(mod, createBudget) {
+    const seen = [];
+    let shows = 0;
+    return mod.checkAuditReadyToClose({
+      getCandidateItemsFn: () => [ITEM],
+      runAuditShow: () => {
+        shows += 1;
+        return shows === 1
+          ? JSON.stringify({ audit: null })
+          : JSON.stringify({
+            audit: { readyToClose: true, auditedAt: '2999-09-05T11:00:00Z' },
+          });
+      },
+      runAuditCommand: (path, id, timeoutMs) => {
+        seen.push({ path, id, timeoutMs });
+        return 'ok';
+      },
+      resolveAuditRunnerFn: () => '/tmp/fake-audit_runner.py',
+      createRemediationBudgetFn: createBudget,
+    }).then((report) => ({ report, seen }));
+  }
+
+  test('the per-item runner timeout is clamped to the budget remaining', async () => {
+    const mod = await import(MODULE_PATH);
+    const budgetMod = await import(
+      join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js')
+    );
+    // 60 s of budget left against a 29 min per-item default: the attempt must
+    // be clamped down to what is left, never allowed to overrun the budget
+    // (the 1865s-of-1800s incident).
+    const { report, seen } = await runWithBudget(
+      mod,
+      () => new budgetMod.RemediationBudget({ budgetMs: 60_000, maxItems: 5, now: () => 0 }),
+    );
+
+    assert.equal(seen.length, 1, 'one remediation attempt is made');
+    assert.equal(seen[0].timeoutMs, 60_000, 'timeout clamped to the remaining budget');
+    assert.equal(report.remediatedItems.length, 1);
+  });
+
+  test('a fresh budget passes the full per-item timeout, which is below the total budget', async () => {
+    const mod = await import(MODULE_PATH);
+    const budgetMod = await import(
+      join(REPO_ROOT, 'skill', 'ship', 'scripts', 'audit-remediation.js')
+    );
+    const { seen } = await runWithBudget(
+      mod,
+      () => new budgetMod.RemediationBudget({
+        budgetMs: budgetMod.DEFAULT_REMEDIATION_BUDGET_MS,
+        maxItems: 5,
+        now: () => 0,
+      }),
+    );
+
+    assert.ok(
+      budgetMod.DEFAULT_REMEDIATION_TIMEOUT_MS < budgetMod.DEFAULT_REMEDIATION_BUDGET_MS,
+      'the default per-item timeout must be smaller than the total budget',
+    );
+    assert.equal(seen[0].timeoutMs, budgetMod.DEFAULT_REMEDIATION_TIMEOUT_MS);
   });
 });
 

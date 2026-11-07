@@ -1,5 +1,5 @@
 #!/bin/sh
-# worklog:pre-push-hook:v3
+# worklog:pre-push-hook:v4
 # 1. Auto-sync Worklog data before pushing (committed hooks).
 # 2. Enforce branch naming policy: block pushes to protected branches.
 # 3. Context-budget regression gate (F6, SA-0MSLK7XNZ00366YY): fail the push
@@ -8,6 +8,16 @@
 #    pushing to refs/heads/dev|main; feature-branch pushes skip tests
 #    (implementation validated changed-scope only; the full suite first runs
 #    at this dev-push integration gate — SA-0MVECQUGF0064U81).
+# 4a. Pushed-commit subject (SA-0MVTRBT50005DUEH): the gate is evidence about
+#    the commit it pushes, never about whichever tree the hook happens to run
+#    in. The pushed <local_sha> is forwarded as `run_tests.py --gate-commit`,
+#    which resolves a checkout whose HEAD is that commit with no dirty paths
+#    (in place, else a clean `git worktree list` checkout) and runs/caches the
+#    suite there. When no clean checkout holds the commit the push is refused
+#    (fail closed) instead of reporting a verdict about a different tree. The
+#    runner emits `run_tests: gate-*` provenance lines on stderr; the hook
+#    echoes them and mirrors the resolved checkout's cache into the main
+#    checkout so post-push verification and the audit can read it.
 #
 # Set WORKLOG_SKIP_PRE_PUSH=1 to bypass worklog sync.
 # Set BRANCH_POLICY_SKIP=1 to bypass branch policy check (not recommended).
@@ -71,29 +81,210 @@ fi
 #   <local_ref> <local_sha> <remote_ref> <remote_sha>
 # Read every line ONCE (stdin is consumed by the first reader) and capture
 # the push targets used by both the test gate and the worklog sync below.
+#
+# For the gated refs (dev/main) the pushed commit is retained too: it is the
+# gate's subject (`--gate-commit`, SA-0MVTRBT50005DUEH). Deletion pushes carry
+# the all-zero sha — there is no commit to gate — and are not recorded.
 need_full_suite=0
 skip_worklog_sync=0
-while read local_ref local_sha remote_ref remote_sha; do
+gated_ref_shas=""
+while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "$remote_ref" ] || continue
   case "$remote_ref" in
-    refs/heads/dev|refs/heads/main) need_full_suite=1 ;;
+    refs/heads/dev|refs/heads/main)
+      need_full_suite=1
+      case "$local_sha" in
+        ''|*[!0]*) gated_ref_shas="$gated_ref_shas $remote_ref=$local_sha" ;;
+      esac
+      ;;
     refs/worklog/data) skip_worklog_sync=1 ;;
   esac
 done
 
+# Mirror the test-runner cache entries a worktree gate run wrote into the main
+# checkout's cache (SA-0MVTFMB7K002Y1F3 cache-compatibility constraint).
+# ``implement.py finish`` now pushes from the linked worktree holding the
+# pushed commit, so ``run_tests.py`` caches per git state under the worktree's
+# cache (``<worktree>/.worklog/cache``, else ``<git-dir>/test-cache``) —
+# invisible to the main checkout's post-push verification and the audit skill
+# (F3), which read ``<main>/.worklog/cache``. Keys are content-addressed
+# (command + git state), so copying an entry the main cache lacks is always
+# safe: an identical key is an identical run. Fail-soft — cache plumbing must
+# never decide a push.
+mirror_suite_cache() {
+  wt_root="$1"
+  git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null || true)"
+  [ -n "$git_dir" ] && [ -d "$git_dir" ] || return 0
+  if [ -d "$wt_root/.worklog" ]; then
+    wt_cache="$wt_root/.worklog/cache"
+  else
+    wt_cache="$git_dir/test-cache"
+  fi
+  [ -d "$wt_cache" ] && [ -n "$(ls -A "$wt_cache" 2>/dev/null)" ] || return 0
+  common_dir="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+  case "$common_dir" in
+    /*) main_git_dir="$common_dir" ;;
+    *) main_git_dir="$(cd "$wt_root" && pwd)/$common_dir" ;;
+  esac
+  main_root="$(dirname "$main_git_dir")"
+  [ "$main_root" != "$wt_root" ] || return 0
+  main_cache="$main_root/.worklog/cache"
+  [ -d "$main_cache" ] || return 0
+  for entry in "$wt_cache"/*; do
+    [ -d "$entry" ] || continue
+    name="$(basename "$entry")"
+    [ -e "$main_cache/$name" ] && continue
+    if cp -a "$entry" "$main_cache/$name" 2>/dev/null; then
+      echo "pre-push: mirrored gate cache entry $name into $main_root/.worklog/cache" >&2
+    else
+      echo "pre-push: warning: could not mirror cache entry $name into $main_root/.worklog/cache" >&2
+    fi
+  done
+  return 0
+}
+
 # Full-suite gate for pushes targeting dev/main (release gates). Partial
-# runs are never full-suite evidence, so the gate always runs scope=full.
+# runs are never full-suite evidence, so the gate always runs scope=full, and
+# it is bound to the pushed commit: `--gate-commit <sha>` makes the runner
+# resolve (and cache against) a clean checkout of exactly that commit, or
+# refuse. See the header note 4a (SA-0MVTRBT50005DUEH).
 if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
   repo_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   runner="$repo_root/skill/test/scripts/run_tests.py"
+
+  # One suite can evidence one commit. A push carrying several different
+  # dev/main commits would need a run per commit (the gate must not run more
+  # than one full suite), so refuse and let the pusher split the push.
+  gate_commit=""
+  for entry in $gated_ref_shas; do
+    entry_sha="${entry#*=}"
+    if [ -z "$gate_commit" ]; then
+      gate_commit="$entry_sha"
+    elif [ "$gate_commit" != "$entry_sha" ]; then
+      {
+        echo "ERROR: pre-push gate cannot evidence one suite for several pushed commits."
+        echo "  pushed:"
+        for ref_entry in $gated_ref_shas; do
+          echo "    ${ref_entry%%=*} ${ref_entry#*=}"
+        done
+        echo "  The full-suite gate runs at most one suite and binds it to one commit."
+        echo "  Recovery: push the dev/main refs one at a time (one commit per push)."
+        echo "  Escape hatch (explicit, not recommended): TEST_SCOPE_SKIP=1 or git push --no-verify."
+      } >&2
+      exit 1
+    fi
+  done
+
   if [ -n "$repo_root" ] && [ -f "$runner" ]; then
-    echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full --strict-git-env" >&2
-    if python3 "$runner" --scope full --strict-git-env --json >/dev/null 2>&1; then
-      echo "pre-push: full suite green (cached runs make repeat pushes cheap)" >&2
+    gate_err="$(mktemp 2>/dev/null || echo "/tmp/pre-push-gate.$$")"
+    gate_out="$(mktemp 2>/dev/null || echo "/tmp/pre-push-gate-out.$$")"
+    # `set -e` is disabled for commands in an `if` condition: the gate's own
+    # non-zero exit is a verdict, not a hook failure, so it is classified below.
+    if [ -n "$gate_commit" ]; then
+      echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full --strict-git-env --gate-commit $gate_commit" >&2
+      if python3 "$runner" --scope full --strict-git-env --json \
+        --project-root "$repo_root" --gate-commit "$gate_commit" \
+        >"$gate_out" 2>"$gate_err"; then
+        gate_status=0
+      else
+        gate_status=$?
+      fi
     else
-      echo "ERROR: Full test suite failed — pushes to dev/main require a green suite." >&2
-      echo "  Run: python3 \"$runner\" --scope full  (or implement.py finish) and fix failures." >&2
+      echo "pre-push: full-suite gate for dev/main push — running run_tests.py --scope full --strict-git-env" >&2
+      if python3 "$runner" --scope full --strict-git-env --json \
+        --project-root "$repo_root" >"$gate_out" 2>"$gate_err"; then
+        gate_status=0
+      else
+        gate_status=$?
+      fi
+    fi
+    # Surface the runner's gate provenance/refusal lines to the pusher: which
+    # state was validated, and executed-vs-cached (AC3).
+    grep '^run_tests: gate-' "$gate_err" >&2 || true
+    if [ "$gate_status" -eq 0 ]; then
+      echo "pre-push: full suite green (cached runs make repeat pushes cheap)" >&2
+      # Mirror the cache of the checkout the gate actually resolved (it may be
+      # a worktree other than this one) into the main checkout's cache.
+      gate_root="$(sed -n 's/^run_tests: gate-root //p' "$gate_err" | head -1)"
+      mirror_suite_cache "${gate_root:-$repo_root}"
+      rm -f "$gate_err" "$gate_out"
+    else
+      # AC3: classify the failure from the runner's machine-readable result so
+      # the pusher is told *why* — no free slot, timeout, killed/unparsed run
+      # versus a genuine red suite — and `implement.py finish` can report the
+      # stable `gate_reason=<code>` line. Never fail open: every path exits 1.
+      # AC4: the shared classifier is resolved through a tiered search order —
+      # repo-local first (the runner's own directory), then the installed
+      # global skill ($HOME/.pi/agent/skills/...), mirroring the release
+      # gate's run_tests.py resolution. When no tier holds an importable copy
+      # the failure is conservatively reported as infrastructure, never
+      # fail-open and never a guessed reason.
+      classifier_dirs="$(dirname "$runner")"
+      if [ -d "$HOME/.pi/agent/skills/test/scripts" ]; then
+        classifier_dirs="$classifier_dirs $HOME/.pi/agent/skills/test/scripts"
+      fi
+      gate_diag=""
+      if ! gate_diag="$(python3 - "$gate_out" "$gate_err" "$classifier_dirs" <<'PY'
+import json
+import sys
+
+out_path, err_path, classifier_dirs = sys.argv[1], sys.argv[2], sys.argv[3]
+# Repo-local tier first: sys.path is searched in order, so a repo copy wins
+# over the installed global-skill copy when both exist (AC4).
+sys.path[:0] = [d for d in classifier_dirs.split() if d]
+try:
+    from gate_reason import classify_gate_result, render_gate_diagnostic
+except Exception:  # classifier unavailable in every tier -> conservative infra
+    print("gate_reason=infrastructure")
+    print(
+        "ERROR: The gate failed and the reason classifier was unavailable — "
+        "treating the failure as infrastructure, not a test failure."
+    )
+    raise SystemExit(0)
+
+result = None
+try:
+    with open(out_path, encoding="utf-8") as handle:
+        result = json.load(handle)
+except (OSError, ValueError):
+    result = None
+
+if result is None:
+    try:
+        with open(err_path, encoding="utf-8") as handle:
+            err = handle.read()
+    except OSError:
+        err = ""
+    # A gate-subject refusal is an infrastructure condition, not a test
+    # failure: the gate refused to bind the pushed commit.
+    if "run_tests: gate-refused" in err or "not found" in err:
+        reason = "infrastructure"
+    else:
+        reason = "unknown"
+else:
+    reason = classify_gate_result(result)
+print(render_gate_diagnostic(reason, result))
+PY
+)"; then
+        gate_diag="gate_reason=infrastructure
+The gate failed and its machine-readable result could not be classified — treating the failure as infrastructure."
+      fi
+      # Preserve the historical message substance for an unclassifiable run
+      # (no structured reason available); classified infrastructure reasons
+      # get their own distinct diagnostic below (AC3).
+      case "$gate_diag" in
+        gate_reason=unknown*)
+          echo "ERROR: Full test suite failed — pushes to dev/main require a green suite." >&2
+          ;;
+      esac
+      printf '%s\n' "$gate_diag" >&2
+      if [ -n "$gate_commit" ]; then
+        echo "  gated commit: $gate_commit${gated_ref_shas:+ (from:$gated_ref_shas)}" >&2
+      fi
+      echo "  Run: python3 \"$runner\" --scope full  (or implement.py finish) and fix/retry." >&2
       echo "  Set TEST_SCOPE_SKIP=1 to bypass (not recommended)." >&2
+      tail -n 20 "$gate_err" | sed 's/^/    /' >&2 || true
+      rm -f "$gate_err" "$gate_out"
       exit 1
     fi
   else

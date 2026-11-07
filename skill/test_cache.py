@@ -43,6 +43,17 @@ module adds a caching layer so repeated verification is cheap:
 - **Correctness first**: a hit requires the git state to match AND the run to
   be within the TTL. Corrupt/unreadable entries degrade to a fresh run and
   never raise into the caller. ``force`` / ``no_cache`` bypass the cache.
+- **Mid-run checkout movement is quarantined** (SA-0MW3FF18I003KGZE): the
+  guarded checkout's own HEAD + tracked-tree content is snapshotted around
+  every executed run; when it moved mid-run (a concurrent ``finish``
+  fast-forward rewriting test files under a lazy-importing suite), the mixed
+  verdict is discarded — no entry is stored under either state, the run is
+  reported non-green with the distinct :data:`STATE_CHANGED_EXIT_CODE` (75,
+  ``EX_TEMPFAIL``) and a ``state_changed_during_run`` notice naming both
+  commits. Differences fully explained by the start-of-run working-tree
+  attribution (another session committing its own start-dirty WIP) never
+  flag a run; an unfingerprintable checkout is fail-closed and never
+  reported as movement.
 - **Read-only query mode**: ``query_cached()`` + ``summary_lines()`` return
   summary lines from a cached run without executing anything (used by the
   ``run_tests.py --summary`` flag and available to read-only consumers such as
@@ -113,7 +124,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from shared.git_sandbox import git_env_for_repo
+from shared.git_sandbox import (
+    compare_own_checkout_states,
+    git_env_for_repo,
+    snapshot_own_checkout,
+)
 from test_runner import (
     executable_test_command,
     is_pytest_command,
@@ -146,6 +161,17 @@ class GitStateUnavailable(RuntimeError):
 #: supplied would-be-commit tree SHA (:func:`compute_tree_state`).
 FINGERPRINT_KIND_WORKTREE = "worktree"
 FINGERPRINT_KIND_TREE = "tree"
+
+#: The distinct non-zero exit status a run whose guarded checkout moved
+#: mid-run is reported with (``EX_TEMPFAIL`` — temporary failure, retryable)
+#: (SA-0MW3FF18I003KGZE AC1). Exported so the runner and the finish gate share
+#: one constant and cannot drift.
+STATE_CHANGED_EXIT_CODE = 75
+
+#: Stable machine-readable notice code for a mid-run checkout move. Emitted as
+#: ``notice_code`` inside ``state_changed_during_run`` and by the runner's
+#: aggregate so gate classification and triage share one vocabulary.
+STATE_CHANGED_NOTICE_CODE = "state_changed_during_run"
 
 DEFAULT_TTL_SECONDS = 2 * 60 * 60  # 2 hours (operator decision)
 # Non-zero-exit runs get a much shorter TTL (SA-0MSJELL44009XYIL): a failed
@@ -430,6 +456,29 @@ def _update_with_path_content(
                 f"cannot read the dirty path {path} to fingerprint it ({exc})"
             ) from exc
         hasher.update(b"\0unreadable")
+
+
+def is_worktree_clean(cwd: str | Path) -> bool | None:
+    """Whether the checkout at *cwd* reports no dirty paths.
+
+    Cleanliness is evaluated with the same ``git status`` call
+    (:func:`_status_entries`, ``--untracked-files=all``) that
+    :func:`compute_git_state` fingerprints, so "clean" here means exactly "the
+    fingerprint is the commit's own state, with no dirty content folded in".
+    That is the property the pre-push gate needs to bind a verdict to a pushed
+    commit: a dirty checkout's fingerprint belongs to the dirty state, never to
+    the commit it happens to have checked out (SA-0MVTRBT50005DUEH).
+
+    Returns ``True`` when no path is dirty, ``False`` when at least one is, and
+    ``None`` when the state cannot be reported at all (corrupt/locked index, a
+    git timeout, a directory that is not a checkout). A caller that must not
+    accept a stale verdict treats ``None`` as "not clean" — fail closed.
+    """
+    try:
+        entries = _status_entries(str(Path(cwd).resolve()), strict=True)
+    except GitStateUnavailable:
+        return None
+    return not entries
 
 
 def _fingerprint_for_cache(cwd: str) -> str | None:
@@ -796,16 +845,62 @@ def run_cached(
         # command+state, so this only matters if command sets ever converge —
         # never serve a partial run as a full-suite result and vice versa).
         if hit is not None and hit.get("scope", "full") == scope:
-            return hit
+            return {**hit, "state_changed_during_run": None}
 
     normalized = normalize_test_command(command)
+    # Detect a mid-run checkout move by bracketing the runner with the guarded
+    # checkout's own state (HEAD + tracked-tree content, SA-0MW3FF18I003KGZE
+    # Q2 = b): a full-suite run started in a checkout that a concurrent
+    # ``implement.py finish`` fast-forwards executes the *new* test files
+    # against the *old* sources and reports failures that exist in neither
+    # tree. On movement the mixed verdict is quarantined — no cache entry under
+    # either state — and reported non-green with the distinct
+    # :data:`STATE_CHANGED_EXIT_CODE`. Differences fully explained by the
+    # start-of-run working-tree attribution (a sibling session committing work
+    # it had itself dirtied) are never flagged (AC3). An unfingerprintable
+    # checkout (``ok=False``) is never reported as movement (fail closed).
+    own_before = snapshot_own_checkout(cwd_str)
     proc = runner(normalized, cwd_str, timeout)
     completed_at = time.time()
+    own_after = snapshot_own_checkout(cwd_str)
+    movement = compare_own_checkout_states(own_before, own_after)
 
     # Record which interpreter actually ran pytest (metadata only; the cache
     # key is unchanged) so the choice is auditable after the fact
     # (SA-0MVK154IE007OS3D AC2). Non-pytest commands record an empty string.
     interpreter = resolve_pytest_executable() if is_pytest_command(normalized) else ""
+
+    if movement["moved"]:
+        checkpoint = movement["checkout"]
+        before_commit = movement["before_commit"]
+        after_commit = movement["after_commit"]
+        notice = {
+            "notice_code": STATE_CHANGED_NOTICE_CODE,
+            "checkout": checkpoint,
+            "before_commit": before_commit,
+            "after_commit": after_commit,
+            "message": (
+                f"checkout {checkpoint} changed while the test suite executed "
+                f"(HEAD {before_commit or '<none>'} -> "
+                f"{after_commit or '<none>'}); the mixed tree does not exist "
+                f"at any single commit, so the verdict is discarded — re-run "
+                f"the suite from a stable checkout."
+            ),
+        }
+        return {
+            "stdout": proc.stdout or "",
+            "stderr": proc.stderr or "",
+            "exit_code": STATE_CHANGED_EXIT_CODE,
+            "completed_at": completed_at,
+            "command": normalized,
+            "git_state": "",
+            "fingerprint_kind": fingerprint_kind,
+            "scope": scope,
+            "test_type": test_type,
+            "interpreter": interpreter,
+            "cached": False,
+            "state_changed_during_run": notice,
+        }
 
     git_state = git_state_before or ""
     if not no_cache:
@@ -863,6 +958,7 @@ def run_cached(
         "test_type": test_type,
         "interpreter": interpreter,
         "cached": False,
+        "state_changed_during_run": None,
     }
 
 
@@ -921,6 +1017,8 @@ __all__ = [
     "FAILED_RUN_TTL_SECONDS",
     "FINGERPRINT_KIND_TREE",
     "FINGERPRINT_KIND_WORKTREE",
+    "STATE_CHANGED_EXIT_CODE",
+    "STATE_CHANGED_NOTICE_CODE",
     "GitStateUnavailable",
     "cache_dir",
     "cache_key",

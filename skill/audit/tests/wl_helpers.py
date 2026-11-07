@@ -112,3 +112,52 @@ def make_stateful_runner(runner):
     """Wrap a plain-function runner (cmd -> CompletedProcess) with the same
     stateful behavior as :func:`stateful_wl_side_effect`."""
     return stateful_wl_side_effect(runner)
+
+
+#: Metadata line a real stored audit carries (kept in sync with
+#: ``audit_runner.AUDIT_CONTENT_FINGERPRINT_PREFIX``).
+AUDIT_CONTENT_FINGERPRINT_PREFIX = "Audit content fingerprint (v2): "
+
+
+def audit_show_response(*, ready_to_close: bool | None = None,
+                        fingerprint: str | None = None,
+                        audited_at: str = "2026-01-01T00:00:00.000Z",
+                        raw_output: str | None = None,
+                        work_item_id: str | None = None,
+                        returncode: int = 0,
+                        stderr: str = "") -> SimpleNamespace:
+    """Build a ``wl audit-show --json`` result for a mock runner.
+
+    Pre-audit audit-record knob for the producer-review rule
+    (SA-0MVR9B1UH002BUST): a test passes the stored *ready_to_close* verdict
+    and content *fingerprint* to model a producer-reviewed passing audit, or
+    ``ready_to_close=None`` (the default) to model "no prior audit".
+
+    The generated report text carries the v2 content-fingerprint metadata
+    line exactly as a real stored audit does, so
+    ``audit_runner._extract_content_fingerprint`` sees it. Pass *raw_output*
+    to model a legacy/manual report verbatim. *work_item_id* embeds the
+    audited item's id, which the persistence readback identity guard
+    requires.
+    """
+    audit = None
+    if ready_to_close is not None or raw_output is not None:
+        if raw_output is None:
+            lines = [
+                f"Ready to close: {'Yes' if ready_to_close else 'No'}",
+                "",
+            ]
+            if work_item_id:
+                lines.append(f"Audit report for work item {work_item_id}")
+            if fingerprint:
+                lines.extend(["", f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{fingerprint}"])
+            raw_output = "\n".join(lines)
+        audit = {
+            "readyToClose": bool(ready_to_close),
+            "auditedAt": audited_at,
+            "rawOutput": raw_output,
+        }
+    payload = {"success": returncode == 0, "audit": audit}
+    return SimpleNamespace(
+        returncode=returncode, stdout=json.dumps(payload), stderr=stderr,
+    )

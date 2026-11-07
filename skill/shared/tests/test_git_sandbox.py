@@ -34,7 +34,12 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
   concurrent fetch/push on a multi-agent host) is invisible to
   ``diff_snapshots`` and ``fingerprint``, while every other mutation (new /
   removed / moved non-excluded ref, local-config rewrite, working-tree
-  change) is still reported.
+  change) is still reported;
+- wl-managed ``refs/heads/worklog/*`` churn (SA-0MVV2W9610002CLW): movement of
+  ``refs/heads/worklog/data`` (every ``wl`` write / ``wl sync``) is excluded
+  from the verdict and reported as an informational note naming the excluded
+  ref, while an ordinary source-branch move still fails and ``refs/worklog/*``
+  tooling refs keep their silent-invisibility behaviour.
 """
 from __future__ import annotations
 
@@ -882,6 +887,124 @@ class TestConcurrencyExcludedRefs:
 
 
 # ---------------------------------------------------------------------------
+# SA-0MVV2W9610002CLW — wl-managed ``refs/heads/worklog/*`` churn is excluded
+# from the verdict and *reported as a note* (never silently filtered)
+# ---------------------------------------------------------------------------
+# Every ``wl`` write and every ``wl sync`` moves ``refs/heads/worklog/data``,
+# the worklog store's data branch. It lives under ``refs/heads/``, so the
+# ``refs/worklog/*`` parser filter never sees it; on a multi-agent host a
+# sibling session's worklog write therefore tripped the guard. The exclusion is
+# a ref-namespace prefix (never a ``wl-*`` name heuristic, per the ownership
+# work's AC4) and the movement is surfaced as an informational note so the
+# exclusion is auditable.
+
+
+def _repo_with_worklog_branch(tmp_path: Path, name: str = "repo") -> Path:
+    """A ``dev`` checkout plus wl's own ``refs/heads/worklog/data`` ref."""
+    repo = gs.init_repo(tmp_path / name, default_branch="dev")
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    gs.commit_all(repo, "init")
+    gs.run_git(repo, ["update-ref", "refs/heads/worklog/data", "HEAD"], check=True)
+    return repo
+
+
+class TestWorklogHeadsRefChurn:
+    """AC1/AC2/AC3: ``refs/heads/worklog/*`` movement is excluded but noted.
+
+    AC1: only the worklog data ref moves → green run plus a note naming the
+    excluded ref. AC2: an ordinary source branch move is still a mutation.
+    AC3: ``refs/worklog/*`` tooling refs behave exactly as before (silently
+    invisible, no note).
+    """
+
+    def test_worklog_data_ref_move_is_invisible_and_noted(self, tmp_path):
+        """AC1: only refs/heads/worklog/data moved → green *and* noted."""
+        repo = _repo_with_worklog_branch(tmp_path)
+        before = gs.snapshot_repo_state(repo)
+        _advance_ref(repo, "refs/heads/worklog/data")
+        after = gs.snapshot_repo_state(repo)
+        assert (
+            after["refs"]["refs/heads/worklog/data"]
+            != before["refs"]["refs/heads/worklog/data"]
+        )
+
+        diff = gs.diff_snapshots(before, after)
+        assert diff["changed"] is False
+        assert gs.fingerprint(after) == gs.fingerprint(before)
+        # The failure renderer must not claim a difference either.
+        assert gs.describe_diff(diff) == "  (no differences)"
+
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1, notes
+        assert gs.EXCLUDED_REF_CHURN_NOTE_PREFIX in notes[0]
+        assert "refs/heads/worklog/data" in notes[0]
+
+    def test_worklog_data_guarded_run_is_green_and_note_names_checkout(self, tmp_path):
+        """AC1: same via ``diff_guarded_roots``; the note names the checkout."""
+        repo = _repo_with_worklog_branch(tmp_path, "guarded")
+        before = gs.snapshot_guarded_roots(repo)
+        _advance_ref(repo, "refs/heads/worklog/data")
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(repo))
+
+        assert diff["changed"] is False, gs.describe_guarded_diff(diff)
+        assert gs.describe_guarded_diff(diff) == "  (no differences)"
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1, notes
+        assert "refs/heads/worklog/data" in notes[0]
+        assert str(repo.resolve()) in notes[0]
+
+    def test_worklog_ref_creation_and_deletion_are_excluded_and_noted(self, tmp_path):
+        """AC1: creating/removing a refs/heads/worklog/* ref is churn too."""
+        repo = _repo_with_worklog_branch(tmp_path, "create-remove")
+        before = gs.snapshot_repo_state(repo)
+
+        gs.run_git(repo, ["update-ref", "refs/heads/worklog/next", "HEAD"], check=True)
+        created = gs.snapshot_repo_state(repo)
+        gs.run_git(repo, ["update-ref", "-d", "refs/heads/worklog/next"], check=True)
+        gs.run_git(repo, ["update-ref", "-d", "refs/heads/worklog/data"], check=True)
+
+        create_diff = gs.diff_snapshots(before, created)
+        assert create_diff["changed"] is False
+        create_notes = gs.excluded_churn_notes(create_diff)
+        assert any("refs/heads/worklog/next" in n for n in create_notes), create_notes
+
+        delete_diff = gs.diff_snapshots(created, gs.snapshot_repo_state(repo))
+        assert delete_diff["changed"] is False
+        delete_notes = gs.excluded_churn_notes(delete_diff)
+        assert any("refs/heads/worklog/next" in n for n in delete_notes), delete_notes
+        assert any("refs/heads/worklog/data" in n for n in delete_notes), delete_notes
+
+    def test_ordinary_source_branch_move_still_fails(self, tmp_path):
+        """AC2: a non-worklog branch move is still a mutation (and not noted)."""
+        repo = _repo_with_worklog_branch(tmp_path, "source-branch")
+        gs.run_git(repo, ["branch", "feature-x"], check=True)
+        before = gs.snapshot_repo_state(repo)
+        _advance_ref(repo, "refs/heads/feature-x")
+        diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
+
+        assert diff["changed"] is True
+        assert "refs/heads/feature-x" in diff["refs"]["moved"]
+        assert gs.excluded_churn_notes(diff) == []
+
+    def test_refs_worklog_namespace_behaviour_is_unchanged(self, tmp_path):
+        """AC3: ``refs/worklog/*`` refs stay silently invisible (no note)."""
+        repo = _repo_with_worklog_branch(tmp_path, "tooling")
+        gs.run_git(
+            repo,
+            ["update-ref", "refs/worklog/remotes/origin/worklog/data", "HEAD"],
+            check=True,
+        )
+        before = gs.snapshot_repo_state(repo)
+        assert "refs/worklog/remotes/origin/worklog/data" not in before["refs"]
+
+        _advance_ref(repo, "refs/worklog/remotes/origin/worklog/data")
+        diff = gs.diff_snapshots(before, gs.snapshot_repo_state(repo))
+
+        assert diff["changed"] is False
+        assert gs.excluded_churn_notes(diff) == []
+
+
+# ---------------------------------------------------------------------------
 # SA-0MUIJAHXS003M7BG — working-tree churn attributed to concurrent sessions
 # ---------------------------------------------------------------------------
 # On a multi-agent host a guarded full-suite run shares the main checkout with
@@ -1322,3 +1445,169 @@ class TestGuardedRoots:
             guarded["roots"][0]["diff"]
         )
         assert "refs/heads/feature-x" in gs.describe_guarded_diff(guarded)
+
+
+# ---------------------------------------------------------------------------
+# Own-checkout state snapshot + comparison (state_changed_during_run)
+# ---------------------------------------------------------------------------
+
+
+class TestOwnCheckoutState:
+    """The guarded root's own HEAD + tracked-tree content surface.
+
+    Tracking: child SA-0MW3GCKJF006SQIE of SA-0MW3FF18I003KGZE (AC3, Q2 = b).
+    Snapshot + comparison helpers in ``skill/shared/git_sandbox.py``; the
+    `state_changed_during_run` notice contract is pinned end-to-end by the
+    regression harness in ``tests/test_test_cache.py`` (child
+    SA-0MW3GCHEL001G8CP).
+    """
+
+    def _commit(self, repo: Path, path: str, content: str, message: str) -> str:
+        (repo / path).write_text(content, encoding="utf-8")
+        return gs.commit_all(repo, message)
+
+    def _snapshot(self, repo: Path) -> dict:
+        return gs.snapshot_own_checkout(repo)
+
+    def test_snapshot_names_head_and_tracked_content(self, tmp_path: Path) -> None:
+        """The snapshot carries the resolved checkout, HEAD and a fingerprint."""
+        repo = gs.init_repo(tmp_path / "repo", default_branch="dev")
+        (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        snap = self._snapshot(repo)
+        assert snap["git"] is True and snap["ok"] is True
+        assert snap["checkout"] == str(repo.resolve())
+        assert snap["head"] == gs.run_git(
+            repo, ["rev-parse", "HEAD"], check=True
+        ).stdout.strip()
+        assert snap["tracked"], "the fingerprint must be non-empty"
+        assert snap["status"] == {}
+
+    def test_head_only_fast_forward_is_reported_moved(self, tmp_path: Path) -> None:
+        """A clean-checkout fast-forward (the incident class) is a move."""
+        repo = gs.init_repo(tmp_path / "repo", default_branch="dev")
+        (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+        before_commit = gs.commit_all(repo, "init")
+        before = self._snapshot(repo)
+
+        after_commit = self._commit(
+            repo, "tracked.txt", "two\n", "concurrent finish fast-forward"
+        )
+        after = self._snapshot(repo)
+
+        assert after_commit != before_commit, "the fixture must really move HEAD"
+        assert before["head"] == before_commit
+        assert gs.compare_own_checkout_states(before, after) == {
+            "moved": True,
+            "checkout": str(repo.resolve()),
+            "before_commit": before_commit,
+            "after_commit": after_commit,
+            "attributed": [],
+        }
+
+    def test_tracked_rewrite_with_unchanged_head_is_reported_moved(
+        self, tmp_path: Path
+    ) -> None:
+        """The Q2 = b dimension: tracked content moving without HEAD is a move."""
+        repo = gs.init_repo(tmp_path / "repo", default_branch="dev")
+        (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+        before_commit = gs.commit_all(repo, "init")
+        before = self._snapshot(repo)
+
+        (repo / "tracked.txt").write_text("rewritten mid-run\n", encoding="utf-8")
+        after = self._snapshot(repo)
+
+        comp = gs.compare_own_checkout_states(before, after)
+        assert comp["moved"] is True
+        assert comp["before_commit"] == before_commit
+        assert comp["after_commit"] == before_commit, "HEAD must not move here"
+
+    def test_start_dirty_to_clean_resolution_is_attributed_not_moved(
+        self, tmp_path: Path
+    ) -> None:
+        """Control (b): a sibling committing its own start-dirty WIP is churn.
+
+        The tracked path was already dirty when the run started and another
+        session commits that same work while the run is in flight: the whole
+        difference is the start-dirty -> end-clean resolution, which the shared
+        attribution explains (SA-0MUIJAHXS003M7BG false-positive class), so the
+        move is attributed and never reported.
+        """
+        repo = gs.init_repo(tmp_path / "repo", default_branch="dev")
+        (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        (repo / "tracked.txt").write_text("sibling WIP\n", encoding="utf-8")
+        before = self._snapshot(repo)
+        assert before["head"] != ""
+
+        gs.commit_all(repo, "another session commits its own WIP")
+        after = self._snapshot(repo)
+
+        assert after["head"] != before["head"], "HEAD really moved"
+        comp = gs.compare_own_checkout_states(before, after)
+        assert comp["moved"] is False
+        assert comp["attributed"], comp["attributed"]
+
+    def test_ref_movement_alone_never_reports_moved(self, tmp_path: Path) -> None:
+        """refs/heads/worklog + refs/remotes/origin movement is invisible."""
+        repo = gs.init_repo(tmp_path / "repo", default_branch="dev")
+        (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+        commit = gs.commit_all(repo, "init")
+        before = self._snapshot(repo)
+
+        # Moved/added/deleted non-HEAD refs — origin/ and worklog namespaces.
+        gs.run_git(repo, ["update-ref", "refs/remotes/origin/dev", commit], check=True)
+        gs.run_git(repo, ["update-ref", "refs/heads/worklog/data", commit], check=True)
+        gs.run_git(repo, ["branch", "feature-x"], check=True)
+        gs.run_git(repo, ["update-ref", "-d", "refs/remotes/origin/dev"], check=True)
+        gs.run_git(repo, ["update-ref", "-d", "refs/heads/worklog/data"], check=True)
+        gs.run_git(repo, ["branch", "-D", "feature-x"], check=True)
+        after = self._snapshot(repo)
+
+        comp = gs.compare_own_checkout_states(before, after)
+        assert comp["moved"] is False
+        assert comp["before_commit"] == comp["after_commit"] == commit
+
+    def test_content_only_change_of_an_already_dirty_path_is_a_move(
+        self, tmp_path: Path
+    ) -> None:
+        """A content rewrite of a pre-dirty path is a move (no status delta).
+
+        The status-code surface cannot see it; the content fingerprint can.
+        """
+        repo = gs.init_repo(tmp_path / "repo", default_branch="dev")
+        (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        (repo / "tracked.txt").write_text("dirty v1\n", encoding="utf-8")
+        before = self._snapshot(repo)
+        assert before["status"].get("tracked.txt") is not None
+
+        (repo / "tracked.txt").write_text("dirty v2 (rewritten mid-run)\n", encoding="utf-8")
+        after = self._snapshot(repo)
+
+        comp = gs.compare_own_checkout_states(before, after)
+        assert comp["moved"] is True, "content-only rewrite of a dirty path moves"
+        assert comp["attributed"] == []
+
+    def test_clean_to_dirty_is_a_retained_move_direction(self, tmp_path: Path) -> None:
+        """A path dirtying from a clean start is a move (incident direction)."""
+        repo = gs.init_repo(tmp_path / "repo", default_branch="dev")
+        (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
+        gs.commit_all(repo, "init")
+        before = self._snapshot(repo)
+
+        (repo / "tracked.txt").write_text("mutated mid-run\n", encoding="utf-8")
+        after = self._snapshot(repo)
+
+        comp = gs.compare_own_checkout_states(before, after)
+        assert comp["moved"] is True
+
+    def test_non_git_checkout_is_never_a_move(self, tmp_path: Path) -> None:
+        """A non-git / unfingerprintable root is fail-closed, never movement."""
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        before = self._snapshot(plain)
+        after = self._snapshot(plain)
+        comp = gs.compare_own_checkout_states(before, after)
+        assert comp["moved"] is False
+        assert before["ok"] is False and after["ok"] is False

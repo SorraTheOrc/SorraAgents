@@ -51,10 +51,12 @@ See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#workflow-for-ai-agents) for the claim
 **Invariant (SA-0MTFTFUIH000UWM9): actively worked => `in_progress`; release to `open` only at true handoff.** No agent process may perform work-item mutations (create children, update description, wire deps, add completion comments) while `status: open`. Use `StatusLifecycle.require_claimed(<id>)` as a guard before any mutation, and `StatusLifecycle.ensure_claimed(<id>)` to re-claim on in-session resume.
 
 Claim with `StatusLifecycle.update_status(<work-item-id>, "in_progress")`
-— plan claims **with no `assignee`**, so it establishes no scheduling hold
-and nothing needs releasing on exit (asserted against the
-[assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant),
-cross-referenced rather than restated) — before starting, and always leave
+— plan claims **with no `assignee`**, so it never *sets* a scheduling hold;
+the terminal transitions below release any claim the item already carried
+(the agent's step-1 pre-claim), because `update_status` enforces the
+[assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)
+for direct durable writes as well as for the context manager
+(cross-referenced rather than restated) — before starting, and always leave
 the item in a **valid terminal status** (`open`, `blocked`, or `completed`)
 when the skill ends — including on error:
 
@@ -326,6 +328,8 @@ Then output a summary of what each stage checked/found.
    - `result["action"] == "auto_close"` → unambiguous gaps were closed by creating covering children (each restating the uncovered parent AC); a comment records what was auto-closed.
    - `result["action"] == "stop"` → unresolvable conflicts exist; **do NOT advance the stage**. The item is left `open` with a comment describing the conflicts and which parent ACs are uncovered.
 
+   Direct children tagged `test-failure` (auto-created by the triage skill) are excluded from the parent-vs-child AC comparison — they are incident fixes, not a decomposition. They stay visible in `result["review"]["excluded_children"]`, and a parent whose only children are triage items therefore reaches `proceed`. Tag-less feature children stay gated exactly as before; a closed child is exempt only when it is also tagged `test-failure`. See [plan-skill-reference.md](../../docs/dev/plan-skill-reference.md#ac-coverage-review-triage-generated-children-are-excluded) (AH-0MVWNR4XF007FX5T).
+
 7. Update work items (agent)
 
    - **Guard (SA-0MTFTFUIH000UWM9):** before any mutation in this step, assert `StatusLifecycle.require_claimed(<work-item-id>)` — fails closed if the item is `open` (the 2026-08-30 gap left AH-0MTFPDKDU006QUDC `open` while creating 3 children). On in-session approval resume, `StatusLifecycle.ensure_claimed(<work-item-id>)` first.
@@ -352,6 +356,16 @@ Then output a summary of what each stage checked/found.
 - Preserve author intent; when uncertain, create an Open Question entry rather than assuming.
 - Keep changes minimal and conservative. Respect `.gitignore`.
 - **Worklog validation**: `feature` or `task` work items must include a `## Acceptance Criteria` section.
+- **AC list formats** (AC coverage review): the shared
+  `../shared/tree_coverage.py::extract_acceptance_criteria` function recognises these list
+  markers inside an `## Acceptance Criteria` section: `- ` (dash bullet), `+ ` (plus bullet),
+  `1. ` (period-numbered) and `1) ` (paren-numbered). (`*` star bullets are **not**
+  recognised.) Bullets and numbers may interleave (collected in document order); a marker
+  indented deeper than the first AC marker is nested detail rather than an AC; wrapped
+  continuation lines join their preceding AC. An `## Acceptance Criteria` section that parses
+  to zero ACs fails the coverage review closed (`recommendation: "stop"`) instead of passing
+  vacuously. See `../shared/tests/test_tree_coverage.py` and the AC coverage review step in
+  [Process](#process-must-follow) for the behavioural contract.
 - **JSON parsing**: `wl ... --json` output may be an object or an array; handle both shapes.
 - If any automated step fails or is ambiguous, surface an Open Question and pause for guidance.
 

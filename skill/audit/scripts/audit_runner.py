@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# <!-- REFACTOR-SA-0MW2SWB2A005CS2B
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 
 # <!-- REFACTOR-SA-0MUQ2OMWJ009QW4O
 # smell: formatting
@@ -148,9 +153,11 @@ except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 from test.scripts.run_tests import (
     full_suite_commands,
+    group_commands,
     paced_runner,
     parse_node_failures,
     parse_pytest_failures,
+    resolve_type_commands,
     suite_timeout_per_command,
 )
 from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
@@ -566,14 +573,40 @@ def _resolve_max_findings_in_report() -> int:
     return parsed
 
 
-CALL_PI_TIMEOUT = 1800
-"""Internal timeout (seconds) for each Pi model subprocess call.
+CALL_PI_TIMEOUT = 2400
+"""Default per-call timeout (seconds) for each Pi model subprocess call.
 
 This is a generous safety net for individual Pi model calls during audit
-processing. Phase 2 deep analysis now runs Pi in agent mode (with file-reading
-tools), which is inherently slower than bare LLM calls. 1800s (30 min)
-accommodates typical agent-mode analyses where the model reads and searches
-multiple implementation files.
+processing. Phase 2 deep analysis runs Pi in agent mode (with file-reading
+tools), which is inherently slower than bare LLM calls, so this budget is
+sized from measurement rather than guessed.
+
+**Derivation (WL-0MW32YZP7005LZ5B, measured — not guessed).** The 2026-11-05
+corpus (``python3 scripts/measure_audit_performance.py --root ~/.audit_debug
+--json``; 934 logs / 2,456 timing lines) for the Phase-2 family:
+
+    context         calls   p50     p90     max    calls at the 1800 s cap
+    phase2_deep      476    288    1085    3600    15
+    phase2_child     454    341    1116    2071    10
+    verdict_reask    211    462    1339    2372     6
+
+The Phase-2 p90 is 1,085–1,116 s and **25 Phase-2 calls landed exactly on the
+old 1,800 s ceiling** — 1,800 s was under-sized for this family, not merely a
+saturation artefact. Following the repository's derivation discipline
+(``ceil(p90 x safety factor 2)``, rounded), the family p90 (1,085–1,116 s) is
+rounded up to the next 100 s bucket (1,200 s) and doubled:
+``ceil(1200 x 2) = 2400`` s (40 min).
+
+Re-derive on a new corpus with::
+
+    python3 scripts/measure_audit_performance.py --root ~/.audit_debug --json
+    # phase2_deep / phase2_child p90 columns -> round up to the next 100 s,
+    # then x 2
+
+The Phase-1 screening budgets (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` and
+``_PARENT_SCREEN_TIMEOUT_DEFAULT`` = 1080 s) and the stall-abort threshold
+(``_STALL_TIMEOUT_DEFAULT`` = 600 s) are unchanged: this constant sizes
+Phase-2 deep-analysis calls only.
 
 The cumulative elapsed-time guard in ``cmd_issue`` (default
 ``PARENT_TIMEOUT_DEFAULT + N x PARENT_TIMEOUT_PER_CHILD``, scaled by the
@@ -641,10 +674,11 @@ AUDIT_CHILD_SCREEN_TIMEOUT_ENV = "AUDIT_CHILD_SCREEN_TIMEOUT"
 Child Phase-1 AC-review screens use a right-sized per-call budget
 (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, derived as
 ``ceil(measured p95 x 2)`` — see that constant's docstring) instead of the
-full 1800 s Phase-2 budget. A screen that exceeds its budget is quarantined
-— the conservative ``partial`` verdict with evidence naming the budget and
-phase, plus a ``child_screen_timeouts`` count in the reliability summary —
-never a full 1800 s burn and never an unqualified judgement. Overridable via
+full Phase-2 budget (``CALL_PI_TIMEOUT`` = 2,400 s). A screen that exceeds its
+budget is quarantined — the conservative ``partial`` verdict with evidence
+naming the budget and phase, plus a ``child_screen_timeouts`` count in the
+reliability summary — never a full 2,400 s burn and never an unqualified
+judgement. Overridable via
 the ``--child-screen-timeout`` CLI flag (flag wins) or this env var.
 """
 
@@ -664,7 +698,7 @@ host-load increase converted completions into timeouts, and 5 of 11 screens
 ``ceil(p95 x safety_factor)`` with a documented **safety factor of 2**:
 ``ceil(506 x 2) = 1012`` s, rounded up to **1080 s** (18 min) for a round value
 with a little extra slack. That keeps ~2.1x headroom over measured p95 while
-staying far below the 1800 s Phase-2 budget, so a genuinely stalled screen
+staying far below the 2,400 s Phase-2 budget, so a genuinely stalled screen
 still fails fast.
 
 Re-derivation on a new corpus::
@@ -689,7 +723,7 @@ The parent Phase-1 AC screen is the same structural screening call as a
 child screen (read the FILE SCOPE manifest, map each AC to a
 met/unmet/partial/adjusted verdict), so it shares the measured right-sized
 screening budget (``_PARENT_SCREEN_TIMEOUT_DEFAULT`` = 1080 s) instead of the
-full 1800 s Phase-2 budget — a parent screen that exceeds its budget is
+full 2,400 s Phase-2 budget — a parent screen that exceeds its budget is
 quarantined exactly like a capped child screen (SA-0MVJ3Q662006RDJR).
 Overridable via the ``--parent-screen-timeout`` CLI flag (flag wins) or this
 env var.
@@ -723,7 +757,7 @@ Re-derivation on a new corpus::
 A capped parent screen never triggers the JSON re-ask and never burns a second
 call: it degrades to ``partial`` with evidence naming the budget and phase and
 increments ``parent_screen_timeouts`` in ``AUDIT_RELIABILITY_SUMMARY``. It
-stays far below the 1800 s Phase-2 budget, so a genuinely stalled parent
+stays far below the 2,400 s Phase-2 budget, so a genuinely stalled parent
 screen still fails fast.
 """
 
@@ -742,7 +776,8 @@ _STALL_TIMEOUT_DEFAULT = 600
 """Default in-process stall-abort threshold (seconds).
 
 10 min is generous vs healthy Phase 1 screens (30-190 s) while still aborting
-a genuinely hung call well before its 1800 s budget (LP-0MSQ32S2M001EA74 AC2).
+a genuinely hung call well before its 2,400 s Phase-2 budget
+(LP-0MSQ32S2M001EA74 AC2).
 """
 
 
@@ -876,6 +911,36 @@ injects this block so the model MAY mark execution-dependent criteria met
 based on the executed green run. Distinct from ``AUTO_GREEN_RUN_BLOCK_HEADER``
 (read-only cache consumption) and ``GREEN-RUN ATTESTATION`` (operator
 attestation).
+"""
+
+HERDR_SUITE_GREEN_RUN_BLOCK_HEADER = "HERDR SUITE GREEN RUN"
+"""Header of the herdr package-suite verification block injected into prompts.
+
+The herdr evidence path (WL-0MVHP5NTU009PA3I / SA-0MW133H3P008TNPQ) consumes
+a green herdr package-suite run from the per-repo test cache READ-ONLY — the
+runner never executes the herdr suite itself. The block tells the model that
+an execution-dependent criterion explicitly about the **herdr package suite**
+MAY be marked met based on that verified cached result, while stating
+explicitly that it never satisfies a "full test suite passes" criterion
+(only a ``--type full`` / ``scope: full`` entry does). Distinct from
+``AUTO_GREEN_RUN_BLOCK_HEADER`` (full suite), ``TEST_SKILL_RUN_BLOCK_HEADER``
+(executed full suite) and ``GREEN-RUN ATTESTATION`` (operator attestation).
+"""
+
+HERDR_SUITE_PATH_PREFIXES = ("packages/herdr/",)
+"""Repository path prefixes whose changes make herdr evidence applicable.
+
+A work item whose resolved touched files include any path under one of these
+prefixes is a "herdr-touching" item: the audit consults the herdr package
+suite cache entries for it (WL-0MVHP5NTU009PA3I AC1).
+"""
+
+HERDR_SUITE_TEST_TYPES = ("herdr", "group:herdr")
+"""Independent cache keys under which a herdr suite run may be recorded.
+
+``--type herdr`` records ``test_type="herdr"``; ``--group herdr`` records
+``test_type="group:herdr"`` (see ``docs/dev/test-suite-baseline.md``). A
+green entry under EITHER key counts as herdr evidence (item assumption).
 """
 
 AUDIT_TEST_SKILL_RUN_TIMEOUT = 600
@@ -1364,6 +1429,44 @@ _INFRA_FALLBACK_MARKERS = (
     "Audit concurrency limit reached",
     "timed out \u2014 manual review required",
 )
+
+# Marker → cause-token mapping used to classify an infrastructure-fallback
+# run as transient (WL-0MW2F2T1I001ZNH7 AC2). Order mirrors
+# ``_INFRA_FALLBACK_MARKERS``; the cause tokens are the machine-readable
+# vocabulary the report's ``Audit classification: transient
+# (verdict_assembly_failure: <cause>)`` line and the release audit gate
+# share, kept in parity with the gate's recognition patterns.
+_INFRA_FALLBACK_CAUSES = (
+    ("Pi model output could not be parsed", "unparseable_output"),
+    ("Pi provider error", "provider_error"),
+    ("Audit concurrency limit reached", "concurrency_cap"),
+    ("timed out \u2014 manual review required", "timeout"),
+)
+
+
+def _classify_infra_fallback(ac_results: list[dict],
+                             child_results: list[dict]) -> str | None:
+    """Return the transient cause token for the first infra-fallback marker
+    found across parent/child AC evidence, or ``None`` for a clean run.
+
+    When any AC verdict came from an infrastructure fallback (Phase-2
+    timeout, provider error, unparseable output, concurrency cap), the run's
+    verdicts are not genuine model assessments and the assembled report must
+    carry the machine-readable transient classification
+    (WL-0MW2F2T1I001ZNH7 AC2).
+    """
+    for r in ac_results:
+        evidence = _evidence_text(r.get("evidence"))
+        for marker, cause in _INFRA_FALLBACK_CAUSES:
+            if marker in evidence:
+                return cause
+    for cr in child_results:
+        for r in cr.get("ac_results", []):
+            evidence = _evidence_text(r.get("evidence"))
+            for marker, cause in _INFRA_FALLBACK_CAUSES:
+                if marker in evidence:
+                    return cause
+    return None
 
 
 def _evidence_text(value) -> str:
@@ -2066,7 +2169,8 @@ def _audit_time_is_fresh(audit_time: datetime, update_time: datetime) -> bool:
 
 def _check_audit_freshness(runner: Runner, issue_id: str,
                            worklog_dir: str | None = None,
-                           work_item: dict | None = None) -> str | None:
+                           work_item: dict | None = None,
+                           audit_sink: dict | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
     Two-stage freshness gate:
@@ -2100,6 +2204,12 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     caller already fetched the work item (SA-0MSL1Z7E9005TLBA): it is used
     for the fingerprint computation and the time-gate ``updatedAt``. When
     omitted, the work item is fetched via ``wl show``.
+
+    *audit_sink* (SA-0MVR9B1UH002BUST) is an optional in-place capture: when
+    the gate's own ``wl audit-show`` returns an audit record, its normalised
+    pre-audit summary (``_summarise_prior_audit``) is written into the dict.
+    The producer-review rule reuses this fetch on the non-forced path so the
+    hot path adds no extra ``wl`` invocation.
     """
 
     try:
@@ -2114,6 +2224,11 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     audit = data.get("audit")
     if not audit:
         return None  # No prior audit
+
+    if audit_sink is not None:
+        summary = _summarise_prior_audit(audit)
+        if summary is not None:
+            audit_sink.update(summary)
 
     audited_at = audit.get("auditedAt")
     raw_output = audit.get("rawOutput")
@@ -2178,6 +2293,293 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
         return raw_output
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Producer-review flag lifecycle (SA-0MVR9B1UH002BUST, Option B+)
+# ---------------------------------------------------------------------------
+# ``needsProducerReview`` is a bare boolean, so it cannot answer "was this
+# reviewed?". Option B+ infers the answer from existing, content-scoped
+# state: a *passing* stored audit whose v2 content fingerprint equals the
+# item's current fingerprint, combined with a currently-cleared flag, can
+# only mean a producer cleared the review after that audit of identical
+# content. The runner then PRESERVES the flag (writes nothing) instead of
+# re-arming it. Every ambiguous case fails safe and flags.
+
+#: Prefix of the persisted-report metadata line recording the producer-review
+#: decision (AC4: durable, human-inspectable, content-scoped). Greppable via
+#: ``wl audit-show`` so a later run can see *why* the flag was set/preserved.
+PRODUCER_REVIEW_REPORT_PREFIX = "Producer review: "
+
+#: Decision actions. ``preserved`` writes nothing (keeps the cleared flag),
+#: ``required`` writes ``--needs-producer-review yes``, ``untouched`` writes
+#: no flag at all (children, cascade-suppressed ``No``, infra failures).
+PRODUCER_REVIEW_PRESERVED = "preserved"
+PRODUCER_REVIEW_REQUIRED = "required"
+PRODUCER_REVIEW_UNTOUCHED = "untouched"
+
+
+def _audit_record_passed(ready_to_close: object) -> bool:
+    """Normalise a stored audit's ``readyToClose`` value to a pass boolean.
+
+    ``wl audit-show --json`` exposes ``audit.readyToClose`` as a boolean;
+    legacy stores/tools may emit ``1`` or ``"yes"``/``"true"``. Anything
+    else (``None``, ``0``, ``"no"``, garbage) is a non-pass, so the review
+    predicate fails safe and flags the item.
+    """
+    if isinstance(ready_to_close, bool):
+        return ready_to_close
+    if isinstance(ready_to_close, (int, float)):
+        return ready_to_close == 1
+    if isinstance(ready_to_close, str):
+        return ready_to_close.strip().lower() in ("yes", "true", "1")
+    return False
+
+
+def _summarise_prior_audit(audit: object) -> dict | None:
+    """Normalise a ``wl audit-show`` audit object for the review predicate.
+
+    Returns ``{"readyToClose": bool, "fingerprint": str | None,
+    "auditedAt": str | None}`` (no ``currentFingerprint`` yet — the caller
+    attaches it once the pre-audit work item is known), or ``None`` when no
+    audit record exists. The fingerprint is the stored report's v2 content
+    fingerprint; a legacy/manual fingerprint-less report yields ``None`` so
+    the predicate fails safe and flags (Constraint: fail-safe direction).
+    """
+    if not isinstance(audit, dict):
+        return None
+    raw_output = audit.get("rawOutput") or audit.get("summary") or ""
+    return {
+        "readyToClose": _audit_record_passed(audit.get("readyToClose")),
+        "fingerprint": _extract_content_fingerprint(raw_output),
+        "auditedAt": audit.get("auditedAt"),
+    }
+
+
+def _fetch_prior_audit(runner: Runner, issue_id: str,
+                       worklog_dir: str | None = None) -> dict | None:
+    """Fetch the item's pre-audit audit record (one ``wl audit-show`` call).
+
+    Used on the FORCED path (``--force`` / ``--refresh-audits`` / batch
+    drains) where the freshness gate does not run. The non-forced path
+    reuses the freshness gate's own fetch via
+    ``_check_audit_freshness(..., audit_sink=...)`` so no extra ``wl``
+    invocation is added to the hot path. Any failure returns ``None``: the
+    caller fails safe and flags the item.
+    """
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", issue_id, "--json"],
+                       worklog_dir=worklog_dir)
+    except RuntimeError:
+        return None
+    if not isinstance(data, dict) or data.get("success") is False:
+        return None
+    return _summarise_prior_audit(data.get("audit"))
+
+
+def _producer_review_preserved(wi: dict | None,
+                               prior_audit: dict | None) -> bool:
+    """Whether a passing re-audit must preserve a producer's review.
+
+    Pure truth table — no ``wl`` calls and no I/O, so it is unit-testable
+    without a model (AC1/AC2/AC4):
+
+    ==============================  ===================================
+    state                           result
+    ==============================  ===================================
+    ``needsProducerReview`` truthy  False — the runner never clears a flag
+    no prior audit                  False — never reviewed → flag (AC2)
+    prior audit not passing         False — no passing review → flag
+    fingerprint missing/legacy      False — ambiguous → fail safe → flag
+    prior passing audit AND stored
+      fingerprint == current        True — producer cleared it over
+                                    unchanged content (AC1)
+    prior passing audit AND stored
+      fingerprint != current        False — content changed → fresh
+                                    review required (AC4)
+    ==============================  ===================================
+
+    ``prior_audit`` carries the stored ``fingerprint`` and the
+    pre-audit ``currentFingerprint`` (both v2, item-data-only sha256 over
+    title + description), so the decision is content-scoped: a comment, a
+    lifecycle flip or an unrelated commit never invalidates a review.
+    """
+    if not isinstance(wi, dict) or not isinstance(prior_audit, dict):
+        return False
+    if wi.get("needsProducerReview"):
+        return False  # already flagged — never cleared by the runner
+    if not prior_audit.get("readyToClose"):
+        return False
+    stored = prior_audit.get("fingerprint")
+    current = prior_audit.get("currentFingerprint")
+    if not stored or not current:
+        return False  # legacy/manual/ambiguous → fail safe → flag
+    return stored == current
+
+
+def _compute_fallback_tainted(ctx: _AuditContext,
+                              verdict: str | None) -> bool:
+    """Whether *verdict* is tainted by an infrastructure-failure fallback.
+
+    Single implementation shared by the terminal lifecycle and the
+    producer-review decision so both agree: a ``No`` produced solely from
+    infra fallbacks must restore, never demote or flag
+    (SA-0MSG9SLGI002OF7V). The evidence-marker scan is a backstop for a
+    future fallback site that forgot to set the flag.
+    """
+    tainted = ctx.ac_fallback_used.is_set()
+    if verdict == "no" and not tainted:
+        tainted = _evidence_has_infra_failure_markers(
+            ctx.ac_results, ctx.child_results,
+        )
+    return tainted
+
+
+def _producer_review_required_reason(wi: dict | None,
+                                     prior_audit: dict | None) -> str:
+    """Human-readable reason a passing top-level audit must flag (AC4)."""
+    if not isinstance(wi, dict):
+        return "no prior passing audit of unchanged content"
+    if wi.get("needsProducerReview"):
+        return "producer-review flag already set"
+    if not isinstance(prior_audit, dict):
+        return "no prior passing audit of unchanged content"
+    if not prior_audit.get("readyToClose"):
+        return "no prior passing audit of unchanged content"
+    if (not prior_audit.get("fingerprint")
+            or not prior_audit.get("currentFingerprint")):
+        return "review state unavailable (fail-safe)"
+    return "content changed since the last passing audit"
+
+
+def _resolve_producer_review_decision(ctx: _AuditContext,
+                                      verdict: str | None) -> dict:
+    """Resolve the producer-review flag action for this audit run.
+
+    Returns ``{"action", "reason", "fingerprint"}`` where ``action`` is
+    ``preserved`` / ``required`` / ``untouched``. Truth table:
+
+    - ``Yes`` + top-level + reviewed unchanged → ``preserved`` (AC1)
+    - ``Yes`` + top-level + never reviewed / content changed → ``required``
+      (AC2)
+    - ``No`` + independent (not cascade-demotion-suppressed) + top-level →
+      ``required`` regardless of ``merge_gate_blocker`` (AC3)
+    - ``No`` + cascade-demotion-suppressed → ``untouched`` (producer Q2)
+    - any verdict + child item → ``untouched`` (AC6, SA-0MSSVKYEW008PJ9H)
+    - infrastructure failure / unparseable verdict / tainted ``No`` →
+      ``untouched`` (producer Q3: neither set nor cleared)
+
+    Resolved once before persistence (so the persisted report records the
+    decision) and reused by ``_apply_terminal_lifecycle`` so the flag write
+    can never disagree with the recorded decision.
+    """
+    prior = ctx.prior_audit if isinstance(ctx.prior_audit, dict) else None
+    fingerprint = (prior or {}).get("fingerprint")
+    wi = ctx.wi
+    top_level = not wi or not wi.get("parentId")
+
+    if verdict is None or ctx.script_failure is not None:
+        return {
+            "action": PRODUCER_REVIEW_UNTOUCHED,
+            "reason": (
+                "infrastructure failure / unparseable verdict — "
+                "flag untouched"
+            ),
+            "fingerprint": fingerprint,
+        }
+
+    if verdict == "no" and _compute_fallback_tainted(ctx, verdict):
+        return {
+            "action": PRODUCER_REVIEW_UNTOUCHED,
+            "reason": (
+                "infrastructure-failure fallback 'No' — flag untouched"
+            ),
+            "fingerprint": fingerprint,
+        }
+
+    if verdict == "yes":
+        if not top_level:
+            return {
+                "action": PRODUCER_REVIEW_UNTOUCHED,
+                "reason": "child item — covered by the parent's review",
+                "fingerprint": fingerprint,
+            }
+        if _producer_review_preserved(wi, prior):
+            return {
+                "action": PRODUCER_REVIEW_PRESERVED,
+                "reason": (
+                    "producer review preserved over an unchanged "
+                    "passing audit"
+                ),
+                "fingerprint": fingerprint,
+            }
+        return {
+            "action": PRODUCER_REVIEW_REQUIRED,
+            "reason": _producer_review_required_reason(wi, prior),
+            "fingerprint": fingerprint,
+        }
+
+    # verdict == "no" — only an INDEPENDENT failing audit surfaces the item
+    # to the producer (producer decision Q2). A parent-triggered cascade
+    # re-audit of an already in_review/done item suppresses the demotion and
+    # therefore leaves the flag untouched, including when merge_gate_blocker
+    # is set (the next independent audit re-surfaces it).
+    if _is_cascade_audit() and ctx.original_stage in ("in_review", "done"):
+        return {
+            "action": PRODUCER_REVIEW_UNTOUCHED,
+            "reason": (
+                "cascade-demotion-suppressed 'No' — flag untouched"
+            ),
+            "fingerprint": fingerprint,
+        }
+    if not top_level:
+        return {
+            "action": PRODUCER_REVIEW_UNTOUCHED,
+            "reason": "child item — covered by the parent's review",
+            "fingerprint": fingerprint,
+        }
+    return {
+        "action": PRODUCER_REVIEW_REQUIRED,
+        "reason": "failing audit (Ready to close: No)",
+        "fingerprint": fingerprint,
+    }
+
+
+def _format_producer_review_line(decision: dict | None) -> str | None:
+    """Render the persisted-report metadata line for *decision*, if any."""
+    if not isinstance(decision, dict):
+        return None
+    action = decision.get("action")
+    reason = decision.get("reason") or ""
+    fingerprint = decision.get("fingerprint")
+    if action == PRODUCER_REVIEW_PRESERVED:
+        detail = (f"content fingerprint {fingerprint}" if fingerprint
+                  else reason)
+        return f"{PRODUCER_REVIEW_REPORT_PREFIX}preserved ({detail})"
+    if action == PRODUCER_REVIEW_REQUIRED:
+        detail = reason
+        if fingerprint:
+            detail += f"; previous content fingerprint {fingerprint}"
+        return f"{PRODUCER_REVIEW_REPORT_PREFIX}required ({detail})"
+    if action == PRODUCER_REVIEW_UNTOUCHED:
+        return f"{PRODUCER_REVIEW_REPORT_PREFIX}untouched ({reason})"
+    return None
+
+
+def _append_producer_review_metadata(report: str,
+                                     decision: dict | None) -> str:
+    """Append the producer-review decision line to a report to persist.
+
+    Idempotent: a report already carrying a ``Producer review:`` line is
+    returned unchanged, so reassembly/re-ask paths never duplicate it.
+    """
+    line = _format_producer_review_line(decision)
+    if not line:
+        return report
+    if any(existing.startswith(PRODUCER_REVIEW_REPORT_PREFIX)
+           for existing in report.splitlines()):
+        return report
+    return report.rstrip("\n") + "\n\n" + line + "\n"
 
 
 def _extract_content_fingerprint(report_text: str) -> str | None:
@@ -3120,6 +3522,233 @@ def _auto_green_run_outcome(
     return None, None, status
 
 
+# ---------------------------------------------------------------------------
+# Herdr package-suite cache classification
+# (WL-0MVHP5NTU009PA3I / SA-0MW133H3P008TNPQ)
+# ---------------------------------------------------------------------------
+
+# Classification statuses returned by _classify_herdr_suite_cache.
+_HERDR_SUITE_CACHE_GREEN = "green"
+_HERDR_SUITE_CACHE_MISS = "miss"
+_HERDR_SUITE_CACHE_RED = "red"
+_HERDR_SUITE_CACHE_ERROR = "error"
+# The item's touched files include no packages/herdr/** path, so a herdr
+# package-suite criterion is not applicable to it.
+_HERDR_SUITE_CACHE_NOT_APPLICABLE = "not_applicable"
+# The item touches packages/herdr/** but the project defines no herdr suite
+# profile (neither --type herdr nor --group herdr), so there is nothing to
+# query. Fail-open: no evidence, never a block.
+_HERDR_SUITE_CACHE_EMPTY = "empty"
+
+
+def _touches_herdr_suite(touched_files: Sequence[str] | None) -> bool:
+    """Return True when any resolved touched path is under packages/herdr/.
+
+    *touched_files* is the ``_resolve_touched_files`` result (committed paths
+    plus Key Files). A missing/empty set means the touched set could not be
+    determined, so herdr evidence is NOT applicable (fail-open: no evidence).
+    """
+    if not touched_files:
+        return False
+    for raw in touched_files:
+        path = _normalise_repo_path(raw).replace("\\", "/")
+        if path.startswith(HERDR_SUITE_PATH_PREFIXES):
+            return True
+    return False
+
+
+def _resolve_herdr_suite_commands(
+    project_root: str | Path | None = None,
+) -> list[tuple[str, list[str]]]:
+    """Return the project's herdr suite profiles as ``(test_type, commands)``.
+
+    Both independent cache keys are resolved (``--type herdr`` and
+    ``--group herdr``). A profile that is absent or malformed is simply
+    skipped: the audit never fabricates herdr evidence from a broken config
+    (fail-open — no evidence, never a block). Returns an empty list when the
+    project defines no herdr suite profile at all.
+    """
+    root = Path(project_root or TARGET_PROJECT_ROOT).resolve()
+    candidates: list[tuple[str, list[str]]] = []
+    for test_type in HERDR_SUITE_TEST_TYPES:
+        try:
+            if test_type == "herdr":
+                commands = resolve_type_commands(root, "herdr")
+            else:
+                commands = group_commands("herdr", root) or []
+        except Exception:  # noqa: BLE001 -- absent/malformed profile => no evidence
+            commands = []
+        if commands:
+            candidates.append((test_type, list(commands)))
+    return candidates
+
+
+def _classify_herdr_suite_cache(
+    runner: Runner,
+    touched_files: Sequence[str] | None,
+    cwd: str | Path | None = None,
+) -> tuple[str, str | None, list[str], list[str]]:
+    """Classify the read-only herdr package-suite cache state at *cwd*.
+
+    The herdr evidence path (WL-0MVHP5NTU009PA3I AC1) is scoped to work items
+    whose resolved touched files include a ``packages/herdr/**`` path. For
+    such an item it queries the per-repo test cache (``query_cached``, never
+    executes) for the project's herdr suite commands under BOTH independent
+    cache keys (``test_type="herdr"`` and ``test_type="group:herdr"``).
+
+    Returns ``(status, head_sha, problems, cache_keys)``:
+
+    - ``"not_applicable"`` — the touched files include no
+      ``packages/herdr/**`` path (or the touched set is undetermined).
+    - ``"empty"`` — herdr-touching, but the project defines no herdr suite
+      profile (no ``--type herdr`` / ``--group herdr``).
+    - ``"green"`` — at least one profile has a cached entry at the audited
+      git state within ``AUDIT_CACHE_TTL_SECONDS``, every command of that
+      profile exits 0, and every entry is ``scope="full"``. ``cache_keys``
+      names the profiles that verified green.
+    - ``"miss"`` — herdr-touching with resolvable profiles, but no profile is
+      fully green and no cached entry is red (missing / changed-scope).
+    - ``"red"`` — at least one cached herdr entry exited non-zero (and none
+      is green).
+    - ``"error"`` — the audited HEAD could not be resolved.
+
+    This classification NEVER feeds the full-suite AC: a herdr entry is not
+    full-suite evidence (AC2). The full-suite classifier is untouched.
+    """
+    if not _touches_herdr_suite(touched_files):
+        return _HERDR_SUITE_CACHE_NOT_APPLICABLE, None, [], []
+
+    head_sha = _resolve_audited_head(runner)
+    if head_sha is None:
+        return _HERDR_SUITE_CACHE_ERROR, None, [], []
+
+    project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
+    candidates = _resolve_herdr_suite_commands(project_root)
+    if not candidates:
+        return _HERDR_SUITE_CACHE_EMPTY, head_sha, [
+            (
+                "the item touches packages/herdr/** but the project defines no "
+                "herdr suite profile (--type herdr / --group herdr); run the "
+                "herdr suite once via the test skill to populate the cache"
+            ),
+        ], []
+
+    green_keys: list[str] = []
+    problems: list[str] = []
+    red = False
+    for test_type, commands in candidates:
+        profile_problems: list[str] = []
+        for command in commands:
+            entry = query_cached(
+                command,
+                cwd=str(project_root),
+                ttl=AUDIT_CACHE_TTL_SECONDS,
+                test_type=test_type,
+            )
+            if entry is None:
+                profile_problems.append(
+                    f"no cached {test_type} herdr suite run for '{command}' "
+                    f"at HEAD {head_sha}"
+                )
+            elif entry.get("scope", "full") != "full":
+                profile_problems.append(
+                    f"cached {test_type} herdr suite run for '{command}' is "
+                    f"changed-scope (partial); a full-scope run is required "
+                    f"at HEAD {head_sha}"
+                )
+            elif int(entry.get("exit_code", -1)) != 0:
+                red = True
+                profile_problems.append(
+                    f"cached {test_type} herdr suite run for '{command}' "
+                    f"exited non-zero ({int(entry.get('exit_code'))})"
+                )
+        if profile_problems:
+            problems.extend(profile_problems)
+        else:
+            green_keys.append(test_type)
+
+    if green_keys:
+        return _HERDR_SUITE_CACHE_GREEN, head_sha, [], green_keys
+    if red:
+        return _HERDR_SUITE_CACHE_RED, head_sha, problems, []
+    return _HERDR_SUITE_CACHE_MISS, head_sha, problems, []
+
+
+def _herdr_green_run_prompt_block(sha: str, cache_keys: Sequence[str]) -> str:
+    """Build the HERDR SUITE GREEN RUN block injected into audit prompts.
+
+    The block tells the model that a cached herdr package-suite run at *sha*
+    (== the audited HEAD) was verified green READ-ONLY (``query_cached`` never
+    executes), so an execution-dependent criterion explicitly about the herdr
+    package suite MAY be marked met. It states explicitly that this evidence
+    does NOT satisfy a "full test suite passes" criterion (WL-0MVHP5NTU009PA3I
+    AC2). Returns a string ending in a blank line so callers can splice it
+    between existing prompt sections.
+    """
+    keys = ", ".join(f"`{key}`" for key in cache_keys)
+    return (
+        f"{HERDR_SUITE_GREEN_RUN_BLOCK_HEADER} — A cached herdr package-suite "
+        f"run at commit {sha} (== current HEAD) was verified green from the "
+        f"per-repo test cache under {keys} (read-only query; the audit never "
+        "executes the herdr suite on this path). An execution-dependent "
+        "criterion explicitly about the HERDR PACKAGE SUITE (e.g. 'herdr "
+        "suite passes') MAY be marked met based on this verified cached "
+        "result. This evidence does NOT satisfy a 'full test suite passes' "
+        "criterion — that still requires a full-suite cache entry "
+        "(type 'full', scope 'full'). The audit runner manages test "
+        "execution: Do NOT execute tests yourself. Do NOT execute any other "
+        "state-modifying command (wl, git, …) — the read-only mandate "
+        "otherwise remains in force.\n\n"
+    )
+
+
+def _auto_herdr_green_run_outcome(
+    runner: Runner,
+    touched_files: Sequence[str] | None,
+    cwd: str | Path | None = None,
+) -> tuple[str | None, str | None, str]:
+    """Resolve automatically-verified herdr package-suite evidence, read-only.
+
+    Delegates the cache query to :func:`_classify_herdr_suite_cache` and maps
+    a GREEN classification onto the prompt block. Fail-closed on evidence: any
+    non-green state (miss, red, empty, error, not-applicable) yields
+    ``(None, None, status)`` — execution-dependent herdr criteria then stay
+    partial and the audit proceeds normally (never blocks).
+    """
+    try:
+        status, head_sha, problems, cache_keys = _classify_herdr_suite_cache(
+            runner, touched_files, cwd=cwd,
+        )
+    except Exception as exc:  # noqa: BLE001 -- fail-closed: never crash the audit
+        print(
+            f"Automatic herdr suite verification unavailable: {exc}. "
+            "Herdr execution-dependent criteria stay partial.",
+            file=sys.stderr,
+        )
+        return None, None, _HERDR_SUITE_CACHE_ERROR
+
+    if status == _HERDR_SUITE_CACHE_GREEN and head_sha is not None:
+        return (
+            _herdr_green_run_prompt_block(head_sha, cache_keys),
+            head_sha,
+            status,
+        )
+    if status in (
+        _HERDR_SUITE_CACHE_MISS,
+        _HERDR_SUITE_CACHE_RED,
+        _HERDR_SUITE_CACHE_EMPTY,
+    ):
+        print(
+            "Automatic herdr suite verification unavailable: "
+            + "; ".join(problems)
+            + ". Run the herdr suite once at this commit (run_tests.py "
+            "--type herdr or --group herdr) to populate the cache, then "
+            "re-audit. Herdr execution-dependent criteria stay partial.",
+            file=sys.stderr,
+        )
+    return None, None, status
+
+
 def _resolve_auto_green_run(
     runner: Runner,
     cwd: str | Path | None = None,
@@ -3204,6 +3833,11 @@ def _run_tests_via_test_skill(
     results: list[dict] = []
     failures: list[dict] = []
     triaged: list[dict] = []
+    #: Commands whose guarded checkout moved while they executed
+    #: (SA-0MW3FF18I003KGZE AC4): their output is a mixed-tree verdict, so
+    #: nothing is parsed from it and NOTHING is triaged — a moved checkout must
+    #: never mint a critical ``test-failure`` item. The run still fails.
+    state_changed: list[dict] = []
     notice = ""
     for command in full_suite_commands(project_root):
         try:
@@ -3234,6 +3868,19 @@ def _run_tests_via_test_skill(
             break
         results.append(run)
         output = f"{run.get('stdout', '')}\n{run.get('stderr', '')}"
+        movement = run.get("state_changed_during_run")
+        if movement:
+            # Quarantine: no failure records, no triage, and the run is red.
+            state_changed.append({**movement, "suite_command": command})
+            print(
+                "notice: [state_changed_during_run] "
+                f"checkout {movement.get('checkout')} changed while the suite "
+                f"executed (HEAD {movement.get('before_commit') or '<none>'} -> "
+                f"{movement.get('after_commit') or '<none>'}): the verdict is "
+                "discarded and not triaged — re-run from a stable checkout.",
+                file=sys.stderr,
+            )
+            continue
         if "pytest" in command:
             cmd_failures = parse_pytest_failures(output)
         else:
@@ -3252,7 +3899,12 @@ def _run_tests_via_test_skill(
                 "suite_command": command,
             })
 
-    success = bool(results) and not notice and not failures
+    success = (
+        bool(results)
+        and not notice
+        and not failures
+        and not state_changed
+    )
 
     # Triage failures per the test skill (AC4) — never silently ignored.
     # Deduplicate by test_name and enforce a hard cap to prevent runaway
@@ -3299,9 +3951,22 @@ def _run_tests_via_test_skill(
                     "error": str(exc),
                 })
 
+    if not notice and state_changed:
+        notice = (
+            "[state_changed_during_run] checkout moved during the run for "
+            f"{len(state_changed)} command(s); their verdicts were discarded "
+            "(re-run from a stable checkout): "
+            + "; ".join(
+                f"{m.get('checkout')} "
+                f"{m.get('before_commit') or '<none>'}->{m.get('after_commit') or '<none>'}"
+                for m in state_changed
+            )
+        )
+
     print(
         f"Test skill run completed: success={success} commands={len(results)} "
         f"failures={len(failures)} triaged={len(triaged)} "
+        f"state_changed={len(state_changed)} "
         f"notice={notice or 'none'}",
         file=sys.stderr,
     )
@@ -3310,6 +3975,9 @@ def _run_tests_via_test_skill(
         "results": results,
         "failures": failures,
         "triaged": triaged,
+        # The flagged commands (SA-0MW3FF18I003KGZE AC4) so the audit report
+        # can name the checkout movement and the required re-run.
+        "state_changed_during_run": state_changed,
         "notice": notice,
     }
 
@@ -4373,13 +5041,14 @@ def _resolve_call_timeout(timeout: int | None, child_screen: bool = False,
          ``_PARENT_SCREEN_TIMEOUT_DEFAULT`` (1080 s — the same measured
          screening budget as child screens, `ceil(p95 x 2)`), so a parent
          screen that exceeds its budget is quarantined instead of burning
-         the full 1800 s (SA-0MVJ3Q662006RDJR)
+         the full 2,400 s (SA-0MVJ3Q662006RDJR)
       3. child Phase-1 AC-review screens: ``AUDIT_CHILD_SCREEN_TIMEOUT``
          env or ``_CHILD_SCREEN_TIMEOUT_DEFAULT`` (1080 s, derived from
          measured p95 x 2) — a child screen that exceeds its budget is
-         quarantined instead of burning the full 1800 s
+         quarantined instead of burning the full 2,400 s
          (LP-0MSQ32S2M001EA74 AC1, SA-0MVI3608M0080QLW)
-      4. all other calls: ``CALL_PI_TIMEOUT`` (1800 s)
+      4. all other calls: ``CALL_PI_TIMEOUT`` (2,400 s — data-derived Phase-2
+         budget, WL-0MW32YZP7005LZ5B)
     """
     if timeout is not None:
         return timeout
@@ -4550,14 +5219,14 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             (``_CHILD_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, derived from measured
             p95 x 2, configurable via
             ``AUDIT_CHILD_SCREEN_TIMEOUT`` / ``--child-screen-timeout``)
-            instead of the 1800 s Phase-2 budget (LP-0MSQ32S2M001EA74 AC1).
+            instead of the 2,400 s Phase-2 budget (LP-0MSQ32S2M001EA74 AC1).
 
         parent_screen: If True, this is the parent Phase-1 AC screen; it uses
             the same measured right-sized screening budget
             (``_PARENT_SCREEN_TIMEOUT_DEFAULT`` = 1080 s, configurable via
             ``AUDIT_PARENT_SCREEN_TIMEOUT`` / ``--parent-screen-timeout``)
-            instead of the 1800 s Phase-2 budget, so a capped parent screen is
-            quarantined rather than burning 30 minutes
+            instead of the 2,400 s Phase-2 budget, so a capped parent screen
+            is quarantined rather than burning 40 minutes
             (SA-0MVJ3Q662006RDJR AC1/AC3).
 
         issue_id: Work-item ID used in the ``--session-id`` flag.
@@ -5864,6 +6533,27 @@ def _child_has_stored_verdict(child: dict) -> bool:
     return bool(child.get("reused_from")) or child.get("child_audit_ready") is not None
 
 
+def _child_audit_verdict_blocks(child: dict) -> bool:
+    """True when *child*'s own audit verdict must block the parent's readiness.
+
+    A serviced child whose OWN persisted audit says ``Ready to close: No``
+    carries ``child_audit_not_ready`` together with ``reused_from`` (both
+    recorded by the child-verdict reuse path) and the blocking
+    ``ac_results`` copied from that audit. Being assessed is not the same as
+    being ready, so its blocking verdicts keep blocking the parent even when
+    its stage (``in_review``) would otherwise exempt it from the AC
+    aggregation (SA-0MVSTZ71J001P67S D2 / parent AC3).
+
+    The ``reused_from`` marker is required: it distinguishes a child whose
+    own audit judged it (the reuse path) from a child whose verdict was
+    tainted by a parent-triggered re-screen, which stays exempt for
+    snapshot-exempt children (SA-0MVI35BIU002MTZQ F3a).
+    """
+    return bool(child.get("child_audit_not_ready")) and bool(
+        child.get("reused_from")
+    )
+
+
 def _child_acs_assessed_in_run(child: dict) -> bool:
     """True when *child* carries real (non-pending) acceptable verdicts.
 
@@ -5944,6 +6634,14 @@ def _classify_child_assessment_reason(
     # because it was set before screening) HAS been assessed — the flag means
     # "no stored verdict at pre-pass time", not "never judged"
     # (MS-0MVQO6N34007DHP8).
+    # A child whose OWN persisted audit judged it NOT ready HAS been
+    # assessed: the child-verdict reuse path records ``child_audit_not_ready``
+    # (plus ``reused_from``) and fills ``ac_results`` from that audit. Its
+    # blocking verdicts still block the parent's readiness — being assessed is
+    # not being ready — but reporting it ``not_assessed`` ("never judged")
+    # misstates the child's state (SA-0MVSTZ71J001P67S D2 / parent AC3).
+    if child.get("child_audit_not_ready") and child.get("reused_from"):
+        return None
     if (
         child.get("child_audit_ready") is False
         and not _child_acs_assessed_in_run(child)
@@ -6007,10 +6705,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            green_run_sha: str | None = None,
                            auto_green_run_sha: str | None = None,
                            test_skill_run_sha: str | None = None,
+                           herdr_green_run_sha: str | None = None,
                            content_fingerprint: str | None = None,
                            merge_gate_evidence: str | None = None,
                            snapshot_exempt: set[str] | None = None,
-                           stale_pending_ids: set[str] | None = None) -> str:
+                           stale_pending_ids: set[str] | None = None,
+                           classification: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -6057,6 +6757,14 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       line is emitted near the header so the report records the evidence
       source distinctly from the cache-consumption path.
 
+    *herdr_green_run_sha* is the herdr package-suite commit sha (when a green
+      cached herdr run was found read-only under the ``herdr`` or
+      ``group:herdr`` cache key for a herdr-touching item,
+      WL-0MVHP5NTU009PA3I). When provided, a
+      ``Herdr suite evidence: <sha> (cached herdr package-suite run)`` line is
+      emitted near the header. It is recorded separately from the full-suite
+      evidence because a herdr entry never satisfies a full-suite AC (AC2).
+
     *content_fingerprint* is the content fingerprint (a sha256 over the work
       item's own title + description payload, zero git calls, see
       ``_compute_content_fingerprint``) captured at audit time. When provided,
@@ -6064,6 +6772,16 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       near the header so the persisted report carries the freshness gate data
       (SA-0MSKB6US1009CNHT, SA-0MVIDI8E00063OOP). The line is parsed back by
       ``_extract_content_fingerprint``.
+
+    *classification* is the optional transient cause token (``timeout`` /
+      ``provider_error`` / ``unparseable_output`` / ``concurrency_cap``) for
+      a run whose verdicts came from an infrastructure fallback
+      (WL-0MW2F2T1I001ZNH7 AC2). When ``None`` (the default) the cause is
+      derived from ``_INFRA_FALLBACK_MARKERS`` present in the AC evidence.
+      When set, the report carries ``Audit classification: transient
+      (verdict_assembly_failure: <classification>)`` immediately after the
+      ``Ready to close:`` first line; a clean run emits no classification
+      line.
 
     Ready-to-close logic:
       - All acceptance criteria (parent + children) must be ``met`` or ``adjusted``.
@@ -6120,8 +6838,14 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         # children without one are NOT-ASSESSED and still count.
         if cid in unserviced_ids and _child_has_stored_verdict(c):
             continue
-        # Assessed exempt children do not block through their AC verdicts.
-        if _child_is_exempt(c, snapshot_exempt) and _child_has_stored_verdict(c):
+        # Assessed exempt children do not block through their AC verdicts —
+        # EXCEPT a child whose own audit said not-ready: that verdict is a
+        # real judgement and must keep blocking (parent AC3).
+        if (
+            _child_is_exempt(c, snapshot_exempt)
+            and _child_has_stored_verdict(c)
+            and not _child_audit_verdict_blocks(c)
+        ):
             continue
         for a in c.get("ac_results", []):
             child_acs.append(a)
@@ -6170,6 +6894,20 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     else:
         ready = ready_before_cq
 
+    # Transient classification (WL-0MW2F2T1I001ZNH7 AC2): an explicit cause
+    # (passed by callers when the run degraded) wins; otherwise derive it
+    # from infra-fallback markers in AC evidence, so a "No" verdict produced
+    # solely by an infrastructure failure is distinguishable from a genuine
+    # model assessment. A clean run carries no classification line.
+    if classification is None:
+        classification = _classify_infra_fallback(ac_results, child_results)
+    classification_lines: list[str] = []
+    if classification:
+        classification_lines = [
+            ("Audit classification: transient "
+             f"(verdict_assembly_failure: {classification})")
+        ]
+
     # Explicit child-audit execution gate (SA-0MU32TE120012T49): in-main-slot
     # pending child screens are never presented as a normal result. The gate
     # names the child ids and how to complete them, and forces Ready=No.
@@ -6199,6 +6937,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             model_line = f"Model: {effective_model} (no provider)"
         lines = [
             f"Ready to close: {ready}",
+            *classification_lines,
             *gate_lines,
             "",
             f"Audit report for work item {issue_id_label}",
@@ -6220,6 +6959,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                 f"Test skill run evidence: {test_skill_run_sha} "
                 "(executed full-suite run)"
             )
+        if herdr_green_run_sha:
+            lines.append("")
+            lines.append(
+                f"Herdr suite evidence: {herdr_green_run_sha} "
+                "(cached herdr package-suite run)"
+            )
         if content_fingerprint:
             lines.append("")
             lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
@@ -6227,6 +6972,7 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     else:
         lines = [
             f"Ready to close: {ready}",
+            *classification_lines,
             *gate_lines,
             "",
             f"Audit report for work item {issue_id_label}",
@@ -6245,6 +6991,12 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
             lines.append(
                 f"Test skill run evidence: {test_skill_run_sha} "
                 "(executed full-suite run)"
+            )
+        if herdr_green_run_sha:
+            lines.append("")
+            lines.append(
+                f"Herdr suite evidence: {herdr_green_run_sha} "
+                "(cached herdr package-suite run)"
             )
         if content_fingerprint:
             lines.append("")
@@ -7018,7 +7770,7 @@ def _call_pi_and_maybe_log(issue_id: str, context: str, prompt: str,
             (LP-0MSQ32S2M001EA74 AC1).
         parent_screen: If True, forwards to _call_pi() so the parent Phase-1
             AC screen uses the right-sized screening budget instead of the
-            1800 s Phase-2 budget (SA-0MVJ3Q662006RDJR AC1).
+            2,400 s Phase-2 budget (SA-0MVJ3Q662006RDJR AC1).
         ac_count: Number of acceptance criteria covered by this call. When
             supplied, the per-call timing line appends ``ac_count=N`` and
             ``avg_ac_elapsed_seconds`` (elapsed / N) so Phase-2 per-AC
@@ -8130,9 +8882,13 @@ def _build_issue_json(
         # parent-triggered re-screen must not block the parent through a
         # tainted/incorrect child verdict (SA-0MVI35BIU002MTZQ AC5, mirrored
         # in the markdown report path). A child with NO stored verdict is NOT
-        # assessed and still counts.
-        and not (_child_is_exempt(c, snapshot_exempt)
-                 and _child_has_stored_verdict(c))
+        # assessed and still counts. A child whose own audit said not-ready
+        # always counts: its verdict is a real judgement (parent AC3).
+        and not (
+            _child_is_exempt(c, snapshot_exempt)
+            and _child_has_stored_verdict(c)
+            and not _child_audit_verdict_blocks(c)
+        )
         for a in c.get("ac_results", [])
     ]
     all_ac_acceptable = all(
@@ -8910,7 +9666,14 @@ def _run_phase2_deep_analysis(
             if script_failure_callback:
                 script_failure_callback(
                     "pi (Phase 2 deep analysis)",
-                    RuntimeError(f"Phase 2 deep analysis timed out after {CALL_PI_TIMEOUT}s"),
+                    # Report the timeout that was ACTUALLY applied (resolved
+                    # from --timeout / AUDIT_PI_TIMEOUT / CALL_PI_TIMEOUT), never
+                    # a hardcoded constant: a 2,700 s override must report
+                    # 2,700 s (WL-0MW32YZP7005LZ5B, absorbing SA-0MV9J471W002LCE1).
+                    RuntimeError(
+                        "Phase 2 deep analysis timed out after "
+                        f"{_resolve_call_timeout(timeout)}s"
+                    ),
                 )
             # Mark all ACs as partial with timeout evidence
             timeout_acs = []
@@ -9306,6 +10069,13 @@ class _AuditContext:
     # persist the resumable in-main-slot pending-screens signal
     # (SA-0MU32TE120012T49). None when checkpointing is disabled.
     checkpoint_dir: str | None = None
+    # Explicit checkpoint directory / disable flag threaded from cmd_issue so
+    # the FRESHNESS gate (_phase_gate — which runs before
+    # ``_open_checkpoint_store`` resolves ``checkpoint_dir``) can read the
+    # resumable pending-screens signal with the same directory resolution as
+    # the checkpoint store itself (SA-0MW2J7NGP006CIEG AC3).
+    explicit_checkpoint_dir: str | None = None
+    no_checkpoint: bool = False
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
@@ -9336,9 +10106,24 @@ class _AuditContext:
     green_run_sha: str | None = None
     auto_green_run_sha: str | None = None
     test_skill_run_sha: str | None = None
+    herdr_green_run_sha: str | None = None
     original_status: str = "open"
     original_stage: str = ""
     wi: dict | None = None
+    prior_audit: dict | None = None
+    """Pre-audit stored audit record for the producer-review rule
+    (SA-0MVR9B1UH002BUST, Option B+).
+
+    Normalised by ``_summarise_prior_audit`` to ``{readyToClose,
+    fingerprint, auditedAt, currentFingerprint}``; ``None`` when there is no
+    prior audit or it could not be read (the review predicate then fails
+    safe and flags the item).
+    """
+    producer_review: dict | None = None
+    """Producer-review flag decision for this run (resolved once before
+    persistence so the persisted report can record it and the terminal
+    lifecycle applies the same rule). See
+    ``_resolve_producer_review_decision``."""
     script_failure: dict | None = None
 
     # Pipeline state
@@ -10331,6 +11116,44 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     except RuntimeError:
         pass  # Fall back to safe defaults
 
+    # Herdr package-suite evidence (WL-0MVHP5NTU009PA3I): a work item whose
+    # resolved touched files include packages/herdr/** may auto-verify a
+    # "herdr suite passes" criterion from the `herdr` / `group:herdr` cache
+    # entry, read-only. This path is INDEPENDENT of the full-suite evidence
+    # above and NEVER satisfies a full-suite AC (AC2) — the injected block
+    # states that explicitly, and the full-suite classifier is untouched.
+    # The already-fetched ``wi`` is passed through so this path adds NO extra
+    # ``wl show`` (the single-fetch contract, SA-0MSL1Z7E9005TLBA).
+    herdr_green_run_sha = None
+    herdr_touched_files: list[str] | None = None
+    try:
+        herdr_touched_files = _resolve_touched_files(
+            runner, issue_id, worklog_dir=worklog_dir, work_item=wi,
+        )
+    except Exception:  # noqa: BLE001 -- fail-open: no herdr evidence
+        herdr_touched_files = None
+    herdr_block, herdr_sha, _herdr_status = _auto_herdr_green_run_outcome(
+        runner, herdr_touched_files, cwd=str(per_audit_root),
+    )
+    if herdr_sha is not None:
+        green_run_block = (green_run_block or "") + (herdr_block or "")
+        herdr_green_run_sha = herdr_sha
+
+    # ------------------------------------------------------------------
+    # Pre-audit audit-record capture for the producer-review rule
+    # (SA-0MVR9B1UH002BUST, Option B+). The freshness gate below already
+    # runs ``wl audit-show`` on the non-forced path, so it captures the
+    # record through ``audit_sink`` — no extra ``wl`` invocation is added
+    # on the hot path. The forced path (``--force`` / ``--refresh-audits``
+    # / batch drains) bypasses that gate and therefore performs exactly one
+    # explicit ``wl audit-show`` here.
+    # ------------------------------------------------------------------
+    prior_audit_sink: dict = {}
+    prior_audit: dict | None = (
+        _fetch_prior_audit(runner, issue_id, worklog_dir=worklog_dir)
+        if force else None
+    )
+
     # ------------------------------------------------------------------
     # Freshness gate: skip if a recent audit already exists
     # (before status lifecycle to avoid unnecessary in_progress transitions)
@@ -10338,27 +11161,58 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     if not force:
         fresh_report = _check_audit_freshness(runner, issue_id,
                                               worklog_dir=worklog_dir,
-                                              work_item=wi)
+                                              work_item=wi,
+                                              audit_sink=prior_audit_sink)
+        prior_audit = prior_audit_sink or None
         if fresh_report is not None:
-            # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt of
-            # the fresh audit so a redundant re-audit is stopped before the
-            # model is invoked (re-audit coordination, SA-0MSQIA84B005NHWC).
-            # The full report still follows so the operator can inspect the
-            # evidence that produced the verdict.
-            audited_at = _fetch_audited_at(
-                runner, issue_id, worklog_dir=worklog_dir,
+            # D1 (SA-0MW2J7NGP006CIEG AC1): a stored report whose own header
+            # says "Child screens pending" is NOT a final verdict. The
+            # content fingerprint only covers the item's title/description,
+            # which an invoking session servicing the emitted child screens
+            # never changes — so honouring the fingerprint alone permanently
+            # clamps such an item (production: LP-0MVLNBCTN0084MT0). The
+            # resumable signal names the screens left outstanding by the
+            # previous run; while it lists any child, fall through to the
+            # pipeline so the checkpoint resume can collect the child
+            # verdicts. ``_check_audit_freshness`` itself is unchanged —
+            # the decision to honour its result lives here.
+            outstanding_screens = (
+                set()
+                if ctx.no_checkpoint
+                else _read_pending_screens_signal(
+                    issue_id, owning_root, ctx.explicit_checkpoint_dir,
+                )
             )
-            verdict = _parse_ready_to_close(fresh_report)
-            verdict_label = "Yes" if verdict == "yes" else "No"
-            notice = (
-                f"Skipping: audit still fresh — Ready to close: "
-                f"{verdict_label}"
-            )
-            if audited_at:
-                notice += f" (audited {audited_at})"
-            print(notice)
-            print(fresh_report)
-            return 0
+            if outstanding_screens:
+                print(
+                    f"Freshness gate bypassed: {len(outstanding_screens)} "
+                    "child screen(s) still pending main-slot review ("
+                    + ", ".join(sorted(outstanding_screens))
+                    + ") — a report with outstanding child screens is not a "
+                    "final verdict; resuming the audit pipeline.",
+                    file=sys.stderr,
+                )
+            else:
+                # AC2 (SA-0MTFX6HMJ006QKR3): surface the verdict + auditedAt
+                # of the fresh audit so a redundant re-audit is stopped
+                # before the model is invoked (re-audit coordination,
+                # SA-0MSQIA84B005NHWC). The full report still follows so the
+                # operator can inspect the evidence that produced the
+                # verdict.
+                audited_at = _fetch_audited_at(
+                    runner, issue_id, worklog_dir=worklog_dir,
+                )
+                verdict = _parse_ready_to_close(fresh_report)
+                verdict_label = "Yes" if verdict == "yes" else "No"
+                notice = (
+                    f"Skipping: audit still fresh — Ready to close: "
+                    f"{verdict_label}"
+                )
+                if audited_at:
+                    notice += f" (audited {audited_at})"
+                print(notice)
+                print(fresh_report)
+                return 0
 
     # ------------------------------------------------------------------
     # Never-block guarantee (F4, SA-0MSTN8CWM003AAU9): the audit NEVER
@@ -10495,9 +11349,20 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     ctx.green_run_sha = green_run_sha
     ctx.auto_green_run_sha = auto_green_run_sha
     ctx.test_skill_run_sha = test_skill_run_sha
+    ctx.herdr_green_run_sha = herdr_green_run_sha
     ctx.original_status = original_status
     ctx.original_stage = original_stage
     ctx.wi = wi
+    # Attach the current (pre-audit) content fingerprint so the review
+    # predicate can compare it with the stored passing audit's fingerprint
+    # (AC4 content scope). ``_compute_content_fingerprint`` uses the already
+    # fetched ``wi`` — zero extra ``wl`` calls.
+    if prior_audit is not None:
+        prior_audit = dict(prior_audit)
+        prior_audit["currentFingerprint"] = _compute_content_fingerprint(
+            runner, issue_id, worklog_dir=worklog_dir, work_item=wi,
+        )
+    ctx.prior_audit = prior_audit
     ctx.ac_fallback_used = ac_fallback_used
     ctx.ac_results = ac_results
     ctx.child_results = child_results
@@ -11998,6 +12863,70 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     })
 
 
+def _re_resolve_pending_main_slot_children(
+    ctx: _AuditContext,
+    child_results: list[dict],
+    active_children: list[dict],
+) -> bool:
+    """Re-resolve checkpoint-restored children still pending in-main-slot.
+
+    A ``phase1_children`` checkpoint whose restored ``child_results`` carry
+    :data:`MAIN_SLOT_PENDING_EVIDENCE` is NOT a completed phase for those
+    children (SA-0MVSTZ71J001P67S D2). The invoking session may have serviced
+    the outstanding ``[AUDIT_IN_MAIN_SLOT_WORK]`` screens and persisted each
+    child audit since the checkpoint was written, so the children are
+    resolved again through the SAME child-verdict reuse path the Phase 1
+    pre-pass uses (:func:`_get_child_audit_verdict` →
+    :func:`_child_acs_from_own_audit`). A child with a fresh stored audit is
+    therefore collected with **zero** child pi calls, its ``reused_from`` /
+    ``child_audit_ready`` / ``child_audit_not_ready`` / ``ac_results`` shape
+    matching a non-resumed run, which lets
+    :func:`_pending_main_slot_child_ids` empty out and the pending-screens
+    signal clear.
+
+    Conservative by construction (never fabricates a serviced state): a
+    child with no stored audit, a stale stored audit, or under ``--force``
+    is left exactly as restored — still carrying its pending placeholder —
+    so it remains pending and keeps blocking the parent's readiness.
+
+    Mutates *child_results* in place; returns ``True`` when at least one
+    child was re-resolved (so the caller persists the refreshed results).
+    """
+    pending_ids = set(_pending_main_slot_child_ids(child_results))
+    if not pending_ids:
+        return False
+    by_id = {
+        str(child.get("id", "") or ""): child
+        for child in active_children or []
+    }
+    for cr in child_results or []:
+        cid = str(cr.get("id", "") or "")
+        if cid not in pending_ids:
+            continue
+        child = by_id.get(cid) or {
+            key: cr.get(key, "")
+            for key in ("id", "title", "status", "stage")
+        }
+        verdict, _reason, audited_at = _get_child_audit_verdict(
+            ctx.runner, cid, worklog_dir=ctx.worklog_dir,
+            force=ctx.force, child=child,
+        )
+        if verdict is not None:
+            cr["child_audit_ready"] = verdict is True
+            cr["child_audit_not_ready"] = verdict is False
+            cr["reused_from"] = audited_at
+            cr["ac_results"] = _child_acs_from_own_audit(
+                child, ctx.runner, worklog_dir=ctx.worklog_dir,
+            )
+        else:
+            # Not resolvable: keep the restored placeholder ACs untouched so
+            # the child stays pending (AC4) — never an empty, fabricated
+            # "assessed" result.
+            cr["child_audit_ready"] = False
+            cr["child_audit_not_ready"] = verdict is False
+    return True
+
+
 def _phase_children(ctx: _AuditContext) -> int | None:
     """Phase 4 — child orchestration + Phase 2 gate.
 
@@ -12128,6 +13057,20 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             )
             phase2_completed = st.get("phase2_completed", phase2_completed)
             phase2_skip_note = st.get("phase2_skip_note", phase2_skip_note)
+            # Restored children still carrying the in-main-slot placeholder
+            # are not resolved yet: collect any child audit persisted since
+            # the checkpoint was written so this run's report/pending-screens
+            # signal reflects the serviced state (SA-0MVSTZ71J001P67S D2).
+            if _re_resolve_pending_main_slot_children(
+                ctx, child_results, active_children,
+            ):
+                _checkpoint_phase_done(checkpoint, PHASE_CHILDREN, {
+                    "ac_results": ac_results,
+                    "child_results": child_results,
+                    "child_persist_results": child_persist_results,
+                    "phase2_completed": phase2_completed,
+                    "phase2_skip_note": phase2_skip_note,
+                })
             print(
                 f"[checkpoint] Skipping completed phase: "
                 f"{PHASE_LABELS[PHASE_PHASE2]}",
@@ -12144,6 +13087,26 @@ def _phase_children(ctx: _AuditContext) -> int | None:
             )
             phase2_completed = st.get("phase2_completed", phase2_completed)
             phase2_skip_note = st.get("phase2_skip_note", phase2_skip_note)
+            # A restored child still carrying the in-main-slot placeholder
+            # means the phase is NOT complete for it: re-resolve exactly
+            # those children through the child-verdict reuse path so a child
+            # audit serviced + persisted since the checkpoint is collected
+            # (zero pi calls) and the pending list can empty
+            # (SA-0MVSTZ71J001P67S D2 / AC1). Children that cannot be
+            # resolved stay pending (AC4).
+            if _re_resolve_pending_main_slot_children(
+                ctx, child_results, active_children,
+            ):
+                # Write the refreshed child_results back BEFORE Phase 2 so a
+                # later resume sees resolved children instead of replaying
+                # the placeholders (AC6).
+                _checkpoint_phase_done(checkpoint, PHASE_CHILDREN, {
+                    "ac_results": ac_results,
+                    "child_results": child_results,
+                    "child_persist_results": child_persist_results,
+                    "phase2_completed": phase2_completed,
+                    "phase2_skip_note": phase2_skip_note,
+                })
             print(
                 f"[checkpoint] Skipping completed phase: "
                 f"{PHASE_LABELS[PHASE_CHILDREN]}",
@@ -12993,6 +13956,7 @@ def _phase_report(ctx: _AuditContext) -> int:
     green_run_sha = ctx.green_run_sha
     auto_green_run_sha = ctx.auto_green_run_sha
     test_skill_run_sha = ctx.test_skill_run_sha
+    herdr_green_run_sha = ctx.herdr_green_run_sha
     content_fingerprint = ctx.content_fingerprint
     child_persist_results = ctx.child_persist_results
     audit_verdict = ctx.audit_verdict
@@ -13040,6 +14004,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 green_run_sha=green_run_sha,
                 auto_green_run_sha=auto_green_run_sha,
                 test_skill_run_sha=test_skill_run_sha,
+                herdr_green_run_sha=herdr_green_run_sha,
                 content_fingerprint=content_fingerprint,
                 merge_gate_evidence=ctx.merge_gate_evidence,
                 snapshot_exempt=ctx.snapshot_exempt_children,
@@ -13078,6 +14043,23 @@ def _phase_report(ctx: _AuditContext) -> int:
         # The finally block only trusts this verdict when the audit pipeline
         # completed successfully (no script failures).
         audit_verdict = _parse_ready_to_close(report)
+
+        # Producer-review flag decision (SA-0MVR9B1UH002BUST): resolved ONCE
+        # here, before persistence, so the persisted report records the
+        # decision (AC4) and the terminal lifecycle applies exactly the same
+        # rule. The report line is skipped for a --do-not-persist dry run
+        # (no report is stored); the flag rules themselves still apply.
+        ctx.producer_review = _resolve_producer_review_decision(
+            ctx, audit_verdict,
+        )
+        if ctx.producer_review["action"] != PRODUCER_REVIEW_UNTOUCHED:
+            review_line = _format_producer_review_line(ctx.producer_review)
+            if review_line:
+                print(review_line, file=sys.stderr)
+        if persist:
+            report = _append_producer_review_metadata(
+                report, ctx.producer_review,
+            )
 
         if json_mode:
             payload = _build_issue_json(
@@ -13127,6 +14109,15 @@ def _phase_report(ctx: _AuditContext) -> int:
                     # repaired verdicts still demotes (SA-0MSGMR7CX00588TZ AC4).
                     ac_fallback_used.clear()
                     report = _assemble_report()
+                    # The re-asked verdicts may change the overall verdict, so
+                    # re-resolve the review decision against the reassembled
+                    # report and re-apply the metadata line (idempotent).
+                    ctx.producer_review = _resolve_producer_review_decision(
+                        ctx, _parse_ready_to_close(report),
+                    )
+                    report = _append_producer_review_metadata(
+                        report, ctx.producer_review,
+                    )
                     persist_rc = persist_audit(
                         issue_id, report, worklog_dir=worklog_dir
                     )
@@ -13456,6 +14447,9 @@ def _cascade_descendants_terminal(
     - Dry-run safe: ``persist=False`` suppresses the cascade entirely.
     - Non-fatal: a per-child ``wl`` failure is logged loudly and does not
       abort the audit; the next passing audit completes the cascade.
+    - Releases the descendant's scheduling hold: the terminalise write also
+      clears a non-producer ``assignee`` (SA-0MW0F91KN004J06U), so a cascaded
+      child is never left on a lingering agent claim.
 
     Args:
         parent_id: The audited parent whose subtree is being terminalised.
@@ -13482,10 +14476,13 @@ def _cascade_descendants_terminal(
         if _is_terminal_lifecycle(status, stage):
             continue
         try:
+            # Terminal outcome for the descendant: release its scheduling hold in
+            # the same write (assignee-hold convention, shared with the
+            # executor's other terminal writes).
             _run_wl(
                 runner,
                 ["wl", "update", child_id, "--status", "completed",
-                 "--stage", "done", "--json"],
+                 "--stage", "done", "--assignee", "", "--json"],
                 worklog_dir=worklog_dir,
             )
         except RuntimeError as exc:
@@ -13601,20 +14598,21 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
         # fallback on some AC evidence (e.g. a read-only test skip with a
         # variance note) leaves the overall 'Ready to close: Yes' verdict
         # trustworthy, so the item still moves to the review queue.
-        fallback_tainted = ctx.ac_fallback_used.is_set()
+        fallback_tainted = _compute_fallback_tainted(ctx, ctx.audit_verdict)
+        # Producer-review flag decision (SA-0MVR9B1UH002BUST). Reuse the
+        # decision resolved before persistence when present, so the flag
+        # write can never disagree with the persisted report's recorded
+        # decision; recompute for callers that reach the lifecycle directly
+        # (unit tests, early-abort paths).
+        producer_review = ctx.producer_review or (
+            _resolve_producer_review_decision(ctx, ctx.audit_verdict)
+        )
         # Every terminal write below is a raw ``wl update`` — this phase does
         # not use ``StatusLifecycle`` — so the helper's release-by-default exit
         # hook cannot clear the audit claim. The ``--assignee ""`` on each
         # command is therefore required and must not be dropped as redundant
         # (assignee-hold convention; pinned by
         # ``tests/test_assignee_release_all_skills.py``).
-        if ctx.audit_verdict == "no" and not fallback_tainted:
-            # Evidence-marker backstop: if any AC evidence carries a known
-            # infra-failure diagnostic, treat the "No" as fallback-tainted
-            # even if a future fallback site forgot to set the flag.
-            fallback_tainted = _evidence_has_infra_failure_markers(
-                ctx.ac_results, ctx.child_results,
-            )
         if (ctx.script_failure is not None or not ctx.audit_completed
                 or ctx.audit_verdict is None
                 or (ctx.audit_verdict == "no" and fallback_tainted)):
@@ -13660,12 +14658,16 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6 / Q2=C): a
             # top-level item is flagged `--needs-producer-review yes` so the
             # release gate blocks it until the producer explicitly reviews
-            # it. Child items are covered by their parent's review, so they
-            # are NOT flagged — the flag would flood the producer queue with
-            # redundant approvals (SA-0MSSVKYEW008PJ9H). In both cases the
-            # audit agent's own assignee claim is CLEARED (status-neutral
-            # claim, WL-0MV85WCJJ0087VMP / WL-0MV7W77AY005MGBL fix). Flags
-            # are inserted before the trailing --json (file convention:
+            # it — EXCEPT when the producer already reviewed this exact
+            # content (AC1: a prior passing audit with an unchanged v2
+            # content fingerprint), in which case the stored `false` is
+            # preserved and nothing is written. Child items are covered by
+            # their parent's review, so they are NOT flagged — the flag
+            # would flood the producer queue with redundant approvals
+            # (SA-0MSSVKYEW008PJ9H). In both cases the audit agent's own
+            # assignee claim is CLEARED (status-neutral claim,
+            # WL-0MV85WCJJ0087VMP / WL-0MV7W77AY005MGBL fix). Flags are
+            # inserted before the trailing --json (file convention:
             # --json last).
             # This is the sole authorisation for the descendant cascade
             # below — a passing verdict, not status/stage (AC3).
@@ -13676,7 +14678,13 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             else:
                 cmd += ["--status", "completed", "--stage", "in_review"]
             cmd += ["--assignee", ""]
-            if not ctx.wi or not ctx.wi.get("parentId"):
+            if (not ctx.wi or not ctx.wi.get("parentId")) and (
+                producer_review["action"] != PRODUCER_REVIEW_PRESERVED
+            ):
+                # A producer review of unchanged content is preserved
+                # (SA-0MVR9B1UH002BUST AC1); every other top-level pass
+                # still enters the producer queue (AC2). The runner never
+                # clears the flag — it only writes "yes" or nothing.
                 cmd += ["--needs-producer-review", "yes"]
             cmd.append("--json")
             restore_cmd = cmd
@@ -13727,13 +14735,14 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                     "--assignee", "", "--json",
                 ]
                 expected_status, expected_stage = "open", "plan_complete"
-                # Merge-gate blocker (SA-0MT456M27001LRTL AC3): a failed
-                # integration fails the audit closed and flags the item for
-                # producer review so the producer investigates and integrates
-                # manually — never proceed past Phase 1 with unmerged work.
-                # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6): flag the
-                # item for producer review, and clear the audit claim.
-                if ctx.merge_gate_blocker:
+                # Independent failing audit flags the producer queue
+                # (SA-0MVR9B1UH002BUST AC3): every independent top-level
+                # 'No' — merge-gate-blocked or ordinary — surfaces the item,
+                # never clears an existing review. The cascade-suppressed
+                # 'No' (handled above) and child items stay untouched
+                # (producer Q2 / AC6). The decision drives the write so the
+                # persisted report and the flag never disagree.
+                if producer_review["action"] == PRODUCER_REVIEW_REQUIRED:
                     restore_cmd = [
                         "wl", "update", ctx.issue_id,
                         "--status", "open", "--stage", "plan_complete",
@@ -13846,6 +14855,26 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # re-queuing the item as a stale-audit candidate. A non-Yes verdict never
     # reaches here (fail-closed: a failed dry-run must not clear staleness).
     if dry_run_freshness_refresh:
+        # AC5 (SA-0MW2J7NGP006CIEG): a dry-run must never re-publish "fresh"
+        # for a run with outstanding in-main-slot child screens. The
+        # child-audit execution gate already forces ``Ready to close: No``
+        # while any screen is pending (so this branch should be unreachable);
+        # this guard is defence in depth and keeps the invariant if that gate
+        # ever regresses. Deliberately broader than the report gate: EVERY
+        # child carrying the unserviced in-main-slot marker blocks the
+        # refresh, including ones the report classifies as unserviced.
+        outstanding_screens = _pending_main_slot_child_ids(ctx.child_results)
+        if outstanding_screens:
+            print(
+                f"Error: refusing to refresh audit freshness for "
+                f"{ctx.issue_id}: {len(outstanding_screens)} child screen(s) "
+                "still pending main-slot review ("
+                + ", ".join(outstanding_screens)
+                + "). A report with outstanding child screens is not a "
+                "final verdict, so a dry run may not mark it fresh.",
+                file=sys.stderr,
+            )
+            return 1
         fresh_rc = persist_audit_freshness(
             ctx.issue_id,
             runner=ctx.runner,
@@ -14133,6 +15162,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
         max_child_audits=max_child_audits, run_tests=run_tests,
         no_execute=no_execute,
         max_citations_per_ac=max_citations_per_ac,
+        explicit_checkpoint_dir=checkpoint_dir,
+        no_checkpoint=no_checkpoint,
     )
     rc = _phase_gate(ctx)
     if rc is not None:
@@ -14192,7 +15223,13 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # misleading with the work unmerged.
             ctx.audit_verdict = "no"
             ctx.audit_completed = True
-            fail_report = _build_merge_gate_failure_report(ctx)
+            # Resolve the producer-review decision before persisting so the
+            # fail-closed report records why the flag was (or was not) set
+            # (SA-0MVR9B1UH002BUST AC3/AC4).
+            ctx.producer_review = _resolve_producer_review_decision(ctx, "no")
+            fail_report = _append_producer_review_metadata(
+                _build_merge_gate_failure_report(ctx), ctx.producer_review,
+            )
             if ctx.json_mode:
                 print(json.dumps({
                     "merge_gate": {
@@ -14679,7 +15716,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "AC-review screens in seconds (default: "
                              "AUDIT_CHILD_SCREEN_TIMEOUT env or 1080; lightweight "
                              "child screens fail fast instead of burning the full "
-                             "1800s budget)"
+                             "Phase-2 budget (2400s))"
                          ))
     p_issue.add_argument("--parent-screen-timeout", type=int, default=None,
                          help=(

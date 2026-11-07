@@ -20,7 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from audit.scripts.audit_runner import cmd_issue
-from audit.scripts.persist_audit import persist_audit
+from audit.scripts.persist_audit import PERSIST_CONTENT_INVALID, persist_audit
 from audit.tests.wl_helpers import make_stateful_runner
 
 # ---------------------------------------------------------------------------
@@ -673,5 +673,105 @@ class TestExitCodes:
             return _fake_proc(returncode=1, stderr="wl not found")
         rc = cmd_issue("SA-MISSING", runner=fake_runner)
         assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# C1 (WL-0MW32Y8E90092TIM): transient classification of persistence failures
+# ---------------------------------------------------------------------------
+# Regression tests for the test-first pair with C2 (WL-0MW32YQ29001ZN66): a
+# verdict that could not be persisted must be distinguishable from a genuine
+# 'Ready to close: No' verdict. Red against current HEAD; green after C2 adds
+# the `Audit classification: transient (verdict_persistence_failure)` line to
+# the fallback and names the classification in the `wl audit-set --summary`.
+
+class TestTransientPersistenceClassification:
+    """Persistence-rejection path carries a transient classification."""
+
+    REPORT = (
+        "Ready to close: No\n"
+        "Audit classification: transient (verdict_assembly_failure: timeout)\n"
+        "\n"
+        "# Audit report for work item SA-TEST\n"
+        "\n"
+        "## Summary\n"
+        "Assembled verdict content rejected during persistence."
+    )
+
+    def test_fallback_carries_transient_classification_and_keeps_ready_line(self):
+        """When `wl update --audit-text` rejects the report, the persisted
+        fallback keeps the `Ready to close:` first line and carries the
+        machine-readable transient classification line (AC1)."""
+        calls = []
+        update_count = {"n": 0}
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            calls.append(cmd_list)
+            if "audit-set" in cmd_list:
+                return _fake_proc(stdout='{"success": true}')
+            if "update" in cmd_list:
+                update_count["n"] += 1
+                if update_count["n"] == 1:
+                    # The full report is rejected by wl's validation.
+                    return _fake_proc(returncode=1, stderr="malformed JSON / validation error")
+                # The compact fallback is accepted.
+                return _fake_proc(stdout='{"success": true}')
+            return _fake_proc(stdout='{"success": true}')
+
+        rc = persist_audit("SA-TEST", self.REPORT, wl_bin="wl", runner=fake_runner, _fail=False)
+
+        # Degraded-but-usable persistence: only the fallback could be stored.
+        assert rc == PERSIST_CONTENT_INVALID
+
+        # The final (fallback) `wl update --audit-text` call persisted text
+        # that starts with the wl-required first line and names the transient
+        # persistence-failure classification.
+        update_calls = [c for c in calls if "update" in c]
+        fallback_cmd = update_calls[-1]
+        fallback_text = fallback_cmd[fallback_cmd.index("--audit-text") + 1]
+        assert fallback_text.startswith("Ready to close:")
+        assert (
+            "Audit classification: transient (verdict_persistence_failure)"
+            in fallback_text
+        ), f"fallback missing transient classification: {fallback_text!r}"
+
+    def test_audit_set_summary_names_transient_classification(self):
+        """On the persistence-rejection path the `wl audit-set --summary`
+        argv names the transient classification, so the stored summary is
+        distinguishable from a genuine verdict (AC1).
+
+        The summary mirrors the report's machine-readable
+        ``Audit classification:`` line (D1, WL-0MW2F2T1I001ZNH7): a degraded
+        run's assembled report carries ``transient (verdict_assembly_failure:
+        <cause>)`` (here a Phase-2 timeout), which persist_audit copies into
+        the ``--summary`` token. The persistence-rejection dynamics below
+        (first ``wl update --audit-text`` rejected, compact fallback
+        persisted, ``PERSIST_CONTENT_INVALID``) exercise the exact incident
+        of WL-0MW1VINII003IL7R.
+        """
+        calls = []
+        update_count = {"n": 0}
+
+        def fake_runner(cmd, **kwargs):
+            cmd_list = list(cmd)
+            calls.append(cmd_list)
+            if "audit-set" in cmd_list:
+                return _fake_proc(stdout='{"success": true}')
+            if "update" in cmd_list:
+                update_count["n"] += 1
+                if update_count["n"] == 1:
+                    return _fake_proc(returncode=1, stderr="malformed JSON / validation error")
+                return _fake_proc(stdout='{"success": true}')
+            return _fake_proc(stdout='{"success": true}')
+
+        rc = persist_audit("SA-TEST", self.REPORT, wl_bin="wl", runner=fake_runner, _fail=False)
+        assert rc == PERSIST_CONTENT_INVALID
+
+        audit_set = next(c for c in calls if "audit-set" in c)
+        summary = audit_set[audit_set.index("--summary") + 1]
+        assert "transient" in summary.lower(), (
+            f"wl audit-set --summary must name the transient classification: "
+            f"{summary!r}"
+        )
 
 
