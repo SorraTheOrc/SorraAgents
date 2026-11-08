@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-# <!-- REFACTOR-SA-0MW0UKUY7002DRJW
-# smell: simplification
-# severity: medium
-# description: Return the condition `not is_producer_assignee(assignee)` directly
-# -->
 # <!-- REFACTOR-SA-0MW0UKTO1004MP0Y
 # smell: formatting
 # severity: low
@@ -17,8 +12,9 @@ work invisible to dispatch. The canonical statement lives in
 ``AGENTS_GLOBAL.md`` (Assignee release invariant):
 
 > any code path that claims an ``assignee`` must release it on every terminal
-> outcome; a persistent hold is represented by the producer assignee (``Map``)
-> or ``needsProducerReview``, never by a lingering agent assignee.
+> outcome; ``needsProducerReview`` is the only persistent hold, so no assignee
+> — including the producer identity (``Map``) — is ever left behind as a
+> lingering claim.
 
 ``StatusLifecycle`` releases the claim on every lifecycle exit. Two gaps remain
 and are closed here (SA-0MW0F91KN004J06U):
@@ -29,21 +25,24 @@ and are closed here (SA-0MW0F91KN004J06U):
    :func:`signal_release` guard) so the session's own claim is released even
    when the workflow is abandoned.
 2. **Claims orphaned by a dead session.** :func:`reap_stale_claims` scans for
-   non-producer claims on non-terminal items older than a TTL and releases
-   them, recording each release (machine-readable output plus a comment naming
-   the previous assignee). It is idempotent and never touches a producer hold,
-   a ``needsProducerReview`` item, or a ``completed``/``deleted`` item.
+   claims on non-terminal items older than a TTL and releases them, recording
+   each release (machine-readable output plus a comment naming the previous
+   assignee). It is idempotent and never touches a ``completed``/``deleted``
+   item or clears the ``needsProducerReview`` flag.
 
-Producer awareness is one predicate (:func:`should_release_assignee`), shared
-by every release path here and by :class:`shared.status_lifecycle.StatusLifecycle`,
-so the reaper and the lifecycle transition can never disagree about what a
-protected hold is.
+One predicate (:func:`should_release_assignee`) is shared by every release
+path here and by :class:`shared.status_lifecycle.StatusLifecycle`, so the
+reaper and the lifecycle transition can never disagree about what a claim is.
 
-Three identities appear in the ``assignee`` field, and only one is a hold:
+Three identities appear in the ``assignee`` field, and **all of them are
+released on every terminal outcome**. The producer's persistent hold is the
+``needsProducerReview`` flag, never an assignee:
 
 * ``Map`` (:data:`PRODUCER_ASSIGNEE_DEFAULT`, overridable with
-  ``WORKLOG_PRODUCER_ASSIGNEE``) — the producer's deliberate hold: never
-  released, never reaped;
+  ``WORKLOG_PRODUCER_ASSIGNEE``) — the producer identity. It is a normal claim
+  for release purposes: a lingering ``Map`` after a skill run is
+  indistinguishable from a stranded claim, so it is released like any other
+  assignee (SA-0MW7QTAHW0030FGV);
 * ``dispatcher`` (:data:`DISPATCHER_ASSIGNEE_DEFAULT`) — the herdr downtime
   dispatcher's claim, recorded when it auto-dispatches a work item
   (WL-0MW51OB1Y0073TLG). It means "an agent is on it", **not** "the producer
@@ -51,7 +50,7 @@ Three identities appear in the ``assignee`` field, and only one is a hold:
 * any other value — an agent identity (``implement``, ``plan``, …): released.
 
 The dispatcher used to claim with ``Map``, which made an auto-dispatched claim
-indistinguishable from a deliberate producer hold: sessions preserved it, the
+indistinguishable from the producer identity: sessions preserved it, the
 reaper never reaped it, and the item was stranded as a scheduling hold with no
 agent working. Keeping both identities single-sourced here is what stops the
 two concepts drifting apart again.
@@ -73,8 +72,8 @@ CLI::
 
 Configuration (environment):
 
-* ``WORKLOG_PRODUCER_ASSIGNEE`` — the producer identity to preserve
-  (default ``Map``).
+* ``WORKLOG_PRODUCER_ASSIGNEE`` — the producer identity (default ``Map``);
+  it is **not** a release exemption — every terminal outcome releases it.
 * ``WORKLOG_CLAIM_REAPER_TTL_HOURS`` — reaper TTL in hours (default ``24``).
 * ``WORKLOG_CLAIM_REAPER=0`` — disable the post-sync reaper hook.
 * ``IMPLEMENT_AGENT_NAME`` / ``WORKLOG_AGENT_NAME`` / ``AGENT_NAME`` /
@@ -106,9 +105,14 @@ LOG = logging.getLogger("skill.shared.claim_release")
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
-#: Environment variable naming the producer identity to preserve.
+#: Environment variable naming the producer identity.
 PRODUCER_ASSIGNEE_ENV = "WORKLOG_PRODUCER_ASSIGNEE"
-#: The producer assignee (``Map`` per ``AGENTS_GLOBAL.md``).
+#: The producer identity (``Map`` per ``AGENTS_GLOBAL.md``).
+#:
+#: Retained so creation paths (e.g. intake creating an item on the producer's
+#: behalf) and documentation can name the identity. It is **not** a release
+#: exemption: since SA-0MW7QTAHW0030FGV every terminal outcome releases it, and
+#: ``needsProducerReview`` is the sole persistent-hold signal.
 PRODUCER_ASSIGNEE_DEFAULT = "Map"
 
 #: The herdr downtime dispatcher's claim identity (WL-0MW51OB1Y0073TLG).
@@ -178,12 +182,17 @@ def _normalise_status(status: object) -> str:
 
 
 def producer_assignee() -> str:
-    """The producer identity whose hold must never be released."""
+    """The producer identity (not a release exemption)."""
     return (os.environ.get(PRODUCER_ASSIGNEE_ENV) or PRODUCER_ASSIGNEE_DEFAULT).strip()
 
 
 def is_producer_assignee(assignee: object) -> bool:
-    """True when *assignee* names the producer (case-insensitive)."""
+    """True when *assignee* names the producer identity (case-insensitive).
+
+    This is an identity check only. ``Map`` is **not** exempt from release
+    (SA-0MW7QTAHW0030FGV): every terminal outcome releases it, and
+    ``needsProducerReview`` is the only persistent hold.
+    """
     if not isinstance(assignee, str):
         return False
     producer = producer_assignee()
@@ -205,14 +214,16 @@ def is_deleted(item: dict[str, Any]) -> bool:
 
 
 def should_release_assignee(item: dict[str, Any]) -> bool:
-    """True when *item*'s assignee is a non-producer claim that should be released.
+    """True when *item* carries an assignee that a terminal outcome must release.
 
-    The single producer-aware predicate shared by every release path (the
-    lifecycle transition, the session backstop and the reaper). Producer holds
-    (``Map``) and ``needsProducerReview`` items are sacrosanct — they are the
-    sanctioned persistent holds, not a lingering agent claim. The
-    auto-dispatcher's ``dispatcher`` claim is NOT one of them: it is a claim
-    (try :func:`is_dispatcher_assignee`) and is released like an agent claim.
+    The single predicate shared by every release path (the lifecycle
+    transition, the session backstop and the reaper). **Every** non-empty
+    assignee is released, including the producer identity ``Map`` and the
+    auto-dispatcher's ``dispatcher`` claim: the producer decided that ``Map``
+    is not a persistent hold, so a lingering ``Map`` after a skill run is
+    indistinguishable from a stranded claim and would block dispatch
+    (SA-0MW7QTAHW0030FGV). ``needsProducerReview`` is the sole persistent hold
+    and is represented by that flag — releasing the assignee never clears it.
 
     Args:
         item: A work item mapping (``wl show --json`` → ``workItem``).
@@ -221,27 +232,22 @@ def should_release_assignee(item: dict[str, Any]) -> bool:
         ``True`` when the assignee is non-empty and releasable.
     """
     assignee = item.get("assignee")
-    if not isinstance(assignee, str) or not assignee.strip():
-        return False
-    if bool(item.get("needsProducerReview")):
-        return False
-    # A ``dispatcher`` claim (the downtime dispatcher's identity) is deliberately
-    # released here: it is a claim, not the producer's scheduling hold
-    # (WL-0MW51OB1Y0073TLG).
-    return not is_producer_assignee(assignee)
+    return isinstance(assignee, str) and bool(assignee.strip())
 
 
 def _release_skip_reason(item: dict[str, Any]) -> str:
-    """Explain why *item*'s assignee must not be released (empty when it should)."""
+    """Explain why *item*'s assignee must not be released (empty when it should).
+
+    Only a deleted item is exempt: it is historical and never rewritten. A
+    ``needsProducerReview`` item is **not** exempt — the flag is the persistent
+    hold, and releasing its assignee leaves the flag untouched
+    (SA-0MW7QTAHW0030FGV).
+    """
     assignee = item.get("assignee")
     if not isinstance(assignee, str) or not assignee.strip():
         return "no-claim"
     if is_deleted(item):
         return "deleted"
-    if bool(item.get("needsProducerReview")):
-        return "needs-producer-review"
-    if is_producer_assignee(assignee):
-        return "producer-hold"
     return ""
 
 
@@ -290,12 +296,12 @@ def release_claim(
     runner: Runner | None = None,
     worklog_dir: str | None = None,
 ) -> dict[str, Any]:
-    """Release a non-producer claim on *work_item_id* and report the outcome.
+    """Release a claim on *work_item_id* and report the outcome.
 
-    The release is a plain ``wl update <id> --assignee ""``; producer holds and
-    ``needsProducerReview`` items are left untouched. With *comment* a worklog
-    comment naming the previous assignee records the release, so an automated
-    cleanup is always recoverable.
+    The release is a plain ``wl update <id> --assignee ""``; deleted items are
+    left untouched and the ``needsProducerReview`` flag is never modified. With
+    *comment* a worklog comment naming the previous assignee records the
+    release, so an automated cleanup is always recoverable.
 
     Args:
         work_item_id: The work item whose claim should be released.
@@ -305,7 +311,7 @@ def release_claim(
         expected_assignee: When given, release only if the persisted assignee
             matches it (case-insensitive). A session backstop passes its own
             identity so it can never clear a *different* live session's claim;
-            ``None`` means "any non-producer claim" (reaper / explicit admin).
+            ``None`` means "any claim" (reaper / explicit admin).
         comment: Record the release as a worklog comment (default ``True``).
         runner: Optional injectable command runner (for tests).
         worklog_dir: Optional explicit ``.worklog`` directory.
@@ -315,9 +321,8 @@ def release_claim(
         protected hold::
 
             {"success": true, "work_item_id": ..., "released": bool,
-             "reason": "released" | "no-claim" | "producer-hold" |
-                       "needs-producer-review" | "claim-not-owned" |
-                       "deleted" | "not-found",
+             "reason": "released" | "no-claim" | "claim-not-owned" |
+                       "deleted" | "not-found" | "release-failed",
              "previous_assignee": str, "status": str, "comment": bool}
     """
     report: dict[str, Any] = {
@@ -419,9 +424,9 @@ def release_session_claim(
     The session's agent identity (see :data:`SESSION_AGENT_ENV_VARS`) is used
     as the ownership guard, so a finishing run never clears a concurrently
     live sibling session's claim. When no identity is configured the helper
-    still releases any non-producer claim — the operator-approved rule for a
-    terminal outcome — while producer holds and ``needsProducerReview`` items
-    stay untouched.
+    still releases any claim — the operator-approved rule for a terminal
+    outcome — while deleted items stay untouched and the
+    ``needsProducerReview`` flag is never modified.
 
     Best-effort by contract: callers are session-end hooks and abort paths, so
     a failure is logged and reported rather than raised.
@@ -535,13 +540,14 @@ def reap_stale_claims(
     worklog_dir: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Release non-producer claims older than the TTL on non-terminal items.
+    """Release claims older than the TTL on non-terminal items.
 
-    Idempotent: a second pass finds nothing to release. Producer holds,
-    ``needsProducerReview`` items, ``completed``/``done``/``deleted`` items and
-    items without a parseable timestamp are never touched. Each release is
-    reported (``id``, ``previous_assignee``, ``age_hours``) and commented on
-    the item, so an automated cleanup is auditable and recoverable.
+    Idempotent: a second pass finds nothing to release. ``Map`` is an ordinary
+    claim and is reaped like any other; the ``needsProducerReview`` flag is
+    never cleared. ``completed``/``done``/``deleted`` items and items without a
+    parseable timestamp are never touched. Each release is reported (``id``,
+    ``previous_assignee``, ``age_hours``) and commented on the item, so an
+    automated cleanup is auditable and recoverable.
 
     Args:
         ttl_hours: Idle-hours threshold; defaults to

@@ -13,11 +13,12 @@ invisible to dispatch. Two gaps are covered here (SA-0MW0F91KN004J06U):
 1. **Session-end / signal backstop.** ``release_session_claim`` and the
    ``signal_release`` guard release the session's own claim even when the run
    never reaches a terminal lifecycle step (SIGINT/SIGTERM, timeout, abort).
-2. **Bounded stale-claim reaper.** ``reap_stale_claims`` releases
-   non-producer claims on non-terminal items older than a TTL, records each
-   release and is idempotent.
+2. **Bounded stale-claim reaper.** ``reap_stale_claims`` releases claims on
+   non-terminal items older than a TTL, records each release and is idempotent.
 
-The producer hold (``Map``) and ``needsProducerReview`` items are sacrosanct;
+The producer identity (``Map``) is **not** a persistent hold: every non-empty
+assignee is released, including ``Map``. ``needsProducerReview`` is the only
+persistent hold and its flag is never cleared by a release.
 ``completed``/``deleted`` items are never touched by the reaper.
 
 Most tests drive the real production functions through an in-memory ``wl``
@@ -168,7 +169,7 @@ class MemoryWl:
 
 
 class TestShouldRelease:
-    """The one producer-aware predicate shared by every release path."""
+    """The one predicate shared by every release path."""
 
     @pytest.mark.parametrize(
         ("item", "expected"),
@@ -177,23 +178,23 @@ class TestShouldRelease:
             ({"assignee": "IMPLEMENT"}, True),
             ({"assignee": ""}, False),
             ({"assignee": "  "}, False),
-            ({"assignee": "Map"}, False),
-            ({"assignee": "map"}, False),
-            ({"assignee": "MAP"}, False),
+            ({"assignee": "Map"}, True),
+            ({"assignee": "map"}, True),
+            ({"assignee": "MAP"}, True),
             ({"assignee": "dispatcher"}, True),
             ({"assignee": "Dispatcher"}, True),
-            (
-                {"assignee": "agent", "needsProducerReview": True},
-                False,
-            ),
+            ({"assignee": "agent", "needsProducerReview": True}, True),
         ),
     )
-    def test_predicate_is_producer_aware(self, item, expected) -> None:
+    def test_predicate_releases_every_assignee(self, item, expected) -> None:
         assert claim_release.should_release_assignee(item) is expected
 
-    def test_producer_assignee_is_configurable(self, monkeypatch) -> None:
+    def test_producer_identity_is_released_and_still_identifiable(
+        self, monkeypatch
+    ) -> None:
         monkeypatch.setenv(claim_release.PRODUCER_ASSIGNEE_ENV, "Producer")
-        assert claim_release.should_release_assignee({"assignee": "Producer"}) is False
+        assert claim_release.is_producer_assignee("Producer") is True
+        assert claim_release.should_release_assignee({"assignee": "Producer"}) is True
         assert claim_release.should_release_assignee({"assignee": "Map"}) is True
 
 
@@ -203,9 +204,9 @@ class TestShouldRelease:
 
 
 class TestReleaseClaim:
-    """``release_claim`` releases a non-producer claim and names the previous one."""
+    """``release_claim`` releases a claim and names the previous one."""
 
-    def test_releases_a_non_producer_claim(self) -> None:
+    def test_releases_a_claim(self) -> None:
         store = MemoryWl({"QZ-1": {"assignee": _AGENT}})
 
         result = claim_release.release_claim(
@@ -238,30 +239,31 @@ class TestReleaseClaim:
         assert len(store.update_commands("QZ-1")) == updates_after_first
         assert len(store.comments) == 1
 
-    def test_preserves_the_producer_hold(self) -> None:
+    def test_releases_the_producer_identity(self) -> None:
+        """``Map`` is a normal claim and is released on a terminal outcome."""
         store = MemoryWl({"QZ-1": {"assignee": "Map"}})
 
         result = claim_release.release_claim(
             "QZ-1", reason="session-end", author=_AGENT, runner=store.runner
         )
 
-        assert result["released"] is False
-        assert result["reason"] == "producer-hold"
-        assert store.assignee("QZ-1") == "Map"
-        assert store.update_commands("QZ-1") == []
+        assert result["released"] is True
+        assert result["reason"] == "released"
+        assert store.assignee("QZ-1") == ""
 
-    def test_preserves_a_needs_producer_review_item(self) -> None:
+    def test_releases_assignee_on_a_needs_producer_review_item(self) -> None:
+        """The flag is the hold; the assignee is released and the flag survives."""
         store = MemoryWl(
-            {"QZ-1": {"assignee": _AGENT, "needsProducerReview": True}}
+            {"QZ-1": {"assignee": "Map", "needsProducerReview": True}}
         )
 
         result = claim_release.release_claim(
             "QZ-1", reason="session-end", author=_AGENT, runner=store.runner
         )
 
-        assert result["released"] is False
-        assert result["reason"] == "needs-producer-review"
-        assert store.assignee("QZ-1") == _AGENT
+        assert result["released"] is True
+        assert store.assignee("QZ-1") == ""
+        assert store.items["QZ-1"]["needsProducerReview"] is True
 
     def test_expected_assignee_guards_against_other_sessions(self) -> None:
         """A session may only release the claim it actually owns."""
@@ -392,19 +394,13 @@ class TestReaper:
     @pytest.mark.parametrize(
         "item",
         (
-            {"assignee": "Map", "activityAt": _iso(1000)},
-            {
-                "assignee": _AGENT,
-                "needsProducerReview": True,
-                "activityAt": _iso(1000),
-            },
             {"assignee": _AGENT, "status": "completed", "activityAt": _iso(1000)},
             {"assignee": _AGENT, "status": "done", "activityAt": _iso(1000)},
             {"assignee": _AGENT, "deletedBy": "operator", "activityAt": _iso(1000)},
         ),
-        ids=("producer", "needs-review", "completed", "done", "deleted"),
+        ids=("completed", "done", "deleted"),
     )
-    def test_never_touches_pinned_or_terminal_items(self, item) -> None:
+    def test_never_touches_terminal_items(self, item) -> None:
         store = MemoryWl({"QZ-1": dict(item)})
 
         report = claim_release.reap_stale_claims(
@@ -414,6 +410,41 @@ class TestReaper:
         assert report["released_count"] == 0
         assert store.update_commands("QZ-1") == []
         assert store.assignee("QZ-1") == item["assignee"]
+
+    @pytest.mark.parametrize(
+        "assignee", ("Map", _AGENT), ids=("producer-identity", "agent-claim")
+    )
+    def test_reaps_a_stale_needs_producer_review_claim_without_clearing_the_flag(
+        self, assignee
+    ) -> None:
+        """The flag is the hold; a stale assignee beside it is still reaped."""
+        store = MemoryWl(
+            {
+                "QZ-1": _held(
+                    assignee, age_hours=48, needsProducerReview=True
+                )
+            }
+        )
+
+        report = claim_release.reap_stale_claims(
+            runner=store.runner, ttl_hours=24
+        )
+
+        assert report["released_count"] == 1
+        assert store.assignee("QZ-1") == ""
+        assert store.items["QZ-1"]["needsProducerReview"] is True
+
+    def test_reaper_releases_a_stale_producer_identity_claim(self) -> None:
+        """``Map`` is a normal claim and is reaped once stale."""
+        store = MemoryWl({"QZ-1": _held("Map", age_hours=48)})
+
+        report = claim_release.reap_stale_claims(
+            runner=store.runner, ttl_hours=24
+        )
+
+        assert report["released_count"] == 1
+        assert report["released"][0]["previous_assignee"] == "Map"
+        assert store.assignee("QZ-1") == ""
 
     def test_unknown_timestamp_is_never_released_blind(self) -> None:
         store = MemoryWl(
@@ -470,7 +501,11 @@ class TestReaper:
     def test_reports_every_skipped_candidate(self) -> None:
         store = MemoryWl(
             {
-                "QZ-1": {"assignee": "Map", "activityAt": _iso(100)},
+                "QZ-1": {
+                    "assignee": _AGENT,
+                    "deletedBy": "operator",
+                    "activityAt": _iso(100),
+                },
                 "QZ-2": {"assignee": _AGENT, "activityAt": _iso(1)},
             }
         )
@@ -481,7 +516,7 @@ class TestReaper:
 
         assert report["scanned"] == 2
         assert report["released_count"] == 0
-        assert set(report["skipped"]) == {"producer-hold", "fresh"}
+        assert set(report["skipped"]) == {"deleted", "fresh"}
 
 
 # ---------------------------------------------------------------------------
@@ -490,14 +525,14 @@ class TestReaper:
 
 
 class TestDispatcherIdentity:
-    """``dispatcher`` is a claim, never a producer hold.
+    """``dispatcher`` is a claim, never a persistent hold.
 
-    The herdr downtime dispatcher used to claim with the producer sentinel
+    The herdr downtime dispatcher used to claim with the producer identity
     ``Map``, which stranded auto-dispatched work: sessions preserved the claim
     believing it was a deliberate producer hold and the reaper never touched
-    it. The identity is now its own value, and every release path treats it
-    exactly like an agent claim while ``Map``/``needsProducerReview`` stay
-    sacrosanct.
+    it. The identity is now its own value; both identities are claims and
+    every release path treats them alike. ``needsProducerReview`` is the only
+    persistent hold (the flag, never the assignee).
     """
 
     @pytest.mark.parametrize(
@@ -517,7 +552,7 @@ class TestDispatcherIdentity:
     ) -> None:
         assert claim_release.is_dispatcher_assignee(assignee) is expected
 
-    def test_dispatcher_is_not_the_producer_hold(self) -> None:
+    def test_dispatcher_identity_is_not_the_producer_identity(self) -> None:
         """The two identities must never collapse back into one value."""
         assert claim_release.DISPATCHER_ASSIGNEE_DEFAULT != (
             claim_release.PRODUCER_ASSIGNEE_DEFAULT
@@ -543,7 +578,7 @@ class TestDispatcherIdentity:
     def test_session_backstop_releases_a_dispatcher_claim(
         self, monkeypatch
     ) -> None:
-        """With no session identity the backstop clears any non-producer claim."""
+        """With no session identity the backstop clears any claim."""
         for var in claim_release.SESSION_AGENT_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
         store = MemoryWl({"QZ-1": {"assignee": "dispatcher"}})
@@ -567,10 +602,10 @@ class TestDispatcherIdentity:
         assert report["released"][0]["previous_assignee"] == "dispatcher"
         assert store.assignee("QZ-1") == ""
 
-    def test_producer_hold_is_still_sacrosanct_beside_a_dispatcher_claim(
+    def test_producer_identity_is_not_a_hold_beside_a_dispatcher_claim(
         self,
     ) -> None:
-        """The two identities in one window: only the dispatcher claim moves."""
+        """Both identities are claims: the reaper releases both when stale."""
         store = MemoryWl(
             {
                 "QZ-1": _held("Map", age_hours=48),
@@ -582,9 +617,9 @@ class TestDispatcherIdentity:
             runner=store.runner, ttl_hours=24
         )
 
-        assert report["released_count"] == 1
-        assert [entry["id"] for entry in report["released"]] == ["QZ-2"]
-        assert store.assignee("QZ-1") == "Map"
+        assert report["released_count"] == 2
+        assert {entry["id"] for entry in report["released"]} == {"QZ-1", "QZ-2"}
+        assert store.assignee("QZ-1") == ""
         assert store.assignee("QZ-2") == ""
 
 

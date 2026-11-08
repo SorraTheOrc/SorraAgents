@@ -41,12 +41,13 @@ so a sync never operates on a second store for the same project prefix.
 
 Stale-claim reaper (SA-0MW0F91KN004J06U): after a successful sync this helper
 runs the TTL-bounded ``shared.claim_release.reap_stale_claims`` sweep, which
-releases non-producer claims on non-terminal items idle longer than the TTL
+releases claims on non-terminal items idle longer than the TTL
 (default 24 h; ``WORKLOG_CLAIM_REAPER_TTL_HOURS``; disable with
 ``WORKLOG_CLAIM_REAPER=0``). It is best-effort — reported as
 ``sync_worklog()["reaper"]``, never able to downgrade the sync result — and
-never touches a producer ``Map`` hold or a ``needsProducerReview`` item.
-See ``docs/dev/assignee-release.md`` and ``docs/dev/worklog-sync.md``.
+never clears the ``needsProducerReview`` flag or touches a
+``completed``/``deleted`` item. See ``docs/dev/assignee-release.md`` and
+``docs/dev/worklog-sync.md``.
 
 Usage::
 

@@ -108,11 +108,12 @@ Startup static-context budget (bytes / tokens):
 > canonical, deterministic measurement; subsequent features (F2–F6) and the
 > final verification gate use it exclusively.
 
-> **Assignee-release update (2026-11-03, SA-0MW0F91KN004J06U):** the canonical
+> **Assignee-release update (2026-11-03, SA-0MW0F91KN004J06U; widened
+> 2026-11-08, SA-0MW7QTAHW0030FGV):** the canonical
 > [Assignee release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)
-> section was widened to state that **any non-producer claim** is released on
-> a terminal outcome and to name the session backstop and the TTL-bounded
-> stale-claim reaper. That added 880 B to `AGENTS_GLOBAL.md` (14,346 B →
+> section states that **every non-empty assignee** is released on a terminal
+> outcome and names the session backstop and the TTL-bounded stale-claim
+> reaper. That added 880 B to `AGENTS_GLOBAL.md` (14,346 B →
 > 15,226 B; total 19,970 B → 20,850 B); the committed thresholds below pin the
 > new approved budget.
 
@@ -124,11 +125,11 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 15843,
+  "global_agents": 15922,
   "project_agents": 3875,
   "skills_prose": 2339,
   "skill_implement_md": 20000,
-  "total": 22057
+  "total": 22136
 }
 ```
 
@@ -278,6 +279,14 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > the standup report quotes each item's `## Impact` sentence — so the
 > thresholds were regenerated to the new measured surface rather than
 > compacting the convention.
+>
+> **Assignee-release invariant bump (2026-11-08, SA-0MW7QTAHW0030FGV):**
+> clarifying that `needsProducerReview` is the only persistent hold and that
+> the producer identity `Map` is released like any other claim added ~79 B to
+> `AGENTS_GLOBAL.md` (`global_agents 15843` → `15922`; `total 22057` →
+> `22136`; `project_agents` and `skills_prose` unchanged). The growth is the
+> canonical-wording clarification (the retired producer-hold exception is
+> removed), so the thresholds were regenerated to the new measured surface.
 >
 > ### Enforcement (committed gate)
 >

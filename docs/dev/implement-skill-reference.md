@@ -271,14 +271,15 @@ path it controls, but three outcomes never reach a normal exit and need an
 explicit durable write:
 
 **Direct terminal writes release too.** `StatusLifecycle.update_status` — the
-shared choke point every skill status write uses — releases an observed
-non-producer claim whenever the transition leaves the active-work status
-(`in-progress`). A prose-only skill (`plan`), the AC-coverage stage advance
+shared choke point every skill status write uses — releases any claim whenever
+the transition leaves the active-work status (`in-progress`). A prose-only
+skill (`plan`), the AC-coverage stage advance
 (`tree_coverage._advance_stage`) and a captured-status restore
 (`effort-and-risk`) therefore cannot reintroduce the hold by omitting an
-explicit `assignee=""`. Producer `Map` and `needsProducerReview` holds are
-preserved, and an explicit `assignee=` / `release_assignee=` overrides the
-automatic decision. Full contract:
+explicit `assignee=""`. Every non-empty assignee — including the producer
+identity `Map` — is released; `needsProducerReview` is the sole persistent
+hold and its flag is preserved. An explicit `assignee=` / `release_assignee=`
+overrides the automatic decision. Full contract:
 [assignee-release.md](assignee-release.md#direct-durable-writes-statuslifecycleupdate_status).
 
 | Outcome | Who does not get to write | Who persists the release |
@@ -298,9 +299,9 @@ assignee that is either empty or the driver's own. Clearing the assignee first
 is what lets that finaliser run at all (it refuses a child "claimed by"
 someone else).
 
-Every other state is untouched, so a producer `Map` hold and a terminal item
-are never disturbed. The helper is idempotent: a child whose own failure path
-already reset it holds no assignee and produces no write. The release never
+Every other state is untouched, so a terminal item is never disturbed. The
+helper is idempotent: a child whose own failure path already reset it holds no
+assignee and produces no write. The release never
 masks the original failure — the chain still stops with `failed_child` and the
 report carries the release under `claim_release` / `orphaned_claim_release`.
 
@@ -310,10 +311,10 @@ A process killed by `SIGKILL` with **no surviving supervisor** cannot write
 anything, so its claim survives until the reaper clears it. The
 TTL-bounded stale-claim reaper (`skill/shared/claim_release.py::reap_stale_claims`,
 default 24 h) now closes that window: it runs after a successful `wl sync`
-through `skill/shared/worklog_sync.py`, releases only non-producer claims on
-non-terminal items older than the TTL, never touches a producer `Map` hold, a
-`needsProducerReview` item or a `completed`/`deleted` item, and records every
-release as a comment naming the previous assignee
+through `skill/shared/worklog_sync.py`, releases claims on non-terminal items
+older than the TTL, never clears the `needsProducerReview` flag and never
+touches a `completed`/`deleted` item, and records every release as a comment
+naming the previous assignee
 (SA-0MW0F91KN004J06U; reference:
 [assignee-release.md](assignee-release.md#3-stale-claim-reaper-reap_stale_claims)).
 

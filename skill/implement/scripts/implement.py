@@ -11303,11 +11303,12 @@ def phase_finish(
         return report
 
     try:
-        # Assignee release is the helper's default, but it only ever clears an
-        # assignee the context manager holds — so finish declares the agent
-        # claim it owns here and releases it with the terminal
-        # ``completed``/``in_review`` transition. A producer hold on the item
-        # is therefore never wiped by finishing it (SA-0MVVF6OJY000JZBL).
+        # Assignee release is the helper's default, and it clears any claim on
+        # the item — so finish declares the agent claim it owns here and
+        # releases it with the terminal ``completed``/``in_review`` transition.
+        # Every non-empty assignee, including the producer identity ``Map``, is
+        # released; the ``needsProducerReview`` flag is the only persistent
+        # hold and is left intact (SA-0MVVF6OJY000JZBL, SA-0MW7QTAHW0030FGV).
         with StatusLifecycle(
             work_item_id,
             assignee=os.environ.get("IMPLEMENT_AGENT_NAME") or "implement",
@@ -14132,10 +14133,9 @@ def _release_orphaned_child_claim(child_id: str) -> dict[str, Any]:
     paths still apply — ``phase_parent`` re-finishes a child whose worktree
     holds the work, and ``drive --finalise-stranded`` still recognises the
     child as ``in-progress``. Every other state holds no claim this workflow
-    owns, so a producer ``Map`` hold or a terminal item is never disturbed,
-    and a child whose own failure path already reset it is left alone — the
-    helper is therefore idempotent and never masks the original failure (the
-    caller keeps reporting it).
+    owns, so a terminal item is never disturbed, and a child whose own failure
+    path already reset it is left alone — the helper is therefore idempotent
+    and never masks the original failure (the caller keeps reporting it).
 
     Args:
         child_id: The child work item whose claim may be orphaned.

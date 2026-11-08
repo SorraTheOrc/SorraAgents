@@ -770,8 +770,8 @@ def main():
         help=(
             "Do not release the session's work-item claim. The end-of-session "
             "report is every skill's final step and doubles as the claim-release "
-            "backstop (producer Map holds and needsProducerReview items are "
-            "always preserved)."
+            "backstop (every non-empty claim is released; the "
+            "needsProducerReview flag is never cleared)."
         ),
     )
     args = parser.parse_args()
@@ -828,10 +828,10 @@ def main():
     # Session-end claim-release backstop (SA-0MW0F91KN004J06U). The canonical
     # report is every skill's final step, so a session that never reached a
     # terminal lifecycle transition still releases its claim here. Best-effort:
-    # a release failure must never break the report. Producer Map holds and
-    # needsProducerReview items are preserved by the shared predicate, and a
-    # configured session identity guards against clearing a live sibling's
-    # claim.
+    # a release failure must never break the report. Every non-empty claim is
+    # released (including the producer identity Map); the needsProducerReview
+    # flag is never cleared, and a configured session identity guards against
+    # clearing a live sibling's claim.
     if not args.no_release_claim:
         try:
             release = release_session_claim(

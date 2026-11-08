@@ -10830,7 +10830,8 @@ def _phase_merge_gate(ctx: _AuditContext) -> int | None:
     Returns None when the gate passes (work merged or never resolvable —
     see below) or when integration succeeded; returns 1 when integration
     is REQUIRED but FAILED (the audit must fail with "Ready to close: No"
-    + the producer hold — AC3, never proceeds past Phase 1 with
+    + the producer-review hold (``needsProducerReview``) — AC3, never proceeds
+    past Phase 1 with
     unmerged work). A gate with no resolvable evidence is NOT a blocker:
     the item may have no code changes at all (docs-only, no feature
     branch, no commits referenced) — verification degrades to a recorded
@@ -11390,7 +11391,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # terminal lifecycle keep/restore `done` (SA-0MUWKGW9W004QXQZ).
     #
     # The claim is status-only and sets no assignee, so it never establishes a
-    # scheduling hold and never overwrites a pre-existing producer hold (the
+    # scheduling hold and never overwrites a pre-existing claim (the
     # status-neutral claim convention documented in AGENTS_GLOBAL.md). The
     # release of the audit agent's own claim happens on the terminal-write path
     # below (SA-0MVVF6Y38004T5OZ).
@@ -14529,8 +14530,8 @@ def _cascade_descendants_terminal(
     - Non-fatal: a per-child ``wl`` failure is logged loudly and does not
       abort the audit; the next passing audit completes the cascade.
     - Releases the descendant's scheduling hold: the terminalise write also
-      clears a non-producer ``assignee`` (SA-0MW0F91KN004J06U), so a cascaded
-      child is never left on a lingering agent claim.
+      clears the ``assignee`` (SA-0MW0F91KN004J06U), so a cascaded child is
+      never left on a lingering claim.
 
     Args:
         parent_id: The audited parent whose subtree is being terminalised.
@@ -15258,7 +15259,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # check, or surface AC assessment): the item's work must be merged
         # into the owning repo's dev, and is integrated when missing. A
         # blocked gate (integration failed) emits a fail-closed report here
-        # ("Ready to close: No" + the producer hold) — the pipeline
+        # ("Ready to close: No" + ``needsProducerReview``) — the pipeline
         # never proceeds past Phase 1 with unmerged work (AC3).
         rc = _phase_fetch_and_cq(ctx)
         if rc is not None:
