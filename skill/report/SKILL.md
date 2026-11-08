@@ -69,7 +69,8 @@ None needed
 
 ## Conclusion
 
-This completes the <skill_name> process for <id> (<title>). Ready for <next_action>.
+✅ Ready to ship
+This completes the <skill_name> process for <id> (<title>).
 ```
 
 ### Layout rules
@@ -96,8 +97,15 @@ This completes the <skill_name> process for <id> (<title>). Ready for <next_acti
 - **Notes**: freeform — context, caveats, assumptions that don't fit the
   structured sections. **Must sit between `## Producer Actions` and
   `## Conclusion`**.
-- **Conclusion**: the literal sentence
-  `This completes the <skill_name> process for <id> (<title>). Ready for <next_action>.`
+- **Conclusion**: the readiness verdict is the **first line** of the section,
+  on its own line, colour-coded via ANSI escapes (best-effort — plain-text
+  terminals degrade gracefully):
+  - `✅ Ready to ship` in green (`\033[32m…\033[0m`) when every AC is `met`,
+    followed by `This completes the <skill_name> process for <id> (<title>).`;
+  - `🚫 Not ready to ship` in red (`\033[31m…\033[0m`) otherwise, followed by
+    `<Skill_name> session for <id> (<title>) is incomplete.`
+  The `next_action` value is no longer rendered; it is retained only for
+  backward compatibility.
 - **Terminator**: the rendered report's final line is `</end_session>` on its own line (only for terminal sessions; question-ended sessions omit the report and the marker).
 
 ### Producer Actions
@@ -114,9 +122,9 @@ question — *is the producer blocking this work item right now?*
 - supplying missing access, credentials, or a token;
 - performing a manual step the agent cannot (e.g. a UI-only configuration).
 
-**Does NOT belong** — routine workflow progression. The Conclusion already
-encodes the next phase in its `Ready for <next_action>` line, so repeating it
-here falsely signals that the producer is blocking:
+**Does NOT belong** — routine workflow progression. The Conclusion's
+standalone ready/not-ready verdict line already conveys the outcome, so
+repeating progression here falsely signals that the producer is blocking:
 
 - "Proceed to /skill:plan", "Run /skill:audit next";
 - "Proceed to the next stage" / "Proceed with implementation";
@@ -145,7 +153,7 @@ Answer the OPEN QUESTION in comment SA-C0MVQ1QK1R0052WGP before `/skill:plan` ca
 ```markdown
 ## Producer Actions
 
-Proceed to /skill:plan        <!-- WRONG: this is the Conclusion's job -->
+Proceed to /skill:plan        <!-- WRONG: progression is not a producer action -->
 ```
 
 The rule is enforced twice, by design: the prose here is the primary fix, and
@@ -392,7 +400,8 @@ Plan deferred until the report-helper tests land (dependency: tests → impl →
 
 ## Conclusion
 
-This completes the plan process for SA-0MSJ082OY003IQ8S (Standardize skill session end-of-session reporting via helper report skill). Ready for review.
+✅ Ready to ship
+This completes the plan process for SA-0MSJ082OY003IQ8S (Standardize skill session end-of-session reporting via helper report skill).
 ```
 
 ## Related

@@ -106,6 +106,24 @@ except ImportError:
         # type: ignore[no-redef]
         return default if not value or not str(value).strip() else str(value)
 
+# ─── ANSI colour helpers ─────────────────────────────────────────────────
+
+# Terminal colour codes — degrade gracefully in plain-text terminals.
+_ANSI_GREEN = "\033[32m"  # green foreground
+_ANSI_RED = "\033[31m"    # red foreground
+_ANSI_RESET = "\033[0m"   # reset all attributes
+
+
+def _green(text: str) -> str:
+    """Wrap *text* in green ANSI escape codes."""
+    return f"{_ANSI_GREEN}{text}{_ANSI_RESET}"
+
+
+def _red(text: str) -> str:
+    """Wrap *text* in red ANSI escape codes."""
+    return f"{_ANSI_RED}{text}{_ANSI_RESET}"
+
+
 # ─── Icon mappings (sourced from ContextHub) ───────────────────────────
 
 # See: ../ContextHub/src/icons.ts
@@ -386,8 +404,9 @@ def normalise_producer_actions(producer_actions):
     complete the **current** stage (answer an open question, decide, approve,
     supply access, perform a manual step). Routine progression — "run
     /skill:<next>", "proceed to <next stage>", "review the brief, then …" —
-    belongs in the Conclusion's ``Ready for <next_action>`` line, so echoing it
-    here would falsely imply the producer is blocking (SA-0MVNQ3RLW006XEFW).
+    is conveyed by the standalone ready/not-ready verdict line in the
+    Conclusion, so echoing it here would falsely imply the producer is
+    blocking (SA-0MVNQ3RLW006XEFW).
 
     Classification is delegated to the single shared classifier
     (:func:`shared.herdr_pane.normalise_producer_actions`) so the renderer and
@@ -402,7 +421,7 @@ def normalise_producer_actions(producer_actions):
     if original.strip() and normalised != original:
         print(
             "render_report: discarded routine producer action "
-            f"(workflow progression belongs in 'Ready for <next_action>'): "
+            f"(workflow progression is not a producer action): "
             f"{original.strip()}",
             file=sys.stderr,
         )
@@ -444,7 +463,9 @@ def render_report(
     notes : str or None
         Freeform agent commentary.
     next_action : str
-        The next action (e.g. "review", "plan", "ship").
+        Retained for backward compatibility only; it is **not** rendered.
+        The Conclusion opens with a standalone verdict line (``✅ Ready to
+        ship`` when every AC is met, ``🚫 Not ready to ship`` otherwise).
     use_cases : list of str or None
         Optional list of use-case strings (e.g. from the work-item
         description).  When provided, a ``## Use Cases`` section is
@@ -528,15 +549,16 @@ def render_report(
     lines.append("## Conclusion")
     lines.append("")
     if status == "completed":
+        lines.append(_green("✅ Ready to ship"))
         lines.append(
             f"This completes the {skill_name} process for "
-            f"{work_item_id} ({title}). Ready for {next_action}."
+            f"{work_item_id} ({title})."
         )
     else:
+        lines.append(_red("🚫 Not ready to ship"))
         lines.append(
             f"{skill_name.title()} session for {work_item_id} ({title}) "
-            f"is incomplete. Requires attention "
-            f"({next_action})."
+            f"is incomplete."
         )
     lines.append("")
     lines.append("</end_session>")
@@ -724,7 +746,11 @@ def main():
     parser.add_argument(
         "--next-action",
         default="review",
-        help="Next action (review, plan, ship, etc.).",
+        help=(
+            "Deprecated: retained for backward compatibility; the value is "
+            "no longer rendered (the Conclusion shows a standalone ready/"
+            "not-ready verdict line)."
+        ),
     )
     parser.add_argument(
         "--no-icons",

@@ -521,26 +521,105 @@ class TestNotesSectionPosition(unittest.TestCase):
 
 
 class TestConclusion(unittest.TestCase):
-    """Verify the Conclusion section format."""
+    """Verify the Conclusion section format (SA-0MVYEZ3V3004AQXN).
+
+    The readiness verdict is the first line of the Conclusion, on its own
+    line, colour-coded green (ready) or red (not ready) via ANSI escapes.
+    """
+
+    GREEN = "\033[32m"
+    RED = "\033[31m"
+    RESET = "\033[0m"
 
     def setUp(self):
         from render_report import render_report
         self.render_report = render_report
 
-    def test_conclusion_format(self):
-        result = self.render_report(
+    def _render(self, acceptance_criteria=None, next_action="plan"):
+        return self.render_report(
             skill_name="implement",
             work_item_id="SA-0TEST0000000001",
             title="Test title",
             headline="",
-            acceptance_criteria=[],
+            acceptance_criteria=acceptance_criteria
+            if acceptance_criteria is not None else [],
             metadata={},
             producer_actions=None,
             notes=None,
-            next_action="plan",
+            next_action=next_action,
         )
-        self.assertIn("This completes the implement process for SA-0TEST0000000001 (Test title).", result)
-        self.assertIn("Ready for plan.", result)
+
+    @staticmethod
+    def _conclusion_lines(report):
+        """Return the non-empty lines of the Conclusion body."""
+        body = report.split("## Conclusion", 1)[1]
+        return [ln for ln in body.split("\n") if ln.strip()]
+
+    def test_completed_first_line_is_green_ready_to_ship(self):
+        """AC1/AC3: green ``✅ Ready to ship`` opens the Conclusion."""
+        lines = self._conclusion_lines(
+            self._render([("1", "AC one", "test", "met")], "ship")
+        )
+        self.assertEqual(lines[0], f"{self.GREEN}\u2705 Ready to ship{self.RESET}")
+
+    def test_completed_second_line_is_completion_sentence(self):
+        """AC1: completion sentence follows the verdict line."""
+        lines = self._conclusion_lines(
+            self._render([("1", "AC one", "test", "met")], "ship")
+        )
+        self.assertEqual(
+            lines[1],
+            "This completes the implement process for "
+            "SA-0TEST0000000001 (Test title).",
+        )
+
+    def test_incomplete_first_line_is_red_not_ready_to_ship(self):
+        """AC2/AC3: red ``🚫 Not ready to ship`` opens the Conclusion."""
+        lines = self._conclusion_lines(
+            self._render([("1", "AC one", "test", "unmet")], "plan")
+        )
+        self.assertEqual(
+            lines[0], f"{self.RED}\U0001f6ab Not ready to ship{self.RESET}"
+        )
+
+    def test_incomplete_second_line_is_incomplete_sentence(self):
+        """AC2: incomplete-session sentence follows the verdict line."""
+        lines = self._conclusion_lines(
+            self._render([("1", "AC one", "test", "unmet")], "plan")
+        )
+        self.assertEqual(
+            lines[1],
+            "Implement session for SA-0TEST0000000001 (Test title) "
+            "is incomplete.",
+        )
+
+    def test_completed_uses_green_ansi_and_resets(self):
+        """AC3: green ANSI escape opens and reset closes the verdict."""
+        report = self._render([("1", "AC one", "test", "met")])
+        self.assertIn(f"{self.GREEN}\u2705 Ready to ship{self.RESET}", report)
+        self.assertNotIn(f"{self.RED}", report)
+
+    def test_incomplete_uses_red_ansi_and_resets(self):
+        """AC3: red ANSI escape opens and reset closes the verdict."""
+        report = self._render([("1", "AC one", "test", "unmet")])
+        self.assertIn(
+            f"{self.RED}\U0001f6ab Not ready to ship{self.RESET}", report
+        )
+        self.assertNotIn(f"{self.GREEN}", report)
+
+    def test_next_action_is_not_rendered(self):
+        """Constraint: ``next_action`` no longer appears in the Conclusion."""
+        report = self._render([("1", "AC one", "test", "met")], "ship")
+        self.assertNotIn("Ready for ship.", report)
+        self.assertNotIn("Ready for plan.", report)
+        self.assertNotIn("Requires attention", report)
+        self.assertNotIn("requires attention", report)
+
+    def test_completed_verdict_is_on_its_own_line(self):
+        """AC1: the verdict is not buried in a longer sentence."""
+        report = self._render([("1", "AC one", "test", "met")])
+        verdict = f"{self.GREEN}\u2705 Ready to ship{self.RESET}"
+        self.assertIn(f"\n{verdict}\n", report)
 
 
 class TestConditionalHeader(unittest.TestCase):
@@ -622,11 +701,15 @@ class TestConditionalHeader(unittest.TestCase):
 class TestConditionalConclusion(unittest.TestCase):
     """Verify the conclusion reflects session outcome (AC1/AC2/AC3)."""
 
+    GREEN = "\033[32m"
+    RED = "\033[31m"
+    RESET = "\033[0m"
+
     def setUp(self):
         from render_report import render_report
         self.render_report = render_report
 
-    def test_all_met_conclusion_ready_for_next_action(self):
+    def test_all_met_conclusion_ready_to_ship(self):
         result = self.render_report(
             skill_name="implement",
             work_item_id="SA-0TEST0000000001",
@@ -641,11 +724,12 @@ class TestConditionalConclusion(unittest.TestCase):
             next_action="ship",
         )
         self.assertIn("This completes the implement process for", result)
-        self.assertIn("Ready for ship.", result)
+        self.assertIn(f"{self.GREEN}\u2705 Ready to ship{self.RESET}", result)
+        self.assertNotIn("Not ready to ship", result)
         self.assertNotIn("incomplete", result.lower())
         self.assertNotIn("requires attention", result.lower())
 
-    def test_any_unmet_conclusion_incomplete_requires_attention(self):
+    def test_any_unmet_conclusion_not_ready_to_ship(self):
         result = self.render_report(
             skill_name="implement",
             work_item_id="SA-0TEST0000000001",
@@ -661,11 +745,13 @@ class TestConditionalConclusion(unittest.TestCase):
             next_action="plan",
         )
         self.assertIn("incomplete", result.lower())
-        self.assertIn("requires attention", result.lower())
+        self.assertIn(
+            f"{self.RED}\U0001f6ab Not ready to ship{self.RESET}", result
+        )
         self.assertNotIn("This completes the", result)
         self.assertNotIn("Ready for plan.", result)
 
-    def test_empty_ac_conclusion_ready_for_next_action(self):
+    def test_empty_ac_conclusion_ready_to_ship(self):
         """Empty AC list with no producer actions/notes => completed."""
         result = self.render_report(
             skill_name="implement",
@@ -678,7 +764,7 @@ class TestConditionalConclusion(unittest.TestCase):
             notes=None,
             next_action="review",
         )
-        self.assertIn("Ready for review.", result)
+        self.assertIn(f"{self.GREEN}\u2705 Ready to ship{self.RESET}", result)
         self.assertNotIn("incomplete", result.lower())
         self.assertNotIn("requires attention", result.lower())
 
@@ -697,7 +783,9 @@ class TestConditionalConclusion(unittest.TestCase):
             next_action="plan",
         )
         self.assertIn("incomplete", result.lower())
-        self.assertIn("requires attention", result.lower())
+        self.assertIn(
+            f"{self.RED}\U0001f6ab Not ready to ship{self.RESET}", result
+        )
 
 
 class TestParseAcArgs(unittest.TestCase):
@@ -766,7 +854,7 @@ class TestRendererWithFixture(unittest.TestCase):
         self.assertIn("## Notes", result)
         self.assertIn("This is a test.", result)
         self.assertIn("## Conclusion", result)
-        self.assertIn("Ready for plan.", result)
+        self.assertIn("\033[32m\u2705 Ready to ship\033[0m", result)
 
     def test_minimal_report_from_fixture(self):
         """Work with a minimal fixture (null/missing fields)."""
@@ -1114,8 +1202,9 @@ class TestPaneStatusIntegration(unittest.TestCase):
 
 # ─── Producer Actions normalisation (parent AC2/AC3) ─────────────────────
 #
-# Routine workflow progression belongs in the Conclusion's
-# ``Ready for <next_action>`` line, never in ``## Producer Actions``. The
+# Routine workflow progression is conveyed by the Conclusion's standalone
+# ready/not-ready verdict line, so it must never appear in
+# ``## Producer Actions``. The
 # classifier/normaliser is implemented by F1 (SA-0MVQ1QL5G007MLGM) and wired
 # into the renderer by F2 (SA-0MVQ1QLP6005MRCH); these tests are written first
 # Normalisation is implemented by F2 (SA-0MVQ1QLP6005MRCH) on top of the

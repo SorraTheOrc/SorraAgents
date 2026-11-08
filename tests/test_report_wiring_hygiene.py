@@ -121,10 +121,10 @@ class TestEveryWorkItemSkillWired:
 # ─── Plan skill: skill-session ACs vs work-item feature ACs ────────────────
 #
 # Regression guard for the operator finding that `/skill:plan` ended with
-# "Plan session for <id> (<title>) is incomplete. Requires attention
-# (implement)." even though planning completed and implement is simply the
-# next phase (SA-0MUYADP50005EYA2). The renderer derives session status from
-# the supplied `--ac` verdicts, so the plan skill must pass its *own*
+# a red "Plan session for <id> (<title>) is incomplete." verdict even though
+# planning completed and implement is simply the next phase
+# (SA-0MUYADP50005EYA2). The renderer derives session status from the
+# supplied `--ac` verdicts, so the plan skill must pass its *own*
 # planning-phase deliverables (all `met`), not the work item's feature ACs.
 
 _FINAL_STEP_SECTION_RE = re.compile(
@@ -215,7 +215,7 @@ class TestPlanSkillPassesPlanningPhaseAcs:
             next_action="implement",
         )
         assert report.startswith("# Completed plan")
-        assert "Ready for implement." in report
+        assert "\033[32m\u2705 Ready to ship\033[0m" in report
         assert "incomplete" not in report.lower()
 
 

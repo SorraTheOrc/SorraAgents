@@ -62,8 +62,8 @@ ROUTINE_TEXTS: frozenset[str] = frozenset({
 #: Optional lead-in phrasings that introduce a *routine workflow-progression*
 #: action ("next step: implement", "then run /skill:plan").
 #:
-#: Routine progression belongs in the report's ``Ready for <next_action>``
-#: conclusion line, never in ``## Producer Actions`` (SA-0MVNQ3RLW006XEFW).
+#: Routine progression is conveyed by the report's standalone ready/not-ready
+#: verdict line, never by ``## Producer Actions`` (SA-0MVNQ3RLW006XEFW).
 ROUTINE_STEP_LEADINS: tuple[str, ...] = ("next step", "then")
 
 #: Imperative verbs that signal routine workflow progression when followed by
@@ -183,8 +183,8 @@ def is_routine_next_step(value) -> bool:
 
     Routine progression — "Proceed to /skill:plan", "Run /skill:audit",
     "Next step: implement", "Review the intake brief and then run
-    /skill:plan" — duplicates the report Conclusion's ``Ready for
-    <next_action>`` line and must never be presented as a producer action
+    /skill:plan" — duplicates the report Conclusion's standalone ready/not-ready
+    verdict line and must never be presented as a producer action
     (SA-0MVNQ3RLW006XEFW).
 
     Conservative by design: **every** clause must match the routine
