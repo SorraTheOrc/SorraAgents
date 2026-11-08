@@ -286,7 +286,14 @@ def test_finish_refuses_when_lock_held_by_other_finish(tmp_path):
 
     The refusal must NOT modify the work item (no status writes) and must not
     comment — AC3: "does not modify the checkout or the work item".
+
+    Regression (SA-0MVY0G5EH000LIMB): when an outer ``implement.py finish``
+    exports ``IMPLEMENT_FINISH_LOCK_TIMEOUT``, the test's own lock-hold +
+    ``phase_finish`` call used to sleep for the full inherited duration before
+    refusing. The ``_no_ambient_lock_timeout`` fixture neutralises the ambient
+    var, and the elapsed-time assertion catches any regression.
     """
+    start = time.monotonic()
     with _finish_harness(tmp_path) as mocks:
         repo = str(tmp_path / "main")
         fd, _ = implement.acquire_main_checkout_lock(repo, "WL-OTHER")
@@ -295,6 +302,10 @@ def test_finish_refuses_when_lock_held_by_other_finish(tmp_path):
             report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
         finally:
             implement._release_main_checkout_lock(fd)
+
+    elapsed = time.monotonic() - start
+    # The fixture neutralises inherited timeouts; refusal is instant.
+    assert elapsed < 5, f"Lock refusal took {elapsed:.1f}s — ambient timeout not neutralised?"
 
     assert report["success"] is False
     assert "WL-OTHER" in report["message"]
