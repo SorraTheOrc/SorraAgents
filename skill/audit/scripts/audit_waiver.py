@@ -34,15 +34,14 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-# Ensure the skills root (``skill/``) and the repository root are on
-# sys.path so ``audit.scripts.audit_runner`` (and the shared helpers it
-# re-uses) import identically when this script is executed directly from any
-# cwd.
-REPO_ROOT = Path(__file__).resolve().parents[3]
+# Self-contained bootstrap (F2, SA-0MSWJ9Z02005DP8X): the skills root is
+# exactly ``parents[2]``; skill modules import as top-level packages, so a
+# copy of the tree works from any depth. Without it the
+# ``audit.scripts.audit_runner`` import below fails when this script is run
+# directly from another cwd.
 SKILLS_ROOT = Path(__file__).resolve().parents[2]
-for _root in (REPO_ROOT, SKILLS_ROOT):
-    if str(_root) not in sys.path:
-        sys.path.insert(0, str(_root))
+if str(SKILLS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SKILLS_ROOT))
 
 from audit.scripts.audit_runner import (
     AUDIT_WAIVER_MARKER,

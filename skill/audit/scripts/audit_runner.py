@@ -850,7 +850,7 @@ object (``{reason, author, waivedAt}``) and the CLI cannot store a per-
 finding list there, so a producer records an accepted finding by commenting
 ``AUDIT-FP-WAIVER: {"rule": ..., "file": ..., "line": ...,
 "justification": ...}`` on the audited item (helper:
-``skill/audit/scripts/audit_waiver.py add``). Waived findings are excluded
+``$(skill_path audit)/scripts/audit_waiver.py add``). Waived findings are excluded
 from chore creation and from blocking checks (SA-0MVZNECSD005XB42 AC3).
 """
 
@@ -12257,7 +12257,7 @@ def _chore_description_for_cfp_decision(
         f"{FP_CHORE_ANNOTATION}.\n\n"
         f"{CFP_CHORE_KEY_PREFIX} {key}\n\n"
         "Accept it once with:\n"
-        f"`python3 skill/audit/scripts/audit_waiver.py add {waiver_target} "
+        f"`python3 $(skill_path audit)/scripts/audit_waiver.py add {waiver_target} "
         f"--rule {code} --file {file} --line {line} "
         "--justification \"<why this is a false positive>\"`\n\n"
         "An accepted finding no longer creates a chore and no longer enters "
