@@ -494,6 +494,37 @@ is unchanged — fairness is about **ordering**, not capacity — and the fast p
 adds one counter `flock` per acquire plus a single non-blocking scan when no
 lower ticket is outstanding.
 
+**Slot discovery and the effective ceiling (SA-0MVWKZ4QD006L2E0).** A waiter
+**discovers** capacity dynamically: every acquisition attempt enumerates the
+numeric slot files currently present in its namespace and takes the lowest
+free one. It is therefore not limited to the slots that existed (or the
+ceiling it resolved) when it started — a slot file created by a **later,
+higher-ceiling process** is usable immediately, within one poll interval plus
+one `flock` attempt. This fixes the snapshot-ceiling starvation where a
+`TEST_MAX_CONCURRENCY_FAST=2` waiter probed only slots `0` and `1` and could
+wait out its entire `TEST_LOCK_TIMEOUT` while slots `2..7` sat free (measured:
+a 105-minute stall with 5 of 8 host slots free).
+
+The **effective pool is the union of slot files present** in the namespace.
+A caller's own ceiling (`TEST_MAX_CONCURRENCY` / `TEST_MAX_CONCURRENCY_FAST`)
+is a **floor it guarantees** — it always creates slots `0..max_workers-1` — but
+**never a host-wide limit it may exceed**: a waiter never creates a slot file
+with an index `>= max_workers`, so a low-ceiling run can use capacity another
+process created but cannot manufacture more. The configured ceiling semantics
+are unchanged; discovery only makes existing capacity usable.
+
+**Maximum poll interval.** The retry cadence is bounded and **never grows**:
+50 ms base with jitter off, or `[0.5, 1.5] ×` the base (maximum **75 ms**) when
+jitter is enabled. There is no backoff, so a long-waiting consumer performs many
+poll attempts and always observes slots created after it began waiting. A new
+backoff must not be introduced without a documented cap.
+
+**`slot_busy` means genuine saturation.** Because discovery scans every slot
+file present, the `slot_busy` code means every slot in the namespace was held
+for the **whole** `TEST_LOCK_TIMEOUT` — never "the waiter failed to discover
+free capacity". An operator can therefore treat `slot_busy` as "retry later"
+without inspecting `/proc`.
+
 **Cache hits never block:** the semaphore is acquired ONLY when an actual
 execution is about to happen (cache miss path). A cached result is served
 without acquiring a slot, so read-only `--summary` queries and fast cached

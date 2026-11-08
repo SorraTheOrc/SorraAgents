@@ -103,6 +103,33 @@ configured bound) and each retry sleeps a jittered cadence. ``jitter=0.0``
 (the default) keeps historical byte-identical behaviour — audit
 semaphores do not opt in.
 
+Slot discovery and the effective ceiling (SA-0MVWKZ4QD006L2E0)
+-------------------------------------------------------------
+A waiter **discovers** capacity dynamically: every acquisition attempt
+enumerates the numeric slot files currently present in its namespace (a
+single ``listdir`` of a directory with ~10 entries, i.e. a few microseconds —
+negligible against the 50 ms poll cadence) and takes the lowest free one. A
+slot file created by a *later*, higher-ceiling process is therefore usable by
+a waiter that started when the namespace held only fewer slots. This fixes the
+snapshot-ceiling starvation where a ``max_workers=2`` waiter probed only
+``range(2)`` and could wait out its entire ``TEST_LOCK_TIMEOUT`` while slots
+``2..7`` sat free (observed: a 105-minute stall).
+
+The **effective pool** is the union of slot files present in the namespace.
+A caller's own ``max_workers`` is a *floor it guarantees* — it still creates
+``0..max_workers-1`` — never a host-wide limit it may exceed: a waiter never
+creates a slot file with an index ``>= max_workers``. The configured ceiling
+(``TEST_MAX_CONCURRENCY`` / ``TEST_MAX_CONCURRENCY_FAST``) is unchanged; this
+only makes existing capacity usable.
+
+Poll cadence
+------------
+The retry cadence is **bounded and never grows**: ``_RETRY_DELAY_SECONDS``
+(50 ms) with jitter off, or a per-attempt ``[0.5, 1.5] x`` spread (maximum
+**75 ms**) when :func:`_jittered_retry_delay` is used. There is no backoff, so
+a waiter polls many times per bound and always observes slots created after it
+began waiting. A new backoff must not be introduced without a documented cap.
+
 Usage
 -----
 .. code-block:: python
@@ -316,9 +343,30 @@ class Semaphore:
             except OSError:  # pragma: no cover - race with another creator
                 pass
 
+    def _slot_indices(self) -> list[int]:
+        """Return the numeric slot indices currently present, ascending.
+
+        Discovery is dynamic (SA-0MVWKZ4QD006L2E0): the pool is the union of
+        slot files actually present, so capacity created by a higher-ceiling
+        process after this waiter started is usable. A single ``listdir`` of
+        a small directory (~10 entries) is negligible against the 50 ms poll
+        cadence; the ascending order keeps acquisition deterministic.
+        """
+        try:
+            entries = os.listdir(self._slot_dir)
+        except OSError:
+            return []
+        return sorted(int(name) for name in entries if name.isdigit())
+
     def _try_acquire_slot(self) -> int | None:
-        """Try to flock one free slot; return its fd, or None if all busy."""
-        for i in range(self.max_workers):
+        """Try to flock one free slot; return its fd, or None if all busy.
+
+        Every numeric slot file currently present in the namespace is probed
+        (not just indices below this caller's snapshot ``max_workers``), in
+        ascending index order, so a late-created higher-index slot is taken
+        within one poll interval plus one ``flock`` attempt.
+        """
+        for i in self._slot_indices():
             path = self._slot_path(i)
             try:
                 fd = os.open(path, os.O_RDWR)
