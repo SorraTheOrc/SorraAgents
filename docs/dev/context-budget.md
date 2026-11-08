@@ -127,8 +127,38 @@ SA-0MT4DFE8Y004J8SP):
   "global_agents": 15843,
   "project_agents": 3875,
   "skills_prose": 2339,
+  "skill_implement_md": 20000,
   "total": 22057
 }
+```
+
+### Implement SKILL.md body gate (SA-0MVYDCUWA001Z8K0)
+
+The implement skill's `SKILL.md` is inlined verbatim into **every**
+`/skill:implement` invocation, so its byte size is a per-turn cost separate
+from the startup surface above. It regrew ~5× after the F5 trim (15,447 B
+budget → 99,749 B by 2026-11-07), so it now has its own measured component
+and threshold: `skill_implement_md: 20000` (AC1/AC4). The component is
+reported by `measure_context.py` and is **excluded from `total`** — it is not
+startup context, and the pre-push hook enforces it alongside the startup
+thresholds.
+
+**Before/after composition of a cold implement turn** (chars/4 token
+estimate):
+
+| Component | Before (2026-11-07) | After | Notes |
+|---|---|---|---|
+| `skill/implement/SKILL.md` body | 99,749 B / ~24,937 tok | **19,830 B / ~4,958 tok** | ≥80% cut; ≤20,000 B gate (AC1), ≤~6.5k body tokens (AC6) |
+| System prompt (AGENTS_GLOBAL + project AGENTS + skills prose) | ~21,080 B / ~5,270 tok | ~21,274 B / ~5,318 tok | unchanged by this item |
+| **Cold implement turn (body + system)** | **~30,200 tok** | **~10,300 tok** | the intake-measured P50 was ~24–25k before further growth |
+
+The deep reference prose was relocated **verbatim** to
+`docs/dev/implement-skill-reference.md` (appendix "relocated SKILL.md prose"),
+so no behavioural content is lost (AC2); the brief keeps the operational step
+sequence and every command/flag an operator needs (AC3). Re-measure with:
+
+```bash
+python3 skill/context-audit/scripts/measure_context.py --json
 ```
 
 > **Assignee-release invariant section (2026-11-02, SA-0MVVF7CZ6002UDKU):**

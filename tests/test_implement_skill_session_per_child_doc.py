@@ -1,4 +1,8 @@
-"""Doc-contract tests: skill/implement/SKILL.md Step 6.1 documents session-per-child.
+"""Doc-contract tests: the implement reference doc Step 6.1 documents session-per-child.
+
+The Step 6.1 prose was relocated verbatim from ``skill/implement/SKILL.md`` to
+``docs/dev/implement-skill-reference.md`` (SA-0MVYDCUWA001Z8K0, AC5), so the
+documented contract is asserted against the reference doc.
 
 Verifies SA-0MTLCCIPU0050Q52 child SA-0MUCMO5YV008RD83: the parent-recursion
 step must state that each epic child is implemented in its own Pi session
@@ -18,24 +22,24 @@ from __future__ import annotations
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_SKILL_MD = _REPO_ROOT / "skill" / "implement" / "SKILL.md"
-_STEP_HEADING = "6.1. Parent recursion"
-_NEXT_LINE = "- Write tests and code to meet ACs:"
+_REFERENCE_DOC = _REPO_ROOT / "docs" / "dev" / "implement-skill-reference.md"
+_STEP_HEADING = "Step 6.1 — Parent recursion"
+_NEXT_HEADING = "### Relocated: Step 9"
 
 
 def _content() -> str:
-    assert _SKILL_MD.exists(), f"File not found: {_SKILL_MD}"
-    return _SKILL_MD.read_text(encoding="utf-8")
+    assert _REFERENCE_DOC.exists(), f"File not found: {_REFERENCE_DOC}"
+    return _REFERENCE_DOC.read_text(encoding="utf-8")
 
 
 def _step() -> str:
-    """Return the Step 6.1 body, whitespace-normalised so prose reflow does
-    not break assertions. Bounded by the Step 6 test bullet."""
+    """Return the relocated Step 6.1 body, whitespace-normalised so prose
+    reflow does not break assertions. Bounded by the next relocated section."""
     content = _content()
     start = content.find(_STEP_HEADING)
-    assert start != -1, f"{_SKILL_MD.name} must contain {_STEP_HEADING!r}"
-    end = content.find(_NEXT_LINE, start)
-    assert end != -1 and end > start, "Step 6.1 must precede the Step 6 test bullet"
+    assert start != -1, f"{_REFERENCE_DOC.name} must contain {_STEP_HEADING!r}"
+    end = content.find(_NEXT_HEADING, start)
+    assert end != -1 and end > start, "Step 6.1 must precede the next relocated section"
     return " ".join(content[start:end].split())
 
 

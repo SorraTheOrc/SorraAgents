@@ -1,8 +1,9 @@
 """Docs-vs-source consistency for the gate classification vocabulary.
 
 SA-0MVTET8KQ0031R6Z (child SA-0MVU8XT1M002MSJX): an operator reads the gate's
-`reason` and its fact fields in `skill/implement/SKILL.md` and in the two
-reference documents — never in the source. A renamed reason, a dropped fact
+`reason` and its fact fields in the reference documents — never in the source.
+The gate-reason table was relocated verbatim from `skill/implement/SKILL.md` to
+`docs/dev/implement-skill-reference.md` (SA-0MVYDCUWA001Z8K0, AC5). A renamed reason, a dropped fact
 field or an undocumented new notice code would silently leave that guidance
 wrong, so this test fails in either direction:
 
@@ -64,7 +65,7 @@ def _reason_table_tokens(markdown: str) -> list[str]:
     """The first-column values of the gate-reason table in *markdown*."""
     lines = markdown.splitlines()
     for index, line in enumerate(lines):
-        if "| `reason` |" not in line:
+        if "| `reason` |" not in line or "Runner code" not in line:
             continue
         tokens: list[str] = []
         for row in lines[index + 1 :]:
@@ -81,20 +82,18 @@ def _reason_table_tokens(markdown: str) -> list[str]:
 @pytest.mark.parametrize("reason", GATE_REASONS)
 def test_every_gate_reason_is_documented_for_the_operator(reason: str) -> None:
     """A reason an operator can receive must be explained, with its remedy."""
-    for doc in (SKILL_MD, GATE_DOC):
-        assert f"`{reason}`" in _read(doc), (
-            f"gate reason {reason!r} is not documented in {doc.name} — an "
-            "operator woken by a red gate cannot act on an unexplained reason"
-        )
+    assert f"`{reason}`" in _read(GATE_DOC), (
+        f"gate reason {reason!r} is not documented in {GATE_DOC.name} — an "
+        "operator woken by a red gate cannot act on an unexplained reason"
+    )
 
 
 @pytest.mark.parametrize("field", implement.GATE_FACT_FIELDS)
 def test_every_fact_field_is_documented(field: str) -> None:
     """Every fact the gate reports must be documented with its meaning."""
-    for doc in (SKILL_MD, GATE_DOC):
-        assert f"`{field}`" in _read(doc), (
-            f"gate fact field {field!r} is not documented in {doc.name}"
-        )
+    assert f"`{field}`" in _read(GATE_DOC), (
+        f"gate fact field {field!r} is not documented in {GATE_DOC.name}"
+    )
 
 
 @pytest.mark.parametrize("code", RUNNER_NOTICE_CODES)
@@ -107,10 +106,10 @@ def test_every_runner_notice_code_is_documented(code: str) -> None:
 
 def test_documented_reason_table_matches_the_source_vocabulary() -> None:
     """The reason table lists exactly the reasons the source can produce."""
-    documented = _reason_table_tokens(_read(SKILL_MD))
+    documented = _reason_table_tokens(_read(GATE_DOC))
 
     assert documented, (
-        f"no gate-reason table found in {SKILL_MD.name}: the operator guidance "
+        f"no gate-reason table found in {GATE_DOC.name}: the operator guidance "
         "must list the reasons with the action for each"
     )
     assert set(documented) == set(GATE_REASONS), (

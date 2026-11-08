@@ -55,8 +55,44 @@ def test_context_budget_gate_within_committed_thresholds() -> None:
 def test_context_budget_thresholds_file_is_valid() -> None:
     """The thresholds file must parse and contain the expected components."""
     data = json.loads(THRESHOLDS.read_text(encoding="utf-8"))
-    for component in ("global_agents", "project_agents", "skills_prose", "total"):
+    for component in (
+        "global_agents",
+        "project_agents",
+        "skills_prose",
+        "skill_implement_md",
+        "total",
+    ):
         assert component in data, f"thresholds missing component {component!r}"
         assert isinstance(data[component], int) and data[component] > 0, (
             f"threshold {component!r} must be a positive integer"
         )
+
+
+def test_skill_implement_md_is_gated_at_or_below_20k() -> None:
+    """SA-0MVYDCUWA001Z8K0 AC4: the implement SKILL.md body has its own gate.
+
+    The operational brief is inlined on every implement invocation, so its
+    byte size is gated separately from the startup ``total``.
+    """
+    data = json.loads(THRESHOLDS.read_text(encoding="utf-8"))
+    assert data["skill_implement_md"] <= 20000, (
+        "the committed skill_implement_md threshold must stay at or below "
+        "20,000 B (SA-0MVYDCUWA001Z8K0 AC1)"
+    )
+
+
+def test_skill_implement_md_is_measured() -> None:
+    """The measurer reports the implement SKILL.md body size."""
+    result = subprocess.run(
+        [sys.executable, str(MEASURE), "--json"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    components = json.loads(result.stdout)["components"]
+    assert "skill_implement_md" in components, (
+        "measure_context.py must report a skill_implement_md component"
+    )
+    assert components["skill_implement_md"]["bytes"] > 0
