@@ -595,9 +595,17 @@ def _handle_signal_cleanup(signum: int) -> None:
             # A claim interrupted before the worktree exists must never be
             # silent: the operator needs to know the item was released and
             # why (SA-0MVQ5AXLF002PAQ3 AC2). The child lock is the phase
-            # marker — only ``phase_start`` holds it, so a signal during
-            # ``finish``/``abort`` never gets a misleading "start" comment.
-            if _child_lock_global is not None and not (wt and Path(wt).exists()):
+            # marker — ``phase_start`` holds the lock for *the item it is
+            # starting*, so a signal during ``finish``/``abort`` never gets a
+            # misleading "start" comment. The id comparison matters for
+            # ``drive``, which holds a **child's** lock while the process-wide
+            # item is the parent: that must not post a "start interrupted"
+            # comment on the parent (SA-0MW7LMUUQ00701KJ).
+            if (
+                _child_lock_global is not None
+                and _child_lock_global.work_item_id == wid
+                and not (wt and Path(wt).exists())
+            ):
                 try:
                     wl_add_comment(
                         wid,
@@ -15802,7 +15810,12 @@ def phase_drive(
         (parent AC3, LP-0MVWEP2KB002WMRY). A child whose per-work-item lock is held by
         another live session is reported with ``action: "skipped-held"``,
         ``skipped_held: True``, ``held_by`` and ``held_children`` — and no
-        session is spawned for it (SA-0MVQ5AXLF002PAQ3). Worktree removal is
+        session is spawned for it (SA-0MVQ5AXLF002PAQ3). The driver itself
+        owns a child's lock for the whole spawned session — the lock file
+        records the live driver pid, the kernel ``flock`` stays held and the
+        session is handed the matching ownership token — releasing it as soon
+        as the session exits, whatever its outcome (success, non-zero exit or
+        timeout) (SA-0MW7LMUUQ00701KJ). Worktree removal is
         driver-owned: each driven child's ``finish`` defers it, so a terminal
         child's clean tree is removed once its session exits and the entry
         records ``worktree_removed`` plus its ``worktree_cleanup`` outcome;
@@ -16407,12 +16420,81 @@ def phase_drive(
             report["failed_child"] = child_id
             break
 
-        env = _child_session_env(worktree_path=worktree_path)
-        LOG.info(
-            "Driving child %s (session %d/%d) in %s",
-            child_id, attempts[child_id], max_child_sessions, worktree_path,
-        )
-        spawn_result = spawner(child_id, worktree_path, timeout, env)
+        # ── Hold the per-child lock for the spawned session's lifetime ──
+        # ``parent`` runs ``start`` as a short-lived subprocess, so the lock it
+        # takes is released before the driven session begins: while the session
+        # is alive the lock file would record a dead ``start`` pid and no kernel
+        # ``flock`` would exist, so the herdr hydrator demotes the child to
+        # ``open`` mid-implementation. The driver therefore owns the lock across
+        # the spawn (SA-0MW7LMUUQ00701KJ): the recorded pid is this live driver,
+        # the flock is held for the session's whole life, and the session
+        # re-enters by ownership token (:func:`_child_session_env` propagates
+        # it from the module-level handle).
+        try:
+            lock = _new_child_lock(child_id)
+            lock_result = lock.acquire()
+        except (OSError, RuntimeError) as exc:
+            report["message"] = (
+                f"Cannot acquire the per-child lock for {child_id}: {exc}. "
+                "Refusing to spawn its session (fail closed) because "
+                "exclusive ownership cannot be guaranteed."
+            )
+            report["failed_child"] = child_id
+            LOG.error("%s", report["message"])
+            break
+
+        if not lock_result.acquired:
+            # A different *live* owner holds the child's critical section: spawn
+            # nothing and report the holder, exactly like a refused ``start``
+            # (AC4). A token-propagated holder chain (this process re-entering)
+            # is reported as acquired, never as contention.
+            report["action"] = ACTION_SKIPPED_HELD
+            report["skipped_held"] = True
+            report["held_by"] = lock_result.held_by
+            report["held_children"] = [child_id]
+            report["lock_path"] = (
+                str(lock_result.path) if lock_result.path is not None else ""
+            )
+            report["children_processed"] = parent_report.get(
+                "children_processed", []
+            )
+            report["message"] = (
+                f"Child {child_id} of {work_item_id} is held by "
+                f"{_describe_child_lock_holder(lock_result.held_by)}; no "
+                "session was spawned for it."
+            )
+            lock.release()  # a losing handle held no kernel lock: no-op
+            LOG.warning("%s", report["message"])
+            break
+
+        if lock_result.reentrant:
+            LOG.info(
+                "Re-entered the per-child lock for %s by ownership token "
+                "(holder chain); not blocked.",
+                child_id,
+            )
+        elif lock_result.reclaimed:
+            # Logged AND surfaced in the drive report (never only in the log).
+            LOG.warning(
+                "%s",
+                _record_child_lock_reclamation(report, child_id, lock_result),
+            )
+
+        _set_child_lock(lock)
+        try:
+            env = _child_session_env(worktree_path=worktree_path)
+            LOG.info(
+                "Driving child %s (session %d/%d) in %s",
+                child_id, attempts[child_id], max_child_sessions,
+                worktree_path,
+            )
+            spawn_result = spawner(child_id, worktree_path, timeout, env)
+        finally:
+            # AC3: the release is bounded to the session, on every outcome —
+            # success, non-zero exit and timeout all leave no stale flock, so
+            # the next ``parent``/``start`` acquires the lock cleanly. Only the
+            # spawn is wrapped: the lock exists to cover the session itself.
+            _release_child_lock()
         report["sessions_spawned"] += 1
         entry = {
             "id": child_id,
