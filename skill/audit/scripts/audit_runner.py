@@ -6339,6 +6339,76 @@ def _phase1_evidence_refs(ac_results: list[dict],
     return refs
 
 
+_WORK_ITEM_EVIDENCE_MAX_CHARS = 12000
+"""Cap for the work-item comments evidence block injected into audit prompts.
+
+Bounded so a long comment history cannot inflate the Phase 1 / Phase 2 prompt
+without limit; comments are reproduced in order up to this many characters.
+"""
+
+
+def _build_work_item_evidence_block(
+    comments: Sequence[dict] | None,
+    *,
+    max_chars: int = _WORK_ITEM_EVIDENCE_MAX_CHARS,
+) -> str:
+    """Render the item's own comments as a bounded read-only evidence block.
+
+    Some acceptance criteria are satisfied by evidence recorded on the work
+    item itself rather than in the codebase — e.g. an execution-log criterion
+    ("the rc=0 results are recorded as a comment on this item") or a runtime
+    command result (``wl doctor upgrade --dry-run --json``). The Phase 1 parent
+    screen and the Phase 2 parent deep analysis historically carried only the
+    FILE SCOPE manifest + the AC list, so such a criterion could never be
+    verified and was graded a false-negative ``unmet``.
+
+    Read-only: the block never mutates parsed verdicts. Returns ``""`` when
+    there are no comments so those prompts stay byte-for-byte unchanged.
+    """
+    if not comments:
+        return ""
+    entries: list[str] = []
+    total = 0
+    for comment in comments:
+        if isinstance(comment, dict):
+            text = str(comment.get("comment", "") or "").strip()
+            author = str(comment.get("author", "") or "").strip() or "unknown"
+            created = str(comment.get("createdAt", "") or "").strip()
+        else:
+            text = str(comment).strip()
+            author, created = "unknown", ""
+        if not text:
+            continue
+        header = f"--- comment by {author}"
+        if created:
+            header += f" ({created})"
+        entry = f"{header} ---\n{text}"
+        remaining = max_chars - total
+        if remaining <= 0:
+            break
+        if len(entry) > remaining:
+            suffix = "\n…[truncated]"
+            keep = max(0, remaining - len(suffix))
+            entry = entry[:keep] + suffix
+        entries.append(entry)
+        total += len(entry)
+        if total >= max_chars:
+            break
+    if not entries:
+        return ""
+    return (
+        "WORK ITEM EVIDENCE — comments recorded on this item are reproduced "
+        "below as read-only evidence. If a criterion requires a verification "
+        "result that is recorded in a comment (for example a command exit "
+        "code, a drifted-DB exercise, or a `wl doctor --dry-run` output), "
+        "treat that comment as valid evidence and do NOT mark the criterion "
+        "'unmet' merely because the evidence lives in a comment rather than "
+        "in a code file.\n\n"
+        + "\n\n".join(entries)
+        + "\n\n"
+    )
+
+
 def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
                                runner: Runner | None = None,
                                project_root: Path | None = None) -> str:
@@ -9450,6 +9520,7 @@ def _run_phase2_deep_analysis(
     worklog_dir: str | None = None,
     ac_fallback_used: threading.Event | None = None,
     green_run_block: str | None = None,
+    comments: Sequence[dict] | None = None,
     skip_parent_deep: bool = False,
     owning_root: Path | None = None,
     max_citations_per_ac: int | None = None,
@@ -9627,6 +9698,7 @@ def _run_phase2_deep_analysis(
             f"{_SCANNING_BLOCK}"
             f"{green_run_block or ''}"
             f"{_max_citations_prompt_snippet(max_citations_per_ac)}"
+            f"{_build_work_item_evidence_block(comments)}"
             "For each acceptance criterion:\n"
             "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
             "2. **Verify the code actually does what the criterion claims.**\n"
@@ -12719,6 +12791,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             f"{file_scope}\n\n"
             f"{_SCANNING_BLOCK}"
             f"{green_run_block or ''}"
+            f"{_build_work_item_evidence_block(ctx.comments)}"
             f"Criteria: {ac_list_json}"
         )
         result, batch, raw_text = _call_phase1_screen(
@@ -13562,6 +13635,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     worklog_dir=worklog_dir,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    comments=ctx.comments,
                     skip_parent_deep=True,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
@@ -13585,6 +13659,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     worklog_dir=worklog_dir,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    comments=ctx.comments,
                     # A phase2-completed resume that is only re-auditing
                     # budget-exceeded children must NOT re-run the parent
                     # deep analysis (AC3) — children only.
@@ -13658,6 +13733,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         worklog_dir=worklog_dir,
                         ac_fallback_used=ac_fallback_used,
                         green_run_block=green_run_block,
+                        comments=ctx.comments,
                         owning_root=owning_root,
                         max_citations_per_ac=max_citations_per_ac,
                         child_in_main_slot=ctx.child_in_main_slot,
@@ -13851,6 +13927,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     worklog_dir=worklog_dir,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    comments=ctx.comments,
                     skip_parent_deep=True,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
