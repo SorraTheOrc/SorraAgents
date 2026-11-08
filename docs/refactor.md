@@ -152,6 +152,15 @@ For smells that existed before the current session, the refactor step:
 This comment serves as a persistent marker so that the same smell is not
 reported again in future refactor runs.
 
+**Work items carry a repository-relative identity.** The file path recorded in
+a work item's title and description is always relative to the repository (or
+worktree) root, never an absolute path — so the same source file scanned from
+different implement worktrees produces one findable identity rather than a new
+duplicate per worktree. A finding whose target resolves under
+`.worklog/worktrees/**` (an ephemeral implement worktree) is skipped rather
+than filed, because the work item would become unactionable once that worktree
+is removed (SA-0MW7Z11PV003V7O2).
+
 ## Usage
 
 ### Via Implement Skills
@@ -344,6 +353,14 @@ The following code smells are currently detected:
   that the sync was not skipped (`--no-sync`) or failed (offline/author gate) —
   a failed sync is non-fatal and logs a warning.
 - Manually close duplicate work items with `wl close <id> --reason "duplicate"`.
+
+### Work items pointing at an implement worktree (`.worklog/worktrees/...`)
+
+- Work items record repository-relative paths, and findings whose target
+  resolves under `.worklog/worktrees/**` are skipped rather than filed, so a
+  scan run inside an implement worktree no longer mints dead work items.
+- If older items still name a worktree path, they predate this behaviour —
+  retire them via the backlog-triage chore rather than actioning them.
 
 ### LLM analysis is not running
 

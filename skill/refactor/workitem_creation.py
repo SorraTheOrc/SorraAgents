@@ -85,38 +85,55 @@ def severity_to_priority(severity: Any) -> str:
     return SEVERITY_PRIORITY_MAP.get(severity.lower(), DEFAULT_PRIORITY)
 
 
-def build_smell_title(smell: dict[str, Any]) -> str:
+def build_smell_title(smell: dict[str, Any], repo_root: str | None = None) -> str:
     """Build a descriptive work item title for a code smell.
 
     The title follows the format::
 
         Refactor: <Smell Type> in <file>
 
+    The recorded file is always **repository-relative** (never an absolute
+    path, never a ``.worklog/worktrees/**`` prefix) so that the same source
+    file scanned from different implement worktrees yields an identical
+    identity (SA-0MW7Z11PV003V7O2).
+
     Args:
         smell: A smell finding dict with at least ``"file"``,
                ``"smell_type"``, and ``"message"`` keys.
+        repo_root: Optional repository root used to normalise an absolute
+            ``file`` path. Defaults to resolving ``git rev-parse
+            --show-toplevel`` from the current checkout.
 
     Returns:
         A title string suitable for a work item.
     """
     smell_type = smell.get("smell_type", "unknown").replace("_", " ").title()
-    file_path = smell.get("file", "unknown file")
+    file_path = _repo_relative_path(smell.get("file", "unknown file"), repo_root)
     return f"{TITLE_PREFIX} {smell_type} in {file_path}"
 
 
-def build_smell_description(smell: dict[str, Any]) -> str:
+def build_smell_description(
+    smell: dict[str, Any], repo_root: str | None = None
+) -> str:
     """Build a detailed work item description for a code smell.
 
     The description includes the file path, line number, smell type,
     severity, source, and original message in a structured markdown format.
 
+    As with :func:`build_smell_title`, the recorded file is repository-relative
+    so an ephemeral worktree path never leaks into the work item
+    (SA-0MW7Z11PV003V7O2).
+
     Args:
         smell: A smell finding dict.
+        repo_root: Optional repository root used to normalise an absolute
+            ``file`` path. Defaults to resolving ``git rev-parse
+            --show-toplevel`` from the current checkout.
 
     Returns:
         A markdown-formatted description string.
     """
-    file_path = smell.get("file", "unknown")
+    file_path = _repo_relative_path(smell.get("file", "unknown"), repo_root)
     line = smell.get("line", 0)
     severity = smell.get("severity", "medium")
     smell_type = smell.get("smell_type", "unknown")
@@ -178,7 +195,97 @@ def has_existing_smell_comment(file_path: str, smell_type: str) -> bool:
     return False
 
 
-def _has_existing_worklog_item(smell: dict[str, Any]) -> bool:
+# Prefix (relative to the repository root) denoting ephemeral implement
+# worktree roots that must never become a work item's identity.
+WORKTREES_PREFIX = ".worklog/worktrees"
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalise_path(path: str) -> str:
+    """Normalise a path to POSIX separators with no leading ``./``/trailing ``/``."""
+    value = str(path).strip().replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    if value not in ("/", ""):
+        value = value.rstrip("/")
+    return value
+
+
+def _git_toplevel() -> str | None:
+    """Return the current checkout's top-level directory.
+
+    Run from inside a git worktree this returns that worktree's root, which is
+    exactly the base an absolute scan path must be made relative to. When git
+    is unavailable or fails, the process working directory is used as a
+    best-effort scan root (the refactor skill runs from the repository or
+    worktree root), so a path is still normalised rather than left absolute.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        proc = None
+
+    if proc is not None and proc.returncode == 0:
+        root = (proc.stdout or "").strip()
+        # Reject non-path output (e.g. a misconfigured/mocked command) so a
+        # bogus root cannot silently produce a wrong relative path.
+        if root and os.path.isabs(root):
+            return root
+
+    fallback = os.getcwd()
+    return fallback if fallback and os.path.isabs(fallback) else None
+
+
+def _repo_relative_path(path: str, repo_root: str | None = None) -> str:
+    """Return *path* relative to the repository (or worktree) root.
+
+    - Paths that are already relative pass through (POSIX-normalised).
+    - Absolute paths are made relative to *repo_root* when supplied, else to
+      ``git rev-parse --show-toplevel``; running inside an implement worktree
+      that resolves to the worktree root, so
+      ``.worklog/worktrees/<wt>/skill/...`` becomes ``skill/...``.
+    - If the root cannot be resolved the path is returned POSIX-normalised.
+
+    This guarantees a work item's identity is stable regardless of which
+    worktree the scan ran in (SA-0MW7Z11PV003V7O2, AC1).
+    """
+    if not path:
+        return ""
+
+    normalised = str(path).replace("\\", "/")
+    if not os.path.isabs(normalised):
+        return _normalise_path(normalised)
+
+    root = str(repo_root) if repo_root else _git_toplevel()
+    if not root:
+        return _normalise_path(normalised)
+
+    try:
+        relative = os.path.relpath(normalised, root)
+    except (ValueError, OSError):
+        return _normalise_path(normalised)
+    return _normalise_path(relative)
+
+
+def _is_under_worklog_worktrees(relative_path: str) -> bool:
+    """Return ``True`` when *relative_path* lies under ``.worklog/worktrees``."""
+    rel = _normalise_path(relative_path)
+    return rel == WORKTREES_PREFIX or rel.startswith(WORKTREES_PREFIX + "/")
+
+
+def _has_existing_worklog_item(
+    smell: dict[str, Any], repo_root: str | None = None
+) -> bool:
     """Check if a work item already exists in the worklog for this smell.
 
     Queries the worklog database for Refactor-tagged items and checks if any
@@ -186,8 +293,14 @@ def _has_existing_worklog_item(smell: dict[str, Any]) -> bool:
     secondary safety net when the REFACTOR comment check is insufficient
     (e.g. the source file was deleted after the work item was created).
 
+    The target file is normalised to a repository-relative path so the same
+    source file scanned from two different implement worktrees is matched as
+    the *same* finding (SA-0MW7Z11PV003V7O2).
+
     Args:
         smell: A smell finding dict with ``file``, ``line``, and ``code`` keys.
+        repo_root: Optional repository root used to normalise an absolute
+            ``file`` path.
 
     Returns:
         ``True`` if a matching work item already exists, ``False`` otherwise.
@@ -218,7 +331,7 @@ def _has_existing_worklog_item(smell: dict[str, Any]) -> bool:
     if not isinstance(work_items, list):
         return False
 
-    target_file = smell.get("file", "")
+    target_file = _repo_relative_path(smell.get("file", ""), repo_root)
     target_line = smell.get("line", 0)
     target_code = smell.get("code", "")
 
@@ -238,11 +351,17 @@ def _has_existing_worklog_item(smell: dict[str, Any]) -> bool:
     return False
 
 
-def create_smell_work_item(smell: dict[str, Any]) -> str | None:
+def create_smell_work_item(
+    smell: dict[str, Any], repo_root: str | None = None
+) -> str | None:
     """Create a single Worklog work item for a code smell.
 
     Enforces the following guards before creating a work item:
 
+    0. **Ephemeral worktree target**: If the smell's repository-relative file
+       path lies under ``.worklog/worktrees/**`` the finding is skipped — such
+       a worktree is ephemeral and the resulting work item would be
+       unactionable (SA-0MW7Z11PV003V7O2, AC2).
     1. **File existence**: If the referenced source file does not exist on
        disk, a warning is logged and creation is skipped.\
        (AC: SA-0MQJLXMV7002X1VY)
@@ -254,6 +373,8 @@ def create_smell_work_item(smell: dict[str, Any]) -> str | None:
 
     Args:
         smell: A smell finding dict.
+        repo_root: Optional repository root used to normalise an absolute
+            ``file`` path to a repository-relative identity.
 
     Returns:
         The work item ID if creation succeeded, or ``None`` if it was
@@ -261,6 +382,17 @@ def create_smell_work_item(smell: dict[str, Any]) -> str | None:
     """
     file_path = smell.get("file", "")
     smell_type = smell.get("smell_type", "unknown")
+    relative_path = _repo_relative_path(file_path, repo_root) if file_path else ""
+
+    # Guard 0: never file an item against an ephemeral implement worktree (AC2).
+    if _is_under_worklog_worktrees(relative_path):
+        LOG.warning(
+            "Skipping work item creation for %s in %s: target lies under "
+            ".worklog/worktrees and is not actionable",
+            smell_type,
+            relative_path,
+        )
+        return None
 
     # Guard 1: File existence check (AC1)
     if file_path and not os.path.isfile(file_path):
@@ -282,7 +414,7 @@ def create_smell_work_item(smell: dict[str, Any]) -> str | None:
         return None
 
     # Guard 3: Check worklog database for existing items (AC3)
-    if _has_existing_worklog_item(smell):
+    if _has_existing_worklog_item(smell, repo_root):
         LOG.info(
             "Skipping creation for %s in %s: existing worklog item found",
             smell_type,
@@ -290,8 +422,8 @@ def create_smell_work_item(smell: dict[str, Any]) -> str | None:
         )
         return None
 
-    title = build_smell_title(smell)
-    description = build_smell_description(smell)
+    title = build_smell_title(smell, repo_root)
+    description = build_smell_description(smell, repo_root)
     priority = severity_to_priority(smell.get("severity", "medium"))
 
     # Build the wl create command
