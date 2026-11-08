@@ -115,6 +115,13 @@
           "contextWindow": 400000,
           "maxTokens": 16384,
           "input": ["text"]
+        },
+        {
+          "id": "deepseek-ai/deepseek-v4.1-flash-1017",
+          "name": "MunitoAI DeepSeek V4.1 Flash 1017 (paid)",
+          "contextWindow": 400000,
+          "maxTokens": 16384,
+          "input": ["text"]
         }
       ]
     }
