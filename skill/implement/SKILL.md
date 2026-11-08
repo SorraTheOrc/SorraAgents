@@ -249,10 +249,18 @@ python3 $(skill_path implement)/scripts/implement.py drive <parent-id>
 worktree, waits, then advances the parent — one session and one worktree per
 child, serial in dependency order. Pane-driving flags (`--pane-sessions`,
 `--no-pane-sessions`, `--focus`/`--no-focus`,
-`IMPLEMENT_DRIVE_PANE_SESSIONS=1`, `IMPLEMENT_DRIVE_ACTIVE=1`,
-`IMPLEMENT_WORKTREE_PATH`) are opt-in (needs `HERDR_ENV=1` + herdr) and
+`IMPLEMENT_DRIVE_PANE_SESSIONS=1`, `IMPLEMENT_DRIVE_ACTIVE=1`) are opt-in
+(needs `HERDR_ENV=1` + herdr) and
 fail-open to the headless `pi -p` spawner (default for the downtime worker,
 audit dispatch and CI).
+
+**Driven-session lock holder (SA-0MW7LMUUQ00701KJ).** The long-lived driver,
+not the short-lived `start` subprocess, holds the child's per-child lock for
+the session's whole lifetime; `_child_session_env` passes
+`IMPLEMENT_CHILD_LOCK_TOKEN`, a `finally` releases it on every spawner
+outcome, a different live holder stays `skipped-held`, and a driver killed
+mid-session is the accepted residual window
+([reference](../../docs/dev/implement-skill-reference.md#per-child-implementation-lock-sa-0mvq7vmrl00498yb)).
 `--infra-retry-limit N` (default `5`; 2 s doubling to a 30 s cap) bounds
 transient finish retries. **Manual fallback:**
 `python3 $(skill_path implement)/scripts/implement.py parent <parent-id>` —
@@ -328,10 +336,9 @@ timeout, gate reasons, terminal read-back):
 
 ## Status Transition Matrix
 
-Claim (Step 1) → `in_progress`; epic/parent done and Step 9 → `completed` +
-stage `in_review` (via `phase_finish()`/`StatusLifecycle`, assignee released);
-every abort/failure/interruption → `open` with `assignee=""` via
-`phase_abort()`/`_safety_reset_if_in_progress()`. Full matrix:
+Claim → `in_progress`; epic/parent done and Step 9 → `completed` + stage
+`in_review` (assignee released); every abort/failure → `open` with
+`assignee=""`. Full matrix:
 [reference — status transition matrix](../../docs/dev/implement-skill-reference.md#relocated-status-transition-matrix).
 
 ## Scripts (canonical runner & modules)
@@ -340,12 +347,6 @@ No single orchestrator — implementation follows the steps above and invokes
 project-local build/test and linters. Build/test steps for repos without
 tooling:
 [reference — build and test steps](../../docs/dev/implement-skill-reference.md#build-step-for-repos-without-a-build-script).
-
-```bash
-wl show SA-0MPYMFZXO0004ZU4 --json
-git push origin HEAD:refs/heads/dev   # ship.js pushToDev preferred
-python3 -c "from skill.shared.status_lifecycle import StatusLifecycle; StatusLifecycle.update_status('SA-0MPYMFZXO0004ZU4', 'completed', stage='in_review')"
-```
 
 ## Final cleanup (belt-and-suspenders)
 

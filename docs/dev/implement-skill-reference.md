@@ -2302,6 +2302,55 @@ equality:
 - A process with a different or absent token is a different owner, even if it
   happens to share the pid.
 
+### Driven sessions: the driver holds the child's lock (SA-0MW7LMUUQ00701KJ)
+
+During a drive, the **long-lived `phase_drive` driver process is the lock
+holder** — not the short-lived `start` subprocess inside `parent`. `parent`
+runs `start` as a short-lived subprocess, so the lock that subprocess takes is
+released before the driven session begins. Previously, while the session was
+alive the lock file recorded a dead `start` pid and no kernel `flock` existed,
+so the herdr hydrator (ContextHub, WL-0MVWDB3IG004NRIU) saw a pane-less item
+whose claim holder looked dead and demoted it to `open` mid-implementation
+(SA-0MVXWMVTH007MNJR).
+
+- **Who holds it.** The driver itself. The lock file's recorded `pid` is the
+  driver pid, and the kernel `flock` is held by the driver process.
+- **For how long.** For the session's whole lifetime: from immediately before
+  the session is spawned until the spawner returns (success, non-zero exit or
+  timeout). Only the spawn is wrapped — the lock exists to cover the session
+  itself.
+- **How the token reaches the session.** The driver acquires the lock with
+  `_new_child_lock(child_id)`, registers it as the process's held lock via
+  `_set_child_lock`, and `_child_session_env()` then propagates
+  `IMPLEMENT_CHILD_LOCK_TOKEN` to the spawned session (headless `pi -p` and
+  the pane transport alike). The session's own `start`/`finish` re-enter the
+  lock as a token-based re-entrant no-op; ownership stays token-based and is
+  never inferred from pid equality.
+- **Release paths.** The release sits in a `finally` around the spawn, so
+  every spawner outcome releases it: success, non-zero exit and timeout all
+  leave no stale `flock`, and the next `parent`/`start` acquires the lock
+  cleanly (or reclaims a genuinely dead holder with the existing warning). An
+  acquire that raises `OSError`/`RuntimeError` fails closed — the driver
+  records `failed_child` and spawns nothing.
+- **A different live holder is still refused.** If the lock is already held
+  by a different live owner, the driver reports `action: "skipped-held"` with
+  `held_by`, `held_children` and `lock_path`, and spawns no session for that
+  child. A holder chain re-entering by this process's own token is reported
+  as acquired (`reentrant`), never as contention. A reclaimed stale holder is
+  surfaced in the drive report (`lock_reclaimed`, `reclaimed_from`,
+  `warnings`).
+
+**Residual window: driver death while the session lives.** If the driver is
+killed while a spawned session is still working, the kernel releases the
+driver's `flock` and the hydrator may demote the item mid-session — the
+original symptom, narrowed from "every driven session" to "the driver died
+before its session finished". This is an **accepted residual window**: the
+session itself keeps running (its `start`/`finish` still re-enter by token and
+its work completes). **Option B** — the spawned session itself holding the
+lock for its own lifetime — would close the window, but it needs a dedicated
+lock-holder process that outlives the driver's spawn call, so it is
+deliberately out of scope here.
+
 ### Stale-holder reclamation
 
 A recorded owner whose pid is no longer alive does not block forever. When the
@@ -2382,7 +2431,9 @@ from `assignee`.
   subprocesses: exactly one acquires, the loser writes nothing and the winner's
   files are not diverged). Lock-store isolation is pinned by
   `skill/implement/tests/test_phase_start_claim.py::test_child_lock_lives_in_the_isolated_store_not_the_real_one`
-  and `tests/test_implement_child_lock_isolation.py`.
+  and `tests/test_implement_child_lock_isolation.py`. The driven-session
+  holder documented above is pinned by
+  `tests/test_implement_driven_lock_holder_doc.py`.
 
 ## Herdr session boundary helper and fake CLI (SA-0MVPHXNTJ006TNFB)
 
