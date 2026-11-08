@@ -1479,6 +1479,45 @@ capped at `PUSH_RETRY_CAP_SECONDS = 30.0`, +/-25% jitter).
   so a `--json` finish report shows the attempt trail, not just a log line
   (SA-0MVXEQEI500641SJ AC3).
 
+### SSH keepalives and the transport-lost failure (SA-0MVWNHLQQ002TFZR)
+
+Retrying alone does not fix a **deterministic** idle close. `.githooks/pre-push`
+runs the full suite *after* git has opened the SSH connection and produces no
+SSH traffic for the whole run (measured 11 min warm, 35 min cold), so a remote
+that closes idle connections (GitHub does) drops the connection before the ref
+update. Every attempt then fails the same way, burning a full suite run each
+time, and the output reads as success ("full suite green") while `origin/dev`
+never moves.
+
+- **Keepalives travel with the code (AC1/AC2).** `git_push_to_dev()` sets
+  `GIT_SSH_COMMAND` in its **push child environment** to an ssh invocation
+  carrying `-o ServerAliveInterval=30 -o ServerAliveCountMax=20 -o
+  TCPKeepAlive=yes` (`SSH_KEEPALIVE_OPTIONS`). Because it is applied by the
+  push itself, a fresh clone or worktree gets it with no operator
+  `~/.ssh/config` edit. The operator's own `GIT_SSH_COMMAND` is preserved: an
+  existing `ssh ...` invocation has the options spliced after the `ssh` token,
+  a command that already carries `ServerAliveInterval` is left untouched, and
+  an unrecognised wrapper is kept (with a warning) rather than broken.
+  (`ServerAliveInterval` is the effective option — the OS-level `TCPKeepAlive`
+  alone defaults to ~2 h.)
+- **A lost ref update is a distinct, loud failure (AC3).** When the bounded
+  retries are exhausted on a transport close, `git_push_to_dev()` raises
+  `PushTransportLostError` instead of returning a generic `False`. It records
+  `evidence_out = {success: False, reason: "connection_closed",
+  transport_lost: True, attempts, retry_trail, stderr_tail}` and `phase_finish`
+  reports `report["steps"]["push"]["reason"] = "connection_closed"` with a
+  comment that says *transport lost — not a test failure*. This distinguishes
+  it from a red suite (`gate_reason=test_failure` / `reason: test_failure`),
+  and `connection_closed` is on the infrastructure allow-list for the drive
+  retry classifier, so a driven child is retried on the infra budget. The
+  pre-push hook's green line is worded as a *gate* verdict ("test gate GREEN
+  … the ref update follows") so it can never be misread as a landed push.
+- **Regression coverage (AC4).** `skill/implement/tests/
+  test_implement_push_transport_keepalive.py` simulates the closed connection
+  (scripted `Popen` stderr) and asserts the keepalive child env, the distinct
+  `PushTransportLostError`, `reason: connection_closed` rather than
+  `test_failure`, and the infrastructure classification.
+
 ### Dev-push gate reason reporting (SA-0MVSJX5HS002DJHI AC2)
 
 `.githooks/pre-push` prints a stable `gate_reason=<code>` line on failure,

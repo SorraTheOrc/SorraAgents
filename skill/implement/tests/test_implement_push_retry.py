@@ -235,20 +235,29 @@ class TestGitPushToDevRetry:
         ambient = set(os.environ.items())
         for env in envs:
             extras = set(env.items()) - ambient
-            assert all(key == "TMPDIR" for key, _ in extras), (
+            # ``GIT_SSH_COMMAND`` carries the SSH keepalive (SA-0MVWNHLQQ002TFZR)
+            # and ``TMPDIR`` the disk-backed scratch dir: neither bypasses the
+            # gate. Anything else (e.g. TEST_SCOPE_SKIP) is forbidden.
+            assert all(
+                key in ("TMPDIR", "GIT_SSH_COMMAND") for key, _ in extras
+            ), (
                 "a retry must not inject TEST_SCOPE_SKIP or any other bypass "
                 f"env; unexpected keys: {extras}"
+            )
+            assert "ServerAliveInterval" in env.get("GIT_SSH_COMMAND", ""), (
+                "every attempt must carry the SSH keepalive so the gate cannot "
+                "idle out the connection"
             )
 
     def test_transport_retry_is_bounded(self, push_harness):
         transport = (128, TRANSPORT_CLOSE)
         push_harness["install"]([transport] * implement.PUSH_RETRY_MAX_ATTEMPTS)
 
-        result = implement.git_push_to_dev(
-            push_harness["cwd"], "wl-test", "abc123"
-        )
+        with pytest.raises(implement.PushTransportLostError):
+            implement.git_push_to_dev(
+                push_harness["cwd"], "wl-test", "abc123"
+            )
 
-        assert result is False
         assert len(push_harness["calls"]) == implement.PUSH_RETRY_MAX_ATTEMPTS
         assert len(push_harness["sleeps"]) == implement.PUSH_RETRY_MAX_ATTEMPTS - 1
 
@@ -261,12 +270,13 @@ class TestGitPushToDevRetry:
         transport = (128, TRANSPORT_CLOSE)
         push_harness["install"]([transport] * implement.PUSH_RETRY_MAX_ATTEMPTS)
 
-        with caplog.at_level(logging.WARNING, logger=implement.LOG.name):
-            result = implement.git_push_to_dev(
+        with (
+            caplog.at_level(logging.WARNING, logger=implement.LOG.name),
+            pytest.raises(implement.PushTransportLostError),
+        ):
+            implement.git_push_to_dev(
                 push_harness["cwd"], "wl-test", "abc123"
             )
-
-        assert result is False
         assert len(push_harness["calls"]) == implement.PUSH_RETRY_MAX_ATTEMPTS
         assert len(push_harness["sleeps"]) == implement.PUSH_RETRY_MAX_ATTEMPTS - 1
 
@@ -412,11 +422,14 @@ class TestRetryTrailEvidence:
         push_harness["install"]([transport] * implement.PUSH_RETRY_MAX_ATTEMPTS)
         evidence: dict = {}
 
-        result = implement.git_push_to_dev(
-            push_harness["cwd"], "wl-test", "abc123", evidence_out=evidence
-        )
+        with pytest.raises(implement.PushTransportLostError):
+            implement.git_push_to_dev(
+                push_harness["cwd"], "wl-test", "abc123", evidence_out=evidence
+            )
 
-        assert result is False
+        assert evidence["success"] is False
+        assert evidence["reason"] == "connection_closed"
+        assert evidence["transport_lost"] is True
         assert evidence["attempts"] == implement.PUSH_RETRY_MAX_ATTEMPTS
         trail = evidence["retry_trail"]
         assert [entry["attempt"] for entry in trail] == [1, 2], trail

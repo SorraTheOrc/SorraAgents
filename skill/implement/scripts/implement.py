@@ -4279,6 +4279,44 @@ class PushNonFastForwardError(RuntimeError):
         )
 
 
+class PushTransportLostError(RuntimeError):
+    """Raised when SSH closes before the ref update after a green suite.
+
+    The pre-push full-suite gate runs *after* git has opened the SSH
+    connection and produces no SSH traffic for its whole duration (measured
+    11 min warm, 35 min cold). A remote that closes the idle connection
+    (GitHub does) leaves git writing the ref update to a dead socket, so the
+    gate's green verdict is discarded and the push never lands
+    (SA-0MVWNHLQQ002TFZR).
+
+    This is deliberately **distinct** from a red suite
+    (``PushGateFailureError`` with ``gate_reason=test_failure``): nothing is
+    wrong with the code, so the operator must not read a green suite followed
+    by silence as a successful push. ``finish`` reports the reason
+    ``connection_closed`` (the existing infrastructure classification) and
+    keeps the commit on its feature branch.
+    """
+
+    def __init__(
+        self,
+        commit_hash: str,
+        branch: str,
+        stderr: str,
+        attempts: int,
+    ) -> None:
+        self.commit_hash = commit_hash
+        self.branch = branch
+        self.stderr = stderr
+        self.attempts = attempts
+        super().__init__(
+            f"Push to dev transport lost after {attempts} attempt(s): the SSH "
+            f"connection closed before the ref update, so a (possibly green) "
+            f"suite verdict was discarded. This is not a test failure. "
+            f"Commit {commit_hash} on branch {branch} is local. "
+            f"stderr: {stderr}"
+        )
+
+
 class PushSubjectMismatchError(RuntimeError):
     """Raised when the dev push would gate a tree other than the pushed commit.
 
@@ -4840,6 +4878,66 @@ PUSH_RETRY_MAX_ATTEMPTS = 3
 PUSH_RETRY_BASE_SECONDS = 2.0
 PUSH_RETRY_CAP_SECONDS = 30.0
 
+#: SSH keepalive options injected into the dev-push child environment
+#: (SA-0MVWNHLQQ002TFZR AC1/AC2). ``.githooks/pre-push`` runs the full suite
+#: *after* git has opened the SSH connection and produces no SSH traffic for
+#: the whole run, so the remote closes the idle connection and the ref update
+#: is written to a dead socket. A 30 s ``ServerAliveInterval`` keeps the
+#: connection alive for the duration of the gate; the OS-level
+#: ``TCPKeepAlive`` alone is far too coarse (default ~2 h).
+SSH_KEEPALIVE_OPTIONS: tuple[str, ...] = (
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=20",
+    "-o",
+    "TCPKeepAlive=yes",
+)
+
+
+def _ssh_keepalive_command(existing: str | None) -> str:
+    """Return a ``GIT_SSH_COMMAND`` that keeps the push SSH session alive.
+
+    The pre-push full-suite gate can idle the SSH connection for far longer
+    than a remote's idle timeout, so the dev push injects SSH keepalives into
+    its own child environment (SA-0MVWNHLQQ002TFZR AC1/AC2). The operator's
+    own ``GIT_SSH_COMMAND`` is preserved, never clobbered:
+
+    - unset: a plain ``ssh`` invocation with the keepalive options;
+    - set as an ``ssh`` invocation (optionally with args such as ``-i``): the
+      keepalive options are spliced in immediately after the ``ssh`` token so
+      the caller's arguments stay intact;
+    - already carrying ``ServerAliveInterval``: returned unchanged — the
+      operator configured keepalives deliberately;
+    - any other command (e.g. a wrapper script): returned unchanged. Options
+      cannot be spliced safely into an unknown wrapper, so the push keeps the
+      operator's command and logs a warning instead of risking a broken push.
+
+    Args:
+        existing: The ambient ``GIT_SSH_COMMAND`` value, or ``None``.
+
+    Returns:
+        The ``GIT_SSH_COMMAND`` to use for the push child process.
+    """
+    base = (existing or "").strip()
+    if "ServerAliveInterval" in base:
+        # The operator already configured keepalives; never second-guess them.
+        return base
+    if not base:
+        return " ".join(("ssh",) + SSH_KEEPALIVE_OPTIONS)
+    tokens = base.split()
+    if Path(tokens[0]).name == "ssh":
+        tokens[1:1] = list(SSH_KEEPALIVE_OPTIONS)
+        return " ".join(tokens)
+    LOG.warning(
+        "Cannot inject SSH keepalives into the custom GIT_SSH_COMMAND %r; "
+        "the dev-push gate may idle out the connection. Configure "
+        "ServerAliveInterval in that command to avoid it.",
+        base,
+    )
+    return base
+
+
 _GATE_REASON_LINE_RE = re.compile(r"^gate_reason=([a-z_]+)\s*$", re.MULTILINE)
 
 #: Reason reported when the repo-local pre-push **pushed-commit guard** refuses
@@ -4993,6 +5091,48 @@ def _push_retry_trail_fields(evidence: dict[str, Any] | None) -> dict[str, Any]:
     return fields
 
 
+def _transport_lost_comment(
+    exc: PushTransportLostError,
+    commit_hash: str,
+    branch: str,
+    worktree_path: str,
+) -> str:
+    """Build the work-item comment for a lost push transport (AC3).
+
+    The wording is deliberately explicit that a green suite is *not* a
+    successful push: the failure the operator must act on is the transport,
+    not the code (SA-0MVWNHLQQ002TFZR AC3).
+    """
+    return "\n".join(
+        [
+            "Dev push transport lost (reason: connection_closed).",
+            (
+                "The SSH connection closed before git could update the remote "
+                "ref, so the full-suite verdict (green or otherwise) was "
+                "discarded and nothing reached origin/dev. This is NOT a "
+                "test failure (`gate_reason=test_failure` means a red suite)."
+            ),
+            (
+                f"The push made {exc.attempts} attempt(s); the SSH keepalive "
+                "(ServerAliveInterval) is now applied to automated dev "
+                "pushes, so re-running finish should keep the connection "
+                "alive for the whole gate."
+            ),
+            "",
+            f"Commit: {commit_hash}",
+            f"Branch: {branch}",
+            f"Worktree: {worktree_path}",
+            (
+                "Local dev was restored to origin/dev (the commit stays on "
+                "its feature branch)."
+            ),
+            "",
+            "Gate output (tail):",
+            exc.stderr,
+        ]
+    )
+
+
 def _dev_push_gate_failure_comment(
     gate_reason: str,
     stderr_tail: str,
@@ -5110,6 +5250,15 @@ def git_push_to_dev(
             _finish_tmpdir = _resolved_finish_tmpdir()
             if _finish_tmpdir is not None:
                 child_env["TMPDIR"] = _finish_tmpdir
+            # Keep the push SSH session alive for the duration of the
+            # pre-push full-suite gate: the hook runs *after* git opens the
+            # connection and produces no SSH traffic, so a remote that closes
+            # idle connections would discard the green gate
+            # (SA-0MVWNHLQQ002TFZR AC1/AC2). The operator's own
+            # GIT_SSH_COMMAND is preserved, never clobbered.
+            child_env["GIT_SSH_COMMAND"] = _ssh_keepalive_command(
+                os.environ.get("GIT_SSH_COMMAND")
+            )
             proc = subprocess.Popen(
                 ["git", "push", PUSH_REMOTE_NAME, f"{branch}:refs/heads/dev"],
                 cwd=cwd,
@@ -5200,6 +5349,40 @@ def git_push_to_dev(
                 _push_retry_sleep(delay)
                 continue
 
+            # The retries are exhausted and the failure is still a transport
+            # close: the suite may have been green, but the ref update never
+            # reached origin. Raise a *distinct* failure (AC3) instead of
+            # returning a generic False, so `finish` can report
+            # "transport lost" rather than silence after "full suite green".
+            if _is_retryable_push_transport(stderr_str):
+                if evidence_out is not None:
+                    evidence_out.clear()
+                    evidence_out.update(
+                        {
+                            "success": False,
+                            "reason": "connection_closed",
+                            "gate_reason": None,
+                            "transport_lost": True,
+                            "stderr_tail": _stderr_tail(stderr_str),
+                        }
+                    )
+                    _attach_trail(evidence_out, attempt)
+                LOG.error(
+                    "git push to dev transport lost (attempt %d/%d): the SSH "
+                    "connection closed before the ref update, so a green "
+                    "suite verdict (if any) was discarded. This is NOT a "
+                    "test failure. stderr: %s",
+                    attempt,
+                    PUSH_RETRY_MAX_ATTEMPTS,
+                    _stderr_tail(stderr_str),
+                )
+                raise PushTransportLostError(
+                    commit_hash or "unknown",
+                    branch,
+                    _stderr_tail(stderr_str),
+                    attempt,
+                )
+
             # The pushed-commit guard (§3a) refuses before the suite runs and
             # prints no ``gate_reason=`` line: recognise its stable diagnostic
             # so a guard refusal is reported distinctly, with the pushed sha /
@@ -5236,6 +5419,7 @@ def git_push_to_dev(
                     PushTimeoutError,
                     PushNonFastForwardError,
                     PushGateFailureError,
+                    PushTransportLostError,
                 ),
             ):
                 raise
@@ -11375,6 +11559,44 @@ def phase_finish(
                 # An interruption from here on names the rebased replacement
                 # hash, which is the commit that actually landed.
                 _set_finish_progress(commit=commit_hash, pushed=True)
+            except PushTransportLostError as exc:
+                # AC3 (SA-0MVWNHLQQ002TFZR): the SSH transport closed before
+                # the ref update. The suite may have been green, but the ref
+                # never reached origin, so the verdict was discarded. Report
+                # this *distinctly* from a red suite: `reason:
+                # connection_closed` is already an infrastructure failure for
+                # the drive retry classifier, and the comment/error say
+                # "transport lost", never "full suite green".
+                push_step = {
+                    "success": False,
+                    "reason": "connection_closed",
+                    "hash": commit_hash,
+                    "transport_lost": True,
+                    "attempts": exc.attempts,
+                    "gate_stderr_tail": exc.stderr,
+                }
+                push_step.update(_push_retry_trail_fields(push_evidence))
+                report["steps"]["push"] = push_step
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
+                wl_add_comment(
+                    work_item_id,
+                    _transport_lost_comment(
+                        exc, commit_hash, branch, worktree_path
+                    ),
+                )
+                raise RuntimeError(
+                    f"git push to dev transport lost: the SSH connection "
+                    f"closed before the ref update after {exc.attempts} "
+                    f"attempt(s), so a green suite verdict (if any) was "
+                    f"discarded. This is NOT a test failure. Commit "
+                    f"{commit_hash} stays local on branch {branch}. "
+                    f"Remedy: retry finish (the SSH keepalive is now applied "
+                    f"automatically)."
+                ) from exc
             except PushGateFailureError as exc:
                 # AC2: the pre-push gate said *why* the push failed. Report the
                 # machine-readable reason in the finish report and post it on

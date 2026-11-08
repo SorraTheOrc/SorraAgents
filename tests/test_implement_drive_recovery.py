@@ -760,6 +760,12 @@ class TestFinishFailureClassifier:
         assert (
             "push", "timeout",
         ) in implement_mod.FINISH_INFRA_REFUSALS
+        # A lost SSH transport is infrastructure, not a red suite: finish emits
+        # it as ``connection_closed`` and drive retries it on the infra budget
+        # (SA-0MVWNHLQQ002TFZR).
+        assert (
+            "push", "connection_closed",
+        ) in implement_mod.FINISH_INFRA_REFUSALS
         for reason in ("push_failed", "non_fast_forward"):
             result = implement_mod.classify_finish_failure(
                 failing_finish_report("push", reason)

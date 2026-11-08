@@ -202,7 +202,11 @@ if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
     # state was validated, and executed-vs-cached (AC3).
     grep '^run_tests: gate-' "$gate_err" >&2 || true
     if [ "$gate_status" -eq 0 ]; then
-      echo "pre-push: full suite green (cached runs make repeat pushes cheap)" >&2
+      # A green *test gate* is not a successful push: git still has to send
+      # the ref update over the (possibly idle-closed) SSH connection. Word
+      # this as a gate verdict so "full suite green" is never misread as
+      # "the push landed" (SA-0MVWNHLQQ002TFZR AC3).
+      echo "pre-push: test gate GREEN — full suite passed (gate verdict only; the ref update follows)" >&2
       # Mirror the cache of the checkout the gate actually resolved (it may be
       # a worktree other than this one) into the main checkout's cache.
       gate_root="$(sed -n 's/^run_tests: gate-root //p' "$gate_err" | head -1)"

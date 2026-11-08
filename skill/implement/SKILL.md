@@ -308,6 +308,22 @@ so an agent could not tell *fix the code* from *retry later*.
   cached full-suite entry. Auth, branch-policy and non-fast-forward errors are
   never retried (non-fast-forward keeps its dedicated rebase recovery), and a
   timeout still raises `PushTimeoutError` immediately.
+- **SSH keepalives keep the idle gate connection alive** (SA-0MVWNHLQQ002TFZR).
+  The pre-push full suite runs *after* git opens the SSH connection and
+  produces no SSH traffic, so a remote that closes idle connections (GitHub)
+  drops it before the ref update and silently discards a green gate.
+  `git_push_to_dev()` therefore sets `GIT_SSH_COMMAND` in the push child env to
+  an ssh invocation carrying `-o ServerAliveInterval=30 -o
+  ServerAliveCountMax=20 -o TCPKeepAlive=yes`, preserving any operator
+  `GIT_SSH_COMMAND` (an existing `ssh …` command is merged; one that already
+  sets `ServerAliveInterval` is left untouched). The fix travels with a fresh
+  clone/worktree — no per-operator `~/.ssh/config` edit.
+- **A lost ref update is a distinct, loud failure.** If the retries are
+  exhausted on a transport close, the push raises `PushTransportLostError` and
+  `finish` records `reason: connection_closed` (infrastructure) with a
+  "transport lost — not a test failure" comment, never "full suite green"
+  followed by silence. This is distinct from a red suite
+  (`gate_reason=test_failure`).
 - **Fairness, not capacity.** `process_semaphore`'s arrival-ordered turnstile
   grants a free slot to the lowest outstanding ticket, so a waiter is bounded
   by its queue position instead of being overtaken indefinitely;

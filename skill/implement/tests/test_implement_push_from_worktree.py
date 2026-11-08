@@ -812,6 +812,84 @@ def test_phase_finish_exposes_the_retry_trail_on_a_successful_push(sandbox):
 
 
 # ---------------------------------------------------------------------------
+# SA-0MVWNHLQQ002TFZR — a lost SSH transport is reported distinctly from a
+# red suite, so "full suite green" is never mistaken for a successful push
+# ---------------------------------------------------------------------------
+
+
+def test_phase_finish_reports_a_lost_transport_distinctly(sandbox):
+    """AC3: an exhausted transport close reports ``connection_closed``.
+
+    The suite may have been green; the ref update never reached origin. The
+    finish report must say so *distinctly* (``reason: connection_closed``, not
+    ``test_failure``), the work-item comment must name the transport — never
+    imply a successful push — and the commit stays local on its branch.
+    """
+    comments: list[str] = []
+
+    def transport_lost_push(cwd, branch, commit_hash=None, **kwargs):
+        evidence = kwargs.get("evidence_out")
+        if evidence is not None:
+            evidence.update(
+                {
+                    "success": False,
+                    "reason": "connection_closed",
+                    "gate_reason": None,
+                    "transport_lost": True,
+                    "stderr_tail": "Connection to github.com closed by remote host.",
+                    "attempts": 3,
+                    "retry_trail": [],
+                }
+            )
+        raise implement.PushTransportLostError(
+            commit_hash or "unknown",
+            branch,
+            "Connection to github.com closed by remote host.",
+            3,
+        )
+
+    pushes: list[tuple] = []
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(
+            implement, "git_push_to_dev", side_effect=transport_lost_push
+        ),
+        patch.object(
+            implement,
+            "wl_add_comment",
+            side_effect=lambda *args, **kwargs: comments.append(args[1]) or True,
+        ),
+    ):
+        report = implement.phase_finish(
+            "SA-TEST", json_output=True, no_refactor=True
+        )
+
+    assert report["success"] is False, report
+    push_step = report["steps"]["push"]
+    assert push_step["reason"] == "connection_closed", push_step
+    assert push_step["transport_lost"] is True, push_step
+    assert push_step["reason"] != "test_failure", (
+        "a transport loss must not be reported as a red suite"
+    )
+    assert push_step["attempts"] == 3, push_step
+
+    assert comments, "the refusal must be recorded on the work item"
+    combined = "\n".join(comments)
+    assert "transport lost" in combined.lower(), combined
+    assert "NOT a test failure" in combined, combined
+    assert "full suite green" not in combined.lower(), (
+        "the comment must never imply the push succeeded: " + combined
+    )
+    # The push failed before local ``dev`` was advanced in this stubbed
+    # fixture, so the restore records nothing to undo; the commit survives on
+    # its feature branch for recovery.
+    restore = report["steps"]["local_dev_restore"]
+    assert restore["success"] is True, restore
+    assert restore["target"] == "refs/remotes/origin/dev", restore
+    assert "git push to dev transport lost" in report["message"], report["message"]
+
+
+# ---------------------------------------------------------------------------
 # SA-0MW3H07A8004Q54C — the pushed-commit guard refusal is distinguishable,
 # and the recovery rebase retries the local-dev fast-forward
 # ---------------------------------------------------------------------------
