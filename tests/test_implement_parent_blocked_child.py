@@ -6,11 +6,11 @@ These tests are the executable form of the parent's ACs 1–5: a child whose
 ``status`` is ``blocked`` must be **re-validated** before it is started or
 skipped, and a stale block must never strand the child forever.
 
-**Cases (a), (b), (e) and the fail-closed case are green** after C2 landed
-(``skip-blocked`` via dep-edge re-validation). Case (c) (prose / cross-project
-blockers) stays red until C3 and case (d) (``drive`` propagation) until C4;
-those two keep ``xfail(strict=False)`` so the suite stays green while their
-contract is documented.
+**Cases (a), (b), (c), (e) and the fail-closed case are green** after C2
+(``skip-blocked`` via dep-edge re-validation) and C3 (prose / cross-project
+blockers) landed. Case (d) (``drive`` propagation) stays red until C4 and
+keeps ``xfail(strict=False)`` so the suite stays green while its contract is
+documented.
 
 Every test drives the production ``phase_parent`` / ``phase_drive`` through the
 shared harnesses (``tests.test_implement_parent_safety.ParentHarness`` and
@@ -39,12 +39,11 @@ from tests.test_implement_parent_safety import ParentHarness, _child
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
 
-#: Remaining contract tests, red until C3 (prose blockers) / C4 (drive).
+#: Remaining contract test, red until C4 (drive propagation).
 _RED = pytest.mark.xfail(
     strict=False,
     reason=(
-        "contract test: expected red until C3 (prose/cross-project blockers) "
-        "and C4 (drive propagation) land"
+        "contract test: expected red until C4 (drive propagation) lands"
     ),
 )
 
@@ -97,6 +96,19 @@ def _entries(report: dict) -> dict[str, dict]:
     return {
         str(entry.get("id")): entry
         for entry in report.get("children_processed", [])
+    }
+
+
+def _classifications(report: dict) -> dict[str, dict]:
+    """Index the per-child classifications (``report["children"]``) by id.
+
+    ``children_processed`` carries the reduced pass verdict (action, status,
+    blocking ids); the richer evidence (``blocker_details``,
+    ``unresolved_blockers``, ``stale_block_ids``) lives on the classification.
+    """
+    return {
+        str(entry.get("id")): entry
+        for entry in report.get("children", [])
     }
 
 
@@ -190,7 +202,6 @@ class TestStaleBlockRevalidation:
 
 
 class TestProseBlocker:
-    @_RED
     def test_prose_blocker_with_unresolvable_id_holds_the_child_and_names_it(
         self, implement_mod
     ):
@@ -505,3 +516,185 @@ class TestStaleBlockReporting:
         entry = _entries(report)["SA-A"]
         assert entry["action"] == "skip-blocked"
         assert entry.get("blocking_ids") == []
+
+
+# ===========================================================================
+# C3: prose ``Blocked by`` / cross-project blockers (AC3)
+# ===========================================================================
+
+
+def _prose_child(
+    work_item_id: str, line: str, extra: str = "", status: str = "blocked"
+) -> dict:
+    """A child whose description carries an explicit blocker line."""
+    child = _child(work_item_id, status=status)
+    child["description"] = (
+        f"# Child {work_item_id}\n\n{line}\n"
+        "**Unblock condition:** the blocker is in `dev`.\n"
+        f"{extra}"
+    )
+    return child
+
+
+def _item(work_item_id: str, status: str) -> dict:
+    """A resolvable work item as returned by ``wl show``."""
+    return {
+        "id": work_item_id,
+        "title": f"Item {work_item_id}",
+        "status": status,
+        "deletedBy": "",
+    }
+
+
+class TestProseBlockerParser:
+    """The parser is narrow: one explicit line, ids only."""
+
+    def test_extracts_ids_from_the_bold_labelled_form(self, implement_mod):
+        description = (
+            "**Blocked by (SorraAgents):** `SA-0MVL2NH1G0094FA2` — *Finish gate*\n"
+            "**Unblock condition:** `SA-0MVTET8KQ0031R6Z` is in dev\n"
+            "## Related work\n- `SA-0MVL7YOMJ006UMDO` — unrelated\n"
+        )
+        assert implement_mod._prose_blocker_ids(description) == [
+            "SA-0MVL2NH1G0094FA2"
+        ]
+
+    def test_extracts_from_a_plain_lowercase_line(self, implement_mod):
+        assert implement_mod._prose_blocker_ids(
+            "blocked by: SA-0MVS1QS9J009DGPT"
+        ) == ["SA-0MVS1QS9J009DGPT"]
+
+    def test_ignores_unblock_condition_and_related_work_without_a_line(
+        self, implement_mod
+    ):
+        description = (
+            "**Unblock condition:** `SA-0MVTET8KQ0031R6Z` is in dev\n"
+            "## Related work\n- `SA-0MVL7YOMJ006UMDO`\n"
+        )
+        assert implement_mod._prose_blocker_ids(description) == []
+
+    def test_empty_and_malformed_input_never_raises(self, implement_mod):
+        assert implement_mod._prose_blocker_ids("") == []
+        assert implement_mod._prose_blocker_ids("Blocked by:") == []
+        assert implement_mod._prose_blocker_ids(None) == []
+
+
+class TestProseBlockerRevalidation:
+    """Prose blockers gate the start exactly like dependency edges."""
+
+    def test_open_resolvable_prose_blocker_holds_with_its_status(
+        self, implement_mod
+    ):
+        children = [
+            _prose_child(
+                "SA-A", "**Blocked by (SorraAgents):** SA-BLOCKER"
+            )
+        ]
+        h = ParentHarness(
+            implement_mod,
+            children,
+            items={"SA-BLOCKER": _item("SA-BLOCKER", "open")},
+        )
+        report = h.run()
+
+        assert h.calls["phase_start"] == []
+        verdict = _entries(report)["SA-A"]
+        assert verdict["action"] == "skip-blocked"
+        assert verdict["blocking_ids"] == ["SA-BLOCKER"]
+        entry = _classifications(report)["SA-A"]
+        assert entry["action"] == "skip-blocked"
+        assert entry["external_blockers"] == ["SA-BLOCKER"]
+        assert entry["blocker_details"] == [
+            {
+                "id": "SA-BLOCKER",
+                "status": "open",
+                "source": "prose",
+                "resolved": True,
+            }
+        ]
+
+    def test_terminal_resolvable_prose_blocker_is_stale_and_starts(
+        self, implement_mod
+    ):
+        children = [
+            _prose_child(
+                "SA-A", "**Blocked by (SorraAgents):** SA-BLOCKER"
+            )
+        ]
+        h = ParentHarness(
+            implement_mod,
+            children,
+            items={"SA-BLOCKER": _item("SA-BLOCKER", "completed")},
+        )
+        report = h.run()
+
+        assert h.calls["phase_start"] == ["SA-A"]
+        assert report["stale_blocks"] == [
+            {"id": "SA-A", "blocking_ids": ["SA-BLOCKER"]}
+        ]
+
+    def test_unresolvable_prose_blocker_holds_with_an_actionable_hint(
+        self, implement_mod
+    ):
+        children = [
+            _prose_child("SA-A", "**Blocked by (SorraAgents):** OSL-EXTERNAL")
+        ]
+        h = ParentHarness(implement_mod, children)  # not resolvable here
+        report = h.run()
+
+        assert h.calls["phase_start"] == []
+        verdict = _entries(report)["SA-A"]
+        assert verdict["action"] == "skip-blocked"
+        assert verdict["blocking_ids"] == ["OSL-EXTERNAL"]
+        assert report["unresolved_blockers"] == {"SA-A": ["OSL-EXTERNAL"]}
+        entry = _classifications(report)["SA-A"]
+        assert entry["unresolved_blockers"][0]["hint"].startswith(
+            "check the owning project's worklog"
+        )
+        # The actionable hint reaches the operator-facing message too.
+        assert "OSL-EXTERNAL" in report["message"]
+        assert "worklog" in report["message"]
+
+    def test_prose_and_edge_blockers_are_merged(self, implement_mod):
+        """Declared edges stay authoritative; the prose line adds to them."""
+        children = [
+            _prose_child(
+                "SA-A", "**Blocked by (SorraAgents):** SA-PROSE"
+            )
+        ]
+        blockers = {"SA-A": [_blocker("SA-EDGE", status="open")]}
+        h = ParentHarness(
+            implement_mod,
+            children,
+            blockers_map=blockers,
+            items={"SA-PROSE": _item("SA-PROSE", "open")},
+        )
+        report = h.run()
+        entry = _classifications(report)["SA-A"]
+
+        assert h.calls["phase_start"] == []
+        assert _entries(report)["SA-A"]["blocking_ids"] == [
+            "SA-EDGE", "SA-PROSE"
+        ]
+        assert {d["id"]: d["source"] for d in entry["blocker_details"]} == {
+            "SA-EDGE": "dependency",
+            "SA-PROSE": "prose",
+        }
+
+    def test_prose_line_on_a_non_blocked_child_does_not_gate(
+        self, implement_mod
+    ):
+        """Only a ``blocked`` child is re-validated from prose (the open
+        child is normal work, not a hold)."""
+        children = [
+            _prose_child(
+                "SA-A",
+                "**Blocked by (SorraAgents):** OSL-EXTERNAL",
+                status="open",
+            )
+        ]
+        h = ParentHarness(implement_mod, children)
+        report = h.run()
+
+        assert h.calls["phase_start"] == ["SA-A"]
+        assert "unresolved_blockers" not in report

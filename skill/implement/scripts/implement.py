@@ -1911,6 +1911,134 @@ def _blocked_child_state(
     }
 
 
+#: An **explicit** ``Blocked by …`` line — the cross-project block convention.
+#: Anchored to the start of the line (bullet and/or bold markers tolerated) and
+#: deliberately narrow: arbitrary prose, an ``Unblock condition:`` line and
+#: ``Related work`` ids are never parsed as blockers (SA-0MVTUFL0U0000NV2 AC3).
+BLOCKED_BY_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-*][ \t]+)?\**[ \t]*blocked[ \t]+by\b[^\n]*",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: A work-item id token: a project prefix, a dash and a body. Deliberately
+#: shape-based rather than length-based — a ``Blocked by`` line may name a
+#: short internal id as well as a full ``SA-0MVS1QS9J009DGPT``-style one.
+WORK_ITEM_ID_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-[A-Z0-9]{2,})\b")
+
+
+def _prose_blocker_ids(description: str) -> list[str]:
+    """Extract blocker ids from an explicit ``Blocked by …`` line only.
+
+    Tolerates the bold/labelled cross-project form
+    (``**Blocked by (SorraAgents):** `SA-…```) and a plain ``Blocked by:``
+    (case-insensitive). Only the first matching line is read, and only ids on
+    that line are returned, so an ``Unblock condition:`` line or a
+    ``Related work`` list can never be mistaken for a blocker.
+
+    Args:
+        description: The child's work-item description.
+
+    Returns:
+        The blocker ids in first-seen order (empty when there is no explicit
+        ``Blocked by`` line).
+    """
+    if not isinstance(description, str) or not description.strip():
+        return []
+    match = BLOCKED_BY_LINE_RE.search(description)
+    if match is None:
+        return []
+    found: list[str] = []
+    for work_item_id in WORK_ITEM_ID_RE.findall(match.group(0)):
+        if work_item_id not in found:
+            found.append(work_item_id)
+    return found
+
+
+def _prose_blockers(child: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve the blocker ids declared in a child's ``Blocked by …`` line.
+
+    Each id is resolved with :func:`wl_show`, which maps an id prefix to the
+    owning project's worklog (``resolve_worklog_flags`` prefix-to-sibling
+    scan) — no network call. A resolved item is returned as a work-item dict,
+    so the same terminal test as dependency edges applies (:func:`_is_terminal_child`).
+    An id that cannot be resolved is returned as an ``unresolved`` sentinel:
+    it **holds** the block (fail closed) and carries the hint for where to
+    check it. A parser failure never raises — the caller's verdict stays
+    fail-closed.
+
+    Args:
+        child: The child work-item dict (``description`` is read).
+
+    Returns:
+        One payload per declared blocker, each tagged ``blocker_source:
+        "prose"``; unresolved payloads also carry ``unresolved: True``.
+    """
+    payloads: list[dict[str, Any]] = []
+    for blocker_id in _prose_blocker_ids(str(child.get("description", ""))):
+        item: dict[str, Any] = {}
+        try:
+            item = wl_show(blocker_id)
+        except Exception:  # noqa: BLE001 — parsing must never crash the phase
+            LOG.warning(
+                "Could not resolve prose blocker %s; treating it as holding.",
+                blocker_id,
+            )
+            item = {}
+        if item and str(item.get("id", "")) == blocker_id:
+            payload = dict(item)
+            payload["blocker_source"] = "prose"
+            payloads.append(payload)
+        else:
+            payloads.append({
+                "id": blocker_id,
+                "status": "",
+                "title": "",
+                "unresolved": True,
+                "blocker_source": "prose",
+            })
+    return payloads
+
+
+def _blocker_detail(
+    blocker: dict[str, Any],
+    resolved_in_chain: bool = False,
+) -> dict[str, Any]:
+    """Render a blocker (edge or prose) as a JSON-friendly detail record.
+
+    Args:
+        blocker: A dependency-edge dict or a payload from
+            :func:`_prose_blockers`.
+        resolved_in_chain: True when the blocker is one of the parent's
+            children (its live record supplies the status).
+
+    Returns:
+        ``{"id", "status", "source", "resolved", "hint"}``; ``status`` is
+        ``"unresolved"`` and ``hint`` names where to check when the id could
+        not be resolved.
+    """
+    blocker_id = str(blocker.get("id", ""))
+    unresolved = bool(blocker.get("unresolved"))
+    detail: dict[str, Any] = {
+        "id": blocker_id,
+        "status": (
+            "unresolved"
+            if unresolved
+            else str(blocker.get("status", "") or "unknown")
+        ),
+        "source": str(blocker.get("blocker_source", "dependency")),
+        "resolved": not unresolved,
+    }
+    if resolved_in_chain:
+        detail["source"] = "dependency"
+        detail["resolved"] = True
+    if unresolved:
+        prefix = _work_item_prefix(blocker_id)
+        detail["hint"] = (
+            "check the owning project's worklog"
+            + (f" (id prefix {prefix})" if prefix else "")
+        )
+    return detail
+
+
 def _outbound_gate(
     work_item_id: str,
     blockers: list[dict[str, Any]] | None = None,
@@ -13285,6 +13413,10 @@ def phase_parent(
     blockers_map: dict[str, list[dict[str, Any]]] = {}
     # Re-validated ``blocked`` holds, keyed by child id (AC1/AC2/AC4).
     blocked_states: dict[str, dict[str, Any]] = {}
+    # The blocker set that gates each child (declared edges plus the explicit
+    # prose ``Blocked by`` ids), so the classification in Step 5 and the start
+    # decision in Step 6 can never disagree (SA-0MVTUFL0U0000NV2 AC3).
+    gate_blockers: dict[str, list[dict[str, Any]]] = {}
     stale_blocks: list[dict[str, Any]] = []
     unvalidated_blocks: list[dict[str, Any]] = []
     # Same-project blockers OUTSIDE the children set: they cannot be ordered
@@ -13292,11 +13424,25 @@ def phase_parent(
     # ``phase_start`` leaf gate). Cross-project edges stay coordination notes
     # for children that are *not* ``blocked`` (SA-0MSQBM2FK005NW1T).
     out_of_chain_blocked: dict[str, list[dict[str, str]]] = {}
+    # Prose-declared blockers that could not be resolved, keyed by child id.
+    unresolved_prose: dict[str, list[str]] = {}
     for child in children:
         cid = str(child.get("id", ""))
-        # Outbound (depends-on) edges: what this child is blocked by.
+        child_status = str(child.get("status", ""))
+        # Outbound (depends-on) edges: what this child is blocked by. Declared
+        # edges are authoritative; the prose ``Blocked by`` line is the narrow
+        # cross-project path consulted only for a ``blocked`` child
+        # (SA-0MVTUFL0U0000NV2 AC3).
         child_blockers = wl_dep_blockers(cid) if cid else []
         blockers_map[cid] = child_blockers
+        prose_blockers = _prose_blockers(child) if child_status == "blocked" else []
+        merged_blockers = list(child_blockers)
+        for payload in prose_blockers:
+            if not any(
+                str(b.get("id", "")) == str(payload.get("id", ""))
+                for b in merged_blockers
+            ):
+                merged_blockers.append(payload)
         # Blockers outside the children set (e.g. cross-project) are
         # coordination notes, not in-chain edges (SA-0MSQBM2FK005NW1T).
         in_chain_ids = {str(c.get("id")) for c in children}
@@ -13308,6 +13454,10 @@ def phase_parent(
             for b in out_of_chain
             if not _is_same_project(cid, str(b.get("id", "")))
         ]
+        for payload in prose_blockers:
+            blocker_id = str(payload.get("id", ""))
+            if blocker_id not in external:
+                external.append(blocker_id)
         unmet_same_project = [
             _blocker_payload(b)
             for b in out_of_chain
@@ -13316,11 +13466,12 @@ def phase_parent(
         ]
         if unmet_same_project:
             out_of_chain_blocked[cid] = unmet_same_project
+        gate_blockers[cid] = merged_blockers
         entry: dict[str, Any] = {
             "id": cid,
             "title": child.get("title", ""),
-            "status": child.get("status", ""),
-            "action": _classify_child(child, child_blockers, children),
+            "status": child_status,
+            "action": _classify_child(child, merged_blockers, children),
             "external_blockers": external,
         }
         classifications.append(entry)
@@ -13330,14 +13481,34 @@ def phase_parent(
             # Surface the live holder's identity so the operator can diagnose
             # who owns the child (AC3).
             entry["held_by"] = _probe_child_lock(cid)
-        if str(child.get("status", "")) == "blocked":
+        if child_status == "blocked":
             # Re-validate the hold on every run: a producer's ``blocked``
-            # status is re-evaluated against the outbound edges so a landed
-            # prerequisite cannot strand its dependent, and a block that
-            # cannot be validated holds instead of defaulting to startable
-            # (SA-0MVTUFL0U0000NV2 AC2/AC4).
-            state = _blocked_child_state(child, child_blockers, children)
+            # status is re-evaluated against the outbound edges and the
+            # explicit ``Blocked by`` line so a landed prerequisite cannot
+            # strand its dependent, and a block that cannot be validated
+            # holds instead of defaulting to startable (SA-0MVTUFL0U0000NV2
+            # AC2/AC3/AC4).
+            state = _blocked_child_state(child, merged_blockers, children)
             blocked_states[cid] = state
+            entry["blocker_details"] = [
+                _blocker_detail(
+                    payload,
+                    resolved_in_chain=str(payload.get("id", "")) in in_chain_ids,
+                )
+                for payload in merged_blockers
+            ]
+            unresolved = [
+                str(payload.get("id", ""))
+                for payload in merged_blockers
+                if payload.get("unresolved")
+            ]
+            if unresolved:
+                unresolved_prose[cid] = unresolved
+                entry["unresolved_blockers"] = [
+                    detail
+                    for detail in entry["blocker_details"]
+                    if detail["status"] == "unresolved"
+                ]
             if state["blocking_ids"]:
                 entry["blocking_ids"] = list(state["blocking_ids"])
             if state["unvalidated"]:
@@ -13346,7 +13517,8 @@ def phase_parent(
                     "id": cid,
                     "reason": (
                         "status is 'blocked' but no outbound dependency edge "
-                        "resolves the blocker; treated as holding (fail closed)"
+                        "and no parseable 'Blocked by' line resolves the "
+                        "blocker; treated as holding (fail closed)"
                     ),
                 })
             if state["stale_block_ids"]:
@@ -13370,6 +13542,8 @@ def phase_parent(
         report["stale_blocks"] = stale_blocks
     if unvalidated_blocks:
         report["unvalidated_blocks"] = unvalidated_blocks
+    if unresolved_prose:
+        report["unresolved_blockers"] = unresolved_prose
     report["children"] = classifications
 
     # ── Step 5.5: Resolve dependency order (blockers first) ────────
@@ -13595,7 +13769,7 @@ def phase_parent(
         cid = str(child.get("id", ""))
         title = child.get("title", "")
         action = _classify_child(
-            child, blockers_map.get(cid, []), children
+            child, gate_blockers.get(cid, blockers_map.get(cid, [])), children
         )
 
         if action == "skip-terminal":
@@ -13610,7 +13784,6 @@ def phase_parent(
             # Already recorded up-front with its ``blocking_ids``: a still
             # valid ``blocked`` hold is never started (AC1).
             continue
-
         if action == ACTION_SKIPPED_HELD:
             # A live holder owns this child's critical section. Stop cleanly
             # with the holder's identity instead of spawning a second session
@@ -13791,10 +13964,17 @@ def phase_parent(
                 if not ids:
                     out_of_chain = out_of_chain_blocked.get(cid) or []
                     ids = [str(b.get("id", "")) for b in out_of_chain]
-                details.append(
+                detail = (
                     f"{cid} (blocked by {', '.join(ids)})"
                     if ids else f"{cid} (unvalidated block)"
                 )
+                unresolved = unresolved_prose.get(cid) or []
+                if unresolved:
+                    detail += (
+                        "; unresolved id(s) " + ", ".join(unresolved)
+                        + " — check the owning project's worklog"
+                    )
+                details.append(detail)
             reasons.append("blocked children: " + "; ".join(details))
         report["message"] = (
             f"No child of {work_item_id} is currently startable: "
