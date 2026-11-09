@@ -63,11 +63,13 @@ def _init_repo(root: Path) -> None:
     gs.commit_all(root, "base")
 
 
-def _commit(root: Path, name: str, text: str = "change\n") -> None:
+def _commit(
+    root: Path, name: str, text: str = "change\n", *, message: str | None = None
+) -> None:
     path = root / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
-    gs.commit_all(root, f"add {name}")
+    gs.commit_all(root, message or f"add {name}")
 
 
 def _add_worktree(root: Path, worktree: Path) -> Path:
@@ -231,7 +233,13 @@ class TestPhaseParentBehindOnlyChild:
         self, worktree: Path
     ) -> None:
         # Non-vacuity: the same harness still finishes a child that did work.
-        _commit(worktree, "child-work.txt")
+        # The commit carries the item id exactly as the implement workflow
+        # does (`<WID>: <summary>`), so it is attributable work — a
+        # non-attributable commit ahead is classified not-finalisable
+        # (SA-0MW74IKJE008JXDQ).
+        _commit(
+            worktree, "child-work.txt", message=f"{CHILD_ID}: child work"
+        )
 
         report = _run_phase_parent(worktree)
 

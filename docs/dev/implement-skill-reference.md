@@ -910,9 +910,18 @@ completed by sibling slices.
   precedence in `_classify_child` runs before any worktree or finish
   handling, and neither the reconciliation nor the reset path can reach a
   terminal child (regression-covered).
+- **Zero-work children are never finalised.** `_classify_child_worktree`
+  refines `_has_worktree_changes` into the question `finish` actually needs:
+  `work` (uncommitted non-state files or commits ahead referencing the item),
+  `verification-only` (the state-file opt-in), `no-work` (a state-file-only
+  dirty surface or non-attributable commits ahead), or `clean`. A `no-work`
+  child is reported `action: "not-finalisable"` in `children_processed` plus a
+  structured `not_finalisable_children` key, `finish` is never run for it,
+  and the parent is not advanced (SA-0MW74IKJE008JXDQ). `finish`'s own no-op
+  refusal remains the defence in depth for direct invocation.
 - **`parent_advanced: false` always means real work remains** — a
-  non-terminal or blocked child. The parent advances only when every child
-  is terminal.
+  non-terminal, blocked, or not-finalisable (zero-work) child. The parent
+  advances only when every child is terminal.
 - **Session-per-child isolation, per-child worktree semantics and
   dependency-order driving are unchanged.**
 

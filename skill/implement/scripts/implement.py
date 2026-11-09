@@ -1882,6 +1882,119 @@ def _outbound_gate(
     }
 
 
+#: Verdicts returned by :func:`_classify_child_worktree`.
+CHILD_WORK = "work"
+CHILD_VERIFICATION_ONLY = "verification-only"
+CHILD_NO_WORK = "no-work"
+CHILD_CLEAN = "clean"
+
+
+def _classify_child_worktree(
+    child_id: str,
+    worktree_path: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> str:
+    """Classify a child's worktree change surface for finalisability.
+
+    This classifier sits next to :func:`_has_worktree_changes` and refines
+    its boolean answer into the question ``finish`` actually needs: **is
+    there work attributable to this item?** It distinguishes:
+
+    - ``"work"`` — uncommitted non-state files, **or** commits ahead of the
+      parent branch whose messages reference *child_id*.
+    - ``"verification-only"`` — no real work, but the state file carries
+      ``verification_only`` (a deliberate no-commit finalisation).
+    - ``"no-work"`` — a misleading change surface only: the state file is
+      dirty (an accidentally-tracked ``.implement_state.json``) and/or there
+      are commits ahead that do not reference the item. Such a child is
+      **not finalisable** (SA-0MW74IKJE008JXDQ AC4).
+    - ``"clean"`` — no dirty files and no commits ahead. This is not a
+      *false positive* surface: ``_has_worktree_changes`` already reports
+      ``False`` and the normal "implement next" path applies.
+
+    Precedence: real work > verification-only > no-work > clean.
+
+    Args:
+        child_id: The child work-item id (for commit attribution).
+        worktree_path: Absolute path to the worktree.
+        parent_branch: Branch the worktree forked from.
+
+    Returns:
+        One of :data:`CHILD_WORK`, :data:`CHILD_VERIFICATION_ONLY`,
+        :data:`CHILD_NO_WORK`, :data:`CHILD_CLEAN`.
+    """
+    wt = Path(worktree_path)
+    if not wt.exists():
+        return CHILD_NO_WORK
+
+    # The verification-only opt-in is recorded in the state file.
+    state_path = wt / STATE_FILE_NAME
+    verification_only = False
+    try:
+        state_data = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(state_data, dict):
+            verification_only = bool(state_data.get("verification_only", False))
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+    expected = expected_dirty_paths(str(wt))
+    status_output = git_status(cwd=str(wt))
+    # Dirty paths excluding .worklog/ and project-declared expected-dirty
+    # prefixes — the same filtering ``_has_worktree_changes`` applies.
+    dirty_paths = dirty_paths_from_status(status_output, expected_dirty=expected)
+    # The state file is not filtered by the generic helpers (it lives at the
+    # worktree root), so identify it explicitly: a dirty state file is never
+    # work.
+    state_file_dirty = STATE_FILE_NAME in dirty_paths
+    non_state_dirty = [p for p in dirty_paths if p != STATE_FILE_NAME]
+
+    if non_state_dirty:
+        return CHILD_WORK
+
+    # Commits ahead of the parent branch: only ones referencing this item are
+    # attributable work; the rest are the ambient-branch false positive.
+    ahead = run_cmd(
+        ["git", "rev-list", "--count", f"{parent_branch}..HEAD"],
+        cwd=str(wt),
+        check=False,
+        capture=True,
+    )
+    commits_ahead = False
+    if ahead.returncode == 0:
+        try:
+            commits_ahead = int(ahead.stdout.strip()) > 0
+        except ValueError:
+            commits_ahead = True  # unparseable; conservatively assume commits
+    else:
+        # Cannot compare (missing ref, git error): fail open so a real change
+        # is never silently discarded.
+        return CHILD_WORK
+
+    if commits_ahead:
+        ref_check = run_cmd(
+            ["git", "-C", str(wt), "log", f"{parent_branch}..HEAD",
+             "--grep", child_id, "-n", "1", "--format=%H"],
+            check=False,
+            timeout=30,
+        )
+        if ref_check.returncode == 0 and ref_check.stdout.strip():
+            return CHILD_WORK
+
+    # Precedence (documented above): real work > verification-only >
+    # no-work > clean. A verification-only child is a deliberate no-commit
+    # finalisation, so its opt-in outranks the misleading-surface verdict.
+    if verification_only:
+        return CHILD_VERIFICATION_ONLY
+
+    # No attributable work. A state-file-only dirty surface and/or
+    # non-attributable commits ahead is the misleading surface the finish
+    # gate refuses — never present it as finishable.
+    if state_file_dirty or commits_ahead:
+        return CHILD_NO_WORK
+
+    return CHILD_CLEAN
+
+
 def _classify_child(child: dict[str, Any]) -> str:
     """Classify a child for the parent-recursion plan.
 
@@ -1896,6 +2009,12 @@ def _classify_child(child: dict[str, Any]) -> str:
     with a stale lock file lying around), and a live holder outranks the
     status-based ``in-progress`` guess because it is a fact about a running
     process, not a lifecycle claim (SA-0MVQ5AXLF002PAQ3, AC3).
+
+    This phase-level classification is refined for open/in-progress children
+    by :func:`_classify_child_worktree` at the two change-surface call sites in
+    ``phase_parent``: a worktree whose only change is the state file (or
+    non-attributable commits) is never presented as finishable
+    (SA-0MW74IKJE008JXDQ).
 
     Args:
         child: A child work-item dict from ``wl show --children``.
@@ -12881,7 +13000,9 @@ def phase_parent(
        are reported as coordination notes.
     5. Classify children: terminal → skip; a live lock holder →
        ``skipped-held`` (report the holder and stop cleanly); in_progress
-       elsewhere → skip+report; blocked by a non-terminal sibling or by a
+       elsewhere → skip+report; a worktree with no attributable work →
+       ``not-finalisable`` (child stays open, parent never advances;
+       SA-0MW74IKJE008JXDQ); blocked by a non-terminal sibling or by a
        same-project item outside the epic → not startable (reported);
        otherwise → implementable.
     6. All children terminal → advance the parent to ``completed``/``in_review``
@@ -13137,6 +13258,7 @@ def phase_parent(
     }
     pending_ids: list[str] = []
     blocked_ids: list[str] = []
+    no_work_ids: list[str] = []
 
     def _in_chain_blockers(child_id: str) -> list[str]:
         return [
@@ -13256,6 +13378,30 @@ def phase_parent(
         })
         return finish_result
 
+    def _record_not_finalisable(
+        cid: str, title: str, status: str, worktree_path: str | None,
+    ) -> None:
+        """Record a child classified as not-finalisable (no work).
+
+        The child stays open, is never handed to ``finish`` and never
+        contributes to parent advancement (SA-0MW74IKJE008JXDQ AC4). The
+        structured entry in ``children_processed`` carries the verdict and
+        the reason so ``drive`` can surface it without prose parsing.
+        """
+        no_work_ids.append(cid)
+        entry: dict[str, Any] = {
+            "id": cid, "title": title,
+            "action": "not-finalisable",
+            "status": status,
+            "reason": (
+                "worktree exists but carries no commit attributable to "
+                "the item and no verification-only signal"
+            ),
+        }
+        if worktree_path:
+            entry["worktree_path"] = worktree_path
+        child_results.append(entry)
+
     for child in ordered_children:
         cid = str(child.get("id", ""))
         title = child.get("title", "")
@@ -13302,11 +13448,26 @@ def phase_parent(
         has_changes = bool(
             worktree_path and _has_worktree_changes(worktree_path, parent_branch)
         )
+        # The work-state verdict decides whether a present worktree's change
+        # surface is real work. ``no-work`` is never finishable (AC4).
+        worktree_verdict = ""
+        if worktree_path:
+            worktree_verdict = _classify_child_worktree(
+                cid, worktree_path, parent_branch
+            )
 
         if action == "skip-in-progress":
             # A started child may be ours (worktree exists) or another
             # agent's claim (no worktree → never clobbered).
             if has_changes:
+                # AC4: the change surface is only the state file (or a
+                # non-attributable commit) — the child did no work, so it is
+                # never presented as finishable (SA-0MW74IKJE008JXDQ).
+                if worktree_verdict == CHILD_NO_WORK:
+                    _record_not_finalisable(
+                        cid, title, child.get("status", ""), worktree_path
+                    )
+                    continue
                 if _run_finish(cid, title) is None:
                     return report
             elif worktree_path:
@@ -13358,6 +13519,13 @@ def phase_parent(
             continue
 
         if has_changes:
+            # AC4: only the state file is dirty (or a non-attributable commit)
+            # — never present zero work as finishable (SA-0MW74IKJE008JXDQ).
+            if worktree_verdict == CHILD_NO_WORK:
+                _record_not_finalisable(
+                    cid, title, child.get("status", ""), worktree_path
+                )
+                continue
             if _run_finish(cid, title) is None:
                 return report
             continue
@@ -13403,15 +13571,27 @@ def phase_parent(
         )
 
     # ── Step 7: Advance only when every child is terminal ──────────
-    if pending_ids:
+    if pending_ids or no_work_ids:
+        reasons: list[str] = []
+        if no_work_ids:
+            reasons.append(
+                f"{len(no_work_ids)} child(ren) classified as not-finalisable "
+                f"(no attributable work)"
+            )
+        if pending_ids:
+            reasons.append(
+                "non-terminal children not in progress are blocked by "
+                "non-terminal siblings or another agent holds them"
+            )
         report["message"] = (
             f"No child of {work_item_id} is currently startable: "
-            f"non-terminal children not in progress are blocked by "
-            f"non-terminal siblings or another agent holds them. Re-run "
-            f"this phase after one completes."
+            + "; ".join(reasons) + ". "
+            "Re-run this phase after one completes."
         )
         if blocked_ids:
             report["blocked_children"] = blocked_ids
+        if no_work_ids:
+            report["not_finalisable_children"] = no_work_ids
         report["children_processed"] = child_results
         if json_output:
             print(format_json_output(report))
@@ -16584,6 +16764,25 @@ def phase_drive(
         _forward_child_lock_reclamation(
             report, str(parent_report.get("next_child") or ""), parent_report
         )
+
+        # AC4: the parent classified one or more children as not-finalisable
+        # (no attributable work). Surface the verdict, keep the parent
+        # un-advanced, spawn nothing (SA-0MW74IKJE008JXDQ).
+        not_finalisable = parent_report.get("not_finalisable_children")
+        if not_finalisable:
+            report["not_finalisable_children"] = not_finalisable
+            report["parent_advanced"] = False
+            report["success"] = True
+            report["children_processed"] = parent_report.get(
+                "children_processed", []
+            )
+            report["message"] = parent_report.get(
+                "message",
+                f"Child(ren) of {work_item_id} classified as not-finalisable "
+                f"(no attributable work): {', '.join(not_finalisable)}. "
+                f"The parent was not advanced.",
+            )
+            break
 
         child_id = parent_report.get("next_child")
         if not child_id:
