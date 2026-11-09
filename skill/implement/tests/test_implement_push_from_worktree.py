@@ -1093,29 +1093,31 @@ def test_recover_retries_the_fast_forward_with_the_rebased_commit(sandbox):
 
     ff_retry: dict = {}
     run_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-    with patch.object(implement, "run_cmd", return_value=run_ok):
-        with patch.object(implement, "git_get_commit_hash", return_value="rebased123"):
-            with patch.object(
-                implement, "_fast_forward_local_dev_for_push", side_effect=fake_ff
-            ):
-                with patch.object(implement, "_assert_push_subject"):
-                    with patch.object(implement, "git_push_to_dev", return_value=True):
-                        with patch.object(implement, "wl_add_comment", return_value=True):
-                            new_commit = implement._recover_non_fast_forward_push(
-                                worktree_path=str(sandbox["wt"]),
-                                repo_root=str(sandbox["main"]),
-                                branch=BRANCH,
-                                commit_hash=sandbox["feature_short"],
-                                exc=implement.PushNonFastForwardError(
-                                    sandbox["feature_short"],
-                                    BRANCH,
-                                    "non-fast-forward",
-                                    "git rebase origin/dev",
-                                ),
-                                work_item_id="SA-TEST",
-                                parent_branch="dev",
-                                ff_retry_out=ff_retry,
-                            )
+    with (
+        patch.object(implement, "run_cmd", return_value=run_ok),
+        patch.object(implement, "git_get_commit_hash", return_value="rebased123"),
+        patch.object(
+            implement, "_fast_forward_local_dev_for_push", side_effect=fake_ff
+        ),
+        patch.object(implement, "_assert_push_subject"),
+        patch.object(implement, "git_push_to_dev", return_value=True),
+        patch.object(implement, "wl_add_comment", return_value=True),
+    ):
+        new_commit = implement._recover_non_fast_forward_push(
+            worktree_path=str(sandbox["wt"]),
+            repo_root=str(sandbox["main"]),
+            branch=BRANCH,
+            commit_hash=sandbox["feature_short"],
+            exc=implement.PushNonFastForwardError(
+                sandbox["feature_short"],
+                BRANCH,
+                "non-fast-forward",
+                "git rebase origin/dev",
+            ),
+            work_item_id="SA-TEST",
+            parent_branch="dev",
+            ff_retry_out=ff_retry,
+        )
 
     assert new_commit == "rebased123"
     assert recorded == [(str(sandbox["main"]), "rebased123", "dev")], recorded
