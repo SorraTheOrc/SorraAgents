@@ -13570,6 +13570,27 @@ def phase_parent(
             entry["worktree_path"] = worktree_path
         child_results.append(entry)
 
+    # A held ``blocked`` child is a verdict about this pass, not work in
+    # progress: record every one before the loop so a report that stops at the
+    # started child still names every block and the ids that hold it
+    # (SA-0MVTUFL0U0000NV2 AC1/AC3).
+    for entry in classifications:
+        if entry["action"] != ACTION_SKIP_BLOCKED:
+            continue
+        held_id = str(entry["id"])
+        pending_ids.append(held_id)
+        blocked_ids.append(held_id)
+        held_entry: dict[str, Any] = {
+            "id": held_id,
+            "title": entry.get("title", ""),
+            "action": ACTION_SKIP_BLOCKED,
+            "status": entry.get("status", ""),
+            "blocking_ids": list(entry.get("blocking_ids") or []),
+        }
+        if entry.get("unvalidated"):
+            held_entry["unvalidated"] = True
+        child_results.append(held_entry)
+
     for child in ordered_children:
         cid = str(child.get("id", ""))
         title = child.get("title", "")
@@ -13586,22 +13607,8 @@ def phase_parent(
             continue
 
         if action == ACTION_SKIP_BLOCKED:
-            # ``status: blocked`` and the re-validated block still holds: the
-            # child is reported with the ids that hold it and is never
-            # started (SA-0MVTUFL0U0000NV2 AC1/AC3). Unvalidatable blocks
-            # hold too, and are flagged so the operator can act on them.
-            state = blocked_states.get(cid) or {}
-            pending_ids.append(cid)
-            blocked_ids.append(cid)
-            entry = {
-                "id": cid, "title": title,
-                "action": ACTION_SKIP_BLOCKED,
-                "status": child.get("status", ""),
-                "blocking_ids": list(state.get("blocking_ids") or []),
-            }
-            if state.get("unvalidated"):
-                entry["unvalidated"] = True
-            child_results.append(entry)
+            # Already recorded up-front with its ``blocking_ids``: a still
+            # valid ``blocked`` hold is never started (AC1).
             continue
 
         if action == ACTION_SKIPPED_HELD:
