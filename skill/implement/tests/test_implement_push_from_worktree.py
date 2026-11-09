@@ -798,11 +798,11 @@ def test_phase_finish_exposes_the_retry_trail_on_a_successful_push(sandbox):
         return True
 
     pushes: list[tuple] = []
-    with _stubbed_finish(sandbox, sandbox["feature_short"], pushes):
-        with patch.object(implement, "git_push_to_dev", side_effect=recovering_push):
-            report = implement.phase_finish(
-                "SA-TEST", json_output=True, no_refactor=True
-            )
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(implement, "git_push_to_dev", side_effect=recovering_push),
+    ):
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
 
     assert report["success"] is True, report["message"]
     push_step = report["steps"]["push"]
