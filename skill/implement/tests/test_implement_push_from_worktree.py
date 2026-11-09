@@ -762,12 +762,12 @@ def test_phase_finish_exposes_the_retry_trail_on_a_gate_refusal(sandbox):
         return False
 
     pushes: list[tuple] = []
-    with _stubbed_finish(sandbox, sandbox["feature_short"], pushes):
-        with patch.object(implement, "git_push_to_dev", side_effect=failing_push):
-            with patch.object(implement, "wl_add_comment", return_value=True):
-                report = implement.phase_finish(
-                    "SA-TEST", json_output=True, no_refactor=True
-                )
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(implement, "git_push_to_dev", side_effect=failing_push),
+        patch.object(implement, "wl_add_comment", return_value=True),
+    ):
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
 
     push_step = report["steps"]["push"]
     assert push_step["reason"] == "slot_contention", push_step
