@@ -1054,16 +1054,16 @@ def test_phase_finish_reports_refused_by_pushed_commit_guard(sandbox):
         return False
 
     pushes: list[tuple] = []
-    with _stubbed_finish(sandbox, sandbox["feature_short"], pushes):
-        with patch.object(implement, "git_push_to_dev", side_effect=guard_refusing_push):
-            with patch.object(
-                implement,
-                "wl_add_comment",
-                side_effect=lambda *args, **kwargs: comments.append(args[1]) or True,
-            ):
-                report = implement.phase_finish(
-                    "SA-TEST", json_output=True, no_refactor=True
-                )
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(implement, "git_push_to_dev", side_effect=guard_refusing_push),
+        patch.object(
+            implement,
+            "wl_add_comment",
+            side_effect=lambda *args, **kwargs: comments.append(args[1]) or True,
+        ),
+    ):
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
 
     assert report["success"] is False, report
     push = report["steps"]["push"]
