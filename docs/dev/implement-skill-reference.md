@@ -1654,6 +1654,17 @@ success/failure contract, so a caller that only tests truthiness is unchanged.
 and an item that genuinely needs no code change is still finalisable —
 deliberately.
 
+### Work-less classification (`drive` / `phase_parent`)
+
+The refusal is also applied **before** `finish` runs. `_classify_child_worktree`
+refines `_has_worktree_changes` into the question finish needs — `work`,
+`verification-only`, `no-work` or `clean` — and a `no-work` child (state-file-only
+dirty surface, or commits ahead not attributable to the item) is reported
+`action: "not-finalisable"` in `children_processed` plus a structured
+`not_finalisable_children` key. `finish` is never run for it, the child stays
+open, and the parent is not advanced (SA-0MW74IKJE008JXDQ AC4). `finish`'s own
+refusal is the defence in depth for a direct invocation.
+
 Regression pin (same file): the default-refusal path (no terminal write, no
 misattributed hash, item released to `open`) and the verification-only path
 (terminal write persists, store read-back passes, report says no changes).

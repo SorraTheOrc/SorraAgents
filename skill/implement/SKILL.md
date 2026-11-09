@@ -64,6 +64,28 @@ manual: `StatusLifecycle.update_status(id, status, stage=…)`.
 Deep detail:
 [reference — StatusLifecycle](../../docs/dev/implement-skill-reference.md#relocated-statuslifecycle-integration).
 
+## No-op finish: refusal by default, `--verification-only` opt-in
+
+`finish` refuses a worktree that produced no commit: no push, no terminal
+write, no completion comment, `success: false` with
+`steps.commit.reason = "no_commit_no_signal"`, and the item released to `open`.
+It never attributes the ambient `dev` HEAD as this item's commit.
+
+- **Produce work (default).** A clean, commit-less worktree is unfinished work:
+  re-enter it, produce what the acceptance criteria require, re-run `finish`.
+- **Verification-only (opt-in).** `start <id> --verification-only` records the
+  signal in the worktree's `.implement_state.json`; `finish <id> --verification-only`
+  supplies it directly. Either pushes a no-op, writes the terminal status and
+  reports "no changes / no commit".
+
+`drive`/`phase_parent` classify a work-less child `no-work` (a
+`verification-only` opt-in keeps it finalisable) and report it
+`action: "not-finalisable"` — `finish` is never run for it and the parent is
+not advanced, so zero work can never advance an epic. The store read-back
+still fails loudly unless it holds `completed`/`in_review`
+(`tests/test_finish_no_diff_status.py`). Deep detail:
+[reference — no-commit finalisation](../../docs/dev/implement-skill-reference.md#no-commit-finalisation-refusal-by-default---verification-only-opt-in).
+
 ## Project-local extensions
 
 `.pi/skills_extensions/implement/` may carry `SKILL_PREFIX.md` (surfaced by
@@ -229,6 +251,11 @@ and the stale-shared-resolution fail-closed gate.
 - **Write tests first** (TDD preferred) — at least one test file before
   editing implementation code; minimal, focused changes. External constraints
   prevent complete tests → harnesses/mocks/placeholders, documented.
+- **A clean, commit-less worktree is unfinished work.** If the acceptance
+  criteria need a change and the tree has nothing to commit, do not treat the
+  empty diff as done — `finish` refuses the terminal write. Produce the work
+  the ACs require and re-run `finish`; reserve `--verification-only` for items
+  whose sole deliverable is an operational run recorded as evidence.
 - Discovered additional work →
   `wl create "<title>" --deps discovered-from:<work-item-id> --json`.
 - Once all ACs are met: **build** (no errors), then validate via `/skill:test`
@@ -296,7 +323,10 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   `finish` builds, tests (changed scope), commits, pushes to `dev`, verifies
   post-push and marks the item `in_review`; the terminal write and assignee
   release are its **last lifecycle action** (SA-0MVXUSK02003ZMDN) — nothing
-  lifecycle-relevant runs after it. `--keep-worktree` (or
+  lifecycle-relevant runs after it. A commit-less finish is refused unless the
+  verification-only opt-in is present — see
+  [No-op finish](#no-op-finish-refusal-by-default---verification-only-opt-in).
+  `--keep-worktree` (or
   `IMPLEMENT_KEEP_WORKTREE=1`) defers worktree removal; driven children never
   pass it (`IMPLEMENT_DRIVE_ACTIVE=1` defers).
 - Follow the mandatory **build → test → commit** order.
