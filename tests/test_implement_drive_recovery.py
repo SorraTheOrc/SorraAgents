@@ -818,6 +818,11 @@ class TestRunFinishFailureThreading:
         )
         monkeypatch.setattr(implement_mod, "_has_worktree_changes",
                             lambda *a: True)
+        # The work-state classifier inspects a real worktree on disk; the
+        # simulated "/wt/SA-CHILD1" carries attributable work
+        # (SA-0MW74IKJE008JXDQ).
+        monkeypatch.setattr(implement_mod, "_classify_child_worktree",
+                            lambda *a: implement_mod.CHILD_WORK)
         monkeypatch.setattr(implement_mod, "wl_add_comment",
                             lambda *a, **k: True)
         monkeypatch.setattr(implement_mod, "_invoke_implement", _fake_finish)
@@ -868,6 +873,11 @@ class TestRunFinishFailureThreading:
         )
         monkeypatch.setattr(implement_mod, "_has_worktree_changes",
                             lambda *a: True)
+        # The work-state classifier inspects a real worktree on disk; the
+        # simulated "/wt/SA-CHILD1" carries attributable work
+        # (SA-0MW74IKJE008JXDQ).
+        monkeypatch.setattr(implement_mod, "_classify_child_worktree",
+                            lambda *a: implement_mod.CHILD_WORK)
         monkeypatch.setattr(implement_mod, "wl_add_comment",
                             lambda *a, **k: True)
         monkeypatch.setattr(
@@ -907,6 +917,11 @@ class TestRunFinishFailureThreading:
         )
         monkeypatch.setattr(implement_mod, "_has_worktree_changes",
                             lambda *a: True)
+        # The work-state classifier inspects a real worktree on disk; the
+        # simulated "/wt/SA-CHILD1" carries attributable work
+        # (SA-0MW74IKJE008JXDQ).
+        monkeypatch.setattr(implement_mod, "_classify_child_worktree",
+                            lambda *a: implement_mod.CHILD_WORK)
         monkeypatch.setattr(implement_mod, "wl_add_comment",
                             lambda *a, **k: True)
         monkeypatch.setattr(
