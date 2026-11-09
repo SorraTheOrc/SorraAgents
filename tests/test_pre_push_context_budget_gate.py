@@ -149,7 +149,9 @@ class TestImplementBodyThresholdCommitted:
             "context-budget.thresholds.json must gate skill_implement_md so the "
             "implement SKILL.md body cannot silently regrow"
         )
-        assert data["skill_implement_md"] <= 20000
+        # 20,000 B originally (SA-0MVYDCUWA001Z8K0); 22,000 B after the
+        # no-op finish contract moved into the brief (SA-0MW74IL6B001AMQN).
+        assert data["skill_implement_md"] <= 22000
 
 
 # ── Bypass and fail-open behaviour ──────────────────────────────────────────

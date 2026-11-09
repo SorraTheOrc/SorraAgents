@@ -68,16 +68,25 @@ def test_context_budget_thresholds_file_is_valid() -> None:
         )
 
 
-def test_skill_implement_md_is_gated_at_or_below_20k() -> None:
+#: Committed cap for the implement SKILL.md body. Originally 20,000 B
+#: (SA-0MVYDCUWA001Z8K0 AC1, the >=80% cut from 99,749 B); raised to 22,000 B
+#: by SA-0MW74IL6B001AMQN so the mandatory no-op finish / --verification-only
+#: contract can live in the brief the agent reads. The cap still ratchets:
+#: a further increase is a conscious budget revision, not a silent regrowth.
+SKILL_IMPLEMENT_MD_CAP = 22000
+
+
+def test_skill_implement_md_is_gated_at_or_below_cap() -> None:
     """SA-0MVYDCUWA001Z8K0 AC4: the implement SKILL.md body has its own gate.
 
     The operational brief is inlined on every implement invocation, so its
     byte size is gated separately from the startup ``total``.
     """
     data = json.loads(THRESHOLDS.read_text(encoding="utf-8"))
-    assert data["skill_implement_md"] <= 20000, (
+    assert data["skill_implement_md"] <= SKILL_IMPLEMENT_MD_CAP, (
         "the committed skill_implement_md threshold must stay at or below "
-        "20,000 B (SA-0MVYDCUWA001Z8K0 AC1)"
+        f"{SKILL_IMPLEMENT_MD_CAP:,} B (SA-0MVYDCUWA001Z8K0 AC1, revised by "
+        "SA-0MW74IL6B001AMQN)"
     )
 
 
