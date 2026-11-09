@@ -1151,14 +1151,14 @@ def test_phase_finish_records_the_fast_forward_retry(sandbox):
         return kwargs["commit_hash"]
 
     pushes: list[tuple] = []
-    with _stubbed_finish(sandbox, sandbox["feature_short"], pushes):
-        with patch.object(implement, "git_push_to_dev", side_effect=push_raises_once):
-            with patch.object(
-                implement, "_recover_non_fast_forward_push", side_effect=fake_recover
-            ):
-                report = implement.phase_finish(
-                    "SA-TEST", json_output=True, no_refactor=True
-                )
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(implement, "git_push_to_dev", side_effect=push_raises_once),
+        patch.object(
+            implement, "_recover_non_fast_forward_push", side_effect=fake_recover
+        ),
+    ):
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
 
     assert report["success"] is True, report["message"]
     recorded = report["steps"]["local_dev_fast_forward"]
