@@ -264,7 +264,12 @@ def _cleanup_result() -> dict:
 
 @contextlib.contextmanager
 def _mocked_phase_finish(
-    *, update_status=None, store_show=None, tmp_path=None, outcome="commit"
+    *,
+    update_status=None,
+    store_show=None,
+    tmp_path=None,
+    outcome="commit",
+    state_verification_only: bool = False,
 ):
     """Patch every external boundary of ``phase_finish``.
 
@@ -284,10 +289,14 @@ def _mocked_phase_finish(
         outcome: The :class:`FakeGitBoundary` outcome — ``"commit"`` (a real
             commit is created; the default) or ``"clean"`` (nothing to
             commit).
+        state_verification_only: Record the verification-only opt-in in the
+            run's state file (the ``start --verification-only`` path) rather
+            than passing the CLI flag to ``phase_finish``.
 
     Yields:
         A dict of mocks; ``boundary`` is the :class:`FakeGitBoundary` so a
-        test can assert whether ``git commit`` was invoked.
+        test can assert whether ``git commit`` was invoked, and
+        ``add_comment`` records every comment the phase posts.
     """
     worktree = str((tmp_path or Path("/tmp/wt-finish-no-diff")).resolve())
     Path(worktree).mkdir(parents=True, exist_ok=True)
@@ -296,6 +305,7 @@ def _mocked_phase_finish(
         worktree_path=worktree,
         repo_root="/tmp/repo-root",
         parent_branch="dev",
+        verification_only=state_verification_only,
     )
     if update_status is None:
         update_status = MagicMock()
@@ -386,13 +396,21 @@ def _mocked_phase_finish(
                 return_value={"method": "skipped", "success": True},
             )
         )
-        stack.enter_context(patch.object(implement, "wl_add_comment", return_value=True))
+        add_comment = MagicMock(return_value=True)
+        stack.enter_context(
+            patch.object(implement, "wl_add_comment", add_comment)
+        )
         stack.enter_context(patch.object(implement, "_surface_postfix_prose"))
         stack.enter_context(
             patch.object(implement.StatusLifecycle, "update_status", update_status)
         )
         stack.enter_context(patch.object(implement.StatusLifecycle, "show", show))
-        yield {"update_status": update_status, "show": show, "boundary": boundary}
+        yield {
+            "update_status": update_status,
+            "show": show,
+            "boundary": boundary,
+            "add_comment": add_comment,
+        }
 
 
 def _terminal_update(update_status: MagicMock) -> tuple | None:
@@ -419,30 +437,40 @@ def _reset_update(update_status: MagicMock) -> tuple | None:
 
 
 def test_finish_no_diff_path_persists_terminal_status(tmp_path):
-    """A no-op-push finish reaches the terminal transition and reads it back.
+    """A verification-only, no-commit finish reaches the terminal transition.
 
     ``git_commit`` sees an empty staged diff (no commit created), the push
     is a no-op success, yet the store must hold ``completed``/``in_review``
-    afterwards — the same guarantee as the push-with-diff path
-    (OSL-0MVME1PI5005WU58 AC3).
+    afterwards — the behaviour pinned for OSL-0MVME1PI5005WU58 AC3, preserved
+    behind the explicit ``--verification-only`` opt-in (SA-0MW74IJWI009NRZ1
+    AC3).
 
     The ``clean`` outcome drives the *real* ``git_commit`` gate, so this test
     genuinely pins the commit-less path: :attr:`FakeGitBoundary.commit_invoked`
-    is ``False`` and the reported hash is the pre-existing HEAD
-    (``_FAKE_CLEAN_HASH``), not a freshly-created commit (AC1).
+    is ``False``. Unlike the old bug it must **never** report the ambient HEAD
+    (``_FAKE_CLEAN_HASH``) as the item's commit (AC2): the report says no
+    changes / no commit and carries an empty hash.
     """
     lifecycle = MagicMock()
     with _mocked_phase_finish(
         update_status=lifecycle, tmp_path=tmp_path, outcome="clean"
     ) as mocks:
-        report = implement.phase_finish("OSL-TEST", json_output=True, no_refactor=True)
+        report = implement.phase_finish(
+            "OSL-TEST",
+            json_output=True,
+            no_refactor=True,
+            verification_only=True,
+        )
 
     assert report["success"] is True, report["message"]
 
-    # A clean tree: ``git commit`` must not have run, and the reported hash
-    # is the ambient HEAD the old bug mistook for the item's commit.
+    # A clean tree: ``git commit`` must not have run, and the report must not
+    # misattribute the ambient HEAD as the item's commit.
     assert mocks["boundary"].commit_invoked is False
-    assert report["hash"] == _FAKE_CLEAN_HASH
+    assert report["hash"] == ""
+    assert report["steps"]["commit"]["created"] is False
+    assert report["steps"]["commit"]["reason"] == "no_changes"
+    assert_report_wording(report, commit_hash=None)
 
     # The real StatusLifecycle.__exit__ issued the terminal write.
     assert _terminal_update(mocks["update_status"]) == ("OSL-TEST", "completed")
@@ -451,6 +479,93 @@ def test_finish_no_diff_path_persists_terminal_status(tmp_path):
     assert report["steps"]["status_readback"]["success"] is True
     assert report["steps"]["status_readback"]["status"] == "completed"
     assert report["steps"]["status_readback"]["stage"] == "in_review"
+
+    # The completion comment says no changes and never names a commit.
+    completion = _completion_comments(mocks["add_comment"])
+    assert completion
+    assert "No changes" in completion[-1]
+    assert "Commit:" not in completion[-1]
+
+
+def test_finish_verification_only_state_flag_finalises(tmp_path):
+    """The ``start --verification-only`` state flag is the finish signal.
+
+    The state file is the single source of truth ``drive`` also reads, so a
+    no-commit finish records the opt-in once (at ``start``) and finalises
+    without the CLI flag being repeated (AC3).
+    """
+    lifecycle = MagicMock()
+    with _mocked_phase_finish(
+        update_status=lifecycle,
+        tmp_path=tmp_path,
+        outcome="clean",
+        state_verification_only=True,
+    ) as mocks:
+        report = implement.phase_finish("OSL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    assert mocks["boundary"].commit_invoked is False
+    assert report["steps"]["commit"]["reason"] == "no_changes"
+    assert _terminal_update(mocks["update_status"]) == ("OSL-TEST", "completed")
+    assert report["steps"]["status_readback"]["success"] is True
+
+
+def test_finish_no_commit_without_signal_refuses_terminal_write(tmp_path):
+    """Default refusal (AC1): no commit and no signal → no terminal write.
+
+    A no-op finish used to read the ambient ``dev`` HEAD (another item's
+    commit), push a no-op and issue the terminal ``completed``/``in_review``
+    write. Without ``--verification-only`` it must instead fail loudly with a
+    structured ``no_commit_no_signal`` reason, leave the item ``open``, post a
+    refusal comment (never a completion comment) and name the retained
+    worktree.
+    """
+    lifecycle = MagicMock()
+    with _mocked_phase_finish(
+        update_status=lifecycle, tmp_path=tmp_path, outcome="clean"
+    ) as mocks:
+        report = implement.phase_finish("OSL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is False, report
+    assert mocks["boundary"].commit_invoked is False
+
+    # Structured, machine-readable refusal reason (never prose parsing).
+    assert report["steps"]["commit"]["reason"] == "no_commit_no_signal"
+    assert report["steps"]["commit"]["created"] is False
+    assert report["steps"]["commit"]["hash"] == ""
+    assert report["steps"]["commit"]["worktree_path"] == report["worktree_path"]
+
+    # No terminal write was issued; the item was released to `open`.
+    assert _terminal_update(mocks["update_status"]) is None
+    assert _reset_update(mocks["update_status"]) == ("OSL-TEST", "open")
+
+    # The failure is loud and actionable: names the retained worktree and the
+    # exact opt-in that would finalise the item deliberately.
+    assert "--verification-only" in report["message"]
+    assert report["worktree_path"] in report["message"]
+
+    # No "Implementation complete" comment is posted; the refusal is recorded.
+    completion = _completion_comments(mocks["add_comment"])
+    assert completion == []
+    refusal = [
+        call.args[1]
+        for call in mocks["add_comment"].call_args_list
+        if len(call.args) > 1 and "no_commit_no_signal" in call.args[1]
+    ]
+    assert refusal, mocks["add_comment"].call_args_list
+
+
+# ----------------------------------------------------------------------
+# Helper: completion comments posted during a phase_finish run
+# ----------------------------------------------------------------------
+
+def _completion_comments(add_comment: MagicMock) -> list[str]:
+    """Return every "Implementation complete" comment the phase posted."""
+    return [
+        str(call.args[1])
+        for call in add_comment.call_args_list
+        if len(call.args) > 1 and "Implementation complete" in str(call.args[1])
+    ]
 
 
 def test_finish_push_with_diff_path_persists_terminal_status(tmp_path):
@@ -541,24 +656,39 @@ def test_finish_success_clears_assignee(tmp_path):
 # ----------------------------------------------------------------------
 
 def test_fake_git_boundary_commit_mode_invokes_commit():
-    """``commit`` outcome: staged diff present, ``git commit`` is recorded."""
+    """``commit`` outcome: staged diff present, a commit is created and named.
+
+    AC5(i)/AC1: the structured outcome reports ``committed=True`` and records
+    the newly created hash, so finish can attribute the commit to this item.
+    """
     boundary = FakeGitBoundary(outcome="commit")
     with boundary:
-        committed = implement.git_commit("/tmp/does-not-matter", "msg")
+        outcome = implement.git_commit("/tmp/does-not-matter", "msg")
 
-    assert committed is True
+    assert bool(outcome) is True
+    assert outcome.committed is True
+    assert outcome.reason == "committed"
+    # ``git rev-parse`` resolves every revision to ``_FAKE_COMMIT`` here.
+    assert outcome.hash == _FAKE_COMMIT
     assert boundary.commit_invoked is True
     assert any(cmd[1] == "commit" for cmd in boundary.run_cmd_calls)
 
 
 def test_fake_git_boundary_clean_mode_skips_commit():
-    """``clean`` outcome: no staged diff, ``git commit`` is never invoked."""
+    """``clean`` outcome: no staged diff, no commit, and ``committed=False``.
+
+    AC5(i)/AC1: the operation still *succeeds* (``bool(outcome) is True``) but
+    the structured outcome says no commit was created and carries no hash —
+    the distinction the old bare-``True`` return could not express.
+    """
     boundary = FakeGitBoundary(outcome="clean")
     with boundary:
-        committed = implement.git_commit("/tmp/does-not-matter", "msg")
+        outcome = implement.git_commit("/tmp/does-not-matter", "msg")
 
-    # ``git_commit`` reports success for a clean tree — but no commit ran.
-    assert committed is True
+    assert bool(outcome) is True
+    assert outcome.committed is False
+    assert outcome.hash == ""
+    assert outcome.reason == "no_changes"
     assert boundary.commit_invoked is False
     assert not any(cmd[1] == "commit" for cmd in boundary.run_cmd_calls)
 

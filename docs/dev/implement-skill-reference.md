@@ -1620,6 +1620,35 @@ Regression pin: `skill/implement/tests/test_finish_no_diff_status.py` covers
 the no-diff path (empty staged diff, no-op push success), the push-with-diff
 companion, and the fail-loud path when the store is non-terminal.
 
+### No-commit finalisation: refusal by default, `--verification-only` opt-in
+
+`git_commit` used to return `True` both when it created a commit **and** when
+the tree was clean, so `phase_finish` read the ambient `dev` HEAD (which can
+be another item's published commit), pushed a no-op and wrote
+`completed`/`in_review` for an item that produced no work. That is the silent
+`in_review` lie this slice removes (SA-0MW74IJWI009NRZ1).
+
+`git_commit` now returns a structured `CommitOutcome`
+(`success`/`committed`/`hash`/`reason`); `bool(outcome)` keeps the historical
+success/failure contract, so a caller that only tests truthiness is unchanged.
+`phase_finish` branches on `committed`:
+
+| Commit outcome | Signal present? | Behaviour |
+|---|---|---|
+| a commit was created | — | Fast-forward, push, ancestry assertions, terminal write (unchanged) |
+| clean tree, no commit | `--verification-only` **or** `verification_only` in the state file | Verification-only finalisation: no-op push, terminal write; report and completion comment say “no changes / no commit” and never name a hash |
+| clean tree, no commit | neither | **Refused**: `success: false`, `steps.commit.reason = "no_commit_no_signal"`, no push, no terminal write, no completion comment; the item is released to `open` and the retained worktree is named with the exact opt-in |
+
+`start <id> --verification-only` records the flag in
+`.implement_state.json` (the single source of truth `drive` also reads);
+`finish <id> --verification-only` supplies it directly. Either is sufficient,
+and an item that genuinely needs no code change is still finalisable —
+deliberately.
+
+Regression pin (same file): the default-refusal path (no terminal write, no
+misattributed hash, item released to `open`) and the verification-only path
+(terminal write persists, store read-back passes, report says no changes).
+
 ## Live-repo guard ownership and main-checkout coverage (WL-0MVPE2BY9001CR9O)
 
 Two guards stand between a test run and a corrupted checkout, and they have

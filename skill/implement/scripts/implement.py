@@ -36,6 +36,10 @@ Optional flags:
   --no-refactor             Skip the refactor step
   --max-retry N             Max test-fix loop retries (default: 3)
   --commit-msg <msg>        Commit message override
+  --verification-only       Finalise an item that produces no commit
+                            (verification-only work); `start` records it in the
+                            state file and `finish` refuses a no-commit
+                            finalisation without it
   --parent-branch <branch>  Override parent branch (default: dev)
   --worktree-path <path>    Override worktree path
   --allow-orphaned-stashes   Acknowledge orphaned-stash warning and proceed
@@ -501,6 +505,12 @@ class ImplementState:
     parent_branch: str = DEFAULT_PARENT_BRANCH
     commit_msg: str = ""
     started_at: str = ""
+    #: Opt-in finalisation for an item that produces no commit (verification-
+    #: only work, e.g. evidence recorded as a worklog comment). Recorded by
+    #: ``start --verification-only`` and read by ``finish``; without it a
+    #: finish that creates no commit is refused (SA-0MW74IJWI009NRZ1 AC1).
+    #: Defaulted so state files written by an older build still load.
+    verification_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -510,6 +520,7 @@ class ImplementState:
             "parent_branch": self.parent_branch,
             "commit_msg": self.commit_msg,
             "started_at": self.started_at,
+            "verification_only": self.verification_only,
         }
 
     @classmethod
@@ -521,6 +532,7 @@ class ImplementState:
             parent_branch=data.get("parent_branch", DEFAULT_PARENT_BRANCH),
             commit_msg=data.get("commit_msg", ""),
             started_at=data.get("started_at", ""),
+            verification_only=bool(data.get("verification_only", False)),
         )
 
 
@@ -969,9 +981,13 @@ def _assert_terminal_status(work_item_id: str) -> dict[str, Any]:
     """Verify the store holds the terminal transition after a successful finish.
 
     The terminal ``status=completed``/``stage=in_review`` write is issued by
-    ``StatusLifecycle.__exit__`` on **both** the push-with-diff path and the
-    no-op-push (no-diff) path — a branch with no diff from ``origin/dev``
-    still reaches the context manager and the write persists. This
+    ``StatusLifecycle.__exit__`` on the two finalisation paths a successful
+    finish can take: the push-with-diff path (a commit was created) and the
+    explicit **verification-only** no-commit path (``--verification-only``, a
+    branch with no diff from ``origin/dev``). A no-commit finish *without* that
+    opt-in never reaches here — it is refused earlier with
+    ``commit.reason = "no_commit_no_signal"`` — so this read-back only ever
+    confirms a deliberate finalisation (SA-0MW74IJWI009NRZ1 AC1/AC3). This
     read-back turns a silently lost or overwritten lifecycle write into a
     loud finish failure instead of a green report: the recorded symptom on
     OSL-0MVMB44C9008IXZX was exactly that — ``finish`` reported success
@@ -4217,7 +4233,49 @@ def stage_tested_tree(cwd: str, tested_tree: str | None) -> dict[str, Any]:
     }
 
 
-def git_commit(cwd: str, message: str) -> bool:
+@dataclass
+class CommitOutcome:
+    """Structured outcome of :func:`git_commit`.
+
+    ``git_commit`` historically returned ``True`` both when it created a
+    commit **and** when the tree was already clean. That ambiguity let
+    ``phase_finish`` read the ambient ``dev`` HEAD (another item's commit) as
+    if it were the item's own commit, push a no-op and issue the terminal
+    ``completed``/``in_review`` write for an item that produced no work
+    (SA-0MW74IJWI009NRZ1 AC1/AC2).
+
+    ``committed`` distinguishes the two outcomes; ``hash`` names the commit
+    this call created (empty when nothing was committed). ``bool(outcome)``
+    stays the historical success/failure contract — both ``committed`` and the
+    clean no-op are successful — so call sites that only test truthiness keep
+    working unchanged.
+
+    Attributes:
+        success: True when the operation succeeded (committed or clean).
+        committed: True only when this call created a commit.
+        hash: The created commit hash (empty when nothing was committed).
+        reason: Machine-readable outcome (``committed``, ``no_changes``,
+            ``add_failed``, ``commit_failed``).
+    """
+
+    success: bool
+    committed: bool
+    hash: str = ""
+    reason: str = ""
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "committed": self.committed,
+            "hash": self.hash,
+            "reason": self.reason,
+        }
+
+
+def git_commit(cwd: str, message: str) -> CommitOutcome:
     """Stage all changes and commit in the given directory.
 
     Args:
@@ -4225,13 +4283,16 @@ def git_commit(cwd: str, message: str) -> bool:
         message: Commit message.
 
     Returns:
-        True if the commit succeeded.
+        A :class:`CommitOutcome`. ``bool(result)`` is ``True`` when the
+        operation succeeded (including the clean-tree no-op);
+        ``result.committed`` is ``True`` only when a commit was actually
+        created, and ``result.hash`` names it.
     """
     # Stage all changes (surgical: only what was modified)
     add_result = run_cmd(["git", "add", "-A"], cwd=cwd, check=False)
     if add_result.returncode != 0:
         LOG.error("git add failed: %s", add_result.stderr.strip())
-        return False
+        return CommitOutcome(success=False, committed=False, reason="add_failed")
 
     # Check if there's anything to commit
     diff_result = run_cmd(
@@ -4239,7 +4300,7 @@ def git_commit(cwd: str, message: str) -> bool:
     )
     if diff_result.returncode == 0:
         LOG.info("No changes to commit (clean working tree)")
-        return True
+        return CommitOutcome(success=True, committed=False, reason="no_changes")
 
     commit_result = run_cmd(
         ["git", "commit", "-m", message],
@@ -4248,8 +4309,13 @@ def git_commit(cwd: str, message: str) -> bool:
     )
     if commit_result.returncode != 0:
         LOG.error("git commit failed: %s", commit_result.stderr.strip())
-        return False
-    return True
+        return CommitOutcome(success=False, committed=False, reason="commit_failed")
+    return CommitOutcome(
+        success=True,
+        committed=True,
+        hash=git_get_commit_hash(cwd),
+        reason="committed",
+    )
 
 
 class PushTimeoutError(RuntimeError):
@@ -9906,6 +9972,7 @@ def phase_start(
     max_retry: int = DEFAULT_MAX_RETRY,
     verbose: bool = False,
     force: bool = False,
+    verification_only: bool = False,
 ) -> dict[str, Any]:
     """Phase 1: Setup the implementation environment.
 
@@ -9942,6 +10009,9 @@ def phase_start(
         max_retry: Max test-fix retries.
         verbose: Enable verbose logging.
         force: Acknowledge orphaned-stash warnings (--allow-orphaned-stashes) and proceed.
+        verification_only: Record the verification-only finalisation opt-in in
+            the state file so ``finish`` can finalise an item that produces no
+            commit (SA-0MW74IJWI009NRZ1 AC3).
 
     Returns:
         Dict with result information.
@@ -10040,6 +10110,7 @@ def phase_start(
             parent_branch=parent_branch,
             worktree_path_override=worktree_path_override,
             force=force,
+            verification_only=verification_only,
         )
     except Exception as exc:  # noqa: BLE001 - release the claim, then report
         # The claim is written before this point, so an *unexpected* failure
@@ -10078,6 +10149,7 @@ def _phase_start_locked(
     parent_branch: str,
     worktree_path_override: str | None,
     force: bool,
+    verification_only: bool = False,
 ) -> dict[str, Any]:
     """Steps 3-9 of :func:`phase_start`, executed under the child lock.
 
@@ -10520,6 +10592,7 @@ def _phase_start_locked(
         repo_root=repo_root,
         parent_branch=parent_branch,
         started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        verification_only=bool(verification_only),
     )
     write_state(state, abs_wt_path)
 
@@ -10707,6 +10780,7 @@ def phase_finish(
     max_retry: int = DEFAULT_MAX_RETRY,
     verbose: bool = False,
     keep_worktree: bool = False,
+    verification_only: bool = False,
 ) -> dict[str, Any]:
     """Phase 2: Complete the implementation.
 
@@ -10788,6 +10862,12 @@ def phase_finish(
         verbose: Enable verbose logging.
         keep_worktree: Defer worktree removal (``--keep-worktree``); the
             caller then owns the cleanup so the session keeps its cwd.
+        verification_only: Opt in to finalising an item that produced **no**
+            commit (verification-only work). Without this signal (or the
+            ``verification_only`` recorded in the run's state file) a finish
+            that creates no commit is refused with
+            ``commit.reason = "no_commit_no_signal"``: no push, no terminal
+            write, no completion comment (SA-0MW74IJWI009NRZ1 AC1).
 
     Returns:
         Dict with result information.
@@ -10820,6 +10900,13 @@ def phase_finish(
 
     # Read state for metadata
     state = read_state(worktree_path)
+    # Verification-only finalisation is an explicit signal: the CLI/state flag
+    # OR the flag recorded by ``start`` (the state file is the single source
+    # of truth ``drive`` also reads). Absent it, a finish that produces no
+    # commit is refused (SA-0MW74IJWI009NRZ1 AC1).
+    verification_only = bool(
+        verification_only or (state.verification_only if state else False)
+    )
     # The shared parent branch this finish syncs and verifies against (dev).
     # Resolved once here so the verified fast-forward (Step 5), the restore
     # (Step 6) and the ancestry assertion (Step 6a) all use the same ref.
@@ -11350,7 +11437,8 @@ def phase_finish(
             # ── Step 4: Commit ─────────────────────────────────────────────
             commit_msg = commit_msg_override or f"{work_item_id}: Implementation complete"
             LOG.info("Committing changes...")
-            if not git_commit(worktree_path, commit_msg):
+            commit_outcome = git_commit(worktree_path, commit_msg)
+            if not commit_outcome:
                 # AC5 (LP-0MVWEP1MM0097RAT): structured steps entry so the
                 # classifier never needs the ``report["message"]`` prose.
                 report["steps"]["commit"] = {
@@ -11359,21 +11447,103 @@ def phase_finish(
                 }
                 raise RuntimeError("git commit failed")
 
-            commit_hash = git_get_commit_hash(worktree_path)
-            report["steps"]["commit"] = {
-                "hash": commit_hash,
-                "message": commit_msg,
-            }
-            LOG.info("Committed at %s", commit_hash)
+            # ``git_commit`` now distinguishes a created commit from a clean
+            # tree. A legacy/patched truthy return (the historical
+            # success/failure contract, still used by harnesses that stub the
+            # boundary) is treated as the commit path.
+            if isinstance(commit_outcome, CommitOutcome):
+                commit_created = commit_outcome.committed
+                created_hash = commit_outcome.hash
+            else:  # pragma: no cover - legacy/patched truthy return
+                commit_created = True
+                created_hash = ""
+
+            if commit_created:
+                commit_hash = created_hash or git_get_commit_hash(worktree_path)
+                report["steps"]["commit"] = {
+                    "success": True,
+                    "committed": True,
+                    "created": True,
+                    "hash": commit_hash,
+                    "message": commit_msg,
+                }
+                LOG.info("Committed at %s", commit_hash)
+            else:
+                # No commit was created. Never surface the ambient HEAD (which
+                # may be another item's published commit) as this item's
+                # commit (AC2): the hash stays empty and the machinery below
+                # uses the worktree HEAD only to fast-forward/push a no-op.
+                commit_hash = git_get_commit_hash(worktree_path)
+                report["steps"]["commit"] = {
+                    "success": verification_only,
+                    "committed": False,
+                    "created": False,
+                    "hash": "",
+                    "message": commit_msg,
+                    "reason": (
+                        "no_changes"
+                        if verification_only
+                        else "no_commit_no_signal"
+                    ),
+                }
+                if not verification_only:
+                    # AC1: refuse the terminal write by default. Raising here
+                    # aborts before the fast-forward/push, so nothing is
+                    # published and no completion comment is posted; the
+                    # outer handler releases the item to open. The report
+                    # names the retained worktree and the exact opt-in.
+                    msg = (
+                        f"Finish refused: no commit was created for "
+                        f"{work_item_id} (the worktree has no change set), and "
+                        f"no --verification-only signal is present.\n"
+                        f"- Worktree: {worktree_path} (retained, branch "
+                        f"{branch})\n"
+                        f"- Commit: none — nothing was committed or pushed.\n"
+                        f"- No terminal transition was written; the item stays "
+                        f"in its prior state (released to open).\n"
+                        f"If this item genuinely needs no code change (evidence "
+                        f"lives elsewhere), finalise it deliberately with:\n"
+                        f"  python3 skill/implement/scripts/implement.py finish "
+                        f"{work_item_id} --verification-only"
+                    )
+                    report["success"] = False
+                    report["message"] = msg
+                    report["worktree_path"] = worktree_path
+                    # Structured evidence of the retained tree alongside the
+                    # machine-readable reason (AC1) — no prose parsing.
+                    report["steps"]["commit"]["worktree_path"] = worktree_path
+                    wl_add_comment(
+                        work_item_id,
+                        "Finish refused (no_commit_no_signal): no commit "
+                        "was created for this item.\n"
+                        f"- Worktree: {worktree_path} (retained)\n"
+                        "- Commit: none — nothing was committed or "
+                        "pushed.\n"
+                        "- No terminal transition was written; the item "
+                        "is released to open.\n"
+                        "If the item genuinely needs no code change, "
+                        "finalise it deliberately with:\n"
+                        "  python3 skill/implement/scripts/implement.py "
+                        f"finish {work_item_id} --verification-only",
+                    )
+                    raise RuntimeError(msg)
+                LOG.info(
+                    "No changes to commit; --verification-only finalisation "
+                    "proceeds without a commit (worktree %s).",
+                    worktree_path,
+                )
             # Interruption context (SA-0MVXUSJJY009HMQ0 AC2): a signal from
             # here on names the committed (and, after Step 6, published) work
             # in its retained-state record instead of releasing the item
-            # unexplained. ``pushed`` is set once Step 6 confirms the push.
+            # unexplained. On the no-commit path there is no item commit to
+            # name — ``commit`` stays empty so the record never misattributes
+            # the ambient HEAD. ``pushed`` is set once Step 6 confirms the
+            # push.
             _set_finish_progress(
                 work_item_id=work_item_id,
                 worktree_path=worktree_path,
                 branch=branch,
-                commit=commit_hash,
+                commit=commit_hash if commit_created else "",
                 pushed=False,
             )
 
@@ -11871,8 +12041,18 @@ def phase_finish(
             # it after the terminal write would bump ``updatedAt`` on an
             # already audit-ready item (and race the dispatcher).
             verdict_lines = "\n".join(_verdict_provenance_lines(report))
+            if commit_created:
+                commit_line = f"- Commit: {commit_hash}\n"
+            else:
+                # AC2: never name the ambient HEAD as this item's commit. A
+                # verification-only finalisation names the absence of a commit
+                # and the retained worktree (named again below).
+                commit_line = (
+                    "- No changes: no commit was created "
+                    "(verification-only finalisation).\n"
+                )
             completion_comment = (
-                f"Implementation complete.\n- Commit: {commit_hash}\n"
+                f"Implementation complete.\n{commit_line}"
                 f"- Branch: {branch}\n- Worktree: {worktree_path}\n"
                 f"{verdict_lines}"
             )
@@ -11916,19 +12096,23 @@ def phase_finish(
             completion_already_recorded = _comment_already_recorded(
                 work_item_id,
                 COMPLETION_COMMENT_MARKER,
-                f"Commit: {commit_hash}",
+                (
+                    f"Commit: {commit_hash}"
+                    if commit_created
+                    else "No changes: no commit was created"
+                ),
             )
             report["steps"]["completion_comment"] = {
                 "posted": not completion_already_recorded,
                 "deduplicated": completion_already_recorded,
-                "commit": commit_hash,
+                "commit": commit_hash if commit_created else "",
             }
             if completion_already_recorded:
                 LOG.info(
-                    "Completion comment for %s (commit %s) is already "
+                    "Completion comment for %s (%s) is already "
                     "recorded; skipping the duplicate on the re-run.",
                     work_item_id,
-                    commit_hash,
+                    f"commit {commit_hash}" if commit_created else "no commit",
                 )
             else:
                 wl_add_comment(work_item_id, completion_comment)
@@ -12115,8 +12299,19 @@ def phase_finish(
     removal_step = report["steps"].get("worktree_removal") or {}
 
     report["success"] = True
-    report["hash"] = commit_hash
-    report["message"] = f"Implementation complete. Commit {commit_hash} pushed to dev."
+    if commit_created:
+        report["hash"] = commit_hash
+        report["message"] = (
+            f"Implementation complete. Commit {commit_hash} pushed to dev."
+        )
+    else:
+        # AC2: a verification-only finalisation says "no changes / no commit"
+        # and never names an ambient hash as the item's commit.
+        report["hash"] = ""
+        report["message"] = (
+            "Implementation complete. No changes — no commit was created "
+            f"(verification-only). Worktree: {worktree_path}."
+        )
 
     if json_output:
         print(format_json_output(report))
@@ -12125,7 +12320,10 @@ def phase_finish(
         print("=" * 60)
         print(f"  ✅ Implementation complete for {work_item_id}")
         print("=" * 60)
-        print(f"  Commit: {commit_hash}")
+        if commit_created:
+            print(f"  Commit: {commit_hash}")
+        else:
+            print("  No changes — no commit was created (verification-only).")
         print(f"  Branch: {branch}")
         print("  Status: in_review")
         if removal_step.get("deferred"):
@@ -17077,6 +17275,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--verification-only",
+        action="store_true",
+        help=(
+            "finalise an item that produces no commit (verification-only "
+            "work). Recorded by `start` in the state file and read by "
+            "`finish`; without it a finish that creates no commit is refused "
+            "(commit.reason = no_commit_no_signal) instead of writing the "
+            "terminal completed/in_review transition."
+        ),
+    )
+    parser.add_argument(
         "--worktree-path",
         default=None,
         help="Override worktree path",
@@ -17224,6 +17433,7 @@ def _main(argv: list[str] | None = None) -> int:
                 max_retry=args.max_retry,
                 verbose=args.verbose,
                 force=args.allow_orphaned_stashes,
+                verification_only=args.verification_only,
             )
             _emit_timing(_root_timer)
     elif args.action == "finish":
@@ -17236,6 +17446,7 @@ def _main(argv: list[str] | None = None) -> int:
                 max_retry=args.max_retry,
                 verbose=args.verbose,
                 keep_worktree=args.keep_worktree,
+                verification_only=args.verification_only,
             )
             _emit_timing(_root_timer)
     elif args.action == "abort":

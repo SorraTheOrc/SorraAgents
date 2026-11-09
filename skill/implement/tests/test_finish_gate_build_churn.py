@@ -344,6 +344,10 @@ def test_build_originated_pin_and_gitlink_are_not_committed(
     restore both to the pre-build composition, so the would-be-commit tree is
     the seeded tree: ``git_commit`` finds nothing to commit and the item's
     commit does not contain the pin or the gitlink.
+
+    A no-change item is finalised deliberately with ``--verification-only``
+    (SA-0MW74IJWI009NRZ1 AC1/AC3); without it finish would refuse the no-commit
+    terminal write.
     """
     monkeypatch.delenv("IMPLEMENT_TEST_COMMAND", raising=False)
     game, engine_v1, engine_v2 = _build_composition_fixture(tmp_path)
@@ -351,7 +355,12 @@ def test_build_originated_pin_and_gitlink_are_not_committed(
     seeds = gs.run_git(game, ["rev-list", "--count", "HEAD"], check=True).stdout.strip()
 
     with _finish_harness(game, tmp_path, build=lambda cwd: _advance_engine(game, engine_v2)):
-        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
+        report = implement.phase_finish(
+            "SA-TEST",
+            json_output=True,
+            no_refactor=True,
+            verification_only=True,
+        )
 
     assert report["success"] is True, report.get("message")
     churn = report["steps"]["build_churn"]
