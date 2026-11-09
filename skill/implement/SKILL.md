@@ -47,19 +47,16 @@ sensitive values.
 
 All status transitions go through the shared `StatusLifecycle` context manager
 ([../shared/status_lifecycle.py](../shared/status_lifecycle.py)) — never
-ad-hoc status writes (`wl update --status`): always `StatusLifecycle`.
-`implement.py` uses it automatically (`phase_start` claims `in_progress`,
-`phase_finish` lands `completed`/`in_review`, `phase_abort` resets to `open`);
-manual: `StatusLifecycle.update_status(id, status, stage=…)`.
+ad-hoc `wl update --status`. `implement.py` uses it automatically; manual:
+`StatusLifecycle.update_status(id, status, stage=…)`.
 
-- **Actively worked ⇒ `in_progress`** — guard with
-  `StatusLifecycle.require_claimed(<id>)`, resume with `ensure_claimed(<id>)`.
-- **Assignee release on every terminal outcome** — `finish` clears it with the
-  `completed`/`in_review` transition; every abort reset to `open` passes
-  `assignee=""`
-  ([assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)).
-- **Terminal status on both finish paths** — both persist it, then read back
-  and fail loudly if lost (`tests/test_finish_no_diff_status.py`).
+- **Actively worked ⇒ `in_progress`** — guard with `require_claimed(<id>)`,
+  resume with `ensure_claimed(<id>)`.
+- **Assignee release on every terminal outcome** — every exit releases any
+  non-empty assignee; abort resets pass `assignee=""`
+  ([invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)).
+- **Terminal status on both finish paths** — persisted, then read back and
+  failed loudly if lost (`tests/test_finish_no_diff_status.py`).
 
 Deep detail:
 [reference — StatusLifecycle](../../docs/dev/implement-skill-reference.md#relocated-statuslifecycle-integration).
@@ -68,22 +65,19 @@ Deep detail:
 
 `finish` refuses a worktree that produced no commit: no push, no terminal
 write, no completion comment, `success: false` with
-`steps.commit.reason = "no_commit_no_signal"`, and the item released to `open`.
-It never attributes the ambient `dev` HEAD as this item's commit.
+`steps.commit.reason = "no_commit_no_signal"`, item released to `open`. It
+never attributes the ambient `dev` HEAD as this item's commit.
 
 - **Produce work (default).** A clean, commit-less worktree is unfinished work:
   re-enter it, produce what the acceptance criteria require, re-run `finish`.
 - **Verification-only (opt-in).** `start <id> --verification-only` records the
-  signal in the worktree's `.implement_state.json`; `finish <id> --verification-only`
-  supplies it directly. Either pushes a no-op, writes the terminal status and
-  reports "no changes / no commit".
+  signal in `.implement_state.json`; `finish <id> --verification-only` supplies
+  it directly. Either pushes a no-op, writes the terminal status and reports
+  "no changes / no commit".
 
-`drive`/`phase_parent` classify a work-less child `no-work` (a
-`verification-only` opt-in keeps it finalisable) and report it
-`action: "not-finalisable"` — `finish` is never run for it and the parent is
-not advanced, so zero work can never advance an epic. The store read-back
-still fails loudly unless it holds `completed`/`in_review`
-(`tests/test_finish_no_diff_status.py`). Deep detail:
+`drive`/`phase_parent` report a work-less (`no-work`) child
+`action: "not-finalisable"` — no `finish`, parent not advanced — while a
+`verification-only` opt-in keeps it finalisable. Deep detail:
 [reference — no-commit finalisation](../../docs/dev/implement-skill-reference.md#no-commit-finalisation-refusal-by-default---verification-only-opt-in).
 
 ## Project-local extensions
@@ -98,15 +92,13 @@ See [docs/dev/skill-extensions.md](../../docs/dev/skill-extensions.md).
 
 - Follow the steps in order; do not skip steps.
 - **Testing is required — TDD preferred, not mandatory.** Write tests first
-  whenever practical; test-after is permitted when TDD would complicate
-  implementation. External constraints prevent complete tests → create
-  harnesses/mocks and document the limitation. **Do NOT write placeholder
+  whenever practical; test-after is permitted. External constraints prevent
+  complete tests → harnesses/mocks, documented. **Do NOT write placeholder
   tests** — track unimplemented features in a work item instead.
-- No search tools (grep/ripgrep/code search) — rely on work-item context and
-  linked docs; if insufficient, run intake interview. Keep changes focused on
-  ACs; never edit `dist/`/`node_modules/`; CLI/API work always provides JSON.
-  Document decisions in work-item comments; handle errors with actionable
-  remediation.
+- No search tools (grep/ripgrep) — rely on work-item context and linked docs;
+  if insufficient, run an intake interview. Keep changes focused on ACs; never
+  edit `dist/`/`node_modules/`; CLI/API work always provides JSON. Document
+  decisions in work-item comments; handle errors with actionable remediation.
 - Follow AGENTS.md policies for branch naming, commit discipline, worktree
   workflow, and push-to-dev
   ([AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item)); after
@@ -116,12 +108,9 @@ See [docs/dev/skill-extensions.md](../../docs/dev/skill-extensions.md).
 ## Background Job Etiquette
 
 Long-running jobs follow the shared
-[background-job etiquette](../shared/background-job-etiquette.md) pattern:
-**launch → prepare other work → one completion-driven wait → collect**. Launch
-with a tailable log, then wait **once** with `../shared/wait_for_job.py --pid
-$PID --log /tmp/job.log --pattern "<done>" --timeout 3600`. Fixed `sleep N`
-polling is deprecated:
-[reference — background job etiquette](../../docs/dev/implement-skill-reference.md#relocated-background-job-etiquette).
+[background-job etiquette](../shared/background-job-etiquette.md) pattern
+(**launch → prepare other work → one `wait_for_job.py` wait → collect**);
+fixed `sleep N` polling is deprecated.
 
 ## Gate failure diagnosis
 
@@ -166,12 +155,12 @@ without asking can strand that work and is forbidden. When uncommitted changes
 exist, STOP and ask the operator how to proceed (commit, stash, revert, or
 abort); act only after the operator explicitly chooses.
 
-- Dirty paths that do **not** overlap the description's Key Files section are
-  left untouched in the main checkout and a clean worktree is created from
-  `HEAD`; a dirty path that overlaps Key Files — or no Key Files section —
-  asks the operator. Project-declared expected-dirty paths (`ignoreDirtyPaths`)
-  do not stop the gate. The gate protects the **main checkout** only; inside a
-  linked worktree it is skipped (those dirty files are the agent's own work).
+- Dirty paths outside the description's Key Files stay untouched in the main
+  checkout and a clean worktree is created from `HEAD`; a path that overlaps
+  Key Files (or no Key Files section) asks the operator. `ignoreDirtyPaths`
+  exemptions apply; the gate protects the **main checkout** only and is
+  skipped inside a linked worktree.
+  [reference — dirty-tree gate](../../docs/dev/implement-skill-reference.md#key-files-aware-dirty-tree-gate-sa-0mv0nsoge000osm)
 
 On abort: `StatusLifecycle.update_status(<work-item-id>, "open", assignee="")`.
 
@@ -179,10 +168,10 @@ On abort: `StatusLifecycle.update_status(<work-item-id>, "open", assignee="")`.
 
 `implement.py start` inspects `git stash list`; stashes that reference an open
 work item are matched, others are reported **orphaned** as a **WARNING**
-(fail-open; `--allow-orphaned-stashes` acknowledges). Triage each orphan:
-restore-and-commit via a proper work item, or delete if stale — never delete a
-stash without explicit permission. `scripts/hygiene_check.sh` runs the same
-check periodically. Recovery playbook:
+(fail-open; `--allow-orphaned-stashes` acknowledges). Triage each orphan
+(restore-and-commit, or delete if stale — never without explicit permission);
+`scripts/hygiene_check.sh` runs the same check periodically. Recovery
+playbook:
 [reference — dirty main-checkout recovery](../../docs/dev/implement-skill-reference.md#relocated-dirty-main-checkout-recovery-playbook).
 
 4. Understand the work item
@@ -230,17 +219,10 @@ git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-
 cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 ```
 
-> **`node_modules` is a worktree-local link farm:** `implement.py start`
-> materialises it as per-package symlinks (nested `node_modules` symlinked
-> too; workspace packages resolve to the worktree's own `packages/*`;
-> supersedes the whole-directory symlink, SA-0MSGS763C006SM1B).
-> **Do NOT run `npm install` inside a worktree** — writes corrupt the shared
-> install. Deep detail:
+> **`node_modules` is a worktree-local link farm** and submodules are
+> auto-initialised (best-effort). **Do NOT run `npm install` in a worktree** —
+> it corrupts the shared install.
 > [reference — worktree creation](../../docs/dev/implement-skill-reference.md#relocated-step-5--create-a-worktree-from-dev-and-branch-inside-it).
-
-> **Git submodules are auto-initialised:** `implement.py start` runs
-> `git submodule update --init --recursive`. Failures produce a **WARNING**
-> but do not abort (best-effort); repos without `.gitmodules` are unaffected.
 
 `implement.py start` handles the rest: idempotent resume from either `cwd`,
 and the stale-shared-resolution fail-closed gate.
@@ -251,11 +233,11 @@ and the stale-shared-resolution fail-closed gate.
 - **Write tests first** (TDD preferred) — at least one test file before
   editing implementation code; minimal, focused changes. External constraints
   prevent complete tests → harnesses/mocks/placeholders, documented.
-- **A clean, commit-less worktree is unfinished work.** If the acceptance
-  criteria need a change and the tree has nothing to commit, do not treat the
-  empty diff as done — `finish` refuses the terminal write. Produce the work
-  the ACs require and re-run `finish`; reserve `--verification-only` for items
-  whose sole deliverable is an operational run recorded as evidence.
+- **A clean, commit-less worktree is unfinished work.** If the ACs need a
+  change and the tree has nothing to commit, the empty diff is not done —
+  `finish` refuses the terminal write. Produce the work the ACs require and
+  re-run `finish`; reserve `--verification-only` for items whose sole
+  deliverable is an operational run recorded as evidence.
 - Discovered additional work →
   `wl create "<title>" --deps discovered-from:<work-item-id> --json`.
 - Once all ACs are met: **build** (no errors), then validate via `/skill:test`
@@ -283,13 +265,9 @@ audit dispatch and CI).
 
 **Driven-session lock holder (SA-0MW7LMUUQ00701KJ).** The long-lived driver,
 not the short-lived `start` subprocess, holds the child's per-child lock for
-the session's whole lifetime; `_child_session_env` passes
-`IMPLEMENT_CHILD_LOCK_TOKEN`, a `finally` releases it on every spawner
-outcome, a different live holder stays `skipped-held`, and a driver killed
-mid-session is the accepted residual window
-([reference](../../docs/dev/implement-skill-reference.md#per-child-implementation-lock-sa-0mvq7vmrl00498yb)).
-`--infra-retry-limit N` (default `5`; 2 s doubling to a 30 s cap) bounds
-transient finish retries. **Manual fallback:**
+the session's whole lifetime; `--infra-retry-limit N` (default `5`) bounds
+transient finish retries
+([reference](../../docs/dev/implement-skill-reference.md#per-child-implementation-lock-sa-0mvq7vmrl00498yb)). **Manual fallback:**
 `python3 $(skill_path implement)/scripts/implement.py parent <parent-id>` —
 no children = leaf; all-terminal children advance the parent to
 `completed`/`in_review`; otherwise `phase_parent` finishes children whose
@@ -343,17 +321,13 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   > `WORKLOG_SKIP_PRE_PUSH=1 git push origin HEAD:refs/heads/dev`.
 
 - **Post-push local parent branch sync:** `finish` fast-forwards the main
-  checkout's local `dev` to the pushed tip (safe-skip if dirty/diverged);
-  `start` refreshes it before `git worktree add`.
+  checkout's local `dev` to the pushed tip (safe-skip if dirty/diverged).
 - **Worktree removal ownership.** A plain leaf session removes its own tree
-  with `implement.py cleanup <work-item-id>` as its **last** bash command; a
-  driven child (`IMPLEMENT_DRIVE_ACTIVE=1`) — **do not remove your own
-  worktree** — `implement.py drive` removes it after exit; a parent/parent-phase
-  flow (`phase_parent`) removes each child's tree in its subprocess. Never
-  remove a live cwd. See
+  with `implement.py cleanup <id>` as its **last** bash command; a driven
+  child (`IMPLEMENT_DRIVE_ACTIVE=1`) — **do not remove your own worktree** — is
+  removed by `drive`; `phase_parent` removes each child's tree. Never remove a
+  live cwd. See
   [reference — worktree removal ownership](../../docs/dev/implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr).
-
-  **Why rebuild?** `dist/` is gitignored; `git pull` does not update it.
 - **Close your response with:**
   `<work-item-id>: <concise-summary>\n\nWork committed to dev`. **Manual
   (only when `finish` was not used):** mark `in_review` via
@@ -373,17 +347,15 @@ Claim → `in_progress`; epic/parent done and Step 9 → `completed` + stage
 
 ## Scripts (canonical runner & modules)
 
-No single orchestrator — implementation follows the steps above and invokes
-project-local build/test and linters. Build/test steps for repos without
-tooling:
+No single orchestrator — follow the steps above with project-local build/test
+and linters. No-tooling repos:
 [reference — build and test steps](../../docs/dev/implement-skill-reference.md#build-step-for-repos-without-a-build-script).
 
 ## Final cleanup (belt-and-suspenders)
 
-Before exiting, `wl show <work-item-id> --json`; if `status: in_progress` and
-work is incomplete, reset via
-`StatusLifecycle.update_status(work_item_id, "open", assignee="")` to prevent
-orphaned items blocking other agents.
+Before exiting, `wl show <work-item-id> --json`; if `status: in_progress` with
+work incomplete, reset via
+`StatusLifecycle.update_status(<id>, "open", assignee="")`.
 
 ## Final step: standardized end-of-session report
 
@@ -412,8 +384,7 @@ bash command:
 python3 $(skill_path implement)/scripts/implement.py cleanup <work-item-id> --json
 ```
 
-The post-push verification and completion comment already ran inside `finish`,
-before the terminal write. A `retained_dirty`/`retained_non_terminal` outcome is
-a reported retention — never force it (no force switch). Driven child and
-parent/parent-phase sessions do **not** run `cleanup` here. See
+A `retained_dirty`/`retained_non_terminal` outcome is a reported retention —
+never force it. Driven-child and parent-phase sessions do **not** run
+`cleanup`.
 [reference — worktree removal ownership](../../docs/dev/implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr).
