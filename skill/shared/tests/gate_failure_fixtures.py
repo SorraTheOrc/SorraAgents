@@ -105,6 +105,68 @@ ENOSPC_IN_PLAYWRIGHT_STDERR = (
 )
 
 
+#: Captured Vitest **browser-mode** failure output (MS-0MW3UR8SX009YZWS). The
+#: text is the real default-reporter shape recorded by the serial browser soak
+#: (``results/soak-browser-waits-20261102-160011-run-1-*.log``): a per-file
+#: tree header (``❯ |browser (chromium)| <file> (20 tests | 2 failed)``), the
+#: ``× <suite> > <test> <duration>`` markers with their ``→ <message>`` lines,
+#: the ``Failed Tests`` blocks (``FAIL  |browser (chromium)| <file> > <suite>
+#: > <test>`` plus the error, code frame and stack), and the ``Test Files`` /
+#: ``Tests`` summary lines. Every line here is evidence, not invention: the
+#: middle of the run is elided only where unaffected passing tests were.
+VITEST_BROWSER_FAILURE_OUTPUT = """
+ RUN  v3.2.7 /ws
+
+ ❯ |browser (chromium)| tests/main-street/MainStreetScene.browser.test.ts (20 tests | 2 failed) 208769ms
+   ✓ MainStreetScene browser tests > renders the street as a 2x5 grid  4142ms
+   ✓ MainStreetScene browser tests > loads placeholder texture and renders it without squashing  5036ms
+   × MainStreetScene browser tests > only materializes purchased cards at destination after transfer animation completes (desktop + narrow viewports) 29146ms
+     → Timed out waiting for business transfer completion after 6000ms
+   ✓ MainStreetScene browser tests > buy transfer animations end exactly at the rendered hand position (desktop + narrow viewports)  36947ms
+   × MainStreetScene browser tests > allows pressing Enter to end the turn when legal 49575ms
+     → Timed out waiting for Turn Summary dialog after end-of-turn presentation after 40000ms (cap 16000ms)
+   ✓ MainStreetScene browser tests > shows the banked action count in the HUD action counter  3673ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯
+
+ FAIL  |browser (chromium)| tests/main-street/MainStreetScene.browser.test.ts > MainStreetScene browser tests > only materializes purchased cards at destination after transfer animation completes (desktop + narrow viewports)
+Error: Timed out waiting for business transfer completion after 6000ms
+ ❯ waitForConditionLegacy tests/main-street/MainStreetScene.browser.test.ts:106:8
+    104|   }
+    105| 
+    106|   throw new Error(`Timed out waiting for ${label} after ${timeoutMs}ms…
+       |        ^
+ ❯ tests/main-street/MainStreetScene.browser.test.ts:465:6
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  |browser (chromium)| tests/main-street/MainStreetScene.browser.test.ts > MainStreetScene browser tests > allows pressing Enter to end the turn when legal
+Error: Timed out waiting for Turn Summary dialog after end-of-turn presentation after 40000ms (cap 16000ms)
+ ❯ waitForCondition core/tests/helpers/waitForCondition.ts:165:8
+    163|   if (predicate()) return;
+    164| 
+    165|   throw new Error(
+       |        ^
+ ❯ tests/main-street/MainStreetScene.browser.test.ts:657:4
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 18 passed (20)
+   Start at  16:00:18
+   Duration  221.06s (transform 371ms, setup 0ms, collect 2.46s, tests 208.77s, environment 0ms, prepare 9.00s)
+
+[vitest-runner] attempts=1 status=1 outcome=failed args="--project browser tests/main-street/MainStreetScene.browser.test.ts" expected=unset
+"""
+
+#: The command the captured browser output came from.
+VITEST_BROWSER_FAILURE_COMMAND = (
+    "npx vitest run --project browser "
+    "tests/main-street/MainStreetScene.browser.test.ts"
+)
+
+
 def completed(
     *, stdout: str = "", stderr: str = "", returncode: int = 0
 ) -> subprocess.CompletedProcess:
@@ -189,6 +251,20 @@ def inode_exhaustion_gate_result() -> dict:
         "notice_codes": [NOTICE_UNPARSED_FAILURE],
         "suites": {"all": {"returncode": 1}},
     }
+
+
+def vitest_browser_failure(
+    *, exit_code: int = 1, output: str = VITEST_BROWSER_FAILURE_OUTPUT
+) -> subprocess.CompletedProcess:
+    """The captured Vitest browser-mode failure (MS-0MW3UR8SX009YZWS).
+
+    A genuine *code* failure: the default reporter names the failing file,
+    suite and test, so the runner parses structured records and the gate
+    reports ``test_failure`` — never ``unparsed``. Replaying the captured text
+    keeps the classification regression tied to evidence rather than to a
+    hand-written approximation of the reporter.
+    """
+    return completed(stdout=output, returncode=exit_code)
 
 
 def timeout_expired(timeout: int = FIXTURE_TIMEOUT) -> subprocess.TimeoutExpired:

@@ -155,8 +155,7 @@ from test.scripts.run_tests import (
     full_suite_commands,
     group_commands,
     paced_runner,
-    parse_node_failures,
-    parse_pytest_failures,
+    parse_failures,
     resolve_type_commands,
     suite_timeout_per_command,
 )
@@ -4007,10 +4006,10 @@ def _run_tests_via_test_skill(
                 file=sys.stderr,
             )
             continue
-        if "pytest" in command:
-            cmd_failures = parse_pytest_failures(output)
-        else:
-            cmd_failures = parse_node_failures(output)
+        # Shared routing (MS-0MW3UR8SX009YZWS): the audit must classify a
+        # Vitest failure exactly as the runner does, or it emits a
+        # ``<suite exited N>`` placeholder where the test name belongs.
+        cmd_failures = parse_failures(command, output)
         for failure in cmd_failures:
             failure["suite_command"] = command
         failures.extend(cmd_failures)

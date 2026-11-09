@@ -151,6 +151,7 @@ from test_runner import (
     canonicalize_quiet_test_command,
     executable_test_command,
     is_pytest_command,
+    is_vitest_command,
     log_repository_override_scrub,
     repository_override_vars_present,
     resolve_pytest_executable,
@@ -1969,6 +1970,154 @@ def _extract_yaml_block(block: str, key: str) -> str:
     return "\n".join(collected).strip()
 
 
+# Vitest default-reporter markers (MS-0MW3UR8SX009YZWS). Both shapes are
+# matched because a real run prints the same failing test twice: once in the
+# per-file tree and once in the ``Failed Tests`` block. ANSI colour codes are
+# stripped first, and the ASCII transliterations of the tree markers
+# (``❯``→``>``, ``×``→``x``) are accepted so a captured or Windows-rendered log
+# still parses.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+#: `` FAIL  |<project>| <file> > <suite> > <test>`` — the Failed Tests header.
+_VITEST_FAIL_HEADER_RE = re.compile(
+    r"^\s*FAIL\s+\|(?P<project>[^|\n]*)\|\s*(?P<name>\S[^\n]*?)\s*$",
+    re.MULTILINE,
+)
+#: `` ❯ |<project>| <file> (N tests | M failed) 1234ms`` — the per-file header.
+_VITEST_FILE_HEADER_RE = re.compile(
+    r"^\s*(?:❯|>)\s+\|(?P<project>[^|\n]*)\|\s*(?P<file>[^\s()]+)",
+    re.MULTILINE,
+)
+#: ``   × <suite> > <test> 29146ms`` — a failed test inside a file's tree.
+_VITEST_TREE_FAIL_RE = re.compile(
+    r"^\s*(?P<marker>[×✗x])\s+(?P<name>\S[^\n]*?)"
+    r"(?:\s+\d+(?:\.\d+)?\s*(?:ms|s))?\s*$",
+    re.MULTILINE,
+)
+#: Any line that starts a new tree/test entry (used to bound detail capture).
+_VITEST_TREE_ENTRY_RE = re.compile(r"^\s*[×✗x✓↓❯>]\s")
+#: Lines that end a failure block or a tree section: the heavy rule Vitest
+#: prints between blocks, the run summary, and the retry-runner trailer.
+_VITEST_BLOCK_END_RE = re.compile(
+    r"^\s*(?:⎯{3,}|─{3,}|Test Files\s|Tests\s|Start at\s|Duration\s|\[vitest-runner\])"
+)
+
+
+def parse_vitest_failures(output: str) -> list[dict[str, str]]:
+    """Parse Vitest's default-reporter output into structured failure records.
+
+    Vitest names a failing test after its file and suite — ``FAIL  |<project>|
+    <file> > <suite> > <test>`` in the ``Failed Tests`` block and ``× <suite> >
+    <test>`` under the ``❯ |<project>| <file>`` tree header. Before
+    MS-0MW3UR8SX009YZWS the runner understood only TAP, so every Vitest
+    failure produced ``failures: []`` and was classified ``unparsed_failure``
+    (gate ``reason: unparsed``): the operator was told the *command or
+    configuration* was broken when the *code* was at fault, and triage fell
+    back to a ``<suite exited N>`` placeholder instead of the test name.
+
+    The ``Failed Tests`` block is parsed first (it carries the error, code
+    frame and stack), then the per-file tree; a test reported in both places
+    yields **one** record. Summary lines (``Test Files …``/``Tests …``) never
+    produce a record, and output without these markers yields none — an
+    infrastructure failure (``ENOSPC`` in the browser provider) therefore keeps
+    its ``unparsed_failure`` classification.
+
+    Args:
+        output: The command's combined stdout/stderr.
+
+    Returns:
+        One record per failing test with ``test_name`` (file, suite and test),
+        ``stdout_excerpt`` (≤1000 chars) and ``stack_trace`` — the shape triage
+        ``check_or_create.py`` and the audit consume.
+    """
+    text = _ANSI_ESCAPE_RE.sub("", output)
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(name: str, detail: str) -> None:
+        clean_name = " ".join(name.split())
+        key = clean_name.lower()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        body = detail.strip()
+        records.append(
+            {
+                "test_name": clean_name,
+                "stdout_excerpt": (body or clean_name)[:1000],
+                "stack_trace": body or clean_name,
+            }
+        )
+
+    # 1) Failed Tests blocks — the richest attribution (error + stack).
+    headers = list(_VITEST_FAIL_HEADER_RE.finditer(text))
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        add(header.group("name"), _vitest_block_body(text[header.end() : end]))
+
+    # 2) Per-file tree markers — the only attribution when a log is truncated
+    #    before the Failed Tests block.
+    lines = text.splitlines()
+    current_file = ""
+    for index, line in enumerate(lines):
+        file_match = _VITEST_FILE_HEADER_RE.match(line)
+        if file_match:
+            current_file = file_match.group("file")
+            continue
+        fail_match = _VITEST_TREE_FAIL_RE.match(line)
+        if not fail_match or not current_file:
+            continue
+        detail = _vitest_tree_detail(lines, index + 1)
+        add(f"{current_file} > {fail_match.group('name')}", detail)
+
+    return records
+
+
+def _vitest_block_body(block: str) -> str:
+    """Return the error/code-frame/stack lines that follow a FAIL header."""
+    body: list[str] = []
+    for line in block.splitlines():
+        if _VITEST_BLOCK_END_RE.match(line):
+            break
+        body.append(line)
+    return "\n".join(body).strip()
+
+
+def _vitest_tree_detail(lines: list[str], start: int) -> str:
+    """Return the ``→ <message>`` line(s) printed under a tree failure marker."""
+    detail: list[str] = []
+    for line in lines[start:]:
+        if not line.strip():
+            if detail:
+                break
+            continue
+        if _VITEST_BLOCK_END_RE.match(line) or _VITEST_TREE_ENTRY_RE.match(line):
+            break
+        detail.append(line.strip())
+    return "\n".join(detail).strip()
+
+
+def parse_failures(command: str, output: str) -> list[dict[str, str]]:
+    """Parse *output* with the failure parser matching *command*'s reporter.
+
+    Routing is shared by every consumer (``run_suite`` and the audit's suite
+    loop) so the two can never drift apart:
+
+    * ``pytest`` commands → :func:`parse_pytest_failures` (unchanged);
+    * Vitest commands → :func:`parse_vitest_failures`;
+    * anything else → :func:`parse_node_failures` (TAP, unchanged), falling
+      back to the Vitest parser when TAP yields nothing. The fallback covers
+      wrapper commands (``npm --silent test``) whose output shape cannot be
+      inferred from the command line; the Vitest markers are specific enough
+      that non-Vitest output still yields no records.
+    """
+    if "pytest" in command:
+        return parse_pytest_failures(output)
+    if is_vitest_command(command):
+        return parse_vitest_failures(output)
+    records = parse_node_failures(output)
+    return records or parse_vitest_failures(output)
+
+
 # ---------------------------------------------------------------------------
 # Suite execution
 # ---------------------------------------------------------------------------
@@ -2793,10 +2942,7 @@ def run_suite(
             # commands would run against the same unstable checkout and
             # contribute nothing usable.
             break
-        if "pytest" in cmd:
-            failures = parse_pytest_failures(output)
-        else:
-            failures = parse_node_failures(output)
+        failures = parse_failures(cmd, output)
         all_failures.extend(failures)
         if proc.returncode != 0:
             overall_returncode = proc.returncode

@@ -1054,7 +1054,7 @@ codes:
 | `test_failure` | structured `failures` | Real failing tests. | Fix the code. Never treated as infrastructure. |
 | `timeout` | `suite_timeout` | The suite exceeded `timeoutPerCommand` and was stopped. | Raise `timeoutPerCommand` in `.pi/test-config.json` with headroom over a green run's elapsed time, then re-run. |
 | `killed` | `killed` (suite `returncode < 0`) | The child was signal-terminated (OOM kill, worker/supervisor crash) with no test result. | Treat as host/infrastructure: read the output tail, re-run; do not "fix" a test. |
-| `unparsed` | `unparsed_failure` | The suite exited non-zero and no test failure could be parsed (bad flag, unloadable config, missing wrapper). | Read the command and output tail; the command or its configuration is the problem. |
+| `unparsed` | `unparsed_failure` | The suite exited non-zero and no test failure could be parsed (bad flag, unloadable config, missing wrapper). Vitest's default reporter — browser mode included — is parsed, so a failing Vitest test is `test_failure`, not this. | Read the command and output tail; the command or its configuration is the problem. |
 | `slot_contention` | `slot_busy` | No host test slot within the bounded wait. | Wait a staggered delay, or raise `TEST_LOCK_TIMEOUT`. The queue wait is reported separately from suite execution. |
 | `infrastructure` | any other notice, or a live-repo mutation | Unattributable to a test, but explained by a notice. | Read the notices; the repo may have been mutated by a concurrent session. |
 | `unknown` | — | Last resort: no structured failure, no notice and no executed command. | Re-run the suite with the test skill to obtain diagnostics. It is unreachable for a timed-out, killed or non-zero run. |
@@ -3044,7 +3044,7 @@ act, and every reason never lands on `unknown` with an empty `failures` list.
 | `test_failure` | Real, parsable failing tests. | Fix the code. Structured failures always win: a genuine failure is never reported as infrastructure. |
 | `timeout` | The suite exceeded `timeoutPerCommand` and was stopped. | Raise `timeoutPerCommand` in `.pi/test-config.json` with headroom over a green run's `elapsed_seconds`, then re-run. |
 | `killed` | The child was signal-terminated (OOM kill, worker/supervisor crash) with no test result. | Treat as host/infrastructure: read the output tail, re-run. Do **not** "fix" a test. |
-| `unparsed` | The suite exited non-zero and no test failure could be parsed (bad flag, unloadable config, missing wrapper). | Read `command` and the output tail: the command or its configuration is wrong, not a test. |
+| `unparsed` | The suite exited non-zero and no test failure could be parsed (bad flag, unloadable config, missing wrapper). A failing **Vitest** test — browser mode included — parses into structured failures, so it is `test_failure`, never this. | Read `command` and the output tail: the command or its configuration is wrong, not a test. |
 | `slot_contention` | No host test slot within the bounded wait (`slot_busy`). | Wait a staggered delay, or raise `TEST_LOCK_TIMEOUT`. The wait is reported separately from execution. |
 | `infrastructure` | Explained by a runner notice but not attributable to a test (includes a live-repo mutation). | Read the notices; the checkout may have been mutated by a concurrent session. |
 | `unknown` | Last resort: no structured failure, no notice and no executed command. | Re-run the suite with the test skill to obtain diagnostics. |

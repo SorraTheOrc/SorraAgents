@@ -405,6 +405,35 @@ the mapping — and the action per reason — in
 and in `skill/implement/SKILL.md` (“Reading a gate failure”); a docs-vs-source
 consistency test keeps the three documents and the producing constants in step.
 
+#### Failure parsing — which output shapes produce structured failures
+
+`failures` is populated by the parser that matches the command's **reporter**,
+selected by one shared routing function (`run_tests.parse_failures`) so the
+runner and the audit skill can never drift apart:
+
+| Command shape | Parser | Recognised failures |
+| --- | --- | --- |
+| `pytest …` | `parse_pytest_failures` | `FAILED <nodeid> - <message>` and `ERROR <nodeid>` short-summary lines, with the FAILURES/ERRORS section as the stack. |
+| vitest (`vitest`, `npx vitest`, `…/.bin/vitest`) | `parse_vitest_failures` | Vitest's default reporter: the `Failed Tests` block (`FAIL  \|<project>\| <file> > <suite> > <test>` plus the error, code frame and stack) **and** the per-file tree (`❯ \|<project>\| <file> (N tests \| M failed)` with `× <suite> > <test>` markers and their `→ <message>` lines). A test reported in both places yields one record; `Test Files …`/`Tests …` summary lines never produce one. |
+| anything else (TAP) | `parse_node_failures`, then the Vitest parser when TAP yields nothing | `not ok N - <name>` TAP failures. The Vitest fallback covers wrapper commands (`npm --silent test`) whose reporter cannot be inferred from the command line. |
+
+Every record carries `test_name` (for Vitest: file, suite and test),
+`stdout_excerpt` (≤1000 chars) and `stack_trace` — the trio triage's
+`check_or_create.py` and the audit consume. Markers are matched after ANSI
+colour codes are stripped, and the ASCII transliterations of the tree markers
+(`❯`→`>`, `×`→`x`) are accepted, so a captured or Windows-rendered log still
+parses (MS-0MW3UR8SX009YZWS).
+
+Before MS-0MW3UR8SX009YZWS only TAP was parsed, so a genuine **Vitest browser
+or unit assertion failure** produced `failures: []` and was classified
+`unparsed_failure` → gate `reason: unparsed`: the operator was told the command
+or configuration was broken when the *code* was at fault, and triage fell back
+to a `<suite exited 1>: …` placeholder instead of naming the test. A regression
+pin replays the captured browser-mode output
+(`skill/shared/tests/gate_failure_fixtures.py::VITEST_BROWSER_FAILURE_OUTPUT`) in
+`skill/test/tests/test_run_tests_vitest_parser.py` and
+`skill/test/tests/test_run_tests_failure_notices.py`.
+
 #### Notice codes (stable strings)
 
 | Code | Meaning |
@@ -413,7 +442,7 @@ consistency test keeps the three documents and the producing constants in step.
 | `command_not_found` | The suite binary/executable could not be spawned. |
 | `suite_timeout` | The command exceeded `timeoutPerCommand` (`TimeoutExpired`). |
 | `killed` | The child was terminated by a signal (`returncode < 0`, e.g. an OOM kill or a worker crash) and produced no parsable failure. |
-| `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). |
+| `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). Vitest's default reporter — including browser mode — **is** parsed (see *Failure parsing* above), so a failing Vitest test is a structured failure, never this code. |
 | `state_changed_during_run` | The guarded checkout moved while a command executed (HEAD and/or the tracked tree it resolves to changed mid-run, e.g. a concurrent `implement.py finish` fast-forward); the mixed-tree verdict is quarantined (no cache entry under either state), the command's parsed failures are dropped and the suite is reported non-green with the distinct exit status 75 (`EX_TEMPFAIL`). The result carries the detail (checkout path + before/after commits) on `state_changed_during_run` — a non-empty dict for the suite, a list under the `run_all` aggregate; the human output prints a `notice: [state_changed_during_run] …` line naming the checkout movement and the required re-run. Runs whose only difference is churn attributable to another session (start-of-run-dirty → end-clean resolutions) are never flagged (SA-0MW3FF18I003KGZE AC3). |
 
 **Precedence.** Structured (parsable) test failures always win: `killed` and
