@@ -435,6 +435,11 @@ PANE_IDENTITY_ENV_KEYS = ("PI_SESSION_ID", "PI_SESSION_FILE")
 #: holder (another driver/session). The refused party performs no work and
 #: reports the holder identity instead of racing it (SA-0MVQ5AXLF002PAQ3).
 ACTION_SKIPPED_HELD = "skipped-held"
+#: Report action for a child whose ``status`` is ``blocked`` and whose block
+#: still holds after re-validation against its outbound dependency edges
+#: (SA-0MVTUFL0U0000NV2 AC1). A stale block — every blocker terminal — is
+#: re-evaluated and the child becomes startable again.
+ACTION_SKIP_BLOCKED = "skip-blocked"
 #: Transport labels recorded on every ``children_driven`` entry, so a
 #: ``--json`` consumer can tell a pane-driven child from a headless one
 #: (SA-0MVPHZ1CI0045QR0 AC5). ``pane_id`` is ``None`` for the headless path.
@@ -1836,6 +1841,76 @@ def _format_blockers(blockers: list[dict[str, str]]) -> str:
     )
 
 
+def _blocked_child_state(
+    child: dict[str, Any],
+    blockers: list[dict[str, Any]] | None,
+    children: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Re-validate a ``blocked`` child's block against its dependency edges.
+
+    A ``blocked`` status is a producer's hold, but it is never honoured
+    forever: it is re-evaluated on every run so a landed prerequisite cannot
+    strand its dependent (SA-0MVTUFL0U0000NV2 AC2). The block is **stale**
+    iff every outbound (``depends-on``) edge is terminal — ``completed`` /
+    ``done`` / ``in_review`` / ``deleted`` or soft-deleted, the same rule as
+    :func:`_is_terminal_child`. Any non-terminal edge holds the block.
+
+    In-chain edges are resolved through the live child list when the edge's
+    own payload carries no status (a ``wl dep list`` edge may omit it), so a
+    sibling's real status always wins over a stale edge copy. A ``blocked``
+    child with **no** resolvable edge is ``unvalidated`` and therefore holds
+    (fail closed, AC4) — it never defaults to startable.
+
+    Args:
+        child: The ``blocked`` child work-item dict.
+        blockers: The child's outbound dependency edges (``None`` = unknown).
+        children: The parent's children, for resolving in-chain edge status.
+
+    Returns:
+        ``{"holds": bool, "blocking_ids": [...], "stale_block_ids": [...],
+        "unvalidated": bool}``. ``blocking_ids`` are the non-terminal edges
+        that hold the child; ``stale_block_ids`` are the terminal edges that
+        made a stale block startable.
+    """
+    edges = [edge for edge in (blockers or []) if isinstance(edge, dict)]
+    child_by_id = {
+        str(c.get("id")): c for c in (children or []) if c.get("id")
+    }
+
+    def _edge_terminal(edge: dict[str, Any]) -> bool:
+        body = child_by_id.get(str(edge.get("id", "")))
+        if body is not None:
+            # The live child record outranks the edge's own copy: an edge may
+            # omit ``status`` entirely (see tests/test_implement_parent_safety).
+            return _is_terminal_child(body)
+        return _is_terminal_child(edge)
+
+    if not edges:
+        return {
+            "holds": True,
+            "blocking_ids": [],
+            "stale_block_ids": [],
+            "unvalidated": True,
+        }
+
+    blocking_ids = [
+        str(edge.get("id", "")) for edge in edges if not _edge_terminal(edge)
+    ]
+    if blocking_ids:
+        return {
+            "holds": True,
+            "blocking_ids": blocking_ids,
+            "stale_block_ids": [],
+            "unvalidated": False,
+        }
+    return {
+        "holds": False,
+        "blocking_ids": [],
+        "stale_block_ids": [str(edge.get("id", "")) for edge in edges],
+        "unvalidated": False,
+    }
+
+
 def _outbound_gate(
     work_item_id: str,
     blockers: list[dict[str, Any]] | None = None,
@@ -1995,7 +2070,11 @@ def _classify_child_worktree(
     return CHILD_CLEAN
 
 
-def _classify_child(child: dict[str, Any]) -> str:
+def _classify_child(
+    child: dict[str, Any],
+    blockers: list[dict[str, Any]] | None = None,
+    children: list[dict[str, Any]] | None = None,
+) -> str:
     """Classify a child for the parent-recursion plan.
 
     Returns one of:
@@ -2003,12 +2082,20 @@ def _classify_child(child: dict[str, Any]) -> str:
       - ``"skipped-held"`` — a live holder owns the child's per-work-item
         lock (another driver/session); reported, never raced.
       - ``"skip-in-progress"`` — claimed by another agent; reported, not clobbered.
+      - ``"skip-blocked"`` — ``status: blocked`` and the block **still
+        holds** after re-validation against the outbound dependency edges;
+        reported with its ``blocking_ids``, never started (AC1).
       - ``"implement"`` — the standard workflow should run on this child.
 
-    Precedence is deliberate: a terminal child is never re-implemented (even
-    with a stale lock file lying around), and a live holder outranks the
+    Precedence is deliberate and is stated once, here: ``skip-terminal`` →
+    ``skipped-held`` → ``skip-in-progress`` → ``skip-blocked`` →
+    ``implement``. A terminal child is never re-implemented (even with a
+    stale lock file lying around), and a live holder outranks the
     status-based ``in-progress`` guess because it is a fact about a running
-    process, not a lifecycle claim (SA-0MVQ5AXLF002PAQ3, AC3).
+    process, not a lifecycle claim (SA-0MVQ5AXLF002PAQ3, AC3). A ``blocked``
+    child is only startable when its block is **stale** — every blocker
+    terminal (:func:`_blocked_child_state`); a block that cannot be validated
+    holds (fail closed, SA-0MVTUFL0U0000NV2 AC4).
 
     This phase-level classification is refined for open/in-progress children
     by :func:`_classify_child_worktree` at the two change-surface call sites in
@@ -2018,6 +2105,9 @@ def _classify_child(child: dict[str, Any]) -> str:
 
     Args:
         child: A child work-item dict from ``wl show --children``.
+        blockers: The child's outbound (``depends-on``) edges; omitted/empty
+            for a ``blocked`` child means the block is unvalidated and holds.
+        children: The parent's children, used to resolve in-chain edge status.
 
     Returns:
         The classification string.
@@ -2029,6 +2119,10 @@ def _classify_child(child: dict[str, Any]) -> str:
         return ACTION_SKIPPED_HELD
     if status in ("in-progress", "in_progress"):
         return "skip-in-progress"
+    if status == "blocked":
+        state = _blocked_child_state(child, blockers, children)
+        if state["holds"]:
+            return ACTION_SKIP_BLOCKED
     return "implement"
 
 
@@ -2112,8 +2206,11 @@ def _next_child_to_implement(
     order (see :func:`_resolve_implementation_order`). A child is startable
     only when every in-chain blocker (a blocker that is also one of these
     children) is already terminal — a blocked child is never implemented
-    before its blockers (AC-2). Independent siblings of an in-progress
-    child may still start.
+    before its blockers (AC-2). A child whose ``status`` is ``blocked`` is
+    re-validated with :func:`_blocked_child_state` and skipped while the
+    block holds, so this legacy path cannot diverge from ``phase_parent``
+    (SA-0MVTUFL0U0000NV2 AC6). Independent siblings of an in-progress child
+    may still start.
 
     Args:
         children: List of child work-item dicts in dependency order.
@@ -2123,7 +2220,7 @@ def _next_child_to_implement(
     Returns:
         The next child dict, or None when no child is startable (every
         remaining child is terminal, in progress elsewhere, or blocked by a
-        non-terminal sibling).
+        non-terminal sibling or by a still-valid ``blocked`` hold).
     """
     blockers_map = blockers_map or {}
     child_ids = {str(c.get("id")) for c in children}
@@ -2133,14 +2230,16 @@ def _next_child_to_implement(
         if _is_terminal_child(c)
     }
     for child in children:
-        action = _classify_child(child)
+        cid = str(child.get("id", ""))
+        action = _classify_child(child, blockers_map.get(cid, []), children)
         if action == "skip-terminal":
             continue
         if action == ACTION_SKIPPED_HELD:
             continue  # a live holder owns it; never a second session
         if action == "skip-in-progress":
             continue  # never clobber another agent's claim
-        cid = str(child.get("id", ""))
+        if action == ACTION_SKIP_BLOCKED:
+            continue  # a still-valid blocked hold; never started (AC1)
         in_chain_blockers = [
             str(b.get("id"))
             for b in blockers_map.get(cid, [])
@@ -13000,8 +13099,12 @@ def phase_parent(
        are reported as coordination notes.
     5. Classify children: terminal → skip; a live lock holder →
        ``skipped-held`` (report the holder and stop cleanly); in_progress
-       elsewhere → skip+report; a worktree with no attributable work →
-       ``not-finalisable`` (child stays open, parent never advances;
+       elsewhere → skip+report; ``status: blocked`` → re-validated against
+       the outbound dependency edges (``skip-blocked`` with ``blocking_ids``
+       while the block holds, a ``stale_blocks`` entry and a startable child
+       once every blocker is terminal, ``unvalidated_blocks`` when no edge
+       resolves it — SA-0MVTUFL0U0000NV2); a worktree with no attributable
+       work → ``not-finalisable`` (child stays open, parent never advances;
        SA-0MW74IKJE008JXDQ); blocked by a non-terminal sibling or by a
        same-project item outside the epic → not startable (reported);
        otherwise → implementable.
@@ -13180,10 +13283,14 @@ def phase_parent(
     # ── Step 5: Classify children ──────────────────────────────────
     classifications: list[dict[str, Any]] = []
     blockers_map: dict[str, list[dict[str, Any]]] = {}
+    # Re-validated ``blocked`` holds, keyed by child id (AC1/AC2/AC4).
+    blocked_states: dict[str, dict[str, Any]] = {}
+    stale_blocks: list[dict[str, Any]] = []
+    unvalidated_blocks: list[dict[str, Any]] = []
     # Same-project blockers OUTSIDE the children set: they cannot be ordered
     # within the epic, but they still gate the child (consistent with the
     # ``phase_start`` leaf gate). Cross-project edges stay coordination notes
-    # (SA-0MSQBM2FK005NW1T).
+    # for children that are *not* ``blocked`` (SA-0MSQBM2FK005NW1T).
     out_of_chain_blocked: dict[str, list[dict[str, str]]] = {}
     for child in children:
         cid = str(child.get("id", ""))
@@ -13209,20 +13316,60 @@ def phase_parent(
         ]
         if unmet_same_project:
             out_of_chain_blocked[cid] = unmet_same_project
-        classifications.append({
+        entry: dict[str, Any] = {
             "id": cid,
             "title": child.get("title", ""),
             "status": child.get("status", ""),
-            "action": _classify_child(child),
+            "action": _classify_child(child, child_blockers, children),
             "external_blockers": external,
-        })
-        entry = classifications[-1]
+        }
+        classifications.append(entry)
         if unmet_same_project:
             entry["out_of_chain_blockers"] = unmet_same_project
         if entry["action"] == ACTION_SKIPPED_HELD:
             # Surface the live holder's identity so the operator can diagnose
             # who owns the child (AC3).
             entry["held_by"] = _probe_child_lock(cid)
+        if str(child.get("status", "")) == "blocked":
+            # Re-validate the hold on every run: a producer's ``blocked``
+            # status is re-evaluated against the outbound edges so a landed
+            # prerequisite cannot strand its dependent, and a block that
+            # cannot be validated holds instead of defaulting to startable
+            # (SA-0MVTUFL0U0000NV2 AC2/AC4).
+            state = _blocked_child_state(child, child_blockers, children)
+            blocked_states[cid] = state
+            if state["blocking_ids"]:
+                entry["blocking_ids"] = list(state["blocking_ids"])
+            if state["unvalidated"]:
+                entry["unvalidated"] = True
+                unvalidated_blocks.append({
+                    "id": cid,
+                    "reason": (
+                        "status is 'blocked' but no outbound dependency edge "
+                        "resolves the blocker; treated as holding (fail closed)"
+                    ),
+                })
+            if state["stale_block_ids"]:
+                entry["stale_block_ids"] = list(state["stale_block_ids"])
+                stale_blocks.append({
+                    "id": cid,
+                    "blocking_ids": list(state["stale_block_ids"]),
+                })
+                LOG.info(
+                    "Child %s has a stale block: every blocker (%s) is "
+                    "terminal, so the child is startable again.",
+                    cid,
+                    _format_blockers(
+                        [
+                            {"id": bid, "status": "terminal"}
+                            for bid in state["stale_block_ids"]
+                        ]
+                    ),
+                )
+    if stale_blocks:
+        report["stale_blocks"] = stale_blocks
+    if unvalidated_blocks:
+        report["unvalidated_blocks"] = unvalidated_blocks
     report["children"] = classifications
 
     # ── Step 5.5: Resolve dependency order (blockers first) ────────
@@ -13267,11 +13414,32 @@ def phase_parent(
             if str(b.get("id")) in child_ids
         ]
 
+    def _note_stale_block(cid: str) -> None:
+        """Record a stale-block finding on the child before it is handed off.
+
+        Q2 = A (SA-0MVTUFL0U0000NV2): the phase reports and logs the stale
+        block, then lets the child start — it never rewrites the child's
+        ``blocked`` lifecycle status, because that status is the lifecycle
+        owner's decision (and ``wl update --status blocked`` is unreliable,
+        WL-0MVTUKSJZ003WK82).
+        """
+        stale = list(blocked_states.get(cid, {}).get("stale_block_ids") or [])
+        if not stale:
+            return
+        wl_add_comment(
+            cid,
+            f"Stale block re-validated by {work_item_id}: every blocker "
+            f"({', '.join(stale)}) is terminal, so the child is startable "
+            "again. The `blocked` lifecycle status is left unchanged "
+            "(lifecycle owner's decision).",
+        )
+
     def _report_implement_next(
         cid: str, worktree_path: str, branch: str, message: str,
         start_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Populate and return the report for a child awaiting implementation."""
+        _note_stale_block(cid)
         if _forward_child_lock_reclamation(report, cid, start_result):
             message = (
                 f"{message} {cid} lock reclaimed from a dead holder "
@@ -13405,7 +13573,9 @@ def phase_parent(
     for child in ordered_children:
         cid = str(child.get("id", ""))
         title = child.get("title", "")
-        action = _classify_child(child)
+        action = _classify_child(
+            child, blockers_map.get(cid, []), children
+        )
 
         if action == "skip-terminal":
             child_results.append({
@@ -13413,6 +13583,25 @@ def phase_parent(
                 "action": "skipped-terminal",
                 "status": child.get("status", ""),
             })
+            continue
+
+        if action == ACTION_SKIP_BLOCKED:
+            # ``status: blocked`` and the re-validated block still holds: the
+            # child is reported with the ids that hold it and is never
+            # started (SA-0MVTUFL0U0000NV2 AC1/AC3). Unvalidatable blocks
+            # hold too, and are flagged so the operator can act on them.
+            state = blocked_states.get(cid) or {}
+            pending_ids.append(cid)
+            blocked_ids.append(cid)
+            entry = {
+                "id": cid, "title": title,
+                "action": ACTION_SKIP_BLOCKED,
+                "status": child.get("status", ""),
+                "blocking_ids": list(state.get("blocking_ids") or []),
+            }
+            if state.get("unvalidated"):
+                entry["unvalidated"] = True
+            child_results.append(entry)
             continue
 
         if action == ACTION_SKIPPED_HELD:
@@ -13583,6 +13772,23 @@ def phase_parent(
                 "non-terminal children not in progress are blocked by "
                 "non-terminal siblings or another agent holds them"
             )
+        if blocked_ids:
+            # Name the ids that hold each child so an unattended operator can
+            # see what to wait for without re-reading the child's description
+            # (SA-0MVTUFL0U0000NV2 AC3).
+            details = []
+            for cid in blocked_ids:
+                ids = list(
+                    blocked_states.get(cid, {}).get("blocking_ids") or []
+                )
+                if not ids:
+                    out_of_chain = out_of_chain_blocked.get(cid) or []
+                    ids = [str(b.get("id", "")) for b in out_of_chain]
+                details.append(
+                    f"{cid} (blocked by {', '.join(ids)})"
+                    if ids else f"{cid} (unvalidated block)"
+                )
+            reasons.append("blocked children: " + "; ".join(details))
         report["message"] = (
             f"No child of {work_item_id} is currently startable: "
             + "; ".join(reasons) + ". "

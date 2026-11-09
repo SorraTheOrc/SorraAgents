@@ -205,14 +205,6 @@ class TestParentDependencyOrder:
         assert report["_calls"]["update_status"] == []
         assert "cycle" in report.get("message", "").lower() or "loop" in report.get("message", "").lower()
 
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "superseded contract (SA-0MVUTD3IX004E03C): an out-of-chain "
-            "blocker must now HOLD a blocked child; expected red until C3 "
-            "lands"
-        ),
-    )
     def test_out_of_chain_blocker_holds_a_blocked_child(self, implement_mod):
         """Superseded contract (SA-0MVUTD3IX004E03C, parent SA-0MVTUFL0U0000NV2).
 

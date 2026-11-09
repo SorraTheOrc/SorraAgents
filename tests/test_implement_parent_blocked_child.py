@@ -6,11 +6,11 @@ These tests are the executable form of the parent's ACs 1–5: a child whose
 ``status`` is ``blocked`` must be **re-validated** before it is started or
 skipped, and a stale block must never strand the child forever.
 
-**Expected red until the implementation items land** — C2 (``skip-blocked``
-via dep-edge re-validation), C3 (prose / cross-project blockers) and C4
-(``drive`` propagation). They are marked ``xfail(strict=False)`` so the suite
-stays green while the contract is documented; when the production change
-lands they xpass and the markers can be removed.
+**Cases (a), (b), (e) and the fail-closed case are green** after C2 landed
+(``skip-blocked`` via dep-edge re-validation). Case (c) (prose / cross-project
+blockers) stays red until C3 and case (d) (``drive`` propagation) until C4;
+those two keep ``xfail(strict=False)`` so the suite stays green while their
+contract is documented.
 
 Every test drives the production ``phase_parent`` / ``phase_drive`` through the
 shared harnesses (``tests.test_implement_parent_safety.ParentHarness`` and
@@ -39,15 +39,15 @@ from tests.test_implement_parent_safety import ParentHarness, _child
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
 
-#: The contract tests below are expected red until C2/C3/C4 land.
+#: Remaining contract tests, red until C3 (prose blockers) / C4 (drive).
 _RED = pytest.mark.xfail(
     strict=False,
     reason=(
-        "contract test: expected red until the blocked-child re-validation "
-        "lands (C2 skip-blocked / C3 prose+cross-project blockers / "
-        "C4 drive propagation)"
+        "contract test: expected red until C3 (prose/cross-project blockers) "
+        "and C4 (drive propagation) land"
     ),
 )
+
 
 
 @pytest.fixture(scope="module")
@@ -111,7 +111,6 @@ def _blob(report: dict) -> str:
 
 
 class TestNonTerminalDepEdgeBlocker:
-    @_RED
     def test_blocked_child_with_open_dep_edge_blocker_is_skip_blocked(
         self, implement_mod
     ):
@@ -131,7 +130,6 @@ class TestNonTerminalDepEdgeBlocker:
         # The new verdict must not be confused with the other skip actions.
         assert entry["action"] not in ("skip-in-progress", "skipped-terminal")
 
-    @_RED
     def test_blocked_child_with_in_chain_non_terminal_blocker_is_skip_blocked(
         self, implement_mod
     ):
@@ -157,7 +155,6 @@ class TestNonTerminalDepEdgeBlocker:
 
 
 class TestStaleBlockRevalidation:
-    @_RED
     def test_blocked_child_with_terminal_dep_edge_blocker_starts_and_reports_stale(
         self, implement_mod
     ):
@@ -175,7 +172,6 @@ class TestStaleBlockRevalidation:
         assert "sa-ext" in blob, "the stale blocker must be named in the report"
         assert "stale" in blob, "the report must say the block was stale"
 
-    @_RED
     def test_blocked_child_with_soft_deleted_blocker_starts(self, implement_mod):
         """A soft-deleted blocker is terminal, so the block is stale."""
         children = [_child("SA-A", status="blocked")]
@@ -268,7 +264,6 @@ class TestDrivePropagation:
 
 
 class TestFailClosed:
-    @_RED
     def test_blocked_child_without_resolvable_blocker_is_not_started(
         self, implement_mod
     ):
@@ -341,3 +336,172 @@ class TestRegressionUnchanged:
         h = ParentHarness(implement_mod, children, blockers_map=blockers)
         h.run()
         assert h.calls["phase_start"] == ["SA-A"]
+
+
+# ===========================================================================
+# Unit-level: the re-validation helper and the classification precedence
+# ===========================================================================
+
+
+class TestBlockedChildState:
+    """Unit tests for ``_blocked_child_state`` (C2, AC2/AC4/AC5)."""
+
+    def test_mixed_terminal_and_open_blockers_holds(self, implement_mod):
+        """A non-terminal blocker wins: the block holds and only the
+        non-terminal id is reported as blocking."""
+        child = _child("SA-A", status="blocked")
+        state = implement_mod._blocked_child_state(
+            child,
+            [
+                _blocker("SA-T", status="completed"),
+                _blocker("SA-O", status="open"),
+            ],
+        )
+        assert state == {
+            "holds": True,
+            "blocking_ids": ["SA-O"],
+            "stale_block_ids": [],
+            "unvalidated": False,
+        }
+
+    def test_all_soft_deleted_blockers_is_stale(self, implement_mod):
+        """Every soft-deleted blocker is terminal ⇒ the block is stale."""
+        child = _child("SA-A", status="blocked")
+        gone = _blocker("SA-GONE", status="open")
+        gone["deletedBy"] = "Map"
+        state = implement_mod._blocked_child_state(child, [gone])
+        assert state["holds"] is False
+        assert state["stale_block_ids"] == ["SA-GONE"]
+
+    def test_no_edges_is_unvalidated_and_holds(self, implement_mod):
+        """No dependency edge ⇒ unvalidated ⇒ holds (never startable)."""
+        child = _child("SA-A", status="blocked")
+        state = implement_mod._blocked_child_state(child, [])
+        assert state["holds"] is True
+        assert state["unvalidated"] is True
+
+    def test_in_chain_edge_without_status_uses_child_record(
+        self, implement_mod
+    ):
+        """An in-chain edge that omits ``status`` is resolved from the live
+        child list, so a completed sibling makes the block stale."""
+        children = [
+            _child("SA-A", status="blocked", sort_index=2),
+            _child("SA-B", status="completed", sort_index=1),
+        ]
+        edge = {"id": "SA-B", "direction": "depends-on"}  # no status
+        state = implement_mod._blocked_child_state(
+            children[0], [edge], children
+        )
+        assert state["holds"] is False
+        assert state["stale_block_ids"] == ["SA-B"]
+
+    def test_in_chain_edge_without_status_uses_child_record_when_open(
+        self, implement_mod
+    ):
+        """The same resolution also holds a child whose sibling is open."""
+        children = [
+            _child("SA-A", status="blocked", sort_index=2),
+            _child("SA-B", status="open", sort_index=1),
+        ]
+        edge = {"id": "SA-B", "direction": "depends-on"}  # no status
+        state = implement_mod._blocked_child_state(
+            children[0], [edge], children
+        )
+        assert state == {
+            "holds": True,
+            "blocking_ids": ["SA-B"],
+            "stale_block_ids": [],
+            "unvalidated": False,
+        }
+
+
+class TestClassifyChildPrecedence:
+    """``_classify_child`` precedence: terminal → held → in-progress →
+    skip-blocked → implement (AC1)."""
+
+    def test_blocked_child_with_holding_block_is_skip_blocked(
+        self, implement_mod
+    ):
+        child = _child("SA-A", status="blocked")
+        action = implement_mod._classify_child(
+            child, [_blocker("SA-O", status="open")]
+        )
+        assert action == implement_mod.ACTION_SKIP_BLOCKED == "skip-blocked"
+
+    def test_blocked_child_with_stale_block_is_implementable(self, implement_mod):
+        child = _child("SA-A", status="blocked")
+        action = implement_mod._classify_child(
+            child, [_blocker("SA-T", status="completed")]
+        )
+        assert action == "implement"
+
+    def test_blocked_child_without_edges_is_skip_blocked(self, implement_mod):
+        """Fail closed: an unvalidatable block never defaults to startable."""
+        child = _child("SA-A", status="blocked")
+        assert (
+            implement_mod._classify_child(child, [])
+            == implement_mod.ACTION_SKIP_BLOCKED
+        )
+
+    def test_terminal_status_outranks_a_blocked_hold(self, implement_mod):
+        """A terminal child is never re-implemented, whatever its edges say."""
+        child = _child("SA-A", status="completed")
+        assert (
+            implement_mod._classify_child(
+                child, [_blocker("SA-O", status="open")]
+            )
+            == "skip-terminal"
+        )
+
+    def test_in_progress_status_outranks_a_blocked_hold(self, implement_mod):
+        """An in-progress claim is never clobbered (precedence documented)."""
+        child = _child("SA-A", status="in-progress", assignee="other")
+        assert (
+            implement_mod._classify_child(
+                child, [_blocker("SA-O", status="open")]
+            )
+            == "skip-in-progress"
+        )
+
+
+class TestStaleBlockReporting:
+    """The stale verdict and the held verdict reach the report (AC3)."""
+
+    def test_stale_block_reported_and_child_started(self, implement_mod):
+        children = [_child("SA-A", status="blocked")]
+        blockers = {"SA-A": [_blocker("SA-EXT", status="in_review")]}
+        h = ParentHarness(implement_mod, children, blockers_map=blockers)
+        report = h.run()
+
+        assert h.calls["phase_start"] == ["SA-A"]
+        assert report["stale_blocks"] == [
+            {"id": "SA-A", "blocking_ids": ["SA-EXT"]}
+        ]
+        # The lifecycle status is left to its owner (Q2 = A).
+        assert [call[0] for call in h.calls["update_status"]] == []
+        # The stale finding is recorded on the child, not only in the report.
+        assert any(
+            cid == "SA-A" and "SA-EXT" in text
+            for cid, text in h.calls["comments"]
+        )
+
+    def test_held_block_reported_in_blocked_children(self, implement_mod):
+        children = [_child("SA-A", status="blocked", sort_index=2)]
+        blockers = {"SA-A": [_blocker("SA-EXT", status="open")]}
+        h = ParentHarness(implement_mod, children, blockers_map=blockers)
+        report = h.run()
+
+        assert report["blocked_children"] == ["SA-A"]
+        # The "no startable child" message names the blocking id.
+        assert "SA-EXT" in report["message"]
+
+    def test_unvalidated_block_reported_in_report(self, implement_mod):
+        children = [_child("SA-A", status="blocked", sort_index=2)]
+        h = ParentHarness(implement_mod, children)
+        report = h.run()
+
+        assert [b["id"] for b in report["unvalidated_blocks"]] == ["SA-A"]
+        entry = _entries(report)["SA-A"]
+        assert entry["action"] == "skip-blocked"
+        assert entry.get("blocking_ids") == []
