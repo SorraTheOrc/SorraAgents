@@ -3951,6 +3951,18 @@ parent itself gets no worktree.
   the work item and routes the failure to triage (SA-0MVXUSJ2P009T97H AC4).
   The session does **not** run this check again after `finish` returns.
 
+  - **Tree-keyed lookup (SA-0MWAXC5TD00461FN).** The dev-push gate binds its
+    verdict to the pushed commit's tree SHA with `fingerprint_kind="tree"`
+    (SA-0MW7C6BMZ00931JG). The verification derives that same tree
+    (`git rev-parse <commit>^{tree}`), queries the tree-keyed entry through
+    `query_cached(..., fingerprint=<tree>, fingerprint_kind="tree")` in the
+    pushed-commit checkout and then the main checkout's mirrored cache, and
+    only falls back to the historical loose `HEAD`+dirty query (for legacy
+    entries) on a tree miss. Querying the loose fingerprint alone can never
+    see the gate's tree entry, so it would report a false `missing` on every
+    successful push and auto-file a spurious
+    `[test-failure] post-push full-suite verification` item.
+
   - **If `finish` refused on the verification**, generate the evidence through
     the test skill and re-run `finish` (idempotent — the no-diff path
     converges):

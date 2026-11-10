@@ -971,6 +971,8 @@ def query_cached(
     cwd: str | Path | None = None,
     ttl: float = DEFAULT_TTL_SECONDS,
     test_type: str = "full",
+    fingerprint: str | None = None,
+    fingerprint_kind: str = FINGERPRINT_KIND_WORKTREE,
 ) -> dict[str, Any] | None:
     """Read-only cache query: never executes anything.
 
@@ -982,12 +984,31 @@ def query_cached(
     An indeterminate git state is a miss, never a hit: the cache cannot prove
     the entry was recorded for this tree, and a degraded fingerprint would
     match every dirty tree (WL-0MVPO9P610055UQ3).
+
+    *fingerprint* (default ``None``) queries an explicit fingerprint instead
+    of computing the loose worktree state — normally a would-be-commit (or
+    pushed-commit) tree SHA from :func:`compute_tree_state`. It is paired with
+    *fingerprint_kind* (default ``"worktree"`` for backwards compatibility;
+    pass ``"tree"`` for a tree key) so a read-only consumer can look up the
+    verdict the tree-keyed gate recorded (SA-0MWAXC5TD00461FN). Passing an
+    explicit fingerprint never recomputes the loose state: the entry is looked
+    up under exactly the named key and a mismatched kind is a miss.
     """
     cwd_str = str(Path(cwd or os.getcwd()).resolve())
-    git_state = _fingerprint_for_cache(cwd_str)
-    if git_state is None:
-        return None
-    return lookup(command, git_state, cwd=cwd_str, ttl=ttl, test_type=test_type)
+    if fingerprint is not None:
+        git_state = str(fingerprint)
+    else:
+        git_state = _fingerprint_for_cache(cwd_str)
+        if git_state is None:
+            return None
+    return lookup(
+        command,
+        git_state,
+        cwd=cwd_str,
+        ttl=ttl,
+        test_type=test_type,
+        fingerprint_kind=fingerprint_kind,
+    )
 
 
 # ---------------------------------------------------------------------------

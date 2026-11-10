@@ -1231,6 +1231,53 @@ def test_tree_bound_entry_never_satisfies_a_loose_request(git_repo: Path) -> Non
     assert tree_hit is not None and tree_hit["cached"] is True
 
 
+def test_query_cached_with_explicit_tree_fingerprint_reads_a_tree_entry(
+    git_repo: Path,
+) -> None:
+    """A read-only consumer can look up a tree-keyed verdict (SA-0MWAXC5TD00461FN).
+
+    The dev-push gate records its verdict under the pushed commit's tree SHA
+    with ``fingerprint_kind="tree"``. ``query_cached`` historically only
+    computed the loose worktree fingerprint, so that verdict was invisible to
+    every read-only consumer (post-push verification and the audit path), and
+    post-push verification reported a false ``missing`` verdict on every
+    successful push. Passing the explicit fingerprint + kind makes the tree
+    entry reachable without changing the default (loose) behaviour.
+    """
+    calls: list[str] = []
+    runner = make_runner(calls)
+    tree = gs.run_git(
+        git_repo, ["rev-parse", "HEAD^{tree}"], check=True
+    ).stdout.strip()
+    primed = run_cached(
+        "pytest", cwd=str(git_repo), fingerprint=tree, runner=runner
+    )
+    assert primed["fingerprint_kind"] == "tree"
+    assert calls == [primed["command"]]
+
+    # The default (loose) query stays a miss: a tree entry is never loose
+    # evidence, so the historical semantics are preserved byte for byte.
+    assert query_cached("pytest", cwd=str(git_repo)) is None
+
+    # The explicit tree query finds it, and executes nothing.
+    hit = query_cached(
+        "pytest",
+        cwd=str(git_repo),
+        fingerprint=tree,
+        fingerprint_kind=FINGERPRINT_KIND_TREE,
+    )
+    assert hit is not None and hit["cached"] is True
+    assert hit["fingerprint_kind"] == "tree"
+    assert calls == [primed["command"]], (
+        "a read-only query must never execute the suite"
+    )
+
+    # A fingerprint recorded under the wrong kind is a miss, never a hit.
+    assert query_cached(
+        "pytest", cwd=str(git_repo), fingerprint=tree
+    ) is None
+
+
 # ---------------------------------------------------------------------------
 # Mid-run checkout movement: state_changed_during_run (regression harness)
 # ---------------------------------------------------------------------------

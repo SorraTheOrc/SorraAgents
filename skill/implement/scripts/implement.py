@@ -255,7 +255,7 @@ except ImportError:  # pragma: no cover - older test skill
     _classify_gate_result = None  # type: ignore[assignment]
     _GATE_REMEDIATION = {}  # type: ignore[assignment]
 
-from test_cache import query_cached, run_cached
+from test_cache import FINGERPRINT_KIND_TREE, query_cached, run_cached
 from test_runner import canonicalize_quiet_test_command
 
 # Canonical quiet full-suite commands — identical cache keys to the test
@@ -4864,7 +4864,9 @@ def _assert_remote_name_only(remote: str) -> None:
         )
 
 
-def _full_suite_cache_present(cwd: str) -> bool:
+def _full_suite_cache_present(
+    cwd: str, commit_hash: str | None = None
+) -> bool:
     """Whether a valid full-suite cache entry exists for *cwd*'s git state.
 
     Read-only: queries the test cache for each full-suite command the repo
@@ -4872,13 +4874,28 @@ def _full_suite_cache_present(cwd: str) -> bool:
     an indeterminate git state is a miss — never a silent green. Fail-soft:
     evidence plumbing may never decide a push's outcome
     (SA-0MVUTXJM8006PQY4 AC3/AC4).
+
+    The dev-push gate now binds its verdict to the pushed commit's **tree**
+    (SA-0MW7C6BMZ00931JG), so when *commit_hash* is supplied the tree-keyed
+    entry is queried first. The historical loose-worktree query is kept as a
+    fallback so legacy entries and pre-tree-keying repos still report evidence.
     """
     try:
         commands = _resolve_full_suite_commands(cwd) or []
     except Exception:  # noqa: BLE001 - evidence must never break a push
         return False
+    if not commands:
+        return False
+    tree = _resolve_commit_tree(cwd, commit_hash)
     for command in commands:
         try:
+            if tree is not None and query_cached(
+                command,
+                cwd=cwd,
+                fingerprint=tree,
+                fingerprint_kind=FINGERPRINT_KIND_TREE,
+            ) is not None:
+                return True
             if query_cached(command, cwd=cwd) is not None:
                 return True
         except Exception as exc:  # noqa: BLE001 - a corrupt entry is a miss
@@ -4910,14 +4927,15 @@ def _dev_push_gate_evidence(
         before_present: Whether a valid full-suite entry existed pre-push.
 
     Returns:
-        Dict with ``root``, ``head``, ``pushed`` and ``full_suite``.
+        Dict with ``root``, ``head``, ``pushed``, ``tree`` and ``full_suite``.
     """
     root = str(Path(cwd).resolve())
     head = _resolve_full_commit(cwd, "HEAD") or "unknown"
     pushed = (
         _resolve_full_commit(cwd, commit_hash) if commit_hash else None
     ) or (commit_hash or "unknown")
-    after_present = _full_suite_cache_present(cwd)
+    tree = _resolve_commit_tree(cwd, commit_hash)
+    after_present = _full_suite_cache_present(cwd, commit_hash)
     if before_present:
         classification = "cached"
     elif after_present:
@@ -4928,6 +4946,7 @@ def _dev_push_gate_evidence(
         "root": root,
         "head": head,
         "pushed": pushed,
+        "tree": tree,
         "full_suite": classification,
     }
     line = (
@@ -4999,7 +5018,7 @@ def _post_push_verification_commands(cwd: str) -> tuple[list[str], str]:
 
 
 def _resolve_post_push_verification(
-    worktree_path: str, repo_root: str
+    worktree_path: str, repo_root: str, commit_hash: str | None = None
 ) -> dict[str, Any]:
     """Read-only full-suite verdict for the just-pushed commit (design A).
 
@@ -5013,8 +5032,15 @@ def _resolve_post_push_verification(
     main checkout's cache (``repo_root``) as the documented fallback: the
     pre-push hook mirrors its entry into the main-checkout
     ``.worklog/cache``, while a worktree's own cache directory is separate.
-    The cache lookup binds the verdict to the current git state (HEAD + dirty
-    content), so an entry recorded for another tree can never be served.
+
+    **Tree-keyed first** (SA-0MWAXC5TD00461FN): the dev-push gate binds its
+    verdict to the pushed commit's tree SHA with ``fingerprint_kind="tree"``
+    (SA-0MW7C6BMZ00931JG), so the verification computes that tree from
+    *commit_hash* and queries the tree-keyed entry before falling back to the
+    historical loose-worktree key. Without this the gate's entry — keyed on
+    the tree, not the loose HEAD+dirty fingerprint — was never visible here
+    and every successful push reported a false ``missing`` verdict. The loose
+    query is retained so pre-tree-keying entries still count as evidence.
 
     Verdict vocabulary:
 
@@ -5031,17 +5057,26 @@ def _resolve_post_push_verification(
     Args:
         worktree_path: The checkout that holds the pushed commit.
         repo_root: The main checkout (cache mirror location).
+        commit_hash: The pushed commit (short or full). When given, its tree
+            SHA is the primary cache key; when omitted (or unresolvable) the
+            historical loose-worktree query is used only.
 
     Returns:
         A structured verdict dict (``verdict``, ``success``, ``executed``,
-        ``commands``, ``entries``, ``reason``, ``checked_at``).
+        ``commands``, ``tree``, ``entries``, ``reason``, ``checked_at``).
     """
     commands, reason = _post_push_verification_commands(worktree_path)
+    tree = _resolve_commit_tree(worktree_path, commit_hash) or (
+        _resolve_commit_tree(repo_root, commit_hash)
+        if commit_hash
+        else None
+    )
     verification: dict[str, Any] = {
         "verdict": POST_PUSH_VERDICT_NOT_APPLICABLE,
         "success": True,
         "executed": False,
         "commands": commands,
+        "tree": tree,
         "entries": [],
         "reason": reason,
         "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -5057,7 +5092,20 @@ def _resolve_post_push_verification(
         cached_at: str | None = None
         for cwd in (worktree_path, repo_root):
             try:
-                entry = query_cached(command, cwd=cwd)
+                if tree is not None:
+                    entry = query_cached(
+                        command,
+                        cwd=cwd,
+                        fingerprint=tree,
+                        fingerprint_kind=FINGERPRINT_KIND_TREE,
+                    )
+                    if entry is None:
+                        # Legacy/pre-tree-keying entry fallback: a loose
+                        # worktree entry still counts as evidence for the
+                        # pushed tree.
+                        entry = query_cached(command, cwd=cwd)
+                else:
+                    entry = query_cached(command, cwd=cwd)
             except Exception as exc:  # noqa: BLE001 - a broken cache is a miss
                 LOG.warning(
                     "Post-push verification: cache query failed for %s in "
@@ -5642,7 +5690,9 @@ def git_push_to_dev(
     # executed-vs-cached verdict is observable afterwards (AC3). Read-only and
     # fail-soft: it never decides the push. Taken once so a transport retry is
     # never misreported as "cached" merely because the first attempt executed.
-    before_present = _full_suite_cache_present(cwd)
+    # The pushed commit already exists locally, so the tree-keyed entry the
+    # gate now writes (SA-0MW7C6BMZ00931JG) is visible here too.
+    before_present = _full_suite_cache_present(cwd, commit_hash)
 
     #: Every transport retry this push made, in order. Carried into
     #: ``evidence_out`` (and from there onto ``report["steps"]["push"]``) so a
@@ -7340,6 +7390,33 @@ def _resolve_full_commit(cwd: str, rev: str) -> str | None:
         cwd=cwd,
         check=False,
     )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _resolve_commit_tree(cwd: str, commit: str | None) -> str | None:
+    """The tree SHA of *commit* in *cwd*, or ``None`` when unresolvable.
+
+    The dev-push gate binds its full-suite verdict to the pushed commit's
+    tree (``git rev-parse <commit>^{tree}``, SA-0MW7C6BMZ00931JG), so a
+    read-only consumer that wants to find that verdict must query the cache
+    with exactly this fingerprint and ``fingerprint_kind="tree"``. Fail-soft:
+    an unresolvable tree (missing commit, non-repository, or a git subprocess
+    failure/timeout) returns ``None`` — the caller falls back to the
+    historical loose-worktree query rather than aborting a finish.
+    """
+    if not commit:
+        return None
+    try:
+        result = run_cmd(
+            ["git", "rev-parse", "--verify", f"{commit}^{{tree}}"],
+            cwd=cwd,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        LOG.debug("Cannot resolve the tree of %s in %s: %s", commit, cwd, exc)
+        return None
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None
@@ -12225,7 +12302,7 @@ def phase_finish(
             # runs inside the held, non-terminal ``StatusLifecycle`` window so
             # the item is never an audit-dispatch candidate while it runs.
             post_push_verification = _resolve_post_push_verification(
-                worktree_path, repo_root
+                worktree_path, repo_root, commit_hash
             )
             report["steps"]["post_push_verification"] = post_push_verification
             if post_push_verification["verdict"] not in (

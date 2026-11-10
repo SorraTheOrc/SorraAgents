@@ -201,10 +201,13 @@ TTL (and, for exactness, the recorded `scope`). Therefore:
 - an entry recorded for a **different kind** or a **different tree** is a
   miss;
 - a corrupt or unreadable entry is a miss and never raises into the caller;
-- `query_cached()` remains a read-only **worktree** query: the finish gate's
-tree-bound entry is intentionally not visible to it (the audit's full-suite
-evidence is recorded at the pushed commit's loose state, not at a
-pre-commit staged tree).
+- `query_cached()` remains a read-only query whose **default** is the loose
+  **worktree** fingerprint (byte-for-byte historical behaviour). A tree-aware
+  consumer passes an explicit `fingerprint=<tree sha>` +
+  `fingerprint_kind="tree"` to read a tree-bound entry; the dev-push gate now
+  records its verdict tree-keyed (SA-0MW7C6BMZ00931JG), so post-push
+  verification resolves the pushed commit's tree and queries that entry before
+  falling back to the loose key (SA-0MWAXC5TD00461FN).
 
 ### 0.4. Pre-push gate subject binding (SA-0MVTRBT50005DUEH, tree-keyed by SA-0MW7C6BMZ00931JG)
 
