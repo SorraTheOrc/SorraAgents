@@ -594,7 +594,9 @@ def lookup(
     is never accepted for a differently-identified tree).
 
     Returns a dict with ``stdout``, ``stderr``, ``exit_code``, ``completed_at``
-    (epoch float), ``command`` (normalized), ``git_state``, ``fingerprint_kind``,
+    (epoch float), ``cache_age_seconds`` (how long ago the entry was recorded —
+    the age of the reused verdict, for provenance reporting), ``command``
+    (normalized), ``git_state``, ``fingerprint_kind``,
     ``scope`` (``"full"`` for historical entries lacking the field — see module
     docs), ``test_type`` (``"full"`` for historical entries lacking the field)
     and ``cached: True``. ``interpreter`` names the concrete
@@ -635,6 +637,7 @@ def lookup(
         "stderr": stderr,
         "exit_code": int(meta.get("exit_code", 0)),
         "completed_at": completed_at,
+        "cache_age_seconds": max(0.0, time.time() - completed_at),
         "command": meta.get("command", normalize_test_command(command)),
         "git_state": git_state,
         "fingerprint_kind": fingerprint_kind,

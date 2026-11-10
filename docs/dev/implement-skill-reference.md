@@ -2126,14 +2126,17 @@ exposed as `report["steps"]["push"]["gate_evidence"]` (`root`, `head`,
 `pushed`, `full_suite`) for `--json` consumers. The evidence path executes no
 test command and never turns a gate-accepted push into a failure.
 
-**Cache compatibility.** Cache keys stay path-independent (command + `HEAD` sha
-+ dirty-content hash), but a worktree's cache directory is private and is
-discarded with the tree. So `.githooks/pre-push`'s `mirror_suite_cache` copies
-any entries the fresh worktree cache holds that the main checkout's
+**Cache compatibility.** Cache keys stay path-independent. A worktree's cache
+directory is private and is discarded with the tree. The gate's verdict is
+**tree-keyed** (command + the pushed commit's tree SHA with
+`fingerprint_kind="tree"` — SA-0MW7C6BMZ00931JG), so it is the same entry a
+tree-keyed finish gate records for that tree and either consumer reuses the
+other's verdict. `.githooks/pre-push`'s `mirror_suite_cache` copies any entries
+the fresh worktree cache holds (tree-kind included) that the main checkout's
 `.worklog/cache` lacks (content-addressed, so an identical key is an identical
 run). Without it, pushing from the worktree would lose the pushed commit's
-green `scope: full` entry as far as the main checkout's post-push verification
-and the audit skill (F3) are concerned.
+green `scope: full` tree-kind entry as far as the main checkout's post-push
+verification and the audit skill (F3) are concerned.
 
 The pre-push fast-forward of the main checkout's local parent branch is
 **main-checkout hygiene only** (it keeps the next worktree's base up to date),

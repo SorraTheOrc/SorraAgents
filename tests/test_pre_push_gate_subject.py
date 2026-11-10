@@ -36,6 +36,12 @@ def head(repo: Path) -> str:
     return gs.run_git(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
 
 
+def tree_of(repo: Path, sha: str) -> str:
+    """The 40-char tree SHA of *sha* — the gate's explicit fingerprint."""
+    proc = gs.run_git(repo, ["rev-parse", f"{sha}^{{tree}}"], check=True)
+    return proc.stdout.strip()
+
+
 def add_detached_worktree(repo: Path, path: Path, sha: str) -> Path:
     gs.run_git(repo, ["worktree", "add", "--detach", str(path), sha], check=True)
     return path
@@ -118,9 +124,9 @@ def test_main_checkout_green_entry_does_not_satisfy_a_different_commit(
     The suite must execute, in a checkout of the *pushed* commit, and the
     green entry left behind must be keyed on that commit's clean state.
     """
-    main_state = tc.compute_git_state(gate_repo)
+    actual_state = tc.compute_git_state(gate_repo)
     tc.store(
-        rt.pytest_command(), main_state, cwd=gate_repo,
+        rt.pytest_command(), actual_state, cwd=gate_repo,
         stdout=SUMMARY_OUTPUT, stderr="", exit_code=0, scope="full",
     )
     worktree = add_detached_worktree(gate_repo, tmp_path / "wt", pushed_sha)
@@ -132,15 +138,23 @@ def test_main_checkout_green_entry_does_not_satisfy_a_different_commit(
     assert Path(executed[0]["cwd"]).resolve() == worktree.resolve(), (
         "the suite must run in the pushed commit's checkout"
     )
+    pushed_tree = tree_of(gate_repo, pushed_sha)
     assert "run_tests: gate-subject" in stderr
     assert "pushed=" + pushed_sha in stderr
+    assert f"fingerprint_kind=tree tree={pushed_tree}" in stderr
 
-    pushed_state = tc.compute_git_state(worktree)
-    assert pushed_state != main_state
-    entry = tc.query_cached(rt.pytest_command(), cwd=str(worktree))
-    assert entry is not None, "a green entry must exist at the pushed commit"
+    # The entry the gate wrote is tree-keyed on the pushed commit's tree, in
+    # the same namespace as the finish gate's tree verdicts (AC1/AC5).
+    entry = tc.lookup(
+        rt.pytest_command(),
+        pushed_tree,
+        cwd=str(worktree),
+        fingerprint_kind=tc.FINGERPRINT_KIND_TREE,
+    )
+    assert entry is not None, "a green entry must exist at the pushed tree"
     assert entry["scope"] == "full"
-    assert entry["fingerprint_kind"] == "worktree"
+    assert entry["fingerprint_kind"] == tc.FINGERPRINT_KIND_TREE
+    assert entry["git_state"] == pushed_tree
 
 
 # ── AC5.2: an entry at the pushed commit's clean state IS served ────────────
@@ -150,26 +164,78 @@ def test_green_entry_at_the_pushed_commit_is_served_from_cache(
     gate_repo: Path, pushed_sha: str, executed: list[dict[str, str]],
     tmp_path: Path, capsys: pytest.CaptureFixture,
 ) -> None:
-    """A staged green entry keyed on the pushed clean state is reused verbatim."""
+    """A staged tree-keyed green entry for the pushed tree is reused verbatim."""
     worktree = add_detached_worktree(gate_repo, tmp_path / "wt", pushed_sha)
-    pushed_state = tc.compute_git_state(worktree)
+    pushed_tree = tree_of(gate_repo, pushed_sha)
     tc.store(
-        rt.pytest_command(), pushed_state, cwd=worktree,
+        rt.pytest_command(), pushed_tree, cwd=worktree,
         stdout=SUMMARY_OUTPUT, stderr="", exit_code=0, scope="full",
+        fingerprint_kind=tc.FINGERPRINT_KIND_TREE,
     )
 
     code, payload, stderr = run_gate(capsys, gate_repo, pushed_sha)
 
     assert code == 0, stderr
-    assert not executed, "a green entry at the pushed state must be served cached"
+    assert not executed, "a green entry at the pushed tree must be served cached"
     assert payload["cached"] is True
-    assert payload["cache_entries"][0]["fingerprint_kind"] == "worktree"
+    assert payload["cache_entries"][0]["fingerprint_kind"] == tc.FINGERPRINT_KIND_TREE
     assert payload["cache_entries"][0]["scope"] == "full"
+    assert isinstance(payload["cache_entries"][0]["cache_age_seconds"], (int, float))
+    # AC3: the JSON report carries the same hit/age/tree provenance as stderr.
+    assert payload["gate"]["cache_hit"] is True
+    assert payload["gate"]["fingerprint_kind"] == "tree"
+    assert payload["gate"]["tree"] == pushed_tree
+    assert isinstance(payload["gate"]["cache_age_seconds"], (int, float))
     verdict = [line for line in stderr.splitlines() if line.startswith("run_tests: gate-verdict")]
     assert verdict, stderr
     assert "verdict=cached" in verdict[0]
-    assert f"git_state={pushed_state}" in verdict[0]
-    assert "fingerprint_kind=worktree" in verdict[0]
+    assert f"tree={pushed_tree}" in verdict[0]
+    assert "fingerprint_kind=tree" in verdict[0]
+    assert "cache_hit=true" in verdict[0]
+    assert "cache_age_seconds=" in verdict[0]
+    assert "cache_age_seconds=n/a" not in verdict[0]
+
+
+def test_second_run_for_the_same_tree_is_a_hit(
+    gate_repo: Path, pushed_sha: str, executed: list[dict[str, str]],
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """The gate's own first run for a tree is reused by its second run.
+
+    The first run has no verdict for the pushed tree, so it executes and
+    stores a tree-keyed entry; the immediate second run for the same tree is
+    served that entry without executing, reporting hit plus age (AC3/AC6).
+    """
+    add_detached_worktree(gate_repo, tmp_path / "wt", pushed_sha)
+
+    first_code, first_payload, first_stderr = run_gate(capsys, gate_repo, pushed_sha)
+    assert first_code == 0, first_stderr
+    assert executed, "the first run must execute (no verdict exists yet)"
+    assert first_payload["cached"] is False
+    assert first_payload["gate"]["cache_hit"] is False
+    assert first_payload["gate"]["cache_age_seconds"] is None
+    first_verdict = [
+        line for line in first_stderr.splitlines()
+        if line.startswith("run_tests: gate-verdict")
+    ]
+    assert first_verdict and "verdict=executed" in first_verdict[0]
+    assert "cache_hit=false" in first_verdict[0]
+    assert "cache_age_seconds=n/a" in first_verdict[0]
+
+    executed.clear()
+    second_code, second_payload, second_stderr = run_gate(capsys, gate_repo, pushed_sha)
+    assert second_code == 0, second_stderr
+    assert not executed, "a second run for the same tree must be served cached"
+    assert second_payload["cached"] is True
+    assert second_payload["gate"]["cache_hit"] is True
+    assert isinstance(second_payload["gate"]["cache_age_seconds"], (int, float))
+    second_verdict = [
+        line for line in second_stderr.splitlines()
+        if line.startswith("run_tests: gate-verdict")
+    ]
+    assert second_verdict and "verdict=cached" in second_verdict[0]
+    assert "cache_hit=true" in second_verdict[0]
+    assert "cache_age_seconds=n/a" not in second_verdict[0]
 
 
 # ── AC5.3: a dirty push cwd at the pushed sha still gates the clean tree ────
@@ -216,6 +282,56 @@ def test_unmaterialisable_pushed_commit_refuses_with_actionable_message(
     assert not executed, "no suite may run when the subject cannot be resolved"
     assert "run_tests: gate-refused" in stderr
     assert missing[:12] in stderr
+    assert "TEST_SCOPE_SKIP=1" in stderr
+
+
+def test_head_differs_and_no_clean_checkout_holds_the_commit_refuses(
+    gate_repo: Path, pushed_sha: str, executed: list[dict[str, str]],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """HEAD != local_sha with no clean checkout of it refuses, running nothing.
+
+    The pushed commit exists in the repository (on ``feature``) but the
+    pusher's checkout is on ``dev`` and no worktree holds ``feature``, so the
+    guard cannot bind a checkout at the pushed commit. It must fail closed,
+    naming the resolved HEAD and the remedy.
+    """
+    code, _payload, stderr = run_gate(capsys, gate_repo, pushed_sha)
+
+    assert code == 2
+    assert not executed, "no suite may run when no checkout holds the pushed commit"
+    assert "run_tests: gate-refused" in stderr
+    assert pushed_sha[:12] in stderr
+    assert "HEAD is" in stderr
+    assert "TEST_SCOPE_SKIP=1" in stderr
+
+
+def test_uncomputable_tree_refuses_and_never_falls_back_to_worktree_key(
+    gate_repo: Path, pushed_sha: str, executed: list[dict[str, str]],
+    capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pushed commit whose tree SHA cannot be computed refuses (fail closed).
+
+    The gate must never fall back to a loose worktree key: an unavailable tree
+    means it cannot prove which tree it measured, so it refuses with an
+    actionable message and runs nothing.
+    """
+    real_git_output = rt._git_output
+
+    def fake_git_output(cwd, *args):
+        if args and args[-1].endswith("^{tree}"):
+            return None  # simulate git failing to resolve the tree
+        return real_git_output(cwd, *args)
+
+    monkeypatch.setattr(rt, "_git_output", fake_git_output)
+
+    code, _payload, stderr = run_gate(capsys, gate_repo, pushed_sha)
+
+    assert code == 2
+    assert not executed, "no suite may run without a computable tree"
+    assert "run_tests: gate-refused" in stderr
+    assert "tree SHA cannot be computed" in stderr
+    assert pushed_sha[:12] in stderr
     assert "TEST_SCOPE_SKIP=1" in stderr
 
 

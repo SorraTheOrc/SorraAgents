@@ -19,6 +19,14 @@
 #    echoes them and mirrors the resolved checkout's cache into the main
 #    checkout so post-push verification and the audit can read it.
 #
+#    The verdict is tree-keyed (SA-0MW7C6BMZ00931JG): the runner derives the
+#    pushed commit's tree SHA, binds the verdict with fingerprint_kind=tree and
+#    reports cache hit/miss plus the reused entry's age. The `gate-subject` and
+#    `gate-verdict` lines the hook echoes below therefore carry `tree=`,
+#    `fingerprint_kind=tree`, `cache_hit=` and `cache_age_seconds=`, so a
+#    served verdict is visible to the pusher. The pushed-commit guard itself is
+#    unchanged.
+#
 # Set WORKLOG_SKIP_PRE_PUSH=1 to bypass worklog sync.
 # Set BRANCH_POLICY_SKIP=1 to bypass branch policy check (not recommended).
 # Set CONTEXT_BUDGET_SKIP=1 to bypass the context-budget gate (not recommended).
@@ -199,7 +207,8 @@ if [ "$need_full_suite" = "1" ] && [ "$TEST_SCOPE_SKIP" != "1" ]; then
       fi
     fi
     # Surface the runner's gate provenance/refusal lines to the pusher: which
-    # state was validated, and executed-vs-cached (AC3).
+    # state was validated, whether it was executed or served cached, and (for
+    # a tree-keyed hit) the reused entry's age (AC3, SA-0MW7C6BMZ00931JG).
     grep '^run_tests: gate-' "$gate_err" >&2 || true
     if [ "$gate_status" -eq 0 ]; then
       # A green *test gate* is not a successful push: git still has to send

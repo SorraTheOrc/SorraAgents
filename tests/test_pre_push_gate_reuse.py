@@ -1,18 +1,17 @@
 """Cross-consumer reuse of a tree-keyed full-suite verdict by the dev-push gate.
 
-Test-first baseline (SA-0MW7C6A9R000PD98) for parent SA-0MVXUCGPK003G2KV
-AC3/AC7: a green full-suite verdict recorded for tree *T* by a tree-keyed
-caller (the finish gate's ``run_cached(..., fingerprint=T)`` path) is **not**
-served to the pre-push gate for the same *T* on today's code — the gate still
-keys on the resolved checkout's loose worktree state
-(``GATE_SUBJECT_PREFIX`` hard-codes ``fingerprint_kind=worktree``), so the push
-executes the identical suite a second time.
+Proof that a green full-suite verdict recorded for tree *T* by a tree-keyed
+caller (the finish gate's ``run_cached(..., fingerprint=T)`` path) **is**
+served to the pre-push gate for the same *T* (parent SA-0MVXUCGPK003G2KV
+AC3/AC7). This started life as the F2 baseline (SA-0MW7C6A9R000PD98) that
+asserted the opposite — the gate then keyed on the resolved checkout's loose
+worktree state (``GATE_SUBJECT_PREFIX`` hard-coded
+``fingerprint_kind=worktree``), so the push executed the identical suite a
+second time. F4 (SA-0MW7C6BMZ00931JG) keys the gate on the pushed commit's
+tree; the baseline assertion is **flipped, not deleted**.
 
 The fixture is hermetic (temp git repo, fake suite runner, isolated semaphore
-namespace) and green **on landing**: the baseline assertion is about today's
-behaviour. The post-fix expectation (a hit for the same *T*, a miss for a
-different *T′*) is documented next to each assertion so F4
-(SA-0MW7C6BMZ00931JG) flips the baseline instead of adding new coverage.
+namespace). A same-tree run is a hit; a different tree *T′* stays a miss.
 
 ``executed`` vs ``cached`` is driven by staged cache entries and fake runners
 (never wall-clock timing), following
@@ -157,29 +156,24 @@ def run_gate(
     return code, payload, captured.err
 
 
-# ── The duplicate-suite vector (AC3/AC7 baseline) ─────────────────────────────
+# ── The duplicate-suite vector, resolved (AC2/AC3) ───────────────────────────
 
 
-def test_same_tree_keyed_verdict_is_a_miss_for_the_gate_today(
+def test_same_tree_keyed_verdict_is_served_to_the_gate(
     gate_repo: Path,
     pushed_sha: str,
     executed: list[dict[str, str]],
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """A green tree-keyed verdict for *T* does NOT serve the gate for the same *T*.
+    """A green tree-keyed verdict for *T* IS served to the gate for the same *T*.
 
-    ── duplicate-suite vector (SA-0MW7C6A9R000PD98) ──
-    A green full-suite verdict recorded for tree *T* by a tree-keyed caller
-    (the finish gate's ``run_cached(..., fingerprint=T)`` path) is **not**
-    served to the pre-push gate for the same *T*: the gate still keys its
-    lookup on the resolved checkout's loose worktree state
-    (``GATE_SUBJECT_PREFIX`` hard-codes ``fingerprint_kind=worktree``), so the
-    push pays for the suite twice — two consumers, one tree, two runs.
-
-    POST-FIX EXPECTATION (F4, SA-0MW7C6BMZ00931JG): the gate keys on the
-    pushed commit's tree, looks up ``fingerprint_kind="tree"`` for the same
-    *T*, and is served the entry recorded below — ``executed`` stays empty and
-    ``payload["cached"]`` is True. This assertion flips, it is not deleted.
+    ── flipped F2 baseline (SA-0MW7C6A9R000PD98) ──
+    The gate now keys on the pushed commit's tree SHA
+    (``fingerprint_kind="tree"``), so the verdict the finish gate's
+    ``run_cached(..., fingerprint=T)`` path recorded for *T* is reused for the
+    very same *T*: the push does not pay for the suite twice. (Before F4 this
+    assertion held the opposite: ``executed`` was non-empty because the gate
+    keyed on the loose worktree state.)
     """
     pushed_tree = tree_of(gate_repo, pushed_sha)
     record_tree_verdict(gate_repo, pushed_tree)
@@ -187,25 +181,31 @@ def test_same_tree_keyed_verdict_is_a_miss_for_the_gate_today(
     code, payload, stderr = run_gate(capsys, gate_repo, pushed_sha)
 
     assert code == 0, stderr
-    assert executed, (
-        "baseline: even though a green full-suite verdict exists for this very "
-        "tree (recorded above through run_cached(..., fingerprint=T)), the gate "
-        "does not reuse it — duplicate-suite vector (SA-0MW7C6A9R000PD98). "
-        "F4 flips: `executed` must be empty."
+    assert not executed, (
+        "the gate must serve the tree-keyed verdict recorded above — a second "
+        "suite run for the same tree is the duplicate-suite defect "
+        "(SA-0MW7C6A9R000PD98) this item fixes."
     )
-    assert payload.get("cached") is False
-    # The gate re-ran the suite and stored a SECOND entry — under its own
-    # worktree key, not the tree key above: the same full suite paid twice.
-    rerun_entry = tc.query_cached(rt.pytest_command(), cwd=str(gate_repo))
-    assert rerun_entry is not None, "the gate must have stored its own entry"
-    assert rerun_entry["fingerprint_kind"] == tc.FINGERPRINT_KIND_WORKTREE
-    assert rerun_entry["git_state"] != pushed_tree
+    assert payload.get("cached") is True
+    assert payload["gate"]["cache_hit"] is True
+    assert payload["gate"]["tree"] == pushed_tree
+    served = tc.lookup(
+        rt.pytest_command(),
+        pushed_tree,
+        cwd=str(gate_repo),
+        fingerprint_kind=tc.FINGERPRINT_KIND_TREE,
+    )
+    assert served is not None, "the tree-keyed verdict must be present"
+    assert payload["cache_entries"][0]["fingerprint_kind"] == tc.FINGERPRINT_KIND_TREE
+    assert payload["cache_entries"][0]["git_state"] == pushed_tree
     verdict = [
         line
         for line in stderr.splitlines()
         if line.startswith("run_tests: gate-verdict")
     ]
-    assert verdict and "verdict=executed" in verdict[0]
+    assert verdict and "verdict=cached" in verdict[0]
+    assert "cache_hit=true" in verdict[0]
+    assert f"tree={pushed_tree}" in verdict[0]
 
 
 # ── AC5: the recording side works — the defect is the gate's key ─────────────
@@ -279,6 +279,12 @@ def test_different_tree_verdict_is_never_served_to_the_gate(
     other_tree = tree_of(gate_repo, other_sha)
     assert pushed_tree != other_tree, "the fixture must exercise two distinct trees"
     record_tree_verdict(gate_repo, pushed_tree)  # only *T* has a verdict
+    assert tc.lookup(
+        rt.pytest_command(),
+        other_tree,
+        cwd=str(gate_repo),
+        fingerprint_kind=tc.FINGERPRINT_KIND_TREE,
+    ) is None, "no verdict may exist for T' before the gate runs"
 
     # The other tree's commit is the main checkout's HEAD: the gate binds it
     # in place, same cache dir, and must STILL execute (no verdict for T′).
@@ -289,9 +295,13 @@ def test_different_tree_verdict_is_never_served_to_the_gate(
     assert code == 0, stderr
     assert executed, "no verdict exists for tree T'; the suite must run"
     assert payload.get("cached") is False
+    assert payload["gate"]["cache_hit"] is False
+    assert "cache_hit=false" in stderr
+    # The gate stored a FRESH verdict for T′ (it never served T's verdict for
+    # a different tree); the earlier T verdict is untouched.
     assert tc.lookup(
         rt.pytest_command(),
         other_tree,
         cwd=str(gate_repo),
         fingerprint_kind=tc.FINGERPRINT_KIND_TREE,
-    ) is None
+    ) is not None

@@ -154,10 +154,8 @@ from test_cache import (
     DEFAULT_TTL_SECONDS,
     STATE_CHANGED_EXIT_CODE,
     STATE_CHANGED_NOTICE_CODE,
-    GitStateUnavailable,
     Runner,
     _default_runner,
-    compute_git_state,
     is_worktree_clean,
     query_cached,
     run_cached,
@@ -2611,14 +2609,18 @@ def _cache_entry_metadata(
     """Reportable metadata of the cache entry a verdict was served from.
 
     ``run`` is a ``run_cached`` result (a cache hit). The returned mapping
-    carries the entry's ``command``, ``completed_at`` (epoch float), ``scope``
-    and ``fingerprint_kind`` so a consumer — the finish gate's report, a
-    completion comment, an auditor — can state *what* was reused rather than
-    only that something was (SA-0MVQHVJEX0071R7G).
+    carries the entry's ``command``, ``completed_at`` (epoch float),
+    ``cache_age_seconds`` (its age at reporting time), ``git_state`` (the
+    fingerprint it is keyed on), ``scope`` and ``fingerprint_kind`` so a
+    consumer — the finish gate's report, a completion comment, an auditor —
+    can state *what* was reused rather than only that something was
+    (SA-0MVQHVJEX0071R7G, SA-0MW7C6BMZ00931JG).
     """
     return {
         "command": run.get("command") or command,
         "completed_at": run.get("completed_at", 0),
+        "cache_age_seconds": run.get("cache_age_seconds"),
+        "git_state": run.get("git_state", ""),
         "scope": run.get("scope", "full"),
         "fingerprint_kind": run.get("fingerprint_kind", ""),
     }
@@ -3361,14 +3363,22 @@ def resolve_gate_subject(
     fresh checkout has no installed dependencies, so suite commands could fail
     for reasons unrelated to the pushed tree.
 
+    The pushed commit's **tree** SHA (``git rev-parse <commit>^{tree}``) is
+    derived as part of the evidence (SA-0MW7C6BMZ00931JG). It is the explicit
+    fingerprint the gate binds its verdict to, so the entry lands in the
+    ``fingerprint_kind="tree"`` namespace shared with the finish gate and is
+    reusable by any tree-keyed consumer. A tree that cannot be computed is a
+    refusal, never a fallback to the loose worktree key.
+
     Returns:
         ``(root, evidence)`` where *root* is the checkout to run/cache against
-        and *evidence* carries ``pushed`` (full sha), ``root`` and ``checkout``
-        (``"in-place"`` or ``"worktree"``).
+        and *evidence* carries ``pushed`` (full sha), ``tree`` (the pushed
+        commit's tree sha), ``root`` and ``checkout`` (``"in-place"`` or
+        ``"worktree"``).
 
     Raises:
-        GateSubjectError: when the commit is not present locally, or no clean
-            checkout holds it.
+        GateSubjectError: when the commit is not present locally, its tree
+            cannot be computed, or no clean checkout holds it.
     """
     root = Path(project_root).resolve()
     commit = (gate_commit or "").strip()
@@ -3392,11 +3402,29 @@ def resolve_gate_subject(
             f"holds it). {escape}"
         )
 
+    # The pushed commit's tree is the fingerprint the verdict is bound to
+    # (SA-0MW7C6BMZ00931JG). It must be computable: an unavailable tree means
+    # the gate cannot prove which tree it measured, so it refuses rather than
+    # falling back to a loose worktree key (the cache's provenance contract).
+    tree = (_git_output(root, "rev-parse", f"{full}^{{tree}}") or "").strip()
+    if not tree:
+        raise GateSubjectError(
+            f"pushed commit {full[:12]} is present in {root} but its tree SHA "
+            f"cannot be computed (`git rev-parse {full[:12]}^{{tree}}` failed), so "
+            "the gate cannot bind its verdict to the pushed tree. "
+            f"{escape}"
+        )
+
     rejected: list[str] = []
     head = (_git_output(root, "rev-parse", "HEAD") or "").strip()
     if head == full:
         if is_worktree_clean(root):
-            return root, {"pushed": full, "root": str(root), "checkout": "in-place"}
+            return root, {
+                "pushed": full,
+                "tree": tree,
+                "root": str(root),
+                "checkout": "in-place",
+            }
         rejected.append(f"{root} (HEAD matches, but the checkout has uncommitted changes)")
     else:
         rejected.append(f"{root} (HEAD is {head[:12] or 'unknown'})")
@@ -3411,6 +3439,7 @@ def resolve_gate_subject(
         if is_worktree_clean(candidate):
             return candidate.resolve(), {
                 "pushed": full,
+                "tree": tree,
                 "root": str(candidate.resolve()),
                 "checkout": "worktree",
             }
@@ -3431,28 +3460,73 @@ def _emit_gate_subject(evidence: dict[str, Any]) -> None:
 
     The root goes on its own line so a path containing spaces survives the
     hook's parse (`.githooks/pre-push` takes the rest of the line verbatim).
+
+    The gate is tree-keyed (SA-0MW7C6BMZ00931JG): it reports the pushed
+    commit's ``tree`` and ``fingerprint_kind=tree`` so the pusher can see the
+    verdict belongs to the pushed tree, not the loose checkout it resolved.
     """
     print(
         f"{GATE_SUBJECT_PREFIX}pushed={evidence['pushed']} "
-        f"checkout={evidence['checkout']} fingerprint_kind=worktree",
+        f"checkout={evidence['checkout']} fingerprint_kind=tree "
+        f"tree={evidence['tree']}",
         file=sys.stderr,
     )
     print(f"{GATE_ROOT_PREFIX}{evidence['root']}", file=sys.stderr)
 
 
-def _emit_gate_verdict(evidence: dict[str, Any], result: dict[str, Any]) -> None:
-    """Print executed-vs-cached plus the cache state the verdict belongs to."""
-    try:
-        state = compute_git_state(evidence["root"], strict=True)
-    except GitStateUnavailable:
-        state = "unavailable"
+def _gate_verdict_facts(
+    evidence: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
+    """The gate's verdict provenance as structured facts.
+
+    Shared by the ``run_tests: gate-verdict`` stderr line and the gate's JSON
+    ``gate`` object, so both report the same ``cache_hit``,
+    ``cache_age_seconds``, ``fingerprint_kind`` and ``tree``
+    (SA-0MW7C6BMZ00931JG AC3). ``cache_age_seconds`` is ``None`` on a miss
+    (nothing was reused) and the age of the **oldest** reused entry on a hit —
+    the weakest evidence in the aggregate.
+    """
     entries = result.get("cache_entries") or []
     kinds = sorted({entry.get("fingerprint_kind") or "" for entry in entries} - {""})
+    cache_hit = bool(result.get("cached"))
+    ages = [
+        float(entry["cache_age_seconds"])
+        for entry in entries
+        if isinstance(entry.get("cache_age_seconds"), (int, float))
+    ]
+    return {
+        "verdict": "cached" if cache_hit else "executed",
+        "cache_hit": cache_hit,
+        "cache_age_seconds": max(ages) if ages else None,
+        "fingerprint_kind": ",".join(kinds) or "tree",
+        "entries": len(entries),
+        "pushed": evidence["pushed"],
+        "tree": evidence["tree"],
+    }
+
+
+def _emit_gate_verdict(evidence: dict[str, Any], result: dict[str, Any]) -> None:
+    """Print executed-vs-cached plus the cache state the verdict belongs to.
+
+    Reports, in the ``run_tests: gate-verdict`` provenance line the hook
+    echoes, whether the verdict was served from the cache (``cache_hit``), the
+    age in seconds of the reused entry (``cache_age_seconds`` — ``n/a`` on a
+    miss) and that the verdict is bound to the pushed tree
+    (``fingerprint_kind=tree``, ``tree=<sha>``). This makes a reused verdict
+    visible and attributable to the pusher (SA-0MW7C6BMZ00931JG AC3).
+    """
+    facts = _gate_verdict_facts(evidence, result)
+    age = (
+        "n/a"
+        if facts["cache_age_seconds"] is None
+        else f"{facts['cache_age_seconds']:.1f}"
+    )
     print(
-        f"{GATE_VERDICT_PREFIX}verdict={'cached' if result.get('cached') else 'executed'} "
-        f"sha={evidence['pushed']} git_state={state} "
-        f"fingerprint_kind={','.join(kinds) or 'worktree'} "
-        f"entries={len(entries)} cached={len(entries)}",
+        f"{GATE_VERDICT_PREFIX}verdict={facts['verdict']} "
+        f"sha={evidence['pushed']} tree={evidence['tree']} "
+        f"fingerprint_kind={facts['fingerprint_kind']} "
+        f"cache_hit={'true' if facts['cache_hit'] else 'false'} "
+        f"cache_age_seconds={age} entries={facts['entries']}",
         file=sys.stderr,
     )
 
@@ -3658,8 +3732,12 @@ def build_parser() -> argparse.ArgumentParser:
         "being pushed. The gate resolves a checkout whose HEAD is SHA with no "
         "dirty paths (in place, else a clean `git worktree list` checkout) and "
         "runs/caches the suite there, so a cache entry computed from any other "
-        "state can never satisfy it. Refuses (exit 2) when no clean checkout "
-        "holds SHA. Omitted: historical behaviour, unchanged.",
+        "state can never satisfy it. The verdict is bound to the pushed "
+        "commit's tree SHA (`git rev-parse SHA^{tree}`) and stored/looked up "
+        "with fingerprint_kind=\"tree\" (SA-0MW7C6BMZ00931JG), so a tree-keyed "
+        "verdict from another consumer (e.g. the finish gate) is reused for the "
+        "same tree. Refuses (exit 2) when no clean checkout holds SHA or its "
+        "tree cannot be computed. Omitted: historical behaviour, unchanged.",
     )
     parser.add_argument(
         "--fingerprint",
@@ -4045,6 +4123,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"run_tests: --fingerprint: {exc}", file=sys.stderr)
             return 2
 
+    # A gate run is tree-keyed (SA-0MW7C6BMZ00931JG): the pushed commit's tree
+    # SHA is the explicit fingerprint, so the verdict is stored and looked up
+    # in the same ``fingerprint_kind="tree"`` namespace as the finish gate's
+    # tree verdicts — a verdict recorded for the same tree by either consumer
+    # serves the other. The derived tree is authoritative; a conflicting
+    # explicit --fingerprint is refused rather than silently overridden.
+    if gate_evidence is not None:
+        gate_tree = str(gate_evidence["tree"])
+        if fingerprint is not None and fingerprint != gate_tree:
+            print(
+                f"run_tests: --gate-commit binds the run to pushed tree "
+                f"{gate_tree}, but --fingerprint names {fingerprint}. They must "
+                "match; omit --fingerprint (the pushed commit's tree is the "
+                "gate's fingerprint).",
+                file=sys.stderr,
+            )
+            return 2
+        fingerprint = gate_tree
+
     # --group: validate group name and route to group-based execution
     group_name = args.group
     if group_name is not None:
@@ -4180,6 +4277,11 @@ def main(argv: list[str] | None = None) -> int:
 
         if gate_evidence is not None:
             _emit_gate_verdict(gate_evidence, result)
+            # The same provenance is carried in the JSON report under
+            # ``gate`` so a served verdict (hit/miss plus the reused entry's
+            # age) is machine-readable, not only echoed on stderr
+            # (SA-0MW7C6BMZ00931JG AC3).
+            result["gate"] = _gate_verdict_facts(gate_evidence, result)
 
         if args.rerun_failures and result["failures"]:
             with Timer("rerun_failures"):

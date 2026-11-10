@@ -147,10 +147,12 @@ a run to a caller-supplied fingerprint (normally a would-be-commit tree SHA):
 - the supplied value is stored **as-is** after the run — it describes the tree
   the caller named and cannot be recomputed from a possibly-churned worktree;
 - callers that pass nothing keep the historical worktree keys byte for byte
-  (test-skill CLI, audit). The pre-push gate is the one worktree-kind caller
-  that *is* bound to a subject: it passes `--gate-commit <sha>` (see
-  *0.4 Pre-push gate subject binding* below) and its key is the pushed
-  commit's own clean worktree state.
+  (test-skill CLI, audit). The pre-push gate is a *tree-keyed* caller
+  (SA-0MW7C6BMZ00931JG): it derives the pushed commit's tree SHA and passes
+  it as `fingerprint` (see *0.4 Pre-push gate subject binding* below), so its
+  verdict lands in the same `fingerprint_kind="tree"` namespace as the finish
+  gate's tree verdicts and either consumer's verdict serves the other for the
+  same tree.
 
 `lookup(..., fingerprint_kind=...)` and `store(..., fingerprint_kind=...)`
 expose the same distinction to callers that manage execution themselves.
@@ -186,8 +188,9 @@ and the loose `compute_git_state` value is never computed. The surface is
   and never the reverse.
 - *Unchanged default.* Omitting the flag keeps the historical loose-worktree
   keys byte for byte (`command + fingerprint (+ test_type)`, kind
-  `"worktree"`) for every existing caller — the test-skill CLI, audit and
-  the pre-push gate.
+  `"worktree"`) for every existing caller — the test-skill CLI and audit.
+  The pre-push gate is tree-keyed (it derives the pushed tree), not a
+  worktree caller; see *0.4*.
 
 **Legacy and foreign entries miss (fail closed).** A cache hit requires the
 command, `test_type`, `fingerprint_kind` and fingerprint to match, plus the
@@ -203,7 +206,7 @@ tree-bound entry is intentionally not visible to it (the audit's full-suite
 evidence is recorded at the pushed commit's loose state, not at a
 pre-commit staged tree).
 
-### 0.4. Pre-push gate subject binding (SA-0MVTRBT50005DUEH)
+### 0.4. Pre-push gate subject binding (SA-0MVTRBT50005DUEH, tree-keyed by SA-0MW7C6BMZ00931JG)
 
 SA-0MVTRBT50005DUEH. The dev-push pre-push gate is evidence about the commit
 it pushes. `git` hands the hook `<local_ref> <local_sha> <remote_ref>
@@ -220,31 +223,55 @@ runner resolves **which checkout to measure** before anything else:
    candidate tried and why it was rejected, and `TEST_SCOPE_SKIP=1`.
 
 The resolved checkout replaces the project root for the whole run, so command
-resolution, the per-command timeout, the suite execution and the **cache key**
-all describe the pushed commit. A green entry recorded for any other state —
-including the main checkout's own `HEAD` plus its dirty `.worklog/` churn —
-is therefore a miss and the suite executes. No temporary worktree is
-materialised (a fresh checkout has no installed dependencies, so a suite
-failure there would not be about the pushed tree); pushing from a clean
-worktree of the commit, or from a clean checkout at it, is the supported
-remedy.
+resolution, the per-command timeout and the suite execution all describe the
+pushed commit.
 
-The gate reports the state it validated on **stderr** (stable prefixes; the
-hook echoes them to the pusher):
+**The verdict is keyed on the pushed commit's tree** (SA-0MW7C6BMZ00931JG).
+`resolve_gate_subject()` derives `git rev-parse <commit>^{tree}` and the runner
+passes it as the explicit `fingerprint`, so the entry is stored and looked up
+with `fingerprint_kind="tree"` — the same namespace as the finish gate's tree
+verdicts. A full-suite verdict recorded for tree *T* by either consumer is
+served to the other for the same *T* (a second push for an unchanged commit
+reuses the finish gate's verdict instead of running the suite again); a
+different tree *T′* misses and executes fresh. A pushed commit whose tree SHA
+**cannot be computed** is a refusal (exit 2), never a fallback to a loose
+worktree key. A green entry recorded for any other state — including the main
+checkout's own `HEAD` plus its dirty churn, a loose worktree entry, or another
+tree — is a miss.
+
+No temporary worktree is materialised (a fresh checkout has no installed
+dependencies, so a suite failure there would not be about the pushed tree);
+pushing from a clean worktree of the commit, or from a clean checkout at it,
+is the supported remedy.
+
+The gate reports the tree and the cache verdict on **stderr** (stable
+prefixes; the hook echoes them to the pusher):
 
 ```text
-run_tests: gate-subject pushed=<sha> checkout=<in-place|worktree> fingerprint_kind=worktree
+run_tests: gate-subject pushed=<sha> checkout=<in-place|worktree> fingerprint_kind=tree tree=<tree sha>
 run_tests: gate-root <absolute path of the resolved checkout>
-run_tests: gate-verdict verdict=<cached|executed> sha=<sha> git_state=<state> fingerprint_kind=worktree entries=<n> cached=<n>
+run_tests: gate-verdict verdict=<cached|executed> sha=<sha> tree=<tree sha> fingerprint_kind=tree cache_hit=<true|false> cache_age_seconds=<age|n/a> entries=<n>
 run_tests: gate-refused <actionable message including TEST_SCOPE_SKIP=1>
 ```
 
+`cache_hit` is `true` when the verdict was served from the cache, and
+`cache_age_seconds` is the age of the oldest reused entry (`n/a` on a miss —
+nothing was reused). The same facts appear in the JSON report under `gate`
+(`cache_hit`, `cache_age_seconds`, `fingerprint_kind`, `tree`, `pushed`,
+`entries`) and in each `cache_entries[]` item (`git_state`, `cache_age_seconds`).
+
+Every refusal path fails closed — a pushed-commit guard failure (`HEAD !=
+local_sha` with no clean checkout holding the commit, a dirty checkout) or an
+uncomputable tree SHA — with a non-zero exit, nothing executed, and a message
+naming the commit, the resolved `HEAD`, the remedy and `TEST_SCOPE_SKIP=1`;
+none falls back to a loose worktree key.
+
 The `gate-root` line is a contract with `.githooks/pre-push`, which mirrors
-that checkout's cache entries into the main checkout's `.worklog/cache` —
-keys are content-addressed, so copying an entry the main cache lacks is
-always safe. Without `--gate-commit` the runner behaves exactly as before
-(no subject resolution, no refusal, no `gate-*` lines), so every other
-caller and every hook that does not forward the sha is unchanged.
+that checkout's cache entries (tree-kind included) into the main checkout's
+`.worklog/cache` — keys are content-addressed, so copying an entry the main
+cache lacks is always safe. Without `--gate-commit` the runner behaves exactly
+as before (no subject resolution, no refusal, no `gate-*` lines), so every
+other caller and every hook that does not forward the sha is unchanged.
 
 **Propagation is per project.** `core.hooksPath=.githooks` makes the hook a
 per-project file, so only a hook that forwards the sha is protected; the
