@@ -6,11 +6,9 @@ These tests are the executable form of the parent's ACs 1–5: a child whose
 ``status`` is ``blocked`` must be **re-validated** before it is started or
 skipped, and a stale block must never strand the child forever.
 
-**Cases (a), (b), (c), (e) and the fail-closed case are green** after C2
-(``skip-blocked`` via dep-edge re-validation) and C3 (prose / cross-project
-blockers) landed. Case (d) (``drive`` propagation) stays red until C4 and
-keeps ``xfail(strict=False)`` so the suite stays green while its contract is
-documented.
+**All cases are green** after C2 (``skip-blocked`` via dep-edge
+re-validation), C3 (prose / cross-project blockers) and C4 (``drive``
+propagation) landed.
 
 Every test drives the production ``phase_parent`` / ``phase_drive`` through the
 shared harnesses (``tests.test_implement_parent_safety.ParentHarness`` and
@@ -39,13 +37,6 @@ from tests.test_implement_parent_safety import ParentHarness, _child
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
 
-#: Remaining contract test, red until C4 (drive propagation).
-_RED = pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "contract test: expected red until C4 (drive propagation) lands"
-    ),
-)
 
 
 
@@ -229,7 +220,6 @@ class TestProseBlocker:
 
 
 class TestDrivePropagation:
-    @_RED
     def test_drive_propagates_skip_blocked_and_blocking_ids(self, implement_mod):
         """No session is spawned for a skip-blocked child and the drive
         report carries the child id plus its blocking ids."""
@@ -698,3 +688,128 @@ class TestProseBlockerRevalidation:
 
         assert h.calls["phase_start"] == ["SA-A"]
         assert "unresolved_blockers" not in report
+
+
+class TestDriveSkipBlockedGuard:
+    """C4: ``drive`` never spawns a ``skip-blocked`` child (AC1/AC2/AC3)."""
+
+    def _verdict(self) -> dict:
+        return {
+            "id": "SA-A",
+            "status": "blocked",
+            "action": "skip-blocked",
+            "blocking_ids": ["SA-EXT"],
+        }
+
+    def test_no_spawn_when_the_parent_offers_a_skip_blocked_child(
+        self, implement_mod
+    ):
+        """Defence in depth: even if the parent offered a skip-blocked child as
+        ``next_child``, drive refuses to spawn its session."""
+        m = implement_mod
+        runner = ScriptedParent([
+            {
+                "success": True,
+                "next_child": "SA-A",
+                "worktree_path": "/wt/SA-A",
+                "children_processed": [self._verdict()],
+            },
+        ])
+        spawner = RecordingSpawner()
+        report = _run_drive(
+            m, runner, spawner, children=[_child("SA-A", status="blocked")]
+        )
+
+        assert spawner.calls == []
+        assert report["sessions_spawned"] == 0
+        assert report["children_driven"] == []
+        assert report["blocked_children"] == ["SA-A"]
+        assert report["blocked_child_details"][0]["blocking_ids"] == ["SA-EXT"]
+        assert "SA-EXT" in report["message"]
+
+    def test_no_startable_child_report_carries_rich_blocked_entries(
+        self, implement_mod
+    ):
+        """The no-startable-child path forwards each verdict with its status,
+        blocking ids and the unvalidated flag."""
+        m = implement_mod
+        runner = ScriptedParent([
+            {
+                "success": True,
+                "next_child": None,
+                "blocked_children": ["SA-A", "SA-B"],
+                "children_processed": [
+                    self._verdict(),
+                    {
+                        "id": "SA-B",
+                        "status": "blocked",
+                        "action": "skip-blocked",
+                        "blocking_ids": [],
+                        "unvalidated": True,
+                    },
+                ],
+                "message": "No child of P is currently startable: two blocked.",
+            },
+        ])
+        spawner = RecordingSpawner()
+        report = _run_drive(
+            m,
+            runner,
+            spawner,
+            children=[
+                _child("SA-A", status="blocked"),
+                _child("SA-B", status="blocked"),
+            ],
+        )
+
+        assert spawner.calls == []
+        details = {
+            entry["id"]: entry
+            for entry in report["blocked_child_details"]
+        }
+        assert details["SA-A"]["blocking_ids"] == ["SA-EXT"]
+        assert details["SA-A"]["status"] == "blocked"
+        assert details["SA-B"]["unvalidated"] is True
+        # The message names every blocking id, not just "blocked or held".
+        assert "SA-EXT" in report["message"]
+        assert "SA-B (unvalidated block)" in report["message"]
+
+    def test_stale_and_unvalidated_verdicts_are_forwarded(
+        self, implement_mod
+    ):
+        """``stale_blocks`` / ``unvalidated_blocks`` / ``unresolved_blockers``
+        reach the drive report unchanged."""
+        m = implement_mod
+        runner = ScriptedParent([
+            {
+                "success": True,
+                "next_child": None,
+                "blocked_children": ["SA-B"],
+                "children_processed": [
+                    {
+                        "id": "SA-B",
+                        "status": "blocked",
+                        "action": "skip-blocked",
+                        "blocking_ids": [],
+                        "unvalidated": True,
+                    },
+                ],
+                "stale_blocks": [
+                    {"id": "SA-S", "blocking_ids": ["SA-LANDED"]},
+                ],
+                "unvalidated_blocks": [
+                    {"id": "SA-B", "reason": "no resolvable blocker"},
+                ],
+                "unresolved_blockers": {"SA-U": ["OSL-EXTERNAL"]},
+            },
+        ])
+        spawner = RecordingSpawner()
+        report = _run_drive(m, runner, spawner, children=[_child("SA-B")])
+
+        assert report["stale_blocks"] == [
+            {"id": "SA-S", "blocking_ids": ["SA-LANDED"]}
+        ]
+        assert report["unvalidated_blocks"] == [
+            {"id": "SA-B", "reason": "no resolvable blocker"}
+        ]
+        assert report["unresolved_blockers"] == {"SA-U": ["OSL-EXTERNAL"]}

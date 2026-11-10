@@ -16258,6 +16258,69 @@ def _sweep_terminal_child_worktrees(
         report["worktree_sweep"] = sweep
 
 
+def _skip_blocked_details(parent_report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-child ``skip-blocked`` verdicts carried by a parent report.
+
+    ``phase_parent`` reports a still-valid ``blocked`` hold as
+    ``action: "skip-blocked"`` with the ``blocking_ids`` that hold it. The
+    drive loop must carry those verdicts — with the child id, status, ids and
+    the stale/unvalidated flags — into its own report, and must never spawn a
+    session for such a child (SA-0MVTUFL0U0000NV2 AC1/AC2/AC3).
+
+    Args:
+        parent_report: A ``phase_parent`` report.
+
+    Returns:
+        One entry per ``skip-blocked`` child (empty when none was reported).
+    """
+    stale: dict[str, list[str]] = {
+        str(entry.get("id")): list(entry.get("blocking_ids") or [])
+        for entry in parent_report.get("stale_blocks") or []
+        if isinstance(entry, dict)
+    }
+    details: list[dict[str, Any]] = []
+    for entry in parent_report.get("children_processed") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("action")) != ACTION_SKIP_BLOCKED:
+            continue
+        child_id = str(entry.get("id") or "")
+        detail: dict[str, Any] = {
+            "id": child_id,
+            "status": str(entry.get("status", "")),
+            "action": ACTION_SKIP_BLOCKED,
+            "blocking_ids": list(entry.get("blocking_ids") or []),
+            "unvalidated": bool(entry.get("unvalidated")),
+        }
+        if child_id in stale:
+            detail["stale"] = True
+            detail["stale_block_ids"] = stale[child_id]
+        details.append(detail)
+    return details
+
+
+def _skip_blocked_verdict(
+    parent_report: dict[str, Any], child_id: str,
+) -> dict[str, Any] | None:
+    """The ``skip-blocked`` verdict for *child_id*, if the parent reported one."""
+    for detail in _skip_blocked_details(parent_report):
+        if detail["id"] == child_id:
+            return detail
+    return None
+
+
+def _describe_skip_blocked(details: list[dict[str, Any]]) -> str:
+    """Render blocked verdicts as ``id (blocked by …)`` for a drive message."""
+    rendered = []
+    for detail in details:
+        ids = ", ".join(detail.get("blocking_ids") or [])
+        rendered.append(
+            f"{detail['id']} (blocked by {ids})" if ids
+            else f"{detail['id']} (unvalidated block)"
+        )
+    return "; ".join(rendered)
+
+
 def _finalise_stranded_child(
     child_id: str,
     evidence: dict[str, Any],
@@ -17185,7 +17248,50 @@ def phase_drive(
                 "by another agent.",
             )
             if parent_report.get("blocked_children"):
-                report["blocked_children"] = parent_report["blocked_children"]
+                report["blocked_children"] = list(
+                    parent_report["blocked_children"]
+                )
+            if parent_report.get("children_processed"):
+                report["children_processed"] = parent_report[
+                    "children_processed"
+                ]
+            for key in (
+                "stale_blocks", "unvalidated_blocks", "unresolved_blockers",
+            ):
+                if parent_report.get(key):
+                    report[key] = parent_report[key]
+            # Carry the blocked verdicts with their blocking ids, so an
+            # unattended dispatcher can see which id to wait for without
+            # re-reading each child's description (AC2/AC3).
+            blocked_details = _skip_blocked_details(parent_report)
+            if blocked_details:
+                report["blocked_child_details"] = blocked_details
+                named = _describe_skip_blocked(blocked_details)
+                missing = [
+                    detail["id"]
+                    for detail in blocked_details
+                    if detail["id"] not in report["message"]
+                ]
+                if missing:
+                    report["message"] = (
+                        f"{report['message']} Blocked children: {named}."
+                    )
+            break
+
+        # Defence in depth (AC1): a child the parent classified ``skip-blocked``
+        # is never spawned — not even if a future parent implementation offered
+        # it as ``next_child``. The block is reported with its ids instead.
+        verdict = _skip_blocked_verdict(parent_report, child_id)
+        if verdict is not None:
+            report["success"] = False
+            report["parent_advanced"] = False
+            report["blocked_children"] = [verdict["id"]]
+            report["blocked_child_details"] = [verdict]
+            report["message"] = (
+                f"No session spawned for {verdict['id']}: its block still "
+                f"holds ({_describe_skip_blocked([verdict])})."
+            )
+            LOG.warning("%s", report["message"])
             break
 
         worktree_path = (
