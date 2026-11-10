@@ -622,6 +622,64 @@ that must never overlap another suite's browser stage should set
 file). Slot-file pruning beyond the ceiling is tracked separately
 (ContextHub WL-0MUL1DSEF004IJU9).
 
+### Re-measuring post-fix slot wait (SA-0MW7C69KU008ZT5K)
+
+`scripts/measure_slot_wait.py` reproduces the post-fix contention measurement
+from the committed read-only harness, so the RCA can be closed with counted
+data instead of an anecdote. The method and classification rules live here so a
+re-check needs no re-derivation.
+
+```bash
+python3 scripts/measure_slot_wait.py --json          # machine-readable report
+python3 scripts/measure_slot_wait.py                 # human table + verdict
+python3 scripts/measure_slot_wait.py --since 2026-11-01T00:00:00Z --sessions-root ~/.pi/agent/sessions
+```
+
+It parses every `*.jsonl` pi session log under `--sessions-root` (default
+`~/.pi/agent/sessions`) and reports, per wait category, the call count and
+p50/p90/max of the queue wait. The window starts at `--since` (default the
+fast-lane fix commit time, `2026-10-31T23:21:00Z`); every record carries its
+own timestamp, so a session that straddles the boundary is split correctly.
+
+**Categories and their sources.** Four call sites are attributed — never two
+at once — so a single acquisition is counted once:
+
+| Category | Source | Lane |
+|---|---|---|
+| `run_tests_full` | bare `run_tests.py` result, per-suite `slot_wait_seconds`/`slot_lane` = `full` | `test` (full) |
+| `run_tests_fast` | bare `run_tests.py` result, per-suite `slot_wait_seconds`/`slot_lane` = `fast` | `test-fast` (partial) |
+| `implement_finish` | `Implement run_tests: test slot acquired — queued_at=… wait_seconds=…` | — |
+| `dev_push_gate` | aggregate `slot_wait_seconds` of a block carrying `run_tests: gate-*` / `pre-push: full-suite gate` provenance | — |
+
+**Double-count avoidance.** A `run_tests.py` `--json` result carries both
+per-suite samples *and* their aggregate; only the per-suite entries are used
+(the aggregate only when no per-suite entry exists and it names a single lane).
+A finish/gate block also contains the inner `run_tests.py` result; for a finish
+block the telemetry line wins, and for a gate block the aggregate wins, so the
+run is counted once. Finish lines repeat whenever a `wait_for_job` tail re-prints
+the log, so finish samples are de-duplicated by `queued_at`.
+
+**Genuine-run filter.** Session logs contain echoed fragments (a `grep` of
+another log, a `python3` probe, a `cat` of the runner source) that reproduce
+`slot_wait_seconds` / `queued N s` text without being a real run. A tool result
+is trusted only when its assistant `toolCall` command is a slot consumer
+(`run_tests.py`, `implement.py`, `git push`, `wait_for_job.py`); results with no
+resolvable command are kept only when the text carries a structural run marker.
+This is what stops a log-tail from inventing a > 120 s sample.
+
+**Pass/fail (parent SA-0MVXUCGPK003G2KV AC3).** The report evaluates three
+thresholds and its exit status is non-zero on any failure:
+
+1. no run reports `slot_wait_seconds > 120 s` (max across every category);
+2. `test-fast` (partial) p90 `< 30 s`;
+3. no `queued N s` notice `>= 30 s`.
+
+A category with fewer than `--min-samples` (default 10) is labelled
+`no regression observed in N samples; re-check after <date>` rather than
+quoted as a percentile (its max is still reported, so a lone outlier is never
+hidden). Any genuine threshold miss is filed as a follow-up work item, not
+smoothed over.
+
 ### 0.6. Nested-run isolation (SA-0MUY6U05F008RG86)
 
 A full-suite run holds a host-wide `"test"` semaphore slot for its whole
