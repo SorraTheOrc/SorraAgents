@@ -84,6 +84,22 @@ Usage:
   run_tests.py [--suite pytest|node|all] [--json] [--parent-work-item-id ID] [--rerun-failures]
   run_tests.py --summary [--summary-grep PATTERN]   (read cached summary lines, no execution)
   run_tests.py --force | --no-cache                (bypass the cache)
+  run_tests.py --scope full --fingerprint SHA      (bind the run to an explicit
+                                                     would-be-commit tree SHA)
+
+Explicit tree fingerprint (--fingerprint):
+  A ``--scope full`` run may be bound to an explicit would-be-commit tree SHA
+  (the value ``git write-tree`` reports for a staged change set): the run is
+  stored and looked up with ``fingerprint_kind="tree"``, keyed on that SHA
+  and never on the loose worktree state. The binding is **fail-closed**: a
+  value that is not a usable tree SHA, or a combination with a mode that
+  cannot bind it (``--scope changed``, ``--summary``, ``--no-cache``), is
+  rejected with exit 2 and an actionable message — never a silent fallback
+  to a loose worktree key. A tree entry never satisfies a worktree request
+  (and vice versa), and a tree request with no stored entry executes fresh
+  and records the entry under ``fingerprint_kind="tree"`` (SA-0MW7C6AYO0062GJB).
+  Callers that pass nothing keep the historical loose-worktree keys byte for
+  byte.
 
 Exit codes:
   0 - all suites passed
@@ -2669,6 +2685,17 @@ def run_suite(
     is recorded in ``type`` as ``"group:<name>"`` so cache keys remain distinct
     (SA-0MUJKF2HP001BR51).
 
+    *fingerprint* (default ``None``) is an explicit expected fingerprint —
+    normally a would-be-commit tree SHA from :func:`compute_tree_state` —
+    forwarded unchanged to :func:`run_cached`. When supplied it keys the
+    lookup and the stored entry (``fingerprint_kind="tree"``) instead of the
+    loose worktree state; a stored entry of a different kind or value is a
+    miss, so a tree request with no matching entry executes fresh. Callers
+    that pass nothing keep the historical loose-worktree keys byte for byte.
+    The CLI's ``--fingerprint`` is the fail-closed surface for this parameter
+    (an unusable value or a mode that cannot bind it is rejected with exit 2,
+    never degraded to a worktree key — SA-0MW7C6AYO0062GJB).
+
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
     ``cached``, ``scope``, ``type``; on a failure WITHOUT structured failures a
     ``notice`` (human-readable) plus a stable ``notice_code`` and bounded
@@ -3430,7 +3457,95 @@ def _emit_gate_verdict(evidence: dict[str, Any], result: dict[str, Any]) -> None
     )
 
 
+#: A full hexadecimal object name as ``git write-tree`` emits: 40 characters
+#: for SHA-1 repositories, 64 for SHA-256. Anything else cannot name a tree,
+#: so an explicit ``--fingerprint`` value is rejected rather than silently
+#: keying the cache on an arbitrary string (SA-0MW7C6AYO0062GJB AC2).
+TREE_FINGERPRINT_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+
+
+class FingerprintRejected(ValueError):
+    """An explicit ``--fingerprint`` value cannot bind a tree-keyed run.
+
+    Raised by :func:`resolve_explicit_fingerprint` for a value that is not a
+    usable tree SHA in the project root; the CLI turns it into exit 2 with
+    the actionable message. Fail-closed by design (SA-0MW7C6AYO0062GJB
+    AC2): a rejected value stops the run instead of being dropped, because a
+    silent drop would fall back to a loose worktree key and hand a
+    tree-requesting consumer a verdict recorded for a different state.
+    """
+
+
+def resolve_explicit_fingerprint(value: str, project_root: Path) -> str:
+    """Validate and normalise an explicit ``--fingerprint`` tree SHA.
+
+    Returns the value lower-cased. Raises :class:`FingerprintRejected` with an
+    actionable message when *value* cannot name a tree in *project_root*:
+
+    * not a full 40-character (SHA-1) or 64-character (SHA-256) hexadecimal
+      object name — the shape ``git write-tree`` emits;
+    * an object the repository does not hold;
+    * an object that is a commit, blob or tag rather than a tree.
+
+    Fail-closed (AC2): a rejected value stops the run (exit 2 at the CLI)
+    instead of degrading to the loose :func:`compute_git_state` key, which
+    would record a tree-requesting caller's verdict against the wrong state.
+    Repository-override variables are scrubbed like every other git call in
+    the runner (SA-0MUIA3OE40001QJX) so a leaked ``GIT_DIR`` cannot have the
+    object resolved in a different repository.
+    """
+    candidate = value.strip()
+    if not TREE_FINGERPRINT_RE.fullmatch(candidate):
+        raise FingerprintRejected(
+            f"value {value!r} is not a usable tree SHA: a full 40-character "
+            "(SHA-1) or 64-character (SHA-256) hexadecimal object name is "
+            "required — the value `git write-tree` reports for the staged "
+            "change set. Supply that tree SHA, or omit --fingerprint to use "
+            "the loose worktree key."
+        )
+    env = subprocess_env_with_scrubbed_overrides()
+    try:
+        proc = subprocess.run(
+            ["git", "cat-file", "-t", candidate],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FingerprintRejected(
+            f"cannot verify tree SHA {candidate} in {project_root}: {exc}. "
+            "Supply a tree SHA from this repository, or omit --fingerprint "
+            "to use the loose worktree key."
+        ) from exc
+    obj_type = proc.stdout.strip()
+    if proc.returncode != 0 or not obj_type:
+        raise FingerprintRejected(
+            f"{project_root} does not hold an object named {candidate} "
+            "(`git cat-file -t` failed). Supply a tree SHA from this "
+            "repository, or omit --fingerprint to use the loose worktree key."
+        )
+    if obj_type != "tree":
+        raise FingerprintRejected(
+            f"{candidate} names a {obj_type}, not a tree — the explicit "
+            "fingerprint must be the tree a commit would produce "
+            "(`git write-tree`), not a commit/blob/tag SHA. Supply that tree "
+            "SHA, or omit --fingerprint to use the loose worktree key."
+        )
+    return candidate.lower()
+
+
 def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser.
+
+    ``--fingerprint`` is validated in :func:`main` by
+    :func:`resolve_explicit_fingerprint` and rejected (exit 2) when it cannot
+    bind a ``--scope full`` run to an explicit would-be-commit tree SHA —
+    fail-closed, never a silent fallback to a loose worktree key
+    (SA-0MW7C6AYO0062GJB).
+    """
     parser = argparse.ArgumentParser(
         description="Run the full project test suite in quiet mode and report failures."
     )
@@ -3545,6 +3660,21 @@ def build_parser() -> argparse.ArgumentParser:
         "runs/caches the suite there, so a cache entry computed from any other "
         "state can never satisfy it. Refuses (exit 2) when no clean checkout "
         "holds SHA. Omitted: historical behaviour, unchanged.",
+    )
+    parser.add_argument(
+        "--fingerprint",
+        default=None,
+        metavar="SHA",
+        help="Bind a --scope full run to an explicit would-be-commit tree SHA "
+        "(the value `git write-tree` reports for a staged change set): the "
+        "run is stored and looked up with fingerprint_kind=\"tree\", keyed on "
+        "that SHA and never on the loose worktree state. Fail-closed: a value "
+        "that is not a usable tree SHA, or a combination that cannot bind it "
+        "(--scope changed, --summary, --no-cache), is rejected with exit 2 "
+        "and an actionable message — never a silent fallback to a loose "
+        "worktree key. A tree entry never satisfies a worktree request (and "
+        "vice versa); a tree request with no stored entry executes fresh. "
+        "Omitted: historical loose-worktree keys, byte for byte.",
     )
     return parser
 
@@ -3873,6 +4003,48 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         _emit_gate_subject(gate_evidence)
 
+    # --fingerprint: bind a --scope full run to an explicit would-be-commit
+    # tree SHA (SA-0MW7C6AYO0062GJB). Fail-closed (AC2): an unusable value, or
+    # a mode that cannot bind a tree-keyed cache entry, is rejected with exit 2
+    # and an actionable message — never silently dropped, because dropping it
+    # would fall back to the loose worktree key and misattribute the verdict.
+    fingerprint: str | None = None
+    if args.fingerprint is not None:
+        if args.scope != "full":
+            print(
+                "run_tests: --fingerprint binds a --scope full run to an "
+                f"explicit tree SHA and cannot bind --scope {args.scope}: a "
+                "partial run is not full-suite evidence for that tree. Drop "
+                "--scope or omit --fingerprint.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.summary:
+            print(
+                "run_tests: --fingerprint stores and queries a cache entry and "
+                "cannot be combined with --summary, which reads only loose "
+                "worktree entries (tree-bound entries are deliberately "
+                "invisible to it). Omit --fingerprint for a summary, or run "
+                "the suite to produce the tree-keyed verdict.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.no_cache:
+            print(
+                "run_tests: --fingerprint binds a stored cache entry and "
+                "cannot be combined with --no-cache, which neither looks up "
+                "nor stores one. Omit --fingerprint or drop --no-cache.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            fingerprint = resolve_explicit_fingerprint(
+                args.fingerprint, project_root
+            )
+        except FingerprintRejected as exc:
+            print(f"run_tests: --fingerprint: {exc}", file=sys.stderr)
+            return 2
+
     # --group: validate group name and route to group-based execution
     group_name = args.group
     if group_name is not None:
@@ -4003,6 +4175,7 @@ def main(argv: list[str] | None = None) -> int:
             commands=override_commands,
             test_type=test_type,
             group=group_name,
+            fingerprint=fingerprint,
         )
 
         if gate_evidence is not None:

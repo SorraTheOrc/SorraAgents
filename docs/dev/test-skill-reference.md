@@ -158,6 +158,37 @@ expose the same distinction to callers that manage execution themselves.
 `fingerprint` through to the cache, so the finish gate reaches it through the
 same canonical runner as every other consumer.
 
+**CLI surface — `run_tests.py --scope full --fingerprint <sha>`**
+(SA-0MW7C6AYO0062GJB). The flag binds a full-suite run to an explicit
+tree SHA (the value `git write-tree` reports for a staged change set): the
+run is looked up and stored under that SHA with `fingerprint_kind="tree"`,
+and the loose `compute_git_state` value is never computed. The surface is
+**fail-closed**:
+
+- *Validation.* The value must be a full 40-character (SHA-1) or 64-character
+  (SHA-256) hexadecimal object name, and `git cat-file -t` in the resolved
+  project root must report a **tree** — a malformed string, an object the
+  repository does not hold, or a commit/blob/tag SHA is rejected with exit 2
+  and an actionable message. The value is normalised to lower case before it
+  keys the entry.
+- *Modes it cannot bind.* `--fingerprint` with `--scope changed` (a partial
+  run is not full-suite evidence for the tree), `--summary` (a read-only
+  loose-worktree query that never sees tree-bound entries) or `--no-cache`
+  (neither looks up nor stores an entry) is rejected with exit 2. Nothing
+  executes and nothing is stored.
+- *No silent fallback.* A rejected value or combination never degrades to a
+  loose worktree key: the run stops, so a tree-requesting consumer can never
+  be handed a verdict recorded for a different state.
+- *Misses execute fresh.* A valid tree request with no matching stored entry
+  (different tree, different `fingerprint_kind`, legacy provenance-less entry,
+  expired TTL) executes the suite and records the entry with
+  `fingerprint_kind="tree"`. A tree entry never satisfies a worktree request,
+  and never the reverse.
+- *Unchanged default.* Omitting the flag keeps the historical loose-worktree
+  keys byte for byte (`command + fingerprint (+ test_type)`, kind
+  `"worktree"`) for every existing caller — the test-skill CLI, audit and
+  the pre-push gate.
+
 **Legacy and foreign entries miss (fail closed).** A cache hit requires the
 command, `test_type`, `fingerprint_kind` and fingerprint to match, plus the
 TTL (and, for exactness, the recorded `scope`). Therefore:

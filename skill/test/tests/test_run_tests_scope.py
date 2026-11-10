@@ -25,6 +25,7 @@ import shutil
 # shadow <skills>/test when only the skills root is on sys.path).
 import sys as _sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -53,6 +54,7 @@ from run_tests import (
     run_summary,
 )
 from shared.git_sandbox import commit_all, init_repo, run_git
+from test_cache import FINGERPRINT_KIND_TREE, lookup
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
@@ -1209,6 +1211,278 @@ class TestCLIFlags:
         parser = build_parser()
         args = parser.parse_args([])
         assert args.target_branch is None
+
+
+# ---------------------------------------------------------------------------
+# Explicit tree fingerprint --fingerprint (SA-0MW7C6AYO0062GJB, runner AC1-AC3)
+# ---------------------------------------------------------------------------
+
+
+class TestFingerprintCLI:
+    """CLI tests for --fingerprint: bind, fail-closed validation, namespaces.
+
+    The cache-layer semantics (store + immediate hit, foreign fingerprint
+    miss, legacy entry miss) are pinned per-kind in tests/test_test_cache.py;
+    these tests cover the runner CLI surface and its threading into
+    run_all/run_suite (AC1), the two rejection paths (AC2), and the help/doc
+    contract (AC6).
+    """
+
+    @staticmethod
+    def _tree_sha(repo: Path) -> str:
+        """The tree SHA of the fixture repo's HEAD (a usable fingerprint)."""
+        return run_git(repo, ["rev-parse", "HEAD^{tree}"], check=True).stdout.strip()
+
+    @staticmethod
+    def _head_sha(repo: Path) -> str:
+        """The HEAD commit SHA of the fixture repo (not a tree)."""
+        return run_git(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
+
+    def _capture_guarded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> dict:
+        """Replace guarded_run_all with a recorder; run never executes."""
+        captured: dict = {}
+
+        def fake_guarded_run_all(*args, **kwargs):
+            captured.update(kwargs)
+            return {
+                "success": True,
+                "suites": {},
+                "failures": [],
+                "notices": [],
+                "scope": kwargs.get("scope", "full"),
+                "timing": {},
+            }
+
+        monkeypatch.setattr(run_tests, "guarded_run_all", fake_guarded_run_all)
+        return captured
+
+    @staticmethod
+    def _fake_run(calls: list[str]):
+        """A green fake command runner recording each invocation."""
+
+        def fake_run(cmd_list, **kwargs):
+            calls.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        return fake_run
+
+    # -- acceptance surface --------------------------------------------------
+
+    def test_default_fingerprint_is_none(self) -> None:
+        """Omitting the flag keeps historical behaviour: None forwarded."""
+        args = build_parser().parse_args([])
+        assert args.fingerprint is None
+
+    def test_valid_tree_sha_is_forwarded_to_the_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A usable tree SHA binds: guarded_run_all receives it (AC1)."""
+        repo = _make_repo(tmp_path)
+        tree = self._tree_sha(repo)
+        captured = self._capture_guarded(monkeypatch)
+        rc = run_tests.main(
+            ["--fingerprint", tree, "--json", "--project-root", str(repo)]
+        )
+        assert rc == 0
+        assert captured["fingerprint"] == tree
+        assert captured["scope"] == "full"
+
+    def test_uppercase_hex_is_normalised_to_lowercase(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The value keys the entry as git writes it: lower case."""
+        repo = _make_repo(tmp_path)
+        tree = self._tree_sha(repo).upper()
+        captured = self._capture_guarded(monkeypatch)
+        rc = run_tests.main(
+            ["--fingerprint", tree, "--project-root", str(repo)]
+        )
+        assert rc == 0
+        assert captured["fingerprint"] == tree.lower()
+
+    def test_same_fingerprint_stores_then_hits_at_run_all(
+        self, tmp_path: Path
+    ) -> None:
+        """AC3: store plus immediate hit for the same fingerprint.
+
+        The first run executes and records the entry under the tree
+        namespace; the second is served from cache — one spawn total.
+        """
+        repo = _make_repo(tmp_path)
+        tree = self._tree_sha(repo)
+        calls: list[str] = []
+        with mock.patch.object(
+            run_tests, "_run_cmd", side_effect=self._fake_run(calls)
+        ), mock.patch.object(run_tests, "_test_concurrency_slot"):
+            first = run_all(suites=("pytest",), cwd=repo, fingerprint=tree)
+            second = run_all(suites=("pytest",), cwd=repo, fingerprint=tree)
+        assert first["suites"]["pytest"]["cached"] is False
+        assert second["suites"]["pytest"]["cached"] is True, (
+            "the tree-keystored verdict must be served to the same tree"
+        )
+        assert len(calls) == 1, "the second run must be served from cache"
+        hit = lookup("pytest", tree, cwd=str(repo), fingerprint_kind="tree")
+        assert hit is not None and hit["cached"] is True
+        assert hit["fingerprint_kind"] == FINGERPRINT_KIND_TREE
+
+    def test_different_fingerprint_misses_and_re_runs(
+        self, tmp_path: Path
+    ) -> None:
+        """AC3: a stored verdict for one tree is a miss for another."""
+        repo = _make_repo(tmp_path)
+        tree_a = self._tree_sha(repo)
+        (repo / "README.md").write_text("# test repo v2\n")
+        commit_all(repo, "second")
+        tree_b = self._tree_sha(repo)
+        assert tree_a != tree_b
+        calls: list[str] = []
+        with mock.patch.object(
+            run_tests, "_run_cmd", side_effect=self._fake_run(calls)
+        ), mock.patch.object(run_tests, "_test_concurrency_slot"):
+            first = run_all(suites=("pytest",), cwd=repo, fingerprint=tree_a)
+            second = run_all(suites=("pytest",), cwd=repo, fingerprint=tree_b)
+        assert first["suites"]["pytest"]["cached"] is False
+        assert second["suites"]["pytest"]["cached"] is False, (
+            "a foreign tree's verdict must never satisfy a tree request"
+        )
+        assert len(calls) == 2
+
+    def test_worktree_legacy_entry_misses_for_a_tree_request(
+        self, tmp_path: Path
+    ) -> None:
+        """AC3: a legacy/foreign worktree entry never satisfies a tree request.
+
+        A default (unfingerprinted) run records a loose-worktree entry, which
+        is a different namespace: the tree request executes fresh and stores
+        its own tree-keyed entry.
+        """
+        repo = _make_repo(tmp_path)
+        tree = self._tree_sha(repo)
+        calls: list[str] = []
+        with mock.patch.object(
+            run_tests, "_run_cmd", side_effect=self._fake_run(calls)
+        ), mock.patch.object(run_tests, "_test_concurrency_slot"):
+            worktree = run_all(suites=("pytest",), cwd=repo)
+            tree_run = run_all(suites=("pytest",), cwd=repo, fingerprint=tree)
+        assert worktree["suites"]["pytest"]["cached"] is False
+        assert tree_run["suites"]["pytest"]["cached"] is False, (
+            "a loose-worktree entry must never satisfy a tree request"
+        )
+        assert len(calls) == 2
+        # The tree namespace holds its own entry, invisible to the worktree kind.
+        hit = lookup("pytest", tree, cwd=str(repo), fingerprint_kind="tree")
+        assert hit is not None and hit["cached"] is True
+
+    # -- rejection paths (AC2: exit 2, actionable, never a silent fallback) --
+
+    def test_malformed_value_rejected_exit_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        repo = _make_repo(tmp_path)
+        rc = run_tests.main(
+            ["--fingerprint", "not-a-sha", "--project-root", str(repo)]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "not a usable tree SHA" in err
+        assert "--fingerprint" in err
+
+    def test_wrong_length_hex_rejected_exit_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        repo = _make_repo(tmp_path)
+        rc = run_tests.main(
+            ["--fingerprint", "a" * 39, "--project-root", str(repo)]
+        )
+        assert rc == 2
+        assert "not a usable tree SHA" in capsys.readouterr().err
+
+    def test_unknown_object_rejected_exit_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """Format-valid but absent: the repository must really hold the tree."""
+        repo = _make_repo(tmp_path)
+        rc = run_tests.main(
+            ["--fingerprint", "a" * 40, "--project-root", str(repo)]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "does not hold an object" in err
+
+    def test_commit_sha_rejected_exit_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """A commit SHA is not a tree: the mode cannot bind it."""
+        repo = _make_repo(tmp_path)
+        rc = run_tests.main(
+            ["--fingerprint", self._head_sha(repo), "--project-root", str(repo)]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "not a tree" in err
+        assert "commit" in err
+
+    def test_scope_changed_rejected_exit_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """--scope changed cannot bind a tree fingerprint: rejected, not loose."""
+        repo = _make_repo(tmp_path)
+        tree = self._tree_sha(repo)
+        rc = run_tests.main(
+            ["--fingerprint", tree, "--scope", "changed",
+             "--project-root", str(repo)]
+        )
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "cannot bind" in err
+        assert "--scope" in err
+
+    def test_summary_rejected_exit_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """--summary reads only worktree entries; the flag cannot bind it."""
+        repo = _make_repo(tmp_path)
+        tree = self._tree_sha(repo)
+        rc = run_tests.main(
+            ["--fingerprint", tree, "--summary", "--project-root", str(repo)]
+        )
+        assert rc == 2
+        assert "--summary" in capsys.readouterr().err
+
+    def test_no_cache_rejected_exit_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        """--no-cache neither stores nor looks up; the flag cannot bind it."""
+        repo = _make_repo(tmp_path)
+        tree = self._tree_sha(repo)
+        rc = run_tests.main(
+            ["--fingerprint", tree, "--no-cache", "--project-root", str(repo)]
+        )
+        assert rc == 2
+        assert "--no-cache" in capsys.readouterr().err
+
+    def test_rejection_never_dispatches_a_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A rejected fingerprint stops before anything executes (fail closed)."""
+        repo = _make_repo(tmp_path)
+        captured = self._capture_guarded(monkeypatch)
+        rc = run_tests.main(
+            ["--fingerprint", "bogus", "--scope", "changed",
+             "--project-root", str(repo)]
+        )
+        assert rc == 2
+        assert not captured, "no dispatch may happen for a rejected combination"
+
+    def test_help_describes_the_flag_as_fail_closed(self) -> None:
+        """--help states the fail-closed contract (AC6)."""
+        help_text = build_parser().format_help()
+        assert "--fingerprint" in help_text
+        assert "Fail-closed" in help_text
+        assert "fingerprint_kind" in help_text
+        assert "--scope full" in help_text
 
 
 # ---------------------------------------------------------------------------

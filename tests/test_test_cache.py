@@ -7,6 +7,7 @@ pipeline normalization sharing, and read-only query mode.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -21,6 +22,8 @@ from shared.git_sandbox import fixture_git_env
 from test_cache import (
     DEFAULT_TTL_SECONDS,
     FAILED_RUN_TTL_SECONDS,
+    FINGERPRINT_KIND_TREE,
+    FINGERPRINT_KIND_WORKTREE,
     _default_runner,
     cache_dir,
     cache_key,
@@ -1033,6 +1036,44 @@ def test_default_request_keeps_loose_worktree_fingerprint_semantics(
     assert legacy["cached"] is True
     assert legacy["stdout"] == "legacy\n"
     assert len(calls) == 1, "a legacy entry must still be served by default"
+
+
+def test_unfingerprinted_caller_keeps_the_byte_identical_worktree_key(
+    git_repo: Path,
+) -> None:
+    """AC4: unfingerprinted callers' cache keys are byte for byte unchanged.
+
+    Asserted explicitly, not merely implied: the historical key is the
+    SHA-256 prefix (32 hex chars) of ``normalized-command NUL git-state``,
+    and an unfingerprinted ``run_cached`` must deposit its entry exactly
+    there — the tree namespace at the *same string* is a different entry, and
+    a tree request at it still misses (SA-0MW7C6AYO0062GJB AC4).
+    """
+    calls: list[str] = []
+    runner = make_runner(calls)
+    loose_state = compute_git_state(str(git_repo))
+    normalized = normalize_test_command("pytest")
+    expected_key = hashlib.sha256(
+        f"{normalized}\x00{loose_state}".encode()
+    ).hexdigest()[:32]
+
+    result = run_cached("pytest", cwd=str(git_repo), runner=runner)
+
+    assert result["git_state"] == loose_state
+    assert result["fingerprint_kind"] == FINGERPRINT_KIND_WORKTREE
+    expected_dir = cache_dir(git_repo) / expected_key
+    assert expected_dir.is_dir(), (
+        "the unfingerprinted run must deposit its entry at the historical "
+        "byte-identical key location"
+    )
+    assert (expected_dir / "metadata.json").exists()
+    # The tree namespace at the same string is a miss: provenance is part of
+    # the request, so the loose entry is never tree evidence (and vice versa).
+    assert lookup(
+        "pytest", loose_state, cwd=str(git_repo), fingerprint_kind=FINGERPRINT_KIND_TREE
+    ) is None
+    # And the fingerprint-kind-agnostic historical lookup still reads it.
+    assert lookup("pytest", loose_state, cwd=str(git_repo)) is not None
 
 
 # ---------------------------------------------------------------------------
