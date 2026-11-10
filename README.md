@@ -77,17 +77,21 @@ runs; see the same section for the operator remedy. The `TMPDIR`/prune work is
 env-only and never changes suite command strings or cache keys.
 
 Every push to `dev`/`main` is also gated by the pre-push hook, which runs the
-full suite against **the pushed commit** rather than the main checkout's
+full suite against **the pushed commit's tree** rather than the main checkout's
 working tree. The hook forwards git's `<local_sha>` as
 `run_tests.py --gate-commit <sha>`; the runner resolves a clean checkout that
-holds that commit (the pusher's worktree when possible) and keys the cache on
-that state, so a green `scope: full` entry computed for any other state —
-including the main checkout's own `HEAD` plus its dirty `.worklog/` churn —
-cannot satisfy the gate. If no clean checkout holds the commit, the push is
-refused and the message names the commit, the remote ref, the remedy and the
-`TEST_SCOPE_SKIP=1` escape hatch. The gate prints the state it validated
-(`gate-subject` / `gate-root` / `gate-verdict` on `stderr`), and the hook
-mirrors the resulting cache entry into the main checkout so Step-9
+holds that commit (the pusher's worktree when possible) and binds the verdict to
+the pushed commit's **tree** SHA (`fingerprint_kind="tree"`), so a green
+`scope: full` entry computed for any other state — including the main
+checkout's own `HEAD` plus its dirty `.worklog/` churn, or a loose worktree
+entry — cannot satisfy the gate, while a tree-keyed verdict recorded for the
+same tree by another consumer (the finish gate) is reused instead of re-running
+the suite. If no clean checkout holds the commit, or the pushed tree SHA cannot
+be computed, the push is refused and the message names the commit, the remote
+ref, the remedy and the `TEST_SCOPE_SKIP=1` escape hatch. The gate prints the
+tree it validated and the cache verdict (`gate-subject` / `gate-root` /
+`gate-verdict`, including `cache_hit` and `cache_age_seconds`, on `stderr`),
+and the hook mirrors the resulting cache entry into the main checkout so Step-9
 `--summary` and audit F3 can consume it. See
 [`docs/dev/test-skill-reference.md`](docs/dev/test-skill-reference.md#04-pre-push-gate-subject-binding-sa-0mvtrbt50005dueh)
 and [`docs/dev/test-isolation.md`](docs/dev/test-isolation.md).
