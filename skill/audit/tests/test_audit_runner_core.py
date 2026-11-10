@@ -2329,6 +2329,103 @@ class TestExtractAcs:
             "All tests must pass",
         ]
 
+    # ------------------------------------------------------------------
+    # Prose must never be mistaken for the heading (SA-0MWB84J17008N4QF)
+    # ------------------------------------------------------------------
+
+    def test_prose_mentioning_acceptance_criteria_before_heading(self):
+        """A prose preamble mentioning the phrase does not hijack the heading.
+
+        Reproducer from SA-0MWB84J17008N4QF: the preamble line normalised to a
+        text starting with "acceptance criteria", so the real heading was never
+        reached and the zero-AC sentinel was returned.
+        """
+        desc = (
+            "## Problem\n"
+            "\n"
+            "some prose mentioning acceptance criteria in passing.\n"
+            "\n"
+            "## Acceptance criteria\n"
+            "\n"
+            "- **AC1 — alpha.** x\n"
+        )
+        assert audit_runner._extract_acs(desc) == ["**AC1 — alpha.** x"]
+
+    def test_wrapped_prose_mentioning_phrase_before_heading(self):
+        """The SA-0MVYYL7X9008MGA1 description shape extracts every AC.
+
+        The problem statement wraps the phrase "acceptance criteria" onto its
+        own wrapped line before the real `## Acceptance criteria` heading; the
+        wrapped prose must be treated as prose, not as a heading.
+        """
+        desc = (
+            "## Problem statement\n"
+            "\n"
+            "`implement.py finish` marks a work item terminal even when its\n"
+            "acceptance criteria were never exercised (e.g. an operational run\n"
+            "that must happen on its own schedule).\n"
+            "\n"
+            "## Acceptance criteria\n"
+            "\n"
+            "- AC1 one\n"
+            "- AC2 two\n"
+        )
+        assert audit_runner._extract_acs(desc) == ["AC1 one", "AC2 two"]
+
+    def test_no_ac_section_with_prose_mention_still_sentinel(self):
+        """The zero-AC sentinel is preserved when there is genuinely no section.
+
+        A description that mentions the phrase only in prose (no heading, no
+        AC bullets) must still fail closed with the sentinel (AC4).
+        """
+        desc = (
+            "## Problem\n"
+            "\n"
+            "This item has no acceptance criteria section at all, and\n"
+            "acceptance criteria were never written down.\n"
+            "\n"
+            "## Notes\n"
+            "Prose only.\n"
+        )
+        assert audit_runner._extract_acs(desc) == [
+            "No acceptance criteria defined."
+        ]
+
+    def test_qualifier_prose_starting_with_phrase_is_not_a_heading(self):
+        """A prose line that merely starts with the phrase is not a heading."""
+        desc = (
+            "Acceptance criteria were never exercised for this item.\n"
+            "\n"
+            "## Acceptance criteria\n"
+            "- AC1 one\n"
+        )
+        assert audit_runner._extract_acs(desc) == ["AC1 one"]
+
+    def test_parent_shaped_description_yields_full_ac_table(self):
+        """A SA-0MVYYL7X9008MGA1-shaped description extracts all eight ACs.
+
+        Locks the AC5 requirement that the parent item's description produces
+        a populated Acceptance Criteria Status table rather than the sentinel.
+        """
+        desc = (
+            "## Problem statement\n"
+            "\n"
+            "The finish path marks an item terminal even when its\n"
+            "acceptance criteria were never exercised, and a parent whose\n"
+            "child carries zero work is advanced to in_review.\n"
+            "\n"
+            "## Acceptance criteria\n"
+            "\n"
+            + "".join(
+                f"- **AC{i} — Criterion {i}.** detail {i}\n"
+                for i in range(1, 9)
+            )
+        )
+        acs = audit_runner._extract_acs(desc)
+        assert len(acs) == 8
+        assert acs[0] == "**AC1 — Criterion 1.** detail 1"
+        assert acs[-1] == "**AC8 — Criterion 8.** detail 8"
+
 
 class TestZeroAcSentinelWarning:
     """SA-0MSRLLQ0V008EW3J: zero-AC sentinel yields warning, not met.

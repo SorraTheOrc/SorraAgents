@@ -6062,10 +6062,44 @@ def _normalize_heading_line(line: str) -> str:
     pattern (SA-0MSJLC8XA00178YD).
     """
     line = line.strip()
-    line = re.sub(r"^#{0,3}\s*", "", line)
+    line = re.sub(r"^#{1,6}\s+", "", line)
     line = line.replace("**", "")
     line = re.sub(r"<<([^>]*)>>", r"\1", line)
     return line.strip()
+
+
+# Heading forms that may legitimately introduce the acceptance-criteria
+# section: a real markdown heading, a bold-only line (``**Acceptance
+# criteria:**``), the angle-bracket convention (``<<Acceptance>>
+# <<criteria>>``), or the bare ``Acceptance Criteria:`` pseudo-heading used by
+# AGENTS.md. A prose sentence that merely mentions the phrase is rejected so
+# it can never start the section (SA-0MWB84J17008N4QF).
+_MARKDOWN_HEADING_LINE_RE = re.compile(r"^#{1,6}\s+\S")
+_BOLD_HEADING_LINE_RE = re.compile(r"^\*\*[^*]+\*\*:?$")
+_ANGLE_HEADING_LINE_RE = re.compile(r"^(?:<<[^>]+>>\s*)+:?$")
+_BARE_HEADING_LINE_RE = re.compile(
+    r"^(?:Acceptance|Success)\s+Criteria\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_heading(line: str) -> bool:
+    """Return True when *line* is a heading form, not prose.
+
+    Only a heading-form line may introduce the AC section; normalising and
+    prefix-matching every line let a wrapped prose line beginning with
+    "acceptance criteria …" masquerade as the heading and silently drop every
+    real AC (SA-0MWB84J17008N4QF).
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return bool(
+        _MARKDOWN_HEADING_LINE_RE.match(stripped)
+        or _BOLD_HEADING_LINE_RE.match(stripped)
+        or _ANGLE_HEADING_LINE_RE.match(stripped)
+        or _BARE_HEADING_LINE_RE.match(stripped)
+    )
 
 
 def _extract_acs(description: str) -> list[str]:
@@ -6081,7 +6115,9 @@ def _extract_acs(description: str) -> list[str]:
     lines = description.splitlines()
     heading_idx = None
     for idx, raw in enumerate(lines):
-        if heading_re.search(_normalize_heading_line(raw)):
+        if not _looks_like_heading(raw):
+            continue
+        if heading_re.match(_normalize_heading_line(raw)):
             heading_idx = idx
             break
     if heading_idx is None:
