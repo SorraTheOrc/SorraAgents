@@ -98,14 +98,32 @@ This completes the <skill_name> process for <id> (<title>).
   structured sections. **Must sit between `## Producer Actions` and
   `## Conclusion`**.
 - **Conclusion**: the readiness verdict is the **first line** of the section,
-  on its own line, colour-coded via ANSI escapes (best-effort — plain-text
-  terminals degrade gracefully):
+  on its own line, colour-coded via ANSI escapes (best-effort — colour is
+  emitted only into a colour-capable sink, so pipes, files, redirected output
+  and `TERM=dumb` receive the plain verdict with **no** escape bytes):
   - `✅ Ready to ship` in green (`\033[32m…\033[0m`) when every AC is `met`,
     followed by `This completes the <skill_name> process for <id> (<title>).`;
   - `🚫 Not ready to ship` in red (`\033[31m…\033[0m`) otherwise, followed by
     `<Skill_name> session for <id> (<title>) is incomplete.`
   The `next_action` value is no longer rendered; it is retained only for
   backward compatibility.
+
+#### Colour capability (AC3, SA-0MVYEZ3V3004AQXN)
+
+`colour_enabled()` decides whether escapes are emitted, in this precedence:
+
+1. An explicit argument — `render_report(..., colour=True|False)` / CLI
+   `--colour` / `--no-colour` — is the most specific instruction and always
+   wins (a deliberate per-invocation override).
+2. `NO_COLOR` (any non-empty value — <https://no-color.org>) — never colour;
+   an env-level opt-out is not overridden by `FORCE_COLOR`.
+3. `FORCE_COLOR` (`1`/`true`/`yes`/`on`) — colour even when stdout is not a
+   terminal (tests, CI, log viewers that render ANSI).
+4. `TERM=dumb` — never colour.
+5. `sys.stdout.isatty()` — colour only for a terminal.
+
+The default (`None`) is auto-detection (steps 2-5), which is what keeps
+agent-pasted reports escape-free.
 - **Terminator**: the rendered report's final line is `</end_session>` on its own line (only for terminal sessions; question-ended sessions omit the report and the marker).
 
 ### Producer Actions
@@ -337,19 +355,22 @@ than stacking a second one.
   a ``## Use Cases`` section is rendered between the title line and the
   headline.
 - `render_metadata(work_item, children=None, audit_result=None)` → the `## Meta-Data` bullet block. `audit_result` is the **top-level** `auditResult` object from the `wl show --json` envelope; when omitted, the legacy `workItem.auditResult` / `workItem.audit` fallbacks apply (see the precedence list above).
-- `render_report_from_workitem(work_item, *, skill_name, headline, acceptance_criteria, ..., children=None, audit_result=None, use_cases=None)` → full report from an already-fetched work-item dict plus the envelope's structured `auditResult`.
+- `render_report_from_workitem(work_item, *, skill_name, headline, acceptance_criteria, ..., children=None, audit_result=None, use_cases=None, colour=None)` → full report from an already-fetched work-item dict plus the envelope's structured `auditResult`.
 - `normalise_producer_actions(producer_actions)` → collapses routine-only
   producer actions to `None needed` (returning genuine blocking text
   verbatim) and writes **one** stderr diagnostic naming the discarded text.
   It delegates to the single shared classifier
   `shared/herdr_pane.py:normalise_producer_actions`, which the pane
   status derivation consumes too, so both paths agree by construction.
-- `render_from_wl(skill_name, work_item_id, ..., use_cases=None)` → fetches the `wl show <id> --children --json` envelope and threads its top-level `auditResult` into the metadata.
-- CLI (`render_report.py <id> --skill-name ... --ac ... --use-case ...`): fetches the item
+- `render_from_wl(skill_name, work_item_id, ..., use_cases=None, colour=None)` → fetches the `wl show <id> --children --json` envelope and threads its top-level `auditResult` into the metadata.
+- `colour_enabled(env=None, stream=None)` → whether ANSI colour may be
+  emitted into `stream` (see [Colour capability](#colour-capability-ac3-sa-0mvyez3v3004aqxn)).
+- CLI (`render_report.py <id> --skill-name ... --ac ... --use-case ... [--colour|--no-colour]`): fetches the item
   via `wl show <id> --children --json` (worklog store resolved via the
   shared prefix-to-sibling scan, so it works from any cwd incl. git
   worktrees) and prints the report. Use `--use-case` (repeatable) to
-  supply use-case strings.
+  supply use-case strings; `--colour` forces escapes into a non-terminal
+  sink and `--no-colour` guarantees plain text (default: auto-detect).
 
 Tests: `./tests/test_render_report.py` (offline — fixture JSON,
 no live `wl` calls). Agent test execution must go through the

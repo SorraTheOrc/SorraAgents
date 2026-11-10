@@ -21,7 +21,7 @@ import os
 import sys
 import textwrap
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from unittest import mock
 
 import pytest
@@ -520,6 +520,28 @@ class TestNotesSectionPosition(unittest.TestCase):
         self.assertLess(notes_pos, conclusion_pos)
 
 
+@contextmanager
+def force_colour():
+    """Force ANSI colour on for the duration of the block.
+
+    The renderer degrades to plain text whenever stdout is not a TTY
+    (AC3, SA-0MVYEZ3V3004AQXN), which is exactly how the test suite runs,
+    so colour assertions opt in explicitly via ``FORCE_COLOR``.
+    """
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("NO_COLOR", "FORCE_COLOR")}
+    env["FORCE_COLOR"] = "1"
+    with mock.patch.dict(os.environ, env, clear=True):
+        yield
+
+
+class _TTYStringIO(io.StringIO):
+    """A TTY-like stream so ``isatty()`` reports True."""
+
+    def isatty(self):
+        return True
+
+
 class TestConclusion(unittest.TestCase):
     """Verify the Conclusion section format (SA-0MVYEZ3V3004AQXN).
 
@@ -534,6 +556,11 @@ class TestConclusion(unittest.TestCase):
     def setUp(self):
         from render_report import render_report
         self.render_report = render_report
+        self._colour = force_colour()
+        self._colour.__enter__()
+
+    def tearDown(self):
+        self._colour.__exit__(None, None, None)
 
     def _render(self, acceptance_criteria=None, next_action="plan"):
         return self.render_report(
@@ -622,6 +649,176 @@ class TestConclusion(unittest.TestCase):
         self.assertIn(f"\n{verdict}\n", report)
 
 
+class TestColourDegradation(unittest.TestCase):
+    """AC3: ANSI colour only where it renders; plain-text sinks stay clean.
+
+    Colour is best-effort: escape sequences must never leak into a sink that
+    cannot render them (pipe, file, redirected output, plain-text terminal),
+    because raw ``\033[32m`` bytes read as garbled text there.
+    """
+
+    GREEN = "\033[32m"
+    RED = "\033[31m"
+
+    def _render(self, acceptance_criteria=None, **kwargs):
+        from render_report import render_report
+
+        return render_report(
+            skill_name="implement",
+            work_item_id="SA-0TEST0000000001",
+            title="Test title",
+            headline="",
+            acceptance_criteria=acceptance_criteria
+            if acceptance_criteria is not None
+            else [("1", "AC one", "test", "met")],
+            metadata={},
+            producer_actions=None,
+            notes=None,
+            **kwargs,
+        )
+
+    def _clean_env(self, **extra):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("NO_COLOR", "FORCE_COLOR")}
+        env.update(extra)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    # ── colour capability detection ─────────────────────────────────────
+
+    def test_colour_enabled_for_tty_stream(self):
+        """A TTY stdout renders colour."""
+        from render_report import colour_enabled
+
+        with self._clean_env(TERM="xterm-256color"):
+            self.assertTrue(colour_enabled(stream=_TTYStringIO()))
+
+    def test_colour_disabled_for_non_tty_stream(self):
+        """A pipe/file stdout degrades to plain text."""
+        from render_report import colour_enabled
+
+        with self._clean_env(TERM="xterm-256color"):
+            self.assertFalse(colour_enabled(stream=io.StringIO()))
+
+    def test_no_color_env_disables_colour_on_tty(self):
+        """``NO_COLOR`` (no-color.org) wins even on a colour terminal."""
+        from render_report import colour_enabled
+
+        with self._clean_env(NO_COLOR="1", TERM="xterm-256color"):
+            self.assertFalse(colour_enabled(stream=_TTYStringIO()))
+
+    def test_no_color_wins_over_force_color(self):
+        """An explicit opt-out is never overridden by an opt-in."""
+        from render_report import colour_enabled
+
+        with self._clean_env(NO_COLOR="1", FORCE_COLOR="1"):
+            self.assertFalse(colour_enabled(stream=_TTYStringIO()))
+
+    def test_force_color_enables_colour_without_tty(self):
+        """``FORCE_COLOR`` opts a non-TTY sink into colour."""
+        from render_report import colour_enabled
+
+        with self._clean_env(FORCE_COLOR="1"):
+            self.assertTrue(colour_enabled(stream=io.StringIO()))
+
+    def test_force_color_zero_does_not_enable_colour(self):
+        """``FORCE_COLOR=0`` is a no-op (not an opt-in)."""
+        from render_report import colour_enabled
+
+        with self._clean_env(FORCE_COLOR="0"):
+            self.assertFalse(colour_enabled(stream=io.StringIO()))
+
+    def test_dumb_terminal_disables_colour(self):
+        """``TERM=dumb`` degrades even on a TTY."""
+        from render_report import colour_enabled
+
+        with self._clean_env(TERM="dumb"):
+            self.assertFalse(colour_enabled(stream=_TTYStringIO()))
+
+    def test_env_mapping_is_injectable(self):
+        """Callers can pass an explicit env mapping (no process-global read)."""
+        from render_report import colour_enabled
+
+        self.assertFalse(colour_enabled(env={"NO_COLOR": "1"},
+                                        stream=_TTYStringIO()))
+        self.assertTrue(colour_enabled(env={}, stream=_TTYStringIO()))
+
+    # ── rendered report behaviour ───────────────────────────────────────
+
+    def test_non_tty_report_has_no_escape_sequences(self):
+        """AC3: a non-TTY report carries no ANSI escapes at all."""
+        with self._clean_env(TERM="xterm-256color"):
+            report = self._render()
+        self.assertNotIn("\033[", report)
+
+    def test_non_tty_verdict_text_is_intact(self):
+        """AC3: the plain-text verdict is readable, not garbled."""
+        with self._clean_env(TERM="xterm-256color"):
+            report = self._render([("1", "AC one", "test", "met")])
+        conclusion = report.split("## Conclusion", 1)[1]
+        self.assertIn("\n\u2705 Ready to ship\n", conclusion)
+
+    def test_non_tty_incomplete_verdict_text_is_intact(self):
+        """AC2/AC3: the red verdict degrades to plain text too."""
+        with self._clean_env(TERM="xterm-256color"):
+            report = self._render([("1", "AC one", "test", "unmet")])
+        conclusion = report.split("## Conclusion", 1)[1]
+        self.assertIn("\n\U0001f6ab Not ready to ship\n", conclusion)
+        self.assertNotIn("\033[", report)
+
+    def test_report_honours_explicit_colour_false(self):
+        """An explicit ``colour=False`` wins over a colour terminal."""
+        with self._clean_env(FORCE_COLOR="1"):
+            report = self._render(colour=False)
+        self.assertNotIn("\033[", report)
+
+    def test_report_honours_explicit_colour_true(self):
+        """An explicit ``colour=True`` forces escapes for a non-TTY sink."""
+        with self._clean_env(TERM="dumb"):
+            report = self._render(colour=True)
+        self.assertIn(f"{self.GREEN}\u2705 Ready to ship\033[0m", report)
+
+    def test_cli_stdout_redirected_writes_no_escapes(self):
+        """The CLI degrades when its stdout is redirected to a buffer."""
+        with self._clean_env(TERM="xterm-256color"):
+            output = self._run_cli()
+        self.assertNotIn("\033[", output)
+
+    def test_cli_colour_flag_forces_escapes(self):
+        """``--colour`` is the deliberate per-invocation override."""
+        with self._clean_env(TERM="dumb"):
+            output = self._run_cli(["--colour"])
+        self.assertIn("\033[32m\u2705 Ready to ship\033[0m", output)
+
+    def test_cli_colour_flag_beats_no_color_env(self):
+        """An explicit flag outranks the environment opt-out."""
+        with self._clean_env(NO_COLOR="1"):
+            output = self._run_cli(["--colour"])
+        self.assertIn("\033[32m\u2705 Ready to ship\033[0m", output)
+
+    def test_cli_no_colour_flag_wins_over_force_color(self):
+        """``--no-colour`` guarantees plain text for log sinks."""
+        with self._clean_env(FORCE_COLOR="1"):
+            output = self._run_cli(["--no-colour"])
+        self.assertNotIn("\033[", output)
+        self.assertIn("\u2705 Ready to ship", output)
+
+    def _run_cli(self, extra_argv=None):
+        """Run the CLI over the passing envelope; return its stdout."""
+        import render_report as rr
+
+        argv = ["render_report.py", "--json", "--skill-name", "implement"]
+        argv.extend(extra_argv or [])
+        with mock.patch.object(rr.sys, "argv", argv), \
+                mock.patch.object(rr.sys, "stdin",
+                                  io.StringIO(PASSING_ENVELOPE_JSON)), \
+                mock.patch.object(rr, "update_pane_title",
+                                  return_value={"updated": False}):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                rr.main()
+        return buffer.getvalue()
+
+
 class TestConditionalHeader(unittest.TestCase):
     """Verify the header reflects session outcome (AC1/AC5)."""
 
@@ -708,6 +905,11 @@ class TestConditionalConclusion(unittest.TestCase):
     def setUp(self):
         from render_report import render_report
         self.render_report = render_report
+        self._colour = force_colour()
+        self._colour.__enter__()
+
+    def tearDown(self):
+        self._colour.__exit__(None, None, None)
 
     def test_all_met_conclusion_ready_to_ship(self):
         result = self.render_report(
@@ -827,18 +1029,19 @@ class TestRendererWithFixture(unittest.TestCase):
         from render_report import render_report_from_workitem
 
         work_item = json.loads(FULL_WORK_ITEM_JSON)
-        result = render_report_from_workitem(
-            work_item=work_item,
-            skill_name="test-skill",
-            headline="Test headline",
-            acceptance_criteria=[
-                ("1", "Feature works", "unit test passes", "met"),
-                ("2", "Docs updated", "README checked", "met"),
-            ],
-            producer_actions="Review the changes.",
-            notes="This is a test.",
-            next_action="plan",
-        )
+        with force_colour():
+            result = render_report_from_workitem(
+                work_item=work_item,
+                skill_name="test-skill",
+                headline="Test headline",
+                acceptance_criteria=[
+                    ("1", "Feature works", "unit test passes", "met"),
+                    ("2", "Docs updated", "README checked", "met"),
+                ],
+                producer_actions="Review the changes.",
+                notes="This is a test.",
+                next_action="plan",
+            )
         # Check key sections
         self.assertIn("# Completed test-skill", result)
         self.assertIn("SA-0TEST0000000001", result)

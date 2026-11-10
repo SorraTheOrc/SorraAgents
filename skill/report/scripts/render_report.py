@@ -55,6 +55,7 @@ Public API
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -108,20 +109,68 @@ except ImportError:
 
 # ─── ANSI colour helpers ─────────────────────────────────────────────────
 
-# Terminal colour codes — degrade gracefully in plain-text terminals.
+# Terminal colour codes — emitted only into a colour-capable sink so that
+# plain-text sinks (pipes, files, redirected output, TERM=dumb) receive no
+# escape bytes at all (AC3, SA-0MVYEZ3V3004AQXN).
 _ANSI_GREEN = "\033[32m"  # green foreground
 _ANSI_RED = "\033[31m"    # red foreground
 _ANSI_RESET = "\033[0m"   # reset all attributes
 
 
-def _green(text: str) -> str:
-    """Wrap *text* in green ANSI escape codes."""
-    return f"{_ANSI_GREEN}{text}{_ANSI_RESET}"
+def colour_enabled(env: Mapping | None = None, stream=None) -> bool:
+    """Whether ANSI colour should be emitted into *stream*.
+
+    Colour is best-effort: escape sequences must never leak into a sink that
+    cannot render them, because raw ``\033[32m`` bytes read as garbled text
+    there. No explicit override is honoured here — that is the caller's
+    ``colour=`` argument (highest precedence). Precedence, highest first:
+
+    1. ``NO_COLOR`` (any non-empty value) — the
+       `no-color.org <https://no-color.org>`_ opt-out always wins, even over
+       an explicit ``FORCE_COLOR``.
+    2. ``FORCE_COLOR`` — a truthy value (``"0"``/``"false"``/``"no"``/
+       empty are not) opts a non-TTY sink into colour, for tests and CI.
+    3. ``TERM=dumb`` — no colour.
+    4. ``stream.isatty()`` — colour only when the sink is a terminal.
+
+    Parameters
+    ----------
+    env : Mapping or None
+        Environment mapping; defaults to ``os.environ``.
+    stream : file-like or None
+        Target stream; defaults to ``sys.stdout``.
+    """
+    env_map = os.environ if env is None else env
+
+    if str(env_map.get("NO_COLOR", "")).strip():
+        return False
+
+    force = str(env_map.get("FORCE_COLOR", "")).strip().lower()
+    if force and force not in ("0", "false", "no", "off"):
+        return True
+
+    if str(env_map.get("TERM", "")).strip().lower() == "dumb":
+        return False
+
+    target = sys.stdout if stream is None else stream
+    try:
+        return bool(target.isatty())
+    except Exception:  # noqa: BLE001 - an exotic sink must not break a report
+        return False
 
 
-def _red(text: str) -> str:
-    """Wrap *text* in red ANSI escape codes."""
-    return f"{_ANSI_RED}{text}{_ANSI_RESET}"
+def _green(text: str, enabled: bool | None = None) -> str:
+    """Wrap *text* in green ANSI escape codes when colour is enabled."""
+    if enabled is None:
+        enabled = colour_enabled()
+    return f"{_ANSI_GREEN}{text}{_ANSI_RESET}" if enabled else text
+
+
+def _red(text: str, enabled: bool | None = None) -> str:
+    """Wrap *text* in red ANSI escape codes when colour is enabled."""
+    if enabled is None:
+        enabled = colour_enabled()
+    return f"{_ANSI_RED}{text}{_ANSI_RESET}" if enabled else text
 
 
 # ─── Icon mappings (sourced from ContextHub) ───────────────────────────
@@ -439,6 +488,7 @@ def render_report(
     notes=None,
     next_action: str = "review",
     use_cases=None,
+    colour: bool | None = None,
 ) -> str:
     """Render the full canonical end-of-session report.
 
@@ -472,6 +522,12 @@ def render_report(
         inserted between the title line and the headline.  Each string
         is rendered as a bulleted ``- <text>`` line.  When ``None`` or
         empty the section is omitted entirely (no empty heading).
+    colour : bool or None
+        Force ANSI colour on (``True``) or off (``False``) for the
+        Conclusion verdict line.  ``None`` (the default) auto-detects via
+        :func:`colour_enabled`, so a pipe/file/plain-text sink receives no
+        escape bytes and the verdict stays readable (AC3,
+        SA-0MVYEZ3V3004AQXN).
 
     Returns
     -------
@@ -548,14 +604,15 @@ def render_report(
     # Conclusion
     lines.append("## Conclusion")
     lines.append("")
+    use_colour = colour_enabled() if colour is None else bool(colour)
     if status == "completed":
-        lines.append(_green("✅ Ready to ship"))
+        lines.append(_green("✅ Ready to ship", use_colour))
         lines.append(
             f"This completes the {skill_name} process for "
             f"{work_item_id} ({title})."
         )
     else:
-        lines.append(_red("🚫 Not ready to ship"))
+        lines.append(_red("🚫 Not ready to ship", use_colour))
         lines.append(
             f"{skill_name.title()} session for {work_item_id} ({title}) "
             f"is incomplete."
@@ -577,6 +634,7 @@ def render_report_from_workitem(
     children: list | None = None,
     audit_result: Mapping | None = None,
     use_cases=None,
+    colour: bool | None = None,
 ) -> str:
     """Convenience wrapper: read metadata from a work-item dict and render.
 
@@ -597,6 +655,7 @@ def render_report_from_workitem(
         notes=notes,
         next_action=next_action,
         use_cases=use_cases,
+        colour=colour,
     )
 
 
@@ -635,6 +694,7 @@ def render_from_wl(
     notes=None,
     next_action: str = "review",
     use_cases=None,
+    colour: bool | None = None,
 ) -> str:
     """Fetch work-item data via ``wl show`` and render a report."""
     cmd = ["wl", "show", work_item_id, "--json", "--children"]
@@ -665,6 +725,7 @@ def render_from_wl(
         children=children,
         audit_result=data.get("auditResult"),
         use_cases=use_cases,
+        colour=colour,
     )
 
 
@@ -757,6 +818,25 @@ def main():
         action="store_true",
         help="Use bracketed-text fallbacks instead of emoji icons.",
     )
+    colour_group = parser.add_mutually_exclusive_group()
+    colour_group.add_argument(
+        "--colour",
+        "--color",
+        dest="colour",
+        action="store_true",
+        default=None,
+        help=(
+            "Force ANSI colour in the Conclusion verdict line even when stdout "
+            "is not a terminal."
+        ),
+    )
+    colour_group.add_argument(
+        "--no-colour",
+        "--no-color",
+        dest="colour",
+        action="store_false",
+        help="Never emit ANSI escapes (plain-text output).",
+    )
     parser.add_argument(
         "--use-case",
         action="append",
@@ -799,6 +879,7 @@ def main():
             notes=args.notes,
             next_action=args.next_action,
             audit_result=audit_result,
+            colour=args.colour,
         )
         apply_pane_status(
             ac_rows, args.producer_actions, args.notes, no_icons=args.no_icons,
@@ -819,6 +900,7 @@ def main():
         notes=args.notes,
         next_action=args.next_action,
         use_cases=args.use_cases,
+        colour=args.colour,
     )
     apply_pane_status(
         ac_rows, args.producer_actions, args.notes, no_icons=args.no_icons,

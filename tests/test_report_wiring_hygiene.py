@@ -187,9 +187,13 @@ class TestPlanSkillPassesPlanningPhaseAcs:
             "plan: final step must warn against passing the work item's feature ACs"
         )
 
-    def test_documented_planning_phase_acs_render_as_completed(self):
+    def test_documented_planning_phase_acs_render_as_completed(self, monkeypatch):
         """The ACs the skill tells agents to pass must render as a completed
         plan — this is the operator-visible behaviour under test."""
+        # The renderer only emits ANSI colour into a colour-capable sink
+        # (AC3, SA-0MVYEZ3V3004AQXN); pytest's captured stdout is not one.
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        monkeypatch.delenv("NO_COLOR", raising=False)
         acs = _documented_acs(_final_step_section("plan"))
         criteria = [
             (str(i), desc, metric, verdict)
