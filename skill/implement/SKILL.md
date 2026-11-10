@@ -278,15 +278,24 @@ child, serial in dependency order. Pane-driving flags (`--pane-sessions`,
 fail-open to the headless `pi -p` spawner (default for the downtime worker,
 audit dispatch and CI).
 
+**Blocked children are re-validated (SA-0MVTUFL0U0000NV2).** A `blocked`
+child is re-checked each run against its `wl dep` edges and explicit
+`Blocked by …` line: a non-terminal or unresolvable blocker ⇒
+`skip-blocked` with `blocking_ids`, never started; all blockers terminal ⇒
+the block is stale and the child starts. Precedence: `skip-terminal` →
+`skipped-held` → `skip-in-progress` → `skip-blocked` → `implement`. `drive`
+never spawns a `skip-blocked` child. Vocabulary (`blocking_ids`,
+`blocker_details`, `stale_blocks`, `unvalidated_blocks`,
+`unresolved_blockers`, extended `blocked_children` entries) and parsing rule:
+[reference](../../docs/dev/implement-skill-reference.md).
+
 **Driven-session lock holder (SA-0MW7LMUUQ00701KJ).** The long-lived driver,
 not the short-lived `start` subprocess, holds the child's per-child lock for
-the session's whole lifetime; `_child_session_env` passes
-`IMPLEMENT_CHILD_LOCK_TOKEN`, a `finally` releases it on every spawner
-outcome, a different live holder stays `skipped-held`, and a driver killed
-mid-session is the accepted residual window
+the session's whole lifetime (`IMPLEMENT_CHILD_LOCK_TOKEN` re-entry, released
+on every spawner outcome); a killed driver is the residual window
 ([reference](../../docs/dev/implement-skill-reference.md#per-child-implementation-lock-sa-0mvq7vmrl00498yb)).
-`--infra-retry-limit N` (default `5`; 2 s doubling to a 30 s cap) bounds
-transient finish retries. **Manual fallback:**
+`--infra-retry-limit N` (5; 2 s doubling to a 30 s cap) bounds finish
+retries. **Manual fallback:**
 `python3 $(skill_path implement)/scripts/implement.py parent <parent-id>` —
 no children = leaf; all-terminal children advance the parent to
 `completed`/`in_review`; otherwise `phase_parent` finishes children whose
@@ -328,7 +337,7 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   pass it (`IMPLEMENT_DRIVE_ACTIVE=1` defers).
 - Follow the mandatory **build → test → commit** order.
 - **Add the `## Impact` sentence before finishing.** A newly completed item's
-  description must carry an `## Impact` section: one sentence describing the user-experience impact — what a user can now do, see, or stop worrying about — not a technical summary (`finish` advances the item to `in_review`).
+  description must carry an `## Impact` section: one sentence describing the user-experience impact — not a technical summary.
 - **Do NOT create a Pull Request to `main`.** Push the feature branch into
   `dev` via the ship skill (`pushToDev()` from
   `$(skill_path ship)/scripts/ship.js`, preferred) or
@@ -370,17 +379,16 @@ Claim → `in_progress`; epic/parent done and Step 9 → `completed` + stage
 
 ## Scripts (canonical runner & modules)
 
-No single orchestrator — implementation follows the steps above and invokes
-project-local build/test and linters. Build/test steps for repos without
-tooling:
-[reference — build and test steps](../../docs/dev/implement-skill-reference.md#build-step-for-repos-without-a-build-script).
+No single orchestrator — follow the steps above and invoke project-local
+build/test and linters
+([reference](../../docs/dev/implement-skill-reference.md)).
 
 ## Final cleanup (belt-and-suspenders)
 
-Before exiting, `wl show <work-item-id> --json`; if `status: in_progress` and
-work is incomplete, reset via
-`StatusLifecycle.update_status(work_item_id, "open", assignee="")` to prevent
-orphaned items blocking other agents.
+Before exiting, `wl show <work-item-id> --json`; if still `in_progress` and
+the work is incomplete, reset to `open` with `assignee=""` so the item never
+blocks another agent
+([reference](../../docs/dev/implement-skill-reference.md)).
 
 ## Final step: standardized end-of-session report
 

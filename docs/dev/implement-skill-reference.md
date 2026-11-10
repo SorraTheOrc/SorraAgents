@@ -3573,7 +3573,10 @@ Scope of the gate: **same-project** edges (the same id prefix, e.g. `SA-` on
 parent itself. A child blocked by a same-project item outside the epic is
 reported as `blocked` (in `blocked_children`) and is not started; `phase_start`
 refuses the equivalent leaf case with the blocker list, before the claim, so no
-orphaned `in_progress` item and no worktree are left behind.
+orphaned `in_progress` item and no worktree are left behind. A child whose own
+`status` is `blocked` is additionally re-validated against its `Blocked by …`
+line (see *Blocked-child re-validation* below), so a prose/cross-project
+blocker holds it instead of being a note.
 
 Then implement that child by recursing into this procedure (steps 1–8), and
 re-run `implement.py parent <parent-id>`. The parent phase **finishes the
@@ -3586,6 +3589,36 @@ the driven child session may call `finish` for its own item — `start` resumes
 the pre-created worktree idempotently from **either** `cwd` — the main
 checkout or inside the worktree — because the default worktree path is
 resolved against the main checkout root, not `cwd`.)
+
+**Blocked-child re-validation and its report vocabulary
+(SA-0MVTUFL0U0000NV2).** A `blocked` child is re-validated on every run
+instead of being treated as startable or honoured forever.
+
+- **`Blocked by` parsing rule (narrow).** Only one explicit `Blocked by …`
+  line is read — case-insensitive, tolerating the bold/labelled form
+  (`**Blocked by (SorraAgents):** `SA-…``) and a plain `Blocked by:` — and only
+  work-item ids on that line are collected. An `Unblock condition:` line or a
+  `Related work` list is never parsed. Malformed or empty input yields "no
+  blocker", never an exception: the verdict then stays fail-closed
+  (`unvalidated`).
+- **Per-child fields** (`report["children"]` and the `children_processed`
+  verdicts): `action: "skip-blocked"`, `blocking_ids` (the ids that hold it),
+  `stale_block_ids`, `unvalidated`, `blocker_details`
+  (`[{id, status, source: dependency|prose, resolved, hint}]`) and
+  `unresolved_blockers` (the entries whose id could not be resolved).
+- **Report-level fields:** `stale_blocks` (`[{id, blocking_ids}]`),
+  `unvalidated_blocks` (`[{id, reason}]`) and
+  `unresolved_blockers` (`{child id: [blocker ids]}`). `blocked_children`
+  keeps its existing id-list shape.
+- **Messages.** The "no startable child" message names each blocked child's
+  `blocking_ids`; an unresolved id is reported with where to check it
+  ("check the owning project's worklog", with the id prefix as the hint).
+- **`drive`.** A `skip-blocked` child is never spawned: `drive` forwards the
+  verdicts as `blocked_child_details` (child id, status, `blocking_ids`,
+  `stale`/`stale_block_ids`, `unvalidated`) alongside `blocked_children`, plus
+  the report-level fields above, and its message names the blocking ids. If a
+  parent report ever offered a `skip-blocked` child as `next_child`, the drive
+  loop refuses to spawn it (no lock, no session) and stops.
 
 **Single-pass, subprocess-isolated orchestration.** Every child's start and
 finish runs through `_invoke_implement` — a **separate `implement.py`
@@ -3669,10 +3702,15 @@ Guards (deterministic, in `phase_parent`):
   status yields the dedicated `blocked` verdict (`parent_blocked_by`) and no
   child worktree. `phase_start` applies the same outbound gate to a leaf,
   before the claim.
-- **Cross-project edges are coordination notes** — an edge to another project
-  (different id prefix) never gates; it is reported in
-  `coordination_blockers` (parent/leaf report) or `external_blockers`
-  (per-child classification).
+- **Cross-project edges on the invoked item are coordination notes** — an
+  edge from the parent/leaf item to another project (different id prefix)
+  never gates; it is reported in `coordination_blockers`. That is the
+  SA-0MSQBM2FK005NW1T assumption and it is unchanged. It does **not** cover a
+  `blocked` child's declared blocker: a cross-project id named on the child's
+  explicit `Blocked by …` line holds that child's block
+  (SA-0MVTUFL0U0000NV2), resolved through the prefix-to-sibling worklog scan so
+  a landed external blocker makes the block stale instead of stranding the
+  child forever.
 - **Terminal children are never re-implemented** (skipped, reported).
 - **Held children are never raced** — a child whose per-work-item lock is held
   by another live session is reported as `skipped-held` (with `held_by`) and no
@@ -3686,11 +3724,28 @@ Guards (deterministic, in `phase_parent`):
   `children_processed` and the loop moves on; already-completed siblings are
   never regressed.
 - **Cycles fail fast** with a clear error (no infinite recursion).
-- **Blocked children wait** — a child is only started once every in-chain
-  blocker is terminal; otherwise it is reported in `blocked_children`. The
-  same applies to a same-project blocker outside the epic (reported with its
-  `blocked_by` payload) — cross-project blockers stay coordination notes and
-  never gate.
+- **Blocked children are re-validated, never honoured forever**
+  (SA-0MVTUFL0U0000NV2) — a child whose `status` is `blocked` is never started
+  while its block holds, and a stale block never strands it. Every run
+  resolves the block against (a) the outbound `wl dep list` edges and (b) the
+  ids on the child's explicit `Blocked by …` line, if present:
+  - any non-terminal blocker (or an unresolvable cross-project id) ⇒ the child
+    is classified `skip-blocked`, reported in `children_processed` with
+    `action: "skip-blocked"` and its `blocking_ids`, listed in
+    `blocked_children`, and **never started**;
+  - every blocker terminal (`completed`/`done`/`in_review`/soft-deleted) ⇒
+    the block is **stale**: the child becomes startable and the stale ids are
+    reported in `stale_blocks` (plus a log line and a comment on the child —
+    the phase never rewrites the child's `blocked` status, which is the
+    lifecycle owner's decision);
+  - no dependency edge and no parseable `Blocked by` line ⇒
+    `unvalidated_blocks` and the child is held (fail closed; it never
+    defaults to startable).
+
+  Classification precedence is exactly `skip-terminal` → `skipped-held` →
+  `skip-in-progress` → `skip-blocked` → `implement`. A child whose blocker is
+  a same-project item outside the epic is unchanged: reported `blocked` with
+  its `blocked_by` payload.
 - **No premature parent advance** — if any non-terminal child remains
   (in-progress elsewhere or blocked), the parent is not advanced; the phase
   reports waiting instead.
