@@ -14317,10 +14317,30 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                 ),
                             }]
                     elif child["id"] in gap_child_ids:
-                        # Parent has gaps and this child owns the affected files
-                        # → full audit (AC3).
-                        cr["child_audit_ready"] = False
-                        pending_children.append((len(child_results), child))
+                        # Parent has gaps and this child owns the affected files.
+                        # Before re-screening, check whether the child already
+                        # has a content-fresh stored audit (AC1): if so the
+                        # child's own audit already evaluated its ACs and the
+                        # parent can reuse those verdicts without a fresh
+                        # Phase 1 screen (same pattern as the
+                        # --audit-children pre-pass at ~line 13756).
+                        verdict, _reason, audited_at = _get_child_audit_verdict(
+                            runner, child["id"], worklog_dir=worklog_dir,
+                            force=force, child=child,
+                        )
+                        if verdict is not None:
+                            # Content-fresh stored audit — adopt its verdicts
+                            # and skip re-screening (AC1).
+                            cr["child_audit_ready"] = verdict is True
+                            cr["child_audit_not_ready"] = verdict is False
+                            cr["reused_from"] = audited_at
+                            cr["ac_results"] = _child_acs_from_own_audit(
+                                child, runner, worklog_dir=worklog_dir,
+                            )
+                        else:
+                            # No fresh audit — full audit required (AC3).
+                            cr["child_audit_ready"] = False
+                            pending_children.append((len(child_results), child))
                     else:
                         # Unrelated child → not audited (AC3), does not block.
                         cr["pass_through"] = "unrelated_to_gaps"
@@ -14443,6 +14463,24 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         # re-persisting it would overwrite the child's own
                         # fingerprint-bearing report and break future
                         # content-gate reuse.
+                        continue
+                    # AC2 guard: if the child already has a content-fresh stored
+                    # audit with real (non-pending) verdicts, skip persisting
+                    # the parent-generated report.  This prevents a parent run
+                    # from overwriting a child's own serviced audit — whether
+                    # the parent set ``reused_from`` in this run (handled above)
+                    # or the fresh audit was written by a prior/independent run
+                    # (e.g. the child was independently audited while the parent
+                    # was not running).
+                    fresh_verdict, _fresh_reason, _fresh_audited_at = _get_child_audit_verdict(
+                        runner, child["id"], worklog_dir=worklog_dir,
+                        force=force, child=child,
+                    )
+                    if fresh_verdict is not None:
+                        # The child has a content-fresh stored audit with a
+                        # real verdict — the child's own audit is the
+                        # authoritative source; skip the parent-generated
+                        # persist (AC2).
                         continue
                     child_fingerprint = _compute_content_fingerprint(
                         runner, child["id"], worklog_dir=worklog_dir,

@@ -1,3 +1,15 @@
+
+# <!-- REFACTOR-SA-0MWCGH0FF009Q8Y0
+# smell: ruff_specific
+# severity: medium
+# description: Unpacked variable `captured` is never used
+# -->
+
+# <!-- REFACTOR-SA-0MWCGGX8P003Y9PF
+# smell: unused_import
+# severity: critical
+# description: Local variable `fresh_raw` is assigned to but never used
+# -->
 from __future__ import annotations
 
 import contextlib
@@ -2042,3 +2054,411 @@ class TestUnservicedVerdictGuardAndAgreement:
         )
         assert set(gate_ids) == set(payload["pending_child_screens"])
 
+
+
+class TestGapMappedChildAuditReuse:
+    """AC1/AC2 regression: gap-mapped children with a content-fresh stored
+    audit are reused in the parent-first flow and never overwritten.
+
+    These tests exercise the DEFAULT parent-first path
+    (``audit_children=False``) with a parent that has gaps that map to a
+    child that has already been serviced (its stored audit carries a v2
+    content fingerprint matching the child's current content). Before the
+    fix the parent unconditionally re-screened such a child and persisted a
+    pending-``partial`` report over its serviced audit, so the parent could
+    never converge.
+    """
+
+    PARENT_HEAD = "b" * 40
+    CHILD_DESC = "## Acceptance Criteria\n- CAC1: child criterion"
+    AUDITED_AT = "2026-08-01T00:00:00.000Z"
+    CHILD_KEY_FILE = "src/gap.py"
+
+    def _fingerprinted_raw(self, ar, child_id, verdict="Yes",
+                           desc=None, title=None, acs=None):
+        """Build a child audit rawOutput carrying a v2 content fingerprint."""
+        child_desc = self.CHILD_DESC if desc is None else desc
+        if title is None:
+            suffix = child_id[len("CHILD-"):] if child_id.startswith("CHILD-") else ""
+            child_title = f"Child {child_id}" if suffix.isdigit() else ""
+        else:
+            child_title = title
+        fp = ar._compute_content_fingerprint(
+            mock.MagicMock(), child_id,
+            work_item={"title": child_title, "description": child_desc},
+        )
+        assert fp is not None
+        lines = [
+            f"Audit report for work item {child_id}",
+            f"Ready to close: {verdict}",
+            "",
+            f"{ar.AUDIT_CONTENT_FINGERPRINT_PREFIX}{fp}",
+            "",
+            "## Summary",
+            "Child audit ok.",
+            "",
+            "## Acceptance Criteria Status",
+            "",
+            "| # | Criterion | Verdict | Evidence |",
+            "|---|-----------|---------|----------|",
+        ]
+        if acs is None:
+            acs = [("CAC1: child criterion", "met", f"{self.CHILD_KEY_FILE}:1")]
+        for i, (text, v, ev) in enumerate(acs, 1):
+            lines.append(f"| {i} | {text} | {v} | {ev} |")
+        return "\n".join(lines)
+
+    def _child(self, child_id="CHILD-1", key_file=None, stage="in_review"):
+        desc = self.CHILD_DESC
+        if key_file:
+            desc += f"\n\n## Key Files\n- {key_file}"
+        return {
+            "id": child_id,
+            "title": f"Child {child_id}",
+            "status": "completed" if stage == "done" else "in_progress",
+            "stage": stage,
+            "updatedAt": "2026-08-05T00:00:00.000Z",
+            "description": desc,
+        }
+
+    def _make_runner(self, children, child_audit_raw=None,
+                     child_updated_at=None):
+        """Mock runner for the parent-first (audit_children=False) flow."""
+        mock_runner = mock.MagicMock()
+        child_audit_raw = child_audit_raw or {}
+        updated_at = child_updated_at or "2026-08-05T00:00:00.000Z"
+
+        def _side_effect(cmd):
+            cmd_str = " ".join(cmd)
+
+            if "audit-show" in cmd_str:
+                child_id = cmd_str.split("audit-show", 1)[1].strip().split()[0]
+                if child_id == "TEST-1":
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({
+                            "success": True,
+                            "audit": {
+                                "rawOutput": "TEST-1 audit report",
+                                "auditedAt": "2026-01-01T00:00:00.000Z",
+                            },
+                        }),
+                        stderr="",
+                    )
+                raw = child_audit_raw.get(child_id)
+                if raw is None:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps({"success": True, "audit": None}),
+                        stderr="",
+                    )
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "audit": {
+                            "rawOutput": raw,
+                            "auditedAt": self.AUDITED_AT,
+                        },
+                    }),
+                    stderr="",
+                )
+
+            if "show" in cmd_str and "--children" not in cmd_str \
+                    and "TEST-1" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1", "status": "open",
+                            "stage": "plan_complete",
+                        },
+                    }),
+                    stderr="",
+                )
+
+            if "show" in cmd_str and "--children" not in cmd_str:
+                child_id = cmd_str.split("show", 1)[1].strip().split()[0]
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": child_id,
+                            "description": self.CHILD_DESC,
+                            "updatedAt": updated_at,
+                        },
+                    }),
+                    stderr="",
+                )
+
+            if "--children" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({
+                        "success": True,
+                        "workItem": {
+                            "id": "TEST-1",
+                            "description": "## Acceptance Criteria\n"
+                                            "- AC1: parent criterion",
+                            "status": "in_progress",
+                        },
+                        "children": children,
+                    }),
+                    stderr="",
+                )
+
+            if "update" in cmd_str:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"success": True}),
+                    stderr="",
+                )
+
+            if cmd_str.startswith(("git status", "git diff")):
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            return SimpleNamespace(
+                returncode=0, stdout=json.dumps({"success": True}), stderr="",
+            )
+
+        mock_runner.side_effect = stateful_wl_side_effect(_side_effect)
+        return mock_runner
+
+    def _run(self, children, *, parent_verdict="unmet",
+             gap_file=None, persist=False, audit_children=False,
+             child_audit_raw=None, child_updated_at=None,
+             persist_calls=None):
+        """Run cmd_issue in the parent-first (or opt-in) flow."""
+        captured = {}
+        pi_calls = []
+        triggered: list[str] = []
+
+        def _fake_pi(issue_id, context, prompt, **kwargs):
+            pi_calls.append(context)
+            if context in ("parent", "phase2_deep"):
+                evidence = f"{gap_file}:1" if gap_file else "parent.py:1"
+                return {"extracted_text": json.dumps([
+                    {"index": 0, "verdict": parent_verdict,
+                     "evidence": evidence},
+                ])}
+            return {"extracted_text": json.dumps([
+                {"index": 0, "verdict": "partial",
+                 "evidence": "child pending"},
+            ])}
+
+        original_assemble = audit_runner._assemble_issue_report
+
+        def _capturing_assemble(issue, ac_results, child_results, **kwargs):
+            captured["child_results"] = child_results
+            captured["ac_results"] = ac_results
+            captured["child_ids"] = [c["id"] for c in child_results]
+            return original_assemble(
+                issue, ac_results, child_results, **kwargs)
+
+        def _fake_persist(issue_id, report, worklog_dir=None):
+            if persist_calls is not None:
+                persist_calls.append((issue_id, report))
+            return 0
+
+        def _fake_subprocess_run(cmd, **kwargs):
+            cmd_str = " ".join(cmd)
+            if "audit_runner.py" in cmd_str and "issue" in cmd_str:
+                triggered.append(cmd_str)
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        runner = self._make_runner(
+            children, child_audit_raw=child_audit_raw,
+            child_updated_at=child_updated_at,
+        )
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log",
+                side_effect=_fake_pi))
+            stack.enter_context(mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0}))
+            stack.enter_context(mock.patch.object(
+                audit_runner, "_assemble_issue_report",
+                side_effect=_capturing_assemble))
+            stack.enter_context(mock.patch.object(
+                audit_runner.subprocess, "run",
+                side_effect=_fake_subprocess_run))
+            stack.enter_context(mock.patch.object(
+                audit_runner, "persist_audit", side_effect=_fake_persist))
+            stack.enter_context(mock.patch.object(
+                audit_runner, "_resolve_audited_head",
+                return_value=self.PARENT_HEAD))
+            rc = audit_runner.cmd_issue(
+                "TEST-1", persist=persist, force=False, runner=runner,
+                json_mode=False, parent_timeout=None,
+                audit_children=audit_children,
+            )
+        captured["pi_calls"] = pi_calls
+        captured["triggered"] = triggered
+        return rc, captured
+
+    # ------------------------------------------------------------------
+    # AC1: gap-mapped child with a content-fresh stored audit is reused
+    # ------------------------------------------------------------------
+
+    def test_ac1_gap_mapped_fresh_child_not_rescreened(self):
+        """AC1: in the DEFAULT parent-first flow, a gap-mapped child with a
+        content-fresh stored audit is reused — the parent adopts the child's
+        persisted verdicts and does NOT emit a child Phase 1 screen.
+
+        Parent AC is unmet and its evidence maps to the child's Key File.
+        The child's stored audit is content-fresh (fingerprint matches) and
+        says "Ready to close: Yes" — so the parent must reuse it.
+        """
+        ar = audit_runner
+        raw = {
+            "CHILD-1": self._fingerprinted_raw(
+                ar, "CHILD-1", verdict="Yes",
+                desc=(self.CHILD_DESC +
+                      f"\n\n## Key Files\n- {self.CHILD_KEY_FILE}"),
+            ),
+        }
+        rc, captured = self._run(
+            [self._child("CHILD-1", key_file=self.CHILD_KEY_FILE)],
+            parent_verdict="unmet", gap_file=self.CHILD_KEY_FILE,
+            audit_children=False, child_audit_raw=raw,
+        )
+        assert rc == 0
+        children = {c["id"]: c for c in captured["child_results"]}
+        child = children["CHILD-1"]
+        # Reused, not re-screened.
+        assert child.get("reused_from") == self.AUDITED_AT, (
+            "gap-mapped fresh child must be reused from its stored audit: "
+            f"{child!r}"
+        )
+        assert child["child_audit_ready"] is True
+        # No child Phase 1 screen was emitted.
+        child_screen_calls = [
+            c for c in captured["pi_calls"] if c.startswith("child:")
+        ]
+        assert child_screen_calls == [], (
+            "gap-mapped fresh child must NOT be re-screened: "
+            f"{child_screen_calls}"
+        )
+        # No child audit was auto-triggered.
+        assert captured["triggered"] == []
+        # AC3 convergence: no child is pending in-main-slot review, so the
+        # ``<id>.pending-screens.json`` signal clears (empty list ⇒ unlink)
+        # and the ``Child screens pending`` gate is never emitted.
+        assert audit_runner._pending_main_slot_child_ids(
+            captured["child_results"]) == []
+
+    def test_ac1_gap_mapped_stale_child_still_screened(self):
+        """AC1 negative control: a gap-mapped child whose stored audit is
+        NOT fresh (fingerprint mismatch) is still screened — the reuse path
+        only applies to content-fresh audits."""
+        ar = audit_runner
+        # Fingerprint built over a DIFFERENT description → stale.
+        raw = {
+            "CHILD-1": self._fingerprinted_raw(
+                ar, "CHILD-1", verdict="Yes", desc="## Old child content",
+            ),
+        }
+        rc, captured = self._run(
+            [self._child("CHILD-1", key_file=self.CHILD_KEY_FILE)],
+            parent_verdict="unmet", gap_file=self.CHILD_KEY_FILE,
+            audit_children=False, child_audit_raw=raw,
+        )
+        assert rc == 0
+        children = {c["id"]: c for c in captured["child_results"]}
+        child = children["CHILD-1"]
+        assert not child.get("reused_from"), (
+            "stale gap-mapped child must NOT be reused: "
+            f"{child!r}"
+        )
+        assert child["child_audit_ready"] is False
+        child_screen_calls = [
+            c for c in captured["pi_calls"] if c.startswith("child:")
+        ]
+        assert child_screen_calls, (
+            "stale gap-mapped child must still be screened"
+        )
+
+    # ------------------------------------------------------------------
+    # AC2: persist never overwrites a content-fresh serviced child audit
+    # ------------------------------------------------------------------
+
+    def test_ac2_persist_does_not_overwrite_fresh_child_audit(self):
+        """AC2: when a child already has a content-fresh stored audit with a
+        real verdict, the parent persist path skips writing the parent's
+        pending report over it.
+
+        We drive the persist path with a stale-fingerprint child (so AC1
+        cannot reuse it in the loop) but patch ``_get_child_audit_verdict``
+        at persist time to report a fresh verdict, simulating the case where
+        the child was serviced between the screening decision and the persist
+        step (e.g. an in-main-slot screen that landed a real verdict).
+        """
+        ar = audit_runner
+        persist_calls: list[tuple[str, str]] = []
+        child = self._child("CHILD-1", key_file=self.CHILD_KEY_FILE)
+        fresh_raw = self._fingerprinted_raw(
+            ar, "CHILD-1", verdict="Yes",
+            desc=(self.CHILD_DESC +
+                  f"\n\n## Key Files\n- {self.CHILD_KEY_FILE}"),
+        )
+
+        # AC1 sees no fresh audit (stale) so the child is screened; AC2 at
+        # persist time sees a fresh audit and must skip persisting.
+        stale_raw = {
+            "CHILD-1": self._fingerprinted_raw(
+                ar, "CHILD-1", verdict="Yes", desc="## Old child content",
+            ),
+        }
+        verdict_calls = {"n": 0}
+        original_get_verdict = ar._get_child_audit_verdict
+
+        def _fake_get_verdict(runner, child_id, **kwargs):
+            verdict_calls["n"] += 1
+            if verdict_calls["n"] == 1:
+                # AC1 loop check: stale → not reusable.
+                return None, "stale", self.AUDITED_AT
+            # Persist guard check: fresh serviced audit exists.
+            return True, "ready", self.AUDITED_AT
+
+        with mock.patch.object(
+            ar, "_get_child_audit_verdict", side_effect=_fake_get_verdict,
+        ):
+            rc, captured = self._run(
+                [child], parent_verdict="unmet",
+                gap_file=self.CHILD_KEY_FILE, persist=True,
+                audit_children=False, child_audit_raw=stale_raw,
+                persist_calls=persist_calls,
+            )
+
+        assert rc == 0
+        persisted_ids = [i for i, _ in persist_calls]
+        assert "CHILD-1" not in persisted_ids, (
+            "parent persist must NOT overwrite a content-fresh serviced "
+            f"child audit: {persisted_ids}"
+        )
+        # The parent report itself still persists.
+        assert "TEST-1" in persisted_ids
+
+    def test_ac2_persist_writes_when_no_fresh_child_audit(self):
+        """AC2 negative control: when the child has NO fresh stored audit,
+        the parent persist path writes the child audit normally."""
+        ar = audit_runner
+        persist_calls: list[tuple[str, str]] = []
+        child = self._child("CHILD-1", key_file=self.CHILD_KEY_FILE)
+
+        rc, captured = self._run(
+            [child], parent_verdict="unmet", gap_file=self.CHILD_KEY_FILE,
+            persist=True, audit_children=False, child_audit_raw=None,
+            persist_calls=persist_calls,
+        )
+        assert rc == 0
+        persisted_ids = [i for i, _ in persist_calls]
+        assert "CHILD-1" in persisted_ids, (
+            "child without a fresh audit must be persisted by the parent: "
+            f"{persisted_ids}"
+        )
+        assert "TEST-1" in persisted_ids
