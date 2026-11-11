@@ -108,11 +108,12 @@ Startup static-context budget (bytes / tokens):
 > canonical, deterministic measurement; subsequent features (F2–F6) and the
 > final verification gate use it exclusively.
 
-> **Assignee-release update (2026-11-03, SA-0MW0F91KN004J06U):** the canonical
+> **Assignee-release update (2026-11-03, SA-0MW0F91KN004J06U; widened
+> 2026-11-08, SA-0MW7QTAHW0030FGV):** the canonical
 > [Assignee release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)
-> section was widened to state that **any non-producer claim** is released on
-> a terminal outcome and to name the session backstop and the TTL-bounded
-> stale-claim reaper. That added 880 B to `AGENTS_GLOBAL.md` (14,346 B →
+> section states that **every non-empty assignee** is released on a terminal
+> outcome and names the session backstop and the TTL-bounded stale-claim
+> reaper. That added 880 B to `AGENTS_GLOBAL.md` (14,346 B →
 > 15,226 B; total 19,970 B → 20,850 B); the committed thresholds below pin the
 > new approved budget.
 
@@ -124,11 +125,50 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 15843,
+  "global_agents": 15922,
   "project_agents": 3875,
   "skills_prose": 2339,
-  "total": 22057
+  "skill_implement_md": 22000,
+  "total": 22136
 }
+```
+
+### Implement SKILL.md body gate (SA-0MVYDCUWA001Z8K0)
+
+The implement skill's `SKILL.md` is inlined verbatim into **every**
+`/skill:implement` invocation, so its byte size is a per-turn cost separate
+from the startup surface above. It regrew ~5× after the F5 trim (15,447 B
+budget → 99,749 B by 2026-11-07), so it now has its own measured component
+and threshold: `skill_implement_md: 22000` (AC1/AC4; raised from 20,000 — see
+the revision note below). The component is reported by `measure_context.py`
+and is **excluded from `total`** — it is not startup context, and the
+pre-push hook enforces it alongside the startup thresholds.
+
+> **No-op finish contract (2026-11-09, SA-0MW74IL6B001AMQN):** the brief had
+> only 57 B of headroom under the 20,000 B cap, so documenting the mandatory
+> no-op finish / `--verification-only` contract could not fit. Rather than
+> delete prose that the doc-consistency tests pin (the Step 5 worktree
+> requirement, the removal-ownership rule, the rebuild note), the cap was
+> revised to **22,000 B** — the body is now 21,576 B, still ~78% below the
+> 99,749 B it started from. The ratchet stays: any further increase is a
+> conscious, recorded budget revision.
+
+**Before/after composition of a cold implement turn** (chars/4 token
+estimate):
+
+| Component | Before (2026-11-07) | After | Notes |
+|---|---|---|---|
+| `skill/implement/SKILL.md` body | 99,749 B / ~24,937 tok | **21,576 B / ~5,394 tok** | ≥78% cut; ≤22,000 B gate (AC1, revised by SA-0MW74IL6B001AMQN) |
+| System prompt (AGENTS_GLOBAL + project AGENTS + skills prose) | ~21,080 B / ~5,270 tok | ~21,274 B / ~5,318 tok | unchanged by this item |
+| **Cold implement turn (body + system)** | **~30,200 tok** | **~10,300 tok** | the intake-measured P50 was ~24–25k before further growth |
+
+The deep reference prose was relocated **verbatim** to
+`docs/dev/implement-skill-reference.md` (appendix "relocated SKILL.md prose"),
+so no behavioural content is lost (AC2); the brief keeps the operational step
+sequence and every command/flag an operator needs (AC3). Re-measure with:
+
+```bash
+python3 skill/context-audit/scripts/measure_context.py --json
 ```
 
 > **Assignee-release invariant section (2026-11-02, SA-0MVVF7CZ6002UDKU):**
@@ -248,6 +288,14 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > the standup report quotes each item's `## Impact` sentence — so the
 > thresholds were regenerated to the new measured surface rather than
 > compacting the convention.
+>
+> **Assignee-release invariant bump (2026-11-08, SA-0MW7QTAHW0030FGV):**
+> clarifying that `needsProducerReview` is the only persistent hold and that
+> the producer identity `Map` is released like any other claim added ~79 B to
+> `AGENTS_GLOBAL.md` (`global_agents 15843` → `15922`; `total 22057` →
+> `22136`; `project_agents` and `skills_prose` unchanged). The growth is the
+> canonical-wording clarification (the retired producer-hold exception is
+> removed), so the thresholds were regenerated to the new measured surface.
 >
 > ### Enforcement (committed gate)
 >

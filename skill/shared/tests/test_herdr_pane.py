@@ -147,8 +147,8 @@ class TestDeriveStatus:
 # SA-0MVQ1QKLN007S1BW).
 #
 # Routine workflow progression ("run /skill:<next>", "proceed to <stage>",
-# "review the brief, then …") belongs in the Conclusion's
-# ``Ready for <next_action>`` line, never in ``## Producer Actions``. The same
+# "review the brief, then …") is conveyed by the Conclusion's standalone
+# ready/not-ready verdict line, never by ``## Producer Actions``. The same
 # shared classifier feeds the report renderer and the pane-status derivation so
 # a routine next step never produces the ⚠️ ``note`` state.
 #

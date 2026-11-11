@@ -213,6 +213,123 @@ describe('pre-push hook: branch policy', () => {
   });
 });
 
+// ── Tree-keyed gate provenance (SA-0MW7C6BMZ00931JG) ──────────────────────
+
+/**
+ * Run the pre-push hook in a temp repo pushing HEAD to `dev`, with a fake
+ * runner that writes `runnerStderr` and exits with `runnerExit`.
+ *
+ * Returns `{ exitCode, output }` where `output` is git's combined stdout +
+ * stderr (the hook's provenance echoes are forwarded to the push's stderr).
+ */
+function runDevGateHook({ runnerStderr, runnerExit = 0 }) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pre-push-gate-'));
+  try {
+    execGit('git init', { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git checkout -b feature', { cwd: tmpDir, stdio: 'pipe' });
+    const hooksDir = path.join(tmpDir, '.git', 'hooks');
+    fs.mkdirSync(hooksDir, { recursive: true });
+    fs.writeFileSync(path.join(hooksDir, 'pre-push'), fs.readFileSync(HOOK_PATH, 'utf8'), {
+      mode: 0o755,
+    });
+    execGit('git config core.hooksPath .git/hooks', { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+    fs.writeFileSync(path.join(tmpDir, 'README.md'), '# test');
+    execGit('git add .', { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+    const fakeRemote = path.join(tmpDir, 'fake-remote.git');
+    execGit(`git init --bare ${fakeRemote}`, { cwd: tmpDir, stdio: 'pipe' });
+    execGit('git remote add origin ' + fakeRemote, { cwd: tmpDir, stdio: 'pipe' });
+
+    // Fake runner: emit the provenance lines the real runner writes, then the
+    // JSON the hook may classify from. The gate only greps stderr for the
+    // gate-* lines when it succeeds.
+    const runner = path.join(tmpDir, 'skill', 'test', 'scripts', 'run_tests.py');
+    fs.mkdirSync(path.dirname(runner), { recursive: true });
+    fs.writeFileSync(
+      runner,
+      'import sys\n' +
+        `sys.stderr.write(${JSON.stringify(runnerStderr)})\n` +
+        'sys.stdout.write("{}\\n")\n' +
+        `sys.exit(${runnerExit})\n`,
+      'utf8'
+    );
+
+    const env = {
+      ...process.env,
+      WORKLOG_SKIP_PRE_PUSH: '1',
+      CONTEXT_BUDGET_SKIP: '1',
+      BRANCH_POLICY_SKIP: '',
+    };
+    try {
+      const out = execGit('git push origin HEAD:refs/heads/dev 2>&1', {
+        cwd: tmpDir,
+        env,
+        stdio: 'pipe',
+      }).toString();
+      return { exitCode: 0, output: out };
+    } catch (err) {
+      return {
+        exitCode: err.status ?? 1,
+        output: (err.stdout?.toString() || '') + (err.stderr?.toString() || ''),
+      };
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+describe('pre-push hook: tree-keyed gate provenance', () => {
+  test('echoes tree-keyed provenance and cache hit/age to the pusher', () => {
+    const lines =
+      'run_tests: gate-subject pushed=abc123 checkout=in-place ' +
+      'fingerprint_kind=tree tree=ttt\n' +
+      'run_tests: gate-root /tmp/gate\n' +
+      'run_tests: gate-verdict verdict=cached sha=abc123 tree=ttt ' +
+      'fingerprint_kind=tree cache_hit=true cache_age_seconds=42.0 entries=1\n';
+    const result = runDevGateHook({ runnerStderr: lines });
+    assert.equal(result.exitCode, 0, result.output);
+    assert.ok(
+      result.output.includes('run_tests: gate-subject'),
+      `expected gate-subject provenance, got: ${result.output}`
+    );
+    assert.ok(result.output.includes('fingerprint_kind=tree'), result.output);
+    assert.ok(result.output.includes('tree=ttt'), result.output);
+    assert.ok(result.output.includes('cache_hit=true'), result.output);
+    assert.ok(
+      result.output.includes('cache_age_seconds=42.0'),
+      `expected the reused verdict's age, got: ${result.output}`
+    );
+  });
+
+  test('surfaces a gate refusal and blocks the push', () => {
+    const result = runDevGateHook({
+      runnerStderr:
+        'run_tests: gate-refused pushed commit abc123 is not present in this ' +
+        'repository. Set TEST_SCOPE_SKIP=1 to bypass (not recommended).\n',
+      runnerExit: 2,
+    });
+    assert.notEqual(result.exitCode, 0, result.output);
+    assert.ok(result.output.includes('run_tests: gate-refused'), result.output);
+    assert.ok(result.output.includes('TEST_SCOPE_SKIP=1'), result.output);
+  });
+
+  test('invokes the runner with --gate-commit (pushed-commit guard intact)', () => {
+    const content = fs.readFileSync(HOOK_PATH, 'utf8');
+    assert.ok(content.includes('--gate-commit'), 'hook must forward --gate-commit');
+    assert.ok(
+      content.includes("grep '^run_tests: gate-'"),
+      'hook must echo the runner gate-* provenance lines'
+    );
+    assert.ok(
+      content.includes('mirror_suite_cache'),
+      'hook must mirror the served entry into the main checkout cache'
+    );
+  });
+});
+
 // ── Hook file integrity ─────────────────────────────────────────────────────
 
 describe('pre-push hook file', () => {

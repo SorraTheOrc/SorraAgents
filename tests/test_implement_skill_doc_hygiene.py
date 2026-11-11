@@ -69,11 +69,16 @@ def _normalised(path: Path) -> str:
 
 
 def _finish_refusal_section() -> str:
-    """The SKILL.md 'Finish lock, verified sync and refusal recovery' block."""
-    content = _normalised(_SKILL_MD)
+    """The reference-doc 'Finish lock, verified sync and refusal recovery' block.
+
+    The prose was relocated verbatim from ``skill/implement/SKILL.md``
+    (SA-0MVYDCUWA001Z8K0, AC5), so the contract is asserted against the
+    reference doc.
+    """
+    content = _normalised(_REFERENCE_DOC)
     marker = "Finish lock, verified sync and refusal recovery"
     start = content.find(marker)
-    assert start != -1, f"{_SKILL_MD.name} must document {marker!r}"
+    assert start != -1, f"{_REFERENCE_DOC.name} must document {marker!r}"
     end = content.find("Pre-push blocking check", start)
     assert end != -1 and end > start, (
         "the finish-refusal section must precede the pre-push check section"
@@ -118,8 +123,12 @@ class TestFinishLockAndVerifiedSyncDocs:
 
     def test_step_9_cross_links_the_recovery_section(self) -> None:
         content = _normalised(_SKILL_MD)
-        assert "Finish lock, verified sync and refusal recovery" in content
-        assert "per-repository finish lock" in content
+        assert (
+            "relocated-finish-lock-verified-sync-and-refusal-recovery" in content
+        ), "Step 9 must cross-link the relocated finish-lock recovery section"
+        reference = _normalised(_REFERENCE_DOC)
+        assert "Finish lock, verified sync and refusal recovery" in reference
+        assert "per-repository finish lock" in reference
 
     def test_reference_doc_documents_the_same_contract(self) -> None:
         doc = _normalised(_REFERENCE_DOC)

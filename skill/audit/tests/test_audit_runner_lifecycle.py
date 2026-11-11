@@ -249,7 +249,8 @@ class TestVerdictDrivenStatusLifecycle:
 
     def test_ready_yes_child_clears_assignee(self):
         """AC2: Ready to close: Yes on a child item (has a parent) clears the
-        assignee — the parent's review covers the subtree, so no producer hold.
+        assignee — the parent's review covers the subtree, so no
+        ``needsProducerReview`` hold.
         """
         updates = []
         self._run_issue(
@@ -266,7 +267,7 @@ class TestVerdictDrivenStatusLifecycle:
 
     def test_ready_yes_keeps_terminal_done_stage(self):
         """AC1: Ready to close: Yes keeps a pre-existing 'done' stage, and a
-        top-level item gets the producer hold."""
+        top-level item gets the ``needsProducerReview`` hold."""
         updates = []
         self._run_issue(
             updates,
@@ -281,7 +282,7 @@ class TestVerdictDrivenStatusLifecycle:
 
     def test_ready_yes_child_keeps_terminal_done_stage(self):
         """AC2: A child keeps a pre-existing 'done' stage and clears the
-        assignee (no producer hold)."""
+        assignee (no ``needsProducerReview`` hold)."""
         updates = []
         self._run_issue(
             updates,

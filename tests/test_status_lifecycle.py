@@ -120,7 +120,9 @@ class TestStatusLifecycleUpdateStatus:
         )
 
         assert len(calls) >= 1, "Expected at least one wl update call"
-        cmd_list = calls[0]
+        # The terminal transition first reads the item to decide the release;
+        # the final call is the update that carries the requested flags.
+        cmd_list = calls[-1]
         assert "--stage" in cmd_list, f"Expected --stage in command, got: {cmd_list}"
         assert "--needs-producer-review" in cmd_list, (
             f"Expected --needs-producer-review in command, got: {cmd_list}"

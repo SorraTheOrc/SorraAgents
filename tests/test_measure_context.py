@@ -129,6 +129,20 @@ class TestMeasure:
         assert comps["skills_prose"]["skill_count"] == 2
         assert comps["total"]["bytes"] == 171
 
+    def test_skill_implement_md_is_a_separate_component(self, repo_root: Path):
+        """SA-0MVYDCUWA001Z8K0 AC4: the implement brief is measured on its own.
+
+        It is inlined on every implement invocation, so it is gated separately
+        from the startup ``total``.
+        """
+        implement = repo_root / "skill" / "implement"
+        implement.mkdir(parents=True)
+        (implement / "SKILL.md").write_text("X" * 42, encoding="utf-8")
+        comps = mc.measure(repo_root)
+        assert comps["skill_implement_md"]["bytes"] == 42
+        # The startup total excludes the implement brief.
+        assert comps["total"]["bytes"] == 171
+
     def test_token_estimates(self, repo_root: Path):
         comps = mc.measure(repo_root)
         assert comps["total"]["tokens"] == mc.estimate_tokens(171)

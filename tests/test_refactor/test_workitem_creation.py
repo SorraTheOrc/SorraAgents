@@ -1113,6 +1113,314 @@ class TestErrorHandling:
             assert result == "medium", f"Expected 'medium' for {invalid!r}, got {result!r}"
 
 
+# ---------------------------------------------------------------------------
+# Tests: Repository-relative path normalisation (AC1, AC2)
+# ---------------------------------------------------------------------------
+
+
+class TestRepoRelativePathNormalisation:
+    """Work items record repository-relative paths, never absolute worktree paths.
+
+    Related acceptance criteria:
+    - AC1: Refactor work items record a repo-relative path, never absolute,
+           never a ``.worklog/worktrees/**`` prefix.
+    - AC2: A finding whose target resolves under ``.worklog/worktrees/**`` is
+           skipped, never filed as a standalone item.
+    - AC3: The same file scanned from two different worktrees produces one item.
+    """
+
+    def test_repo_relative_path_already_relative(self):
+        """Already-relative paths pass through unchanged."""
+        from refactor.workitem_creation import _repo_relative_path
+
+        result = _repo_relative_path("skill/refactor/workitem_creation.py")
+        assert result == "skill/refactor/workitem_creation.py"
+
+    def test_repo_relative_path_normalises_absolute(self, monkeypatch):
+        """Absolute paths are converted to repo-relative via git rev-parse."""
+        from refactor.workitem_creation import _repo_relative_path
+
+        absolute = "/home/user/project/skill/refactor/workitem_creation.py"
+
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, *args, **kwargs: (subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="/home/user/project", stderr="",
+            ) if "rev-parse" in " ".join(cmd) else _cp()),
+        )
+
+        result = _repo_relative_path(absolute)
+        assert result == "skill/refactor/workitem_creation.py"
+
+    def test_repo_relative_path_handles_trailing_slash(self):
+        """Trailing slashes are normalised away."""
+        from refactor.workitem_creation import _repo_relative_path
+
+        result = _repo_relative_path("/some/path/skill/refactor/", repo_root="/some/path")
+        assert result == "skill/refactor"
+
+    def test_build_smell_title_uses_repo_relative_path(self):
+        """Title uses repo-relative path, never absolute."""
+        from refactor.workitem_creation import build_smell_title
+
+        smell: dict[str, Any] = {
+            "file": "skill/implement/scripts/implement.py",
+            "smell_type": "security",
+            "message": "Test",
+        }
+        title = build_smell_title(smell)
+        assert "skill/implement/scripts/implement.py" in title
+        assert "/" in title or "skill/" in title
+        # Ensure no absolute path leakage
+        assert not title.startswith("Refactor:") or not title[9:].startswith("/")
+
+    def test_build_smell_description_uses_repo_relative_path(self):
+        """Description uses repo-relative path, never absolute."""
+        from refactor.workitem_creation import build_smell_description
+
+        smell: dict[str, Any] = {
+            "file": "skill/implement/scripts/implement.py",
+            "line": 42,
+            "severity": "high",
+            "smell_type": "complex_function",
+            "source": "linter",
+            "message": "Test description",
+        }
+        desc = build_smell_description(smell)
+        assert "skill/implement/scripts/implement.py" in desc
+        assert "`skill/implement/scripts/implement.py`" in desc
+
+    def test_no_worktree_path_in_title_or_description(self, monkeypatch):
+        """Neither title nor description contains .worklog/worktrees."""
+        from refactor.workitem_creation import (
+            build_smell_description,
+            build_smell_title,
+        )
+
+        repo_root = "/home/user/project"
+        smell: dict[str, Any] = {
+            "file": f"{repo_root}/skill/implement/scripts/implement.py",
+            "line": 42,
+            "severity": "high",
+            "smell_type": "complex_function",
+            "source": "linter",
+            "message": "Test",
+        }
+
+        # Resolve the default repo root from git.
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda cmd, *args, **kwargs: subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout=repo_root, stderr="",
+            )
+            if "rev-parse" in " ".join(cmd)
+            else _cp(),
+        )
+
+        title = build_smell_title(smell)
+        desc = build_smell_description(smell)
+
+        assert ".worklog/worktrees" not in title
+        assert ".worklog/worktrees" not in desc
+        assert repo_root not in title
+        assert repo_root not in desc
+
+    def test_no_worktree_path_when_scanned_from_worktree_root(self):
+        """A scan rooted in an implement worktree yields a repo-relative identity."""
+        from refactor.workitem_creation import (
+            build_smell_description,
+            build_smell_title,
+        )
+
+        worktree_root = (
+            "/home/user/project/.worklog/worktrees/wl-ABC123-xyz"
+        )
+        smell: dict[str, Any] = {
+            "file": f"{worktree_root}/skill/implement/scripts/implement.py",
+            "line": 42,
+            "severity": "high",
+            "smell_type": "complex_function",
+            "source": "linter",
+            "message": "Test",
+        }
+
+        title = build_smell_title(smell, repo_root=worktree_root)
+        desc = build_smell_description(smell, repo_root=worktree_root)
+
+        assert ".worklog/worktrees" not in title
+        assert ".worklog/worktrees" not in desc
+        assert "skill/implement/scripts/implement.py" in title
+        assert "skill/implement/scripts/implement.py" in desc
+
+    def test_same_file_different_worktrees_produce_same_title(self):
+        """Same repo-relative file scanned from two worktrees produces identical title."""
+        from refactor.workitem_creation import (
+            build_smell_description,
+            build_smell_title,
+        )
+
+        smell: dict[str, Any] = {
+            "line": 42,
+            "severity": "high",
+            "smell_type": "complex_function",
+            "source": "linter",
+            "message": "Test",
+        }
+
+        wt1_root = "/home/user/project/.worklog/worktrees/wl-ABC123-xyz"
+        wt2_root = "/home/user/project/.worklog/worktrees/wl-DEF456-abc"
+
+        smell1 = dict(smell)
+        smell1["file"] = f"{wt1_root}/skill/implement/scripts/implement.py"
+
+        smell2 = dict(smell)
+        smell2["file"] = f"{wt2_root}/skill/implement/scripts/implement.py"
+
+        title1 = build_smell_title(smell1, repo_root=wt1_root)
+        title2 = build_smell_title(smell2, repo_root=wt2_root)
+        desc1 = build_smell_description(smell1, repo_root=wt1_root)
+        desc2 = build_smell_description(smell2, repo_root=wt2_root)
+
+        assert title1 == title2, (
+            f"Titles differ for same repo-relative file: {title1!r} vs {title2!r}"
+        )
+        assert desc1 == desc2, "Descriptions differ for the same repo-relative file"
+        assert title1 == "Refactor: Complex Function in skill/implement/scripts/implement.py"
+
+    def test_same_file_two_worktrees_produces_one_item(self, monkeypatch, temp_dir):
+        """Scanning the same file from two worktrees creates only one item (AC3)."""
+        import refactor.workitem_creation as wic
+
+        wt1_root = str(temp_dir / ".worklog" / "worktrees" / "wl-AAA-1")
+        wt2_root = str(temp_dir / ".worklog" / "worktrees" / "wl-BBB-2")
+        rel_file = "skill/implement/scripts/implement.py"
+        for root in (wt1_root, wt2_root):
+            f = Path(root) / rel_file
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("# dummy\n")
+
+        base_smell: dict[str, Any] = {
+            "line": 42,
+            "severity": "high",
+            "smell_type": "complex_function",
+            "source": "linter",
+            "message": "Test",
+            "code": "S112",
+        }
+        smell1 = dict(base_smell, file=f"{wt1_root}/{rel_file}")
+        smell2 = dict(base_smell, file=f"{wt2_root}/{rel_file}")
+
+        created: list[dict[str, Any]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            key = " ".join(cmd)
+            if key.startswith("wl list"):
+                return _cp(stdout=json.dumps({"success": True, "workItems": created}))
+            if key.startswith("wl create"):
+                created.append({
+                    "id": "SA-0MOCK0001X000ONE",
+                    "title": wic.build_smell_title(smell1, repo_root=wt1_root),
+                    "description": wic.build_smell_description(smell1, repo_root=wt1_root),
+                })
+                return _cp(
+                    stdout=json.dumps(
+                        {"success": True, "workItem": {"id": "SA-0MOCK0001X000ONE"}}
+                    )
+                )
+            raise FileNotFoundError(key)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(wic.shutil, "which", lambda _name: "/usr/bin/wl")
+
+        id1 = wic.create_smell_work_item(smell1, repo_root=wt1_root)
+        id2 = wic.create_smell_work_item(smell2, repo_root=wt2_root)
+
+        assert id1 == "SA-0MOCK0001X000ONE"
+        assert id2 is None, "Second worktree scan must be deduplicated, not re-filed"
+        assert len(created) == 1
+
+
+class TestWorktreePathExclusion:
+    """Findings under .worklog/worktrees/ are skipped, never filed."""
+
+    def test_skip_finding_under_worktree_root(self, monkeypatch, temp_dir):
+        """A smell whose file resolves to .worklog/worktrees/ is skipped."""
+        from refactor.workitem_creation import create_smell_work_item
+
+        # Create a file inside a simulated worktree path
+        wt_path = temp_dir / ".worklog" / "worktrees" / "wl-ABC123-xyz"
+        smell_file = wt_path / "skill" / "implement" / "scripts" / "implement.py"
+        smell_file.parent.mkdir(parents=True, exist_ok=True)
+        smell_file.write_text("# dummy")
+
+        smell: dict[str, Any] = {
+            "file": str(smell_file),
+            "line": 42,
+            "severity": "high",
+            "smell_type": "complex_function",
+            "source": "linter",
+            "message": "Test",
+        }
+
+        # Mock git rev-parse to return the temp_dir as repo root
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda cmd, *args, **kwargs: (
+                subprocess.CompletedProcess(
+                    args=cmd, returncode=0,
+                    stdout=str(temp_dir),
+                    stderr="",
+                )
+                if "rev-parse" in " ".join(cmd)
+                else _cp()
+            ),
+        )
+
+        result = create_smell_work_item(smell)
+        assert result is None, (
+            f"Expected None for worktree-resolved path, got {result!r}"
+        )
+
+    def test_skip_finding_under_nested_worktrees_dir(self, monkeypatch, temp_dir):
+        """A finding whose repo-relative path is under .worklog/worktrees/ is skipped."""
+        from refactor.workitem_creation import create_smell_work_item
+
+        # A file that resolves (relative to the scan root) under .worklog/worktrees.
+        smell_file = temp_dir / ".worklog" / "worktrees" / "wl-ABC123-xyz" / "src" / "main.py"
+        smell_file.parent.mkdir(parents=True, exist_ok=True)
+        smell_file.write_text("# dummy")
+
+        smell: dict[str, Any] = {
+            "file": str(smell_file),
+            "line": 42,
+            "severity": "high",
+            "smell_type": "complex_function",
+            "source": "linter",
+            "message": "Test",
+        }
+
+        # Mock git rev-parse to return temp_dir as the repo root.
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda cmd, *args, **kwargs: (
+                subprocess.CompletedProcess(
+                    args=cmd, returncode=0,
+                    stdout=str(temp_dir),
+                    stderr="",
+                )
+                if "rev-parse" in " ".join(cmd)
+                else _cp()
+            ),
+        )
+
+        result = create_smell_work_item(smell)
+        assert result is None, (
+            f"Expected None for worktree-resolved path, got {result!r}"
+        )
+
+
 class TestDocHygiene:
     """Doc hygiene tests for SKILL.md."""
 

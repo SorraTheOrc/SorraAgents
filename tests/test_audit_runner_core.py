@@ -1421,8 +1421,8 @@ class TestStatusLifecycle:
 
     def test_completed_update_applies_producer_hold_when_ready_to_close(self, monkeypatch):
         """On a 'Ready to close: Yes' verdict for a top-level item (no parent),
-        the terminal wl update applies the producer hold (assignee sentinel) —
-        replacing --needs-producer-review (AC1, WL-0MV85WE7Q00044P9)."""
+        the terminal wl update sets ``needsProducerReview`` and clears the
+        assignee (AC1, WL-0MV85WE7Q00044P9)."""
         calls = []
 
         monkeypatch.setattr(

@@ -1523,6 +1523,108 @@ class TestDrivePaneLifecycle:
         assert retained[0]["remedy"] == "herdr pane read w1:p5"
         assert titles == [("note", "w1:p5")]
 
+    def test_non_terminal_child_keeps_its_pane_open_and_reports_it(
+        self, implement_mod, monkeypatch,
+    ):
+        """A success spawn whose child is still non-terminal retains the pane.
+
+        The close-or-retain decision is the *parent report's* verdict, never
+        the session's exit status: a session that exited cleanly but whose
+        child is still ``in-progress`` (for example it stopped early without
+        committing) must leave its pane open and reported, so the operator
+        can inspect what the agent did instead of losing the transcript
+        (SA-0MVPHZ1CI0045QR0 AC3/AC4, parent SA-0MVLKHY27005UK40 AC4).
+        """
+        m = implement_mod
+        titles: list[tuple] = []
+        monkeypatch.setattr(
+            m, "_update_pane_title",
+            lambda status, **kw: (
+                titles.append((status, kw.get("pane_id")))
+                or {"updated": True}
+            ),
+        )
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {
+                "success": True,
+                "next_child": None,
+                "message": "SA-C1 is still in progress.",
+                "children_processed": [
+                    {"id": "SA-C1", "status": "in-progress",
+                     "action": "started"},
+                ],
+            },
+        ])
+        spawner = RecordingSpawner([_pane_result(pane="w1:p6")])
+        client = RecordingPaneClient()
+
+        report = _run(m, runner, spawner, [{"id": "SA-C1"}],
+                      pane_client=client)
+
+        # The session exited successfully, but terminality was never
+        # confirmed — so the pane is never closed on the exit status alone.
+        assert report["sessions_spawned"] == 1
+        assert report["parent_advanced"] is False
+        assert client.closed == []
+        entry = report["children_driven"][0]
+        assert entry["pane_closed"] is False
+        assert entry["pane_retained"] == "w1:p6"
+        retained = report["retained_panes"]
+        assert [p["pane_id"] for p in retained] == ["w1:p6"]
+        assert "not terminal" in retained[0]["reason"]
+        assert retained[0]["remedy"] == "herdr pane read w1:p6"
+        # The retained pane carries its ⚠️ verdict title for the operator.
+        assert titles == [("note", "w1:p6")]
+
+    def test_drive_ending_before_resolution_retains_the_pane_untitled(
+        self, implement_mod, monkeypatch,
+    ):
+        """A queued pane the drive never resolves is reported, not leaked.
+
+        When the loop stops before the follow-up parent report names the
+        child's state (no startable child left), the pane is still reported
+        with its inspection remedy. No verdict title is applied: the drive
+        has nothing to announce about that session yet
+        (SA-0MVPHZ1CI0045QR0 AC3/AC4, parent SA-0MVLKHY27005UK40 AC4).
+        """
+        m = implement_mod
+        titles: list[tuple] = []
+        monkeypatch.setattr(
+            m, "_update_pane_title",
+            lambda status, **kw: (
+                titles.append((status, kw.get("pane_id")))
+                or {"updated": True}
+            ),
+        )
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {
+                "success": True,
+                "next_child": None,
+                "message": "No startable child remained.",
+                "children_processed": [],
+            },
+        ])
+        spawner = RecordingSpawner([_pane_result(pane="w1:p7")])
+        client = RecordingPaneClient()
+
+        report = _run(m, runner, spawner, [{"id": "SA-C1"}],
+                      pane_client=client)
+
+        assert report["sessions_spawned"] == 1
+        assert report["parent_advanced"] is False
+        assert client.closed == []
+        entry = report["children_driven"][0]
+        assert entry["pane_closed"] is False
+        assert entry["pane_retained"] == "w1:p7"
+        assert "pane_title" not in entry
+        retained = report["retained_panes"]
+        assert [p["pane_id"] for p in retained] == ["w1:p7"]
+        assert "drive ended before the parent reported" in retained[0]["reason"]
+        assert retained[0]["remedy"] == "herdr pane read w1:p7"
+        assert titles == []
+
     def test_headless_entries_carry_transport_and_pane_id(self, implement_mod):
         """Report parity holds for the headless path too (additive keys)."""
         m = implement_mod

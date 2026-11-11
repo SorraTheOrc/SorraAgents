@@ -46,7 +46,7 @@ SEMAPHORE_MODULE = "shared.process_semaphore"
 
 pytest.importorskip(SEMAPHORE_MODULE)
 
-from shared.process_semaphore import Semaphore
+from shared.process_semaphore import ENV_LOCK_DIR, Semaphore
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -724,4 +724,179 @@ def test_fail_fast_acquires_free_slot_while_tickets_are_outstanding(tmp_path):
             if proc is not None and proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic slot discovery across processes (SA-0MVWKZ4QD006L2E0)
+#
+# A waiter whose own ceiling is 2 must still use a free higher-index slot that
+# another process created. Before the fix, ``_try_acquire_slot`` probed only
+# ``range(max_workers)``, so a two-slot waiter never opened slot files 2..7 and
+# could wait out its whole bound while capacity sat idle (the 105-minute stall).
+# The discovery assertion runs against the dynamic-discovery implementation;
+# the strict ``xfail`` marker that pinned it test-first has been removed by the
+# implementation child. The own-ceiling assertion stays active too.
+# ---------------------------------------------------------------------------
+
+#: A worker that acquires a slot and reports which slot index it holds by
+#: matching the inode of its held file descriptor against the slot files. It
+#: also snapshots the namespace before/after so "no extra slots created" can
+#: be asserted cross-process.
+DISCOVERY_WORKER_TEMPLATE = r"""
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.environ["REPO_ROOT"])
+sys.path.insert(0, os.environ["SKILLS_ROOT"])
+
+from shared.process_semaphore import Semaphore  # noqa: E402
+
+name = os.environ["SEM_NAME"]
+max_workers = int(os.environ.get("SEM_MAX", "2"))
+timeout = float(os.environ.get("SEM_TIMEOUT", "10"))
+slot_dir = os.environ["SEM_SLOT_DIR"]
+
+
+def _slot_names():
+    try:
+        return sorted(int(n) for n in os.listdir(slot_dir) if n.isdigit())
+    except OSError:
+        return []
+
+
+before = _slot_names()
+result = {"acquired": None, "slot": None, "error": None,
+          "before": before, "after": None}
+try:
+    sem = Semaphore(name, max_workers=max_workers, timeout=timeout)
+    with sem:
+        result["acquired"] = time.time()
+        held_fd = sem._held_fd
+        st = os.fstat(held_fd)
+        for n in _slot_names():
+            path = os.path.join(slot_dir, str(n))
+            try:
+                ps = os.stat(path)
+            except OSError:
+                continue
+            if (ps.st_dev, ps.st_ino) == (st.st_dev, st.st_ino):
+                result["slot"] = n
+                break
+        result["after"] = _slot_names()
+except Exception as exc:  # noqa: BLE001
+    result["error"] = f"{type(exc).__name__}: {exc}"
+    result["after"] = _slot_names()
+
+print(json.dumps(result))
+sys.exit(0 if result["acquired"] is not None else 1)
+"""
+
+
+def _hold_named_slots(sem_name, ceiling, count):
+    """Create slots ``0..ceiling-1`` and acquire *count* of them in-process."""
+    holders = []
+    for _ in range(count):
+        sem = Semaphore(sem_name, max_workers=ceiling, timeout=5)
+        sem.acquire()
+        holders.append(sem)
+    return holders
+
+
+def test_low_ceiling_waiter_uses_higher_index_slot_created_by_another_process(
+    tmp_path, monkeypatch
+):
+    """AC1: a max_workers=2 subprocess acquires higher-index slot 3.
+
+    The parent process creates slots 0..3 (ceiling 4), holds 0, 1 and 2, and
+    leaves slot 3 free. A subprocess waiter whose own ceiling is 2 must
+    discover and acquire slot 3 well inside its timeout — the snapshot-ceiling
+    probe would only ever see slots 0 and 1.
+    """
+    monkeypatch.setenv(ENV_LOCK_DIR, str(tmp_path / "locks"))
+    name = f"guard-discovery-{int(time.time())}"
+    holders = _hold_named_slots(name, ceiling=4, count=3)  # holds 0, 1, 2
+    slot_dir = str(tmp_path / "locks" / name)
+    try:
+        env = dict(os.environ)
+        env.update(
+            {
+                "REPO_ROOT": str(REPO_ROOT),
+                "SKILLS_ROOT": str(REPO_ROOT / "skill"),
+                "SEM_NAME": name,
+                "SEM_MAX": "2",
+                "SEM_TIMEOUT": "8",
+                "SEM_SLOT_DIR": slot_dir,
+            }
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", DISCOVERY_WORKER_TEMPLATE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        out, err = proc.communicate(timeout=40)
+        try:
+            result = json.loads(out.strip())
+        except json.JSONDecodeError:
+            result = {"error": f"bad output: {out!r} {err!r}"}
+        assert result.get("acquired") is not None, result
+        assert result.get("slot") == 3, (
+            f"waiter must acquire the free higher-index slot 3: {result}"
+        )
+    finally:
+        for holder in holders:
+            holder.release()
+
+
+def test_low_ceiling_waiter_creates_no_slots_above_its_ceiling(
+    tmp_path, monkeypatch
+):
+    """AC2: the subprocess waiter creates no slot files of its own.
+
+    Slots 0..3 already exist (created by the parent's higher ceiling), so a
+    max_workers=2 waiter must leave the namespace unchanged: it may use higher
+    slots another process created, but it must never create more than its own
+    ``0..max_workers-1`` floor.
+    """
+    monkeypatch.setenv(ENV_LOCK_DIR, str(tmp_path / "locks"))
+    name = f"guard-discovery-own-{int(time.time())}"
+    holders = _hold_named_slots(name, ceiling=4, count=3)  # holds 0, 1, 2
+    slot_dir = str(tmp_path / "locks" / name)
+    try:
+        env = dict(os.environ)
+        env.update(
+            {
+                "REPO_ROOT": str(REPO_ROOT),
+                "SKILLS_ROOT": str(REPO_ROOT / "skill"),
+                "SEM_NAME": name,
+                "SEM_MAX": "2",
+                "SEM_TIMEOUT": "8",
+                "SEM_SLOT_DIR": slot_dir,
+            }
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", DISCOVERY_WORKER_TEMPLATE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        out, _err = proc.communicate(timeout=40)
+        try:
+            result = json.loads(out.strip())
+        except json.JSONDecodeError:
+            result = {"error": f"bad output: {out!r}"}
+        # The namespace must gain no new slot files: the waiter created nothing.
+        assert result.get("after") == result["before"], (
+            "waiter created slot files beyond its own ceiling: "
+            f"before={result['before']} after={result['after']}"
+        )
+        assert result["after"] == [0, 1, 2, 3], result
+    finally:
+        for holder in holders:
+            holder.release()
+
 

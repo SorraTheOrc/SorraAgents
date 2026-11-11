@@ -760,6 +760,12 @@ class TestFinishFailureClassifier:
         assert (
             "push", "timeout",
         ) in implement_mod.FINISH_INFRA_REFUSALS
+        # A lost SSH transport is infrastructure, not a red suite: finish emits
+        # it as ``connection_closed`` and drive retries it on the infra budget
+        # (SA-0MVWNHLQQ002TFZR).
+        assert (
+            "push", "connection_closed",
+        ) in implement_mod.FINISH_INFRA_REFUSALS
         for reason in ("push_failed", "non_fast_forward"):
             result = implement_mod.classify_finish_failure(
                 failing_finish_report("push", reason)
@@ -812,6 +818,11 @@ class TestRunFinishFailureThreading:
         )
         monkeypatch.setattr(implement_mod, "_has_worktree_changes",
                             lambda *a: True)
+        # The work-state classifier inspects a real worktree on disk; the
+        # simulated "/wt/SA-CHILD1" carries attributable work
+        # (SA-0MW74IKJE008JXDQ).
+        monkeypatch.setattr(implement_mod, "_classify_child_worktree",
+                            lambda *a: implement_mod.CHILD_WORK)
         monkeypatch.setattr(implement_mod, "wl_add_comment",
                             lambda *a, **k: True)
         monkeypatch.setattr(implement_mod, "_invoke_implement", _fake_finish)
@@ -862,6 +873,11 @@ class TestRunFinishFailureThreading:
         )
         monkeypatch.setattr(implement_mod, "_has_worktree_changes",
                             lambda *a: True)
+        # The work-state classifier inspects a real worktree on disk; the
+        # simulated "/wt/SA-CHILD1" carries attributable work
+        # (SA-0MW74IKJE008JXDQ).
+        monkeypatch.setattr(implement_mod, "_classify_child_worktree",
+                            lambda *a: implement_mod.CHILD_WORK)
         monkeypatch.setattr(implement_mod, "wl_add_comment",
                             lambda *a, **k: True)
         monkeypatch.setattr(
@@ -901,6 +917,11 @@ class TestRunFinishFailureThreading:
         )
         monkeypatch.setattr(implement_mod, "_has_worktree_changes",
                             lambda *a: True)
+        # The work-state classifier inspects a real worktree on disk; the
+        # simulated "/wt/SA-CHILD1" carries attributable work
+        # (SA-0MW74IKJE008JXDQ).
+        monkeypatch.setattr(implement_mod, "_classify_child_worktree",
+                            lambda *a: implement_mod.CHILD_WORK)
         monkeypatch.setattr(implement_mod, "wl_add_comment",
                             lambda *a, **k: True)
         monkeypatch.setattr(

@@ -190,6 +190,29 @@ def is_pytest_command(command: str) -> bool:
     return _is_pytest_command(parts) is not None
 
 
+#: Basenames that identify the Vitest executable inside a command line. Wrapper
+#: forms (``npx vitest``, ``npm exec -- vitest``) and direct paths
+#: (``node_modules/.bin/vitest``) all contain a token whose basename is here.
+VITEST_EXECUTABLE_NAMES = frozenset({"vitest", "vitest.mjs", "vitest.js", "vitest.cjs"})
+
+
+def is_vitest_command(command: str) -> bool:
+    """Whether *command* invokes Vitest (``vitest``, ``npx vitest``, and paths).
+
+    Vitest's default reporter names its failures in a format the runner must
+    parse to distinguish a code failure from a broken command
+    (MS-0MW3UR8SX009YZWS). Only the executable token is inspected — a wrapper
+    such as ``npm --silent test`` cannot be identified statically, so callers
+    fall back to marker-based parsing for those (see
+    ``run_tests.parse_failures``).
+    """
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    return any(Path(part).name in VITEST_EXECUTABLE_NAMES for part in parts)
+
+
 def resolve_pytest_executable() -> str:
     """Return the concrete interpreter/executable that runs pytest.
 

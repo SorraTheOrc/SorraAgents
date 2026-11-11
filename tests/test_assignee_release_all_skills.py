@@ -8,11 +8,11 @@
 
 A non-empty ``assignee`` is a scheduling hold; the canonical statement in
 ``AGENTS_GLOBAL.md`` (Assignee release invariant) is: "any code path that
-claims an ``assignee`` must release it on every terminal outcome; a persistent
-hold is represented by the producer assignee (``Map``) or
-``needsProducerReview``, never by a lingering agent assignee.". ``wl next``
-skips a held item, so an item left on a lingering *agent* assignee after a
-terminal outcome is invisible to dispatch and blocks re-work.
+claims an ``assignee`` must release it on every terminal outcome;
+``needsProducerReview`` is the only persistent hold, so no assignee —
+including the producer identity (``Map``) — is ever left behind as a lingering
+claim.". ``wl next`` skips a held item, so an item left on a lingering
+assignee after a terminal outcome is invisible to dispatch and blocks re-work.
 
 This module is the **enforcement point** for the assignee-release invariant
 (parent SA-0MVVEDK2Q008NDUH, child SA-0MVVF6GWG005VIFK): one table enumerates
@@ -29,10 +29,11 @@ script, or an entry point inside one, is not classified by this module. A new
 skill that claims an assignee therefore cannot silently reintroduce the hold
 without adding a row here.
 
-Intentional holds (producer ``Map`` holds, ``needsProducerReview`` holds, the
-agent-log-review creation assignee and ``verify_context_reduction``'s assignee
-restore) are pinned separately in :data:`PINNED_HOLD_ROWS`; they must survive
-any future default flip unchanged.
+Intentional preserves are pinned separately in :data:`PINNED_HOLD_ROWS`: the
+``needsProducerReview`` flag hold, the agent-log-review creation-time producer
+identity assignment, and ``verify_context_reduction``'s captured-state
+restore. ``Map`` is **not** itself a persistent hold (SA-0MW7QTAHW0030FGV);
+those rows must survive any future default flip unchanged.
 """
 
 from __future__ import annotations
@@ -112,8 +113,8 @@ class FakeWorklogStore:
       mutates the item (so a read-back reflects what the code actually wrote);
     * ``wl show <id> --json`` returns the persisted item (the read-back path);
     * ``wl show <id> --children --json`` returns the parent plus its children;
-    * ``wl create`` creates an item with the requested assignee (intentional
-      producer holds);
+    * ``wl create`` creates an item with the requested assignee (including
+      intentional creation-time producer-identity assignments);
     * every other command succeeds with a minimal, well-formed JSON payload.
 
     No command ever reaches the real worklog, so exercising the production
@@ -367,7 +368,6 @@ class Invocation:
     run: Callable[[FakeWorklogStore, Path], Any]
     check: Callable[[Any, FakeWorklogStore], None] | None = None
     seed_status: str = "in-progress"
-    seed_assignee: str = _AGENT
 
 
 @dataclass(frozen=True)
@@ -386,13 +386,18 @@ class ReleaseRow:
 
 @dataclass(frozen=True)
 class PinnedHold:
-    """An intentional hold that the release default must not regress."""
+    """An intentional preserve that the release default must not regress.
+
+    Covers the ``needsProducerReview`` flag hold, a creation-time producer
+    identity assignment, and a captured-state restore. ``Map`` on an
+    in-progress item is **not** preserved — it is an ordinary claim.
+    """
 
     name: str
     source: str
     entry_points: tuple[str, ...]
     exercise: Callable[[Path], None] = field(compare=False)
-    classification: str = "intentional-hold"
+    classification: str = "intentional-preserve"
 
 
 @dataclass(frozen=True)
@@ -425,9 +430,10 @@ class ReadOnlyCaller:
     """A reviewed read-only caller that must never establish a claim.
 
     ``exercise`` runs the production entry point against the in-memory store
-    seeded with a pre-existing producer ``Map`` hold. A read-only caller must
-    write no ``--assignee`` at all: it cannot leave a hold behind, and the
-    release-by-default must not wrongly clear a hold it never held.
+    seeded with a pre-existing ``Map`` claim. A read-only caller must write no
+    **non-empty** ``--assignee`` (it cannot establish a hold). It may release
+    the pre-existing claim: ``Map`` is not a persistent hold, so the
+    release-by-default rule clears it (SA-0MW7QTAHW0030FGV).
     """
 
     name: str
@@ -752,6 +758,11 @@ def _run_phase_start_failure(store: FakeWorklogStore, tmp_path: Path) -> dict:
 
 def _run_finalise_stranded_child(store: FakeWorklogStore, tmp_path: Path) -> dict:
     child = store.show("SA-MATRIXCHILD")
+    # The finaliser refuses a child claimed by *another* live agent. Pass the
+    # seeded claim as the driving identity so the terminal write is exercised
+    # for both the agent pre-claim and the producer identity ``Map`` (the
+    # safety gate itself is unchanged).
+    driver = str(child.get("assignee") or "") or _AGENT
     with (
         patch.object(implement, "wl_show", return_value=child),
         patch.object(implement, "wl_add_comment", return_value=True),
@@ -764,7 +775,7 @@ def _run_finalise_stranded_child(store: FakeWorklogStore, tmp_path: Path) -> dic
                 "commit": "abc1234",
                 "evidence": "abc1234",
             },
-            assignee=_AGENT,
+            assignee=driver,
         )
 
 
@@ -1063,16 +1074,14 @@ RELEASE_ROWS: tuple[ReleaseRow, ...] = (
             label="plan-complete",
             target_id="SA-MATRIXPLAN",
             run=_run_plan_complete,
-            # Plan's documented claim carries no assignee, so the exercise
-            # seeds the workflow pre-claim an agent makes *before* the skill
-            # runs — the hold the skip must release (SA-0MW0F91KN004J06U).
-            seed_assignee=_AGENT,
+            # Plan's documented claim carries no assignee; the matrix seeds
+            # the workflow pre-claim an agent makes *before* the skill runs —
+            # the hold the skip must release (SA-0MW0F91KN004J06U).
         ),
         failure=Invocation(
             label="plan-error-reset",
             target_id="SA-MATRIXPLAN",
             run=_run_plan_abort,
-            seed_assignee=_AGENT,
         ),
     ),
 )
@@ -1085,29 +1094,37 @@ RELEASE_ROWS: tuple[ReleaseRow, ...] = (
 
 @pytest.mark.parametrize("row", RELEASE_ROWS, ids=[row.row_id for row in RELEASE_ROWS])
 @pytest.mark.parametrize("outcome", ("success", "failure"))
+@pytest.mark.parametrize(
+    "seed_assignee", (_AGENT, "Map"), ids=("agent-claim", "producer-identity")
+)
 def test_terminal_outcome_releases_assignee(
-    row: ReleaseRow, outcome: str, tmp_path: Path
+    row: ReleaseRow, outcome: str, seed_assignee: str, tmp_path: Path
 ) -> None:
-    """Both terminal outcomes persist an empty assignee (read back via ``wl show``)."""
+    """Both terminal outcomes persist an empty assignee (read back via ``wl show``).
+
+    Every row is exercised twice: once with an agent pre-claim (the workflow's
+    step-1 claim) and once with the producer identity ``Map`` (the stranded
+    case from SA-0MW7QTAHW0030FGV). Both must be released.
+    """
     assert row.classification == "must-release-on-terminal"
     invocation: Invocation = getattr(row, outcome)
     store = FakeWorklogStore.with_item(
         invocation.target_id,
         status=invocation.seed_status,
-        assignee=invocation.seed_assignee,
+        assignee=seed_assignee,
     )
 
-    # Precondition: the item really starts on the seeded hold (read through the
-    # same injected runner the assertion uses), so a no-op cannot pass.
-    assert store.assignee(invocation.target_id) == invocation.seed_assignee
+    # Precondition: the item really starts on the seeded claim (read through
+    # the same injected runner the assertion uses), so a no-op cannot pass.
+    assert store.assignee(invocation.target_id) == seed_assignee
 
     result = invocation.run(store, tmp_path)
     if invocation.check is not None:
         invocation.check(result, store)
 
     assert store.assignee(invocation.target_id) == "", (
-        f"{row.row_id}/{invocation.label}: the terminal outcome left the item "
-        f"on assignee {store.assignee(invocation.target_id)!r}"
+        f"{row.row_id}/{invocation.label}/{seed_assignee}: the terminal outcome "
+        f"left the item on assignee {store.assignee(invocation.target_id)!r}"
     )
     assert any(
         invocation.target_id in command for command in store.update_commands
@@ -1119,13 +1136,38 @@ def test_terminal_outcome_releases_assignee(
     )
 
 
+def test_map_on_a_needs_producer_review_item_is_released_and_the_flag_survives(
+    tmp_path: Path,
+) -> None:
+    """A pre-existing ``Map`` claim on a review-hold item is released.
+
+    ``needsProducerReview`` is the only persistent hold and is represented by
+    the flag, never the assignee. The flag must survive the release
+    (SA-0MW7QTAHW0030FGV AC4).
+    """
+    item_id = "SA-MATRIXPLAN"
+    store = FakeWorklogStore.with_item(
+        item_id, status="in-progress", assignee="Map", needs_producer_review=True
+    )
+
+    _run_plan_complete(store, tmp_path)
+
+    persisted = store.show(item_id)
+    assert persisted["assignee"] == ""
+    assert persisted["needsProducerReview"] is True
+
+
 # ---------------------------------------------------------------------------
 # Pinned intentional holds
 # ---------------------------------------------------------------------------
 
 
 def _pin_producer_creation_assignee(tmp_path: Path) -> None:
-    """agent-log-review creates recommendation items on the producer ``Map`` hold."""
+    """agent-log-review creates recommendation items on the producer identity.
+
+    This is a creation-time assignment, not a persistent hold: ``Map`` on an
+    in-progress item is an ordinary claim and the reaper may later release it.
+    """
     store = FakeWorklogStore.with_item(
         "SA-MATRIXHOLD", status="in-progress", assignee=_AGENT
     )
@@ -1152,7 +1194,7 @@ def _pin_producer_creation_assignee(tmp_path: Path) -> None:
 
 
 def _pin_verify_context_reduction_restore(tmp_path: Path) -> None:
-    """verify_context_reduction restores a pre-existing (producer) assignee."""
+    """verify_context_reduction restores the captured pre-audit assignee verbatim."""
     item_id = "SA-MATRIXHOLD"
     store = FakeWorklogStore.with_item(
         item_id, status="open", stage="plan_complete", assignee="audit-agent"
@@ -1189,30 +1231,33 @@ def _pin_needs_producer_review_hold(tmp_path: Path) -> None:
 
 PINNED_HOLD_ROWS: tuple[PinnedHold, ...] = (
     PinnedHold(
-        name="agent-log-review creation assignee (producer Map hold)",
+        name="agent-log-review creation assignee (creation-time producer identity)",
         source="agent-log-review/scripts/agent_log_review.py",
         entry_points=("file_recommendations",),
         exercise=_pin_producer_creation_assignee,
     ),
     PinnedHold(
-        name="verify_context_reduction assignee restore",
+        name="verify_context_reduction captured-state restore",
         source="audit/scripts/verify_context_reduction.py",
         entry_points=("_restore_item_state",),
         exercise=_pin_verify_context_reduction_restore,
     ),
     PinnedHold(
-        name="needsProducerReview hold (audit passing verdict)",
+        name="needsProducerReview flag hold (audit passing verdict)",
         source="audit/scripts/audit_runner.py",
         entry_points=(),
         exercise=_pin_needs_producer_review_hold,
+        classification="intentional-hold",
     ),
 )
 
 
 @pytest.mark.parametrize("hold", PINNED_HOLD_ROWS, ids=[hold.name for hold in PINNED_HOLD_ROWS])
-def test_intentional_holds_are_preserved(hold: PinnedHold, tmp_path: Path) -> None:
-    """Intentional holds must survive the release-by-default behaviour."""
-    assert hold.classification == "intentional-hold"
+def test_intentional_preserves_survive_the_release_default(
+    hold: PinnedHold, tmp_path: Path
+) -> None:
+    """Pinned preserves (including the flag-only hold) survive the default."""
+    assert hold.classification in {"intentional-hold", "intentional-preserve"}
     hold.exercise(tmp_path)
 
 
@@ -1301,10 +1346,14 @@ READ_ONLY_CALLERS: tuple[ReadOnlyCaller, ...] = (
 @pytest.mark.parametrize(
     "case", READ_ONLY_CALLERS, ids=[case.name for case in READ_ONLY_CALLERS]
 )
-def test_read_only_callers_never_touch_an_assignee(
+def test_read_only_callers_never_acquire_an_assignee(
     case: ReadOnlyCaller, tmp_path: Path
 ) -> None:
-    """A read-only caller writes no assignee and preserves a producer hold."""
+    """A read-only caller never writes a non-empty assignee (no new claim).
+
+    It still releases the pre-existing ``Map`` claim: ``Map`` is not a
+    persistent hold (SA-0MW7QTAHW0030FGV).
+    """
     assert case.classification == "must-not-acquire-assignee"
     store = FakeWorklogStore.with_item(
         "SA-MATRIXRO", status="open", stage="plan_complete", assignee="Map"
@@ -1314,13 +1363,19 @@ def test_read_only_callers_never_touch_an_assignee(
     case.exercise(store, tmp_path)
 
     assert store.update_commands, "the read-only caller issued no wl update at all"
-    offending = [cmd for cmd in store.update_commands if "--assignee" in cmd]
+    offending = [
+        cmd
+        for cmd in store.update_commands
+        if "--assignee" in cmd
+        and cmd[cmd.index("--assignee") + 1] != ""
+    ]
     assert not offending, (
-        f"{case.name}: a read-only caller wrote an assignee ({offending[0]}); it "
-        "must neither claim nor release a hold"
+        f"{case.name}: a read-only caller tried to acquire an assignee "
+        f"({offending[0]}); it must never establish a claim"
     )
-    assert store.assignee("SA-MATRIXRO") == "Map", (
-        f"{case.name}: the read-only caller wrongly cleared the producer hold"
+    assert store.assignee("SA-MATRIXRO") == "", (
+        f"{case.name}: the read-only caller left the pre-existing Map claim "
+        "behind; Map is not a persistent hold"
     )
 
 
@@ -1362,26 +1417,32 @@ EXTERNALLY_PRE_CLAIMED_ROWS: tuple[ReadOnlyCaller, ...] = (
     EXTERNALLY_PRE_CLAIMED_ROWS,
     ids=[case.name for case in EXTERNALLY_PRE_CLAIMED_ROWS],
 )
-def test_read_only_caller_releases_an_externally_set_agent_claim(
-    case: ReadOnlyCaller, tmp_path: Path
+@pytest.mark.parametrize(
+    "seed_assignee", (_AGENT, "Map"), ids=("agent-claim", "producer-identity")
+)
+def test_read_only_caller_releases_an_externally_set_claim(
+    case: ReadOnlyCaller, seed_assignee: str, tmp_path: Path
 ) -> None:
     """The workflow pre-claim is released on the run's terminal transition.
 
     ``AGENTS_GLOBAL.md`` step 1 claims the item *before* the skill runs, so the
-    helper only clearing a hold it set itself left the agent's pre-claim behind
-    (SA-0MW0F91KN004J06U AC1). The widened rule releases any non-producer claim
-    observed on entry, while the producer ``Map`` hold stays untouched (asserted
-    by ``test_read_only_callers_never_touch_an_assignee``).
+    helper only clearing a hold it set itself left the pre-claim behind
+    (SA-0MW0F91KN004J06U AC1). Every non-empty claim observed on entry is
+    released — including the producer identity ``Map`` (SA-0MW7QTAHW0030FGV).
     """
     store = FakeWorklogStore.with_item(
-        "SA-MATRIXRO", status="open", stage="plan_complete", assignee=_AGENT
+        "SA-MATRIXRO",
+        status="open",
+        stage="plan_complete",
+        assignee=seed_assignee,
     )
-    assert store.assignee("SA-MATRIXRO") == _AGENT
+    assert store.assignee("SA-MATRIXRO") == seed_assignee
 
     case.exercise(store, tmp_path)
 
     assert store.assignee("SA-MATRIXRO") == "", (
-        f"{case.name}: the externally pre-set agent claim survived the run"
+        f"{case.name}: the externally pre-set {seed_assignee!r} claim survived "
+        "the run"
     )
 
 
@@ -1629,8 +1690,9 @@ def _uncovered_message(uncovered: dict[str, set[str]]) -> str:
         "Add a RELEASE_ROWS row (with a success and a failure/abort "
         "exercise) or a RELEASE_EXERCISES entry in "
         "tests/test_assignee_release_all_skills.py, or list the entry "
-        "point in PINNED_HOLD_ROWS if the hold is intentional (producer "
-        "Map hold / needsProducerReview), or in "
+        "point in PINNED_HOLD_ROWS if the assignment/restore is intentional "
+        "(creation-time producer identity, captured-state restore, or the "
+        "needsProducerReview flag hold), or in "
         "NON_TERMINAL_ENTRY_POINTS / COVERED_BY_SKILL_TESTS with a "
         "justification (COVERED_BY_SKILL_TESTS must name an existing "
         "test file that mentions the entry point). A new skill must never "

@@ -425,8 +425,8 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
 > **Note:** The AC table records the **plan skill session's** own deliverables — not the
 > work item's feature acceptance criteria. Passing the feature ACs (which are
 > unmet until the feature is built) would incorrectly render the plan session as
-> "incomplete" ("Requires attention (implement)") even though planning completed
-> successfully and `implement` is simply the next phase.
+> "Not ready to ship" (red) even though planning completed successfully and
+> `implement` is simply the next phase.
 
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, so the operator sees the report itself (not just the

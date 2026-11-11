@@ -8,7 +8,9 @@
   "httpIdleTimeoutMs": 1800000,
   "enabledModels": [
     "Local Proxy/plan",
-    "Local Proxy/code"
+    "Local Proxy/code",
+    "MunitoAI/*",
+    "deepseek/deepseek*"
   ],
   "theme": "dark",
   "compaction": {

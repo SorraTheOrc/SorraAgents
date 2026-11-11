@@ -29,9 +29,9 @@ AGENTS_GLOBAL = REPO_ROOT / "AGENTS_GLOBAL.md"
 #: The canonical statement, as required verbatim by the acceptance criteria.
 CANONICAL_STATEMENT = (
     "any code path that claims an `assignee` must release it on every "
-    "terminal outcome; a persistent hold is represented by the producer "
-    "assignee (`Map`) or `needsProducerReview`, never by a lingering agent "
-    "assignee."
+    "terminal outcome; `needsProducerReview` is the only persistent hold, "
+    "so no assignee — including the producer identity (`Map`) — is ever "
+    "left behind as a lingering claim."
 )
 
 #: Every document that must cross-reference the canonical section.
@@ -123,14 +123,15 @@ def test_no_deprecated_flag_in_skill_docs() -> None:
 
 
 def test_canonical_section_documents_the_widened_rule_and_backstops() -> None:
-    """The invariant must state that any non-producer claim is released.
+    """The invariant must state that every non-empty assignee is released.
 
     The pre-widening wording ("only the assignee it set on entry") is the gap
-    SA-0MW0F91KN004J06U closed, so the canonical section must name the widened
-    scope and both backstops rather than the narrow rule.
+    SA-0MW0F91KN004J06U closed, and SA-0MW7QTAHW0030FGV widened it to every
+    non-empty assignee (including ``Map``); the canonical section must name
+    both backstops rather than the narrow rule.
     """
     section = _read(AGENTS_GLOBAL).split("## Assignee release invariant", 1)[1]
-    assert "non-producer claim" in section
+    assert "non-empty assignee" in section
     assert "release_session_claim" in section
     assert "reap_stale_claims" in section
     assert "assignee-release.md" in section
@@ -150,7 +151,7 @@ def test_reference_documents_ownership_backstop_and_reaper() -> None:
         "WORKLOG_CLAIM_REAPER_TTL_HOURS",
         "WORKLOG_PRODUCER_ASSIGNEE",
         "needsProducerReview",
-        "producer `Map` hold",
+        "producer identity",
         "idempotent",
         "SIGKILL",
     ):

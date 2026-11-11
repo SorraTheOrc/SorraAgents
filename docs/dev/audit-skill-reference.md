@@ -327,7 +327,9 @@ reviewed?"*. This section defines exactly when the audit runner writes it.
 | Verdict | Item | Review signal | `needsProducerReview` after the run |
 |---|---|---|---|
 | `Yes` | top-level | prior passing audit whose v2 fingerprint == current, flag `false` | **preserved** (writes no flag) |
-| `Yes` | top-level | never reviewed / prior audit not passing / content changed / signal unavailable | **`yes`** |
+| `Yes` | top-level | only medium/low candidate false positives already tracked by a live chore or accepted by a waiver, and this run created no new chore | **untouched** (SA-0MVZNECSD005XB42 AC2) |
+| `Yes` | top-level | the item is itself an audit-generated candidate-false-positive tracker chore | **untouched** (SA-0MVZNECSD005XB42 AC4) |
+| `Yes` | top-level | never reviewed / prior audit not passing / content changed / signal unavailable / new tracking chore created this run / `uncertain` finding present | **`yes`** |
 | `No` | top-level, independent | either | **`yes`** |
 | `No` | top-level, cascade-demotion-suppressed | either | **untouched** (producer decision Q2) |
 | `No` | child (has a parent) | either | **untouched** (SA-0MSSVKYEW008PJ9H) |
@@ -335,6 +337,27 @@ reviewed?"*. This section defines exactly when the audit runner writes it.
 
 The runner **never** writes `--needs-producer-review no` on any path: it may
 preserve a stored `false`, but it never clears a review.
+
+### Where the signal comes from
+
+After the production predicate, `_passing_audit_producer_decision(ctx)` decides
+whether a passing top-level audit still needs a producer at all
+(SA-0MVZNECSD005XB42 AC2):
+
+- new candidate-false-positive tracking chores created this run → **required**
+  (the producer decides on each new candidate once);
+- any `uncertain` classification or genuinely blocking finding → **required**;
+- only medium/low `confident-false-positive` findings that are already tracked
+  by a live chore or accepted by a waiver → **no decision required**, nothing
+  is written;
+- the item is itself an audit-generated tracker chore (`CFP-Chore-Key` marker
+  or the candidate-false-positive annotation) → **no decision required**, nothing
+  is written;
+- otherwise → the content-scoped reason above applies (unreviewed or changed
+  content → **required**).
+
+This is what lets releases converge: a repository with deliberate lint patterns
+no longer re-arms its release gate on every audit cycle.
 
 ### Where the signal comes from
 
@@ -1195,6 +1218,24 @@ The ONLY relaxation of the audit's no-create rule, for tracking false positives:
   sibling-project audits create the chore in the owning project's worklog.
 - **Medium/low confident-false-positive findings**: a tracking `chore` with no
   commit link, annotated "candidate false positive — producer decision required".
+- **Deduplicated** (SA-0MVZNECSD005XB42 AC1): each such chore carries
+  `CFP-Chore-Key: <linter>:<rule>:<file>:<line>` in its description. Before
+  creating one the runner searches the worklog (`wl list "<marker> <key>"
+  --json`) and **reuses** the first non-terminal `chore` carrying that exact
+  marker, so repeated audits of unchanged code are idempotent (`chores_reused`).
+  A failed lookup fails safe and creates the chore. Closed/deleted chores no
+  longer track a finding.
+- **Waived findings are never tracked** (SA-0MVZNECSD005XB42 AC3): a finding the
+  producer accepted as a false positive gets no chore and does not block. The
+  waiver is recorded once with
+  `python3 skill/audit/scripts/audit_waiver.py add <id> --rule <code> --file
+  <path> [--line <n>] --justification "<why>"`, which comments a
+  `AUDIT-FP-WAIVER: {"rule", "file", "line", "justification"}` marker on the
+  audited item (`--line` omitted accepts the rule for the whole file). The
+  worklog's `auditWaiver` column is a single-slot audit-gap waiver object the CLI
+  cannot extend to a per-finding list, so the comment marker is the transport;
+  `_collect_audit_waivers` also honours a `findings` list on `auditWaiver` should
+  a future store persist one.
 - **Never tracked**: `uncertain` and `genuine` findings get no work item.
 - **Fail-safe** (`chore_failures`): a `wl create` failure never reverts the
   remediation commit; the affected finding stays blocking `genuine` (demoted with
@@ -1202,7 +1243,7 @@ The ONLY relaxation of the audit's no-create rule, for tracking false positives:
 
 Chore ids surface in the report (`#### Remediation loop`) and in
 `_build_issue_json` under `code_quality.remediation.chore_items` /
-`.chore_failures`.
+`.chore_failures`, alongside `chores_reused` and `waived_findings`.
 
 ## Context reduction (SA-0MSISKM8F004NW1U)
 

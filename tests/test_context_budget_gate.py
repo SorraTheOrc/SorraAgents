@@ -55,8 +55,53 @@ def test_context_budget_gate_within_committed_thresholds() -> None:
 def test_context_budget_thresholds_file_is_valid() -> None:
     """The thresholds file must parse and contain the expected components."""
     data = json.loads(THRESHOLDS.read_text(encoding="utf-8"))
-    for component in ("global_agents", "project_agents", "skills_prose", "total"):
+    for component in (
+        "global_agents",
+        "project_agents",
+        "skills_prose",
+        "skill_implement_md",
+        "total",
+    ):
         assert component in data, f"thresholds missing component {component!r}"
         assert isinstance(data[component], int) and data[component] > 0, (
             f"threshold {component!r} must be a positive integer"
         )
+
+
+#: Committed cap for the implement SKILL.md body. Originally 20,000 B
+#: (SA-0MVYDCUWA001Z8K0 AC1, the >=80% cut from 99,749 B); raised to 22,000 B
+#: by SA-0MW74IL6B001AMQN so the mandatory no-op finish / --verification-only
+#: contract can live in the brief the agent reads. The cap still ratchets:
+#: a further increase is a conscious budget revision, not a silent regrowth.
+SKILL_IMPLEMENT_MD_CAP = 22000
+
+
+def test_skill_implement_md_is_gated_at_or_below_cap() -> None:
+    """SA-0MVYDCUWA001Z8K0 AC4: the implement SKILL.md body has its own gate.
+
+    The operational brief is inlined on every implement invocation, so its
+    byte size is gated separately from the startup ``total``.
+    """
+    data = json.loads(THRESHOLDS.read_text(encoding="utf-8"))
+    assert data["skill_implement_md"] <= SKILL_IMPLEMENT_MD_CAP, (
+        "the committed skill_implement_md threshold must stay at or below "
+        f"{SKILL_IMPLEMENT_MD_CAP:,} B (SA-0MVYDCUWA001Z8K0 AC1, revised by "
+        "SA-0MW74IL6B001AMQN)"
+    )
+
+
+def test_skill_implement_md_is_measured() -> None:
+    """The measurer reports the implement SKILL.md body size."""
+    result = subprocess.run(
+        [sys.executable, str(MEASURE), "--json"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    components = json.loads(result.stdout)["components"]
+    assert "skill_implement_md" in components, (
+        "measure_context.py must report a skill_implement_md component"
+    )
+    assert components["skill_implement_md"]["bytes"] > 0

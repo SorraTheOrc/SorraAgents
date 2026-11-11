@@ -1564,7 +1564,7 @@ class TestHerdrSuiteEvidence:
             audit_runner, "_resolve_herdr_suite_commands",
             return_value=self._candidates("herdr", "group:herdr"),
         ), mock.patch.object(audit_runner, "query_cached", side_effect=_side_effect):
-            status, sha, problems, keys = audit_runner._classify_herdr_suite_cache(
+            status, sha, _problems, keys = audit_runner._classify_herdr_suite_cache(
                 _green_run_git_runner(), [self.HERDR_FILE], cwd=str(tmp_path),
             )
         assert status == "green"

@@ -36,6 +36,10 @@ Optional flags:
   --no-refactor             Skip the refactor step
   --max-retry N             Max test-fix loop retries (default: 3)
   --commit-msg <msg>        Commit message override
+  --verification-only       Finalise an item that produces no commit
+                            (verification-only work); `start` records it in the
+                            state file and `finish` refuses a no-commit
+                            finalisation without it
   --parent-branch <branch>  Override parent branch (default: dev)
   --worktree-path <path>    Override worktree path
   --allow-orphaned-stashes   Acknowledge orphaned-stash warning and proceed
@@ -251,7 +255,7 @@ except ImportError:  # pragma: no cover - older test skill
     _classify_gate_result = None  # type: ignore[assignment]
     _GATE_REMEDIATION = {}  # type: ignore[assignment]
 
-from test_cache import query_cached, run_cached
+from test_cache import FINGERPRINT_KIND_TREE, query_cached, run_cached
 from test_runner import canonicalize_quiet_test_command
 
 # Canonical quiet full-suite commands — identical cache keys to the test
@@ -431,6 +435,11 @@ PANE_IDENTITY_ENV_KEYS = ("PI_SESSION_ID", "PI_SESSION_FILE")
 #: holder (another driver/session). The refused party performs no work and
 #: reports the holder identity instead of racing it (SA-0MVQ5AXLF002PAQ3).
 ACTION_SKIPPED_HELD = "skipped-held"
+#: Report action for a child whose ``status`` is ``blocked`` and whose block
+#: still holds after re-validation against its outbound dependency edges
+#: (SA-0MVTUFL0U0000NV2 AC1). A stale block — every blocker terminal — is
+#: re-evaluated and the child becomes startable again.
+ACTION_SKIP_BLOCKED = "skip-blocked"
 #: Transport labels recorded on every ``children_driven`` entry, so a
 #: ``--json`` consumer can tell a pane-driven child from a headless one
 #: (SA-0MVPHZ1CI0045QR0 AC5). ``pane_id`` is ``None`` for the headless path.
@@ -501,6 +510,12 @@ class ImplementState:
     parent_branch: str = DEFAULT_PARENT_BRANCH
     commit_msg: str = ""
     started_at: str = ""
+    #: Opt-in finalisation for an item that produces no commit (verification-
+    #: only work, e.g. evidence recorded as a worklog comment). Recorded by
+    #: ``start --verification-only`` and read by ``finish``; without it a
+    #: finish that creates no commit is refused (SA-0MW74IJWI009NRZ1 AC1).
+    #: Defaulted so state files written by an older build still load.
+    verification_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -510,6 +525,7 @@ class ImplementState:
             "parent_branch": self.parent_branch,
             "commit_msg": self.commit_msg,
             "started_at": self.started_at,
+            "verification_only": self.verification_only,
         }
 
     @classmethod
@@ -521,6 +537,7 @@ class ImplementState:
             parent_branch=data.get("parent_branch", DEFAULT_PARENT_BRANCH),
             commit_msg=data.get("commit_msg", ""),
             started_at=data.get("started_at", ""),
+            verification_only=bool(data.get("verification_only", False)),
         )
 
 
@@ -595,9 +612,17 @@ def _handle_signal_cleanup(signum: int) -> None:
             # A claim interrupted before the worktree exists must never be
             # silent: the operator needs to know the item was released and
             # why (SA-0MVQ5AXLF002PAQ3 AC2). The child lock is the phase
-            # marker — only ``phase_start`` holds it, so a signal during
-            # ``finish``/``abort`` never gets a misleading "start" comment.
-            if _child_lock_global is not None and not (wt and Path(wt).exists()):
+            # marker — ``phase_start`` holds the lock for *the item it is
+            # starting*, so a signal during ``finish``/``abort`` never gets a
+            # misleading "start" comment. The id comparison matters for
+            # ``drive``, which holds a **child's** lock while the process-wide
+            # item is the parent: that must not post a "start interrupted"
+            # comment on the parent (SA-0MW7LMUUQ00701KJ).
+            if (
+                _child_lock_global is not None
+                and _child_lock_global.work_item_id == wid
+                and not (wt and Path(wt).exists())
+            ):
                 try:
                     wl_add_comment(
                         wid,
@@ -961,9 +986,13 @@ def _assert_terminal_status(work_item_id: str) -> dict[str, Any]:
     """Verify the store holds the terminal transition after a successful finish.
 
     The terminal ``status=completed``/``stage=in_review`` write is issued by
-    ``StatusLifecycle.__exit__`` on **both** the push-with-diff path and the
-    no-op-push (no-diff) path — a branch with no diff from ``origin/dev``
-    still reaches the context manager and the write persists. This
+    ``StatusLifecycle.__exit__`` on the two finalisation paths a successful
+    finish can take: the push-with-diff path (a commit was created) and the
+    explicit **verification-only** no-commit path (``--verification-only``, a
+    branch with no diff from ``origin/dev``). A no-commit finish *without* that
+    opt-in never reaches here — it is refused earlier with
+    ``commit.reason = "no_commit_no_signal"`` — so this read-back only ever
+    confirms a deliberate finalisation (SA-0MW74IJWI009NRZ1 AC1/AC3). This
     read-back turns a silently lost or overwritten lifecycle write into a
     loud finish failure instead of a green report: the recorded symptom on
     OSL-0MVMB44C9008IXZX was exactly that — ``finish`` reported success
@@ -1812,6 +1841,204 @@ def _format_blockers(blockers: list[dict[str, str]]) -> str:
     )
 
 
+def _blocked_child_state(
+    child: dict[str, Any],
+    blockers: list[dict[str, Any]] | None,
+    children: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Re-validate a ``blocked`` child's block against its dependency edges.
+
+    A ``blocked`` status is a producer's hold, but it is never honoured
+    forever: it is re-evaluated on every run so a landed prerequisite cannot
+    strand its dependent (SA-0MVTUFL0U0000NV2 AC2). The block is **stale**
+    iff every outbound (``depends-on``) edge is terminal — ``completed`` /
+    ``done`` / ``in_review`` / ``deleted`` or soft-deleted, the same rule as
+    :func:`_is_terminal_child`. Any non-terminal edge holds the block.
+
+    In-chain edges are resolved through the live child list when the edge's
+    own payload carries no status (a ``wl dep list`` edge may omit it), so a
+    sibling's real status always wins over a stale edge copy. A ``blocked``
+    child with **no** resolvable edge is ``unvalidated`` and therefore holds
+    (fail closed, AC4) — it never defaults to startable.
+
+    Args:
+        child: The ``blocked`` child work-item dict.
+        blockers: The child's outbound dependency edges (``None`` = unknown).
+        children: The parent's children, for resolving in-chain edge status.
+
+    Returns:
+        ``{"holds": bool, "blocking_ids": [...], "stale_block_ids": [...],
+        "unvalidated": bool}``. ``blocking_ids`` are the non-terminal edges
+        that hold the child; ``stale_block_ids`` are the terminal edges that
+        made a stale block startable.
+    """
+    edges = [edge for edge in (blockers or []) if isinstance(edge, dict)]
+    child_by_id = {
+        str(c.get("id")): c for c in (children or []) if c.get("id")
+    }
+
+    def _edge_terminal(edge: dict[str, Any]) -> bool:
+        body = child_by_id.get(str(edge.get("id", "")))
+        if body is not None:
+            # The live child record outranks the edge's own copy: an edge may
+            # omit ``status`` entirely (see tests/test_implement_parent_safety).
+            return _is_terminal_child(body)
+        return _is_terminal_child(edge)
+
+    if not edges:
+        return {
+            "holds": True,
+            "blocking_ids": [],
+            "stale_block_ids": [],
+            "unvalidated": True,
+        }
+
+    blocking_ids = [
+        str(edge.get("id", "")) for edge in edges if not _edge_terminal(edge)
+    ]
+    if blocking_ids:
+        return {
+            "holds": True,
+            "blocking_ids": blocking_ids,
+            "stale_block_ids": [],
+            "unvalidated": False,
+        }
+    return {
+        "holds": False,
+        "blocking_ids": [],
+        "stale_block_ids": [str(edge.get("id", "")) for edge in edges],
+        "unvalidated": False,
+    }
+
+
+#: An **explicit** ``Blocked by …`` line — the cross-project block convention.
+#: Anchored to the start of the line (bullet and/or bold markers tolerated) and
+#: deliberately narrow: arbitrary prose, an ``Unblock condition:`` line and
+#: ``Related work`` ids are never parsed as blockers (SA-0MVTUFL0U0000NV2 AC3).
+BLOCKED_BY_LINE_RE = re.compile(
+    r"^[ \t]*(?:[-*][ \t]+)?\**[ \t]*blocked[ \t]+by\b[^\n]*",
+    re.IGNORECASE | re.MULTILINE,
+)
+#: A work-item id token: a project prefix, a dash and a body. Deliberately
+#: shape-based rather than length-based — a ``Blocked by`` line may name a
+#: short internal id as well as a full ``SA-0MVS1QS9J009DGPT``-style one.
+WORK_ITEM_ID_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-[A-Z0-9]{2,})\b")
+
+
+def _prose_blocker_ids(description: str) -> list[str]:
+    """Extract blocker ids from an explicit ``Blocked by …`` line only.
+
+    Tolerates the bold/labelled cross-project form
+    (``**Blocked by (SorraAgents):** `SA-…```) and a plain ``Blocked by:``
+    (case-insensitive). Only the first matching line is read, and only ids on
+    that line are returned, so an ``Unblock condition:`` line or a
+    ``Related work`` list can never be mistaken for a blocker.
+
+    Args:
+        description: The child's work-item description.
+
+    Returns:
+        The blocker ids in first-seen order (empty when there is no explicit
+        ``Blocked by`` line).
+    """
+    if not isinstance(description, str) or not description.strip():
+        return []
+    match = BLOCKED_BY_LINE_RE.search(description)
+    if match is None:
+        return []
+    found: list[str] = []
+    for work_item_id in WORK_ITEM_ID_RE.findall(match.group(0)):
+        if work_item_id not in found:
+            found.append(work_item_id)
+    return found
+
+
+def _prose_blockers(child: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve the blocker ids declared in a child's ``Blocked by …`` line.
+
+    Each id is resolved with :func:`wl_show`, which maps an id prefix to the
+    owning project's worklog (``resolve_worklog_flags`` prefix-to-sibling
+    scan) — no network call. A resolved item is returned as a work-item dict,
+    so the same terminal test as dependency edges applies (:func:`_is_terminal_child`).
+    An id that cannot be resolved is returned as an ``unresolved`` sentinel:
+    it **holds** the block (fail closed) and carries the hint for where to
+    check it. A parser failure never raises — the caller's verdict stays
+    fail-closed.
+
+    Args:
+        child: The child work-item dict (``description`` is read).
+
+    Returns:
+        One payload per declared blocker, each tagged ``blocker_source:
+        "prose"``; unresolved payloads also carry ``unresolved: True``.
+    """
+    payloads: list[dict[str, Any]] = []
+    for blocker_id in _prose_blocker_ids(str(child.get("description", ""))):
+        item: dict[str, Any] = {}
+        try:
+            item = wl_show(blocker_id)
+        except Exception:  # noqa: BLE001 — parsing must never crash the phase
+            LOG.warning(
+                "Could not resolve prose blocker %s; treating it as holding.",
+                blocker_id,
+            )
+            item = {}
+        if item and str(item.get("id", "")) == blocker_id:
+            payload = dict(item)
+            payload["blocker_source"] = "prose"
+            payloads.append(payload)
+        else:
+            payloads.append({
+                "id": blocker_id,
+                "status": "",
+                "title": "",
+                "unresolved": True,
+                "blocker_source": "prose",
+            })
+    return payloads
+
+
+def _blocker_detail(
+    blocker: dict[str, Any],
+    resolved_in_chain: bool = False,
+) -> dict[str, Any]:
+    """Render a blocker (edge or prose) as a JSON-friendly detail record.
+
+    Args:
+        blocker: A dependency-edge dict or a payload from
+            :func:`_prose_blockers`.
+        resolved_in_chain: True when the blocker is one of the parent's
+            children (its live record supplies the status).
+
+    Returns:
+        ``{"id", "status", "source", "resolved", "hint"}``; ``status`` is
+        ``"unresolved"`` and ``hint`` names where to check when the id could
+        not be resolved.
+    """
+    blocker_id = str(blocker.get("id", ""))
+    unresolved = bool(blocker.get("unresolved"))
+    detail: dict[str, Any] = {
+        "id": blocker_id,
+        "status": (
+            "unresolved"
+            if unresolved
+            else str(blocker.get("status", "") or "unknown")
+        ),
+        "source": str(blocker.get("blocker_source", "dependency")),
+        "resolved": not unresolved,
+    }
+    if resolved_in_chain:
+        detail["source"] = "dependency"
+        detail["resolved"] = True
+    if unresolved:
+        prefix = _work_item_prefix(blocker_id)
+        detail["hint"] = (
+            "check the owning project's worklog"
+            + (f" (id prefix {prefix})" if prefix else "")
+        )
+    return detail
+
+
 def _outbound_gate(
     work_item_id: str,
     blockers: list[dict[str, Any]] | None = None,
@@ -1858,7 +2085,124 @@ def _outbound_gate(
     }
 
 
-def _classify_child(child: dict[str, Any]) -> str:
+#: Verdicts returned by :func:`_classify_child_worktree`.
+CHILD_WORK = "work"
+CHILD_VERIFICATION_ONLY = "verification-only"
+CHILD_NO_WORK = "no-work"
+CHILD_CLEAN = "clean"
+
+
+def _classify_child_worktree(
+    child_id: str,
+    worktree_path: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> str:
+    """Classify a child's worktree change surface for finalisability.
+
+    This classifier sits next to :func:`_has_worktree_changes` and refines
+    its boolean answer into the question ``finish`` actually needs: **is
+    there work attributable to this item?** It distinguishes:
+
+    - ``"work"`` — uncommitted non-state files, **or** commits ahead of the
+      parent branch whose messages reference *child_id*.
+    - ``"verification-only"`` — no real work, but the state file carries
+      ``verification_only`` (a deliberate no-commit finalisation).
+    - ``"no-work"`` — a misleading change surface only: the state file is
+      dirty (an accidentally-tracked ``.implement_state.json``) and/or there
+      are commits ahead that do not reference the item. Such a child is
+      **not finalisable** (SA-0MW74IKJE008JXDQ AC4).
+    - ``"clean"`` — no dirty files and no commits ahead. This is not a
+      *false positive* surface: ``_has_worktree_changes`` already reports
+      ``False`` and the normal "implement next" path applies.
+
+    Precedence: real work > verification-only > no-work > clean.
+
+    Args:
+        child_id: The child work-item id (for commit attribution).
+        worktree_path: Absolute path to the worktree.
+        parent_branch: Branch the worktree forked from.
+
+    Returns:
+        One of :data:`CHILD_WORK`, :data:`CHILD_VERIFICATION_ONLY`,
+        :data:`CHILD_NO_WORK`, :data:`CHILD_CLEAN`.
+    """
+    wt = Path(worktree_path)
+    if not wt.exists():
+        return CHILD_NO_WORK
+
+    # The verification-only opt-in is recorded in the state file.
+    state_path = wt / STATE_FILE_NAME
+    verification_only = False
+    try:
+        state_data = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(state_data, dict):
+            verification_only = bool(state_data.get("verification_only", False))
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+    expected = expected_dirty_paths(str(wt))
+    status_output = git_status(cwd=str(wt))
+    # Dirty paths excluding .worklog/ and project-declared expected-dirty
+    # prefixes — the same filtering ``_has_worktree_changes`` applies.
+    dirty_paths = dirty_paths_from_status(status_output, expected_dirty=expected)
+    # The state file is not filtered by the generic helpers (it lives at the
+    # worktree root), so identify it explicitly: a dirty state file is never
+    # work.
+    state_file_dirty = STATE_FILE_NAME in dirty_paths
+    non_state_dirty = [p for p in dirty_paths if p != STATE_FILE_NAME]
+
+    if non_state_dirty:
+        return CHILD_WORK
+
+    # Commits ahead of the parent branch: only ones referencing this item are
+    # attributable work; the rest are the ambient-branch false positive.
+    ahead = run_cmd(
+        ["git", "rev-list", "--count", f"{parent_branch}..HEAD"],
+        cwd=str(wt),
+        check=False,
+        capture=True,
+    )
+    commits_ahead = False
+    if ahead.returncode == 0:
+        try:
+            commits_ahead = int(ahead.stdout.strip()) > 0
+        except ValueError:
+            commits_ahead = True  # unparseable; conservatively assume commits
+    else:
+        # Cannot compare (missing ref, git error): fail open so a real change
+        # is never silently discarded.
+        return CHILD_WORK
+
+    if commits_ahead:
+        ref_check = run_cmd(
+            ["git", "-C", str(wt), "log", f"{parent_branch}..HEAD",
+             "--grep", child_id, "-n", "1", "--format=%H"],
+            check=False,
+            timeout=30,
+        )
+        if ref_check.returncode == 0 and ref_check.stdout.strip():
+            return CHILD_WORK
+
+    # Precedence (documented above): real work > verification-only >
+    # no-work > clean. A verification-only child is a deliberate no-commit
+    # finalisation, so its opt-in outranks the misleading-surface verdict.
+    if verification_only:
+        return CHILD_VERIFICATION_ONLY
+
+    # No attributable work. A state-file-only dirty surface and/or
+    # non-attributable commits ahead is the misleading surface the finish
+    # gate refuses — never present it as finishable.
+    if state_file_dirty or commits_ahead:
+        return CHILD_NO_WORK
+
+    return CHILD_CLEAN
+
+
+def _classify_child(
+    child: dict[str, Any],
+    blockers: list[dict[str, Any]] | None = None,
+    children: list[dict[str, Any]] | None = None,
+) -> str:
     """Classify a child for the parent-recursion plan.
 
     Returns one of:
@@ -1866,15 +2210,32 @@ def _classify_child(child: dict[str, Any]) -> str:
       - ``"skipped-held"`` — a live holder owns the child's per-work-item
         lock (another driver/session); reported, never raced.
       - ``"skip-in-progress"`` — claimed by another agent; reported, not clobbered.
+      - ``"skip-blocked"`` — ``status: blocked`` and the block **still
+        holds** after re-validation against the outbound dependency edges;
+        reported with its ``blocking_ids``, never started (AC1).
       - ``"implement"`` — the standard workflow should run on this child.
 
-    Precedence is deliberate: a terminal child is never re-implemented (even
-    with a stale lock file lying around), and a live holder outranks the
+    Precedence is deliberate and is stated once, here: ``skip-terminal`` →
+    ``skipped-held`` → ``skip-in-progress`` → ``skip-blocked`` →
+    ``implement``. A terminal child is never re-implemented (even with a
+    stale lock file lying around), and a live holder outranks the
     status-based ``in-progress`` guess because it is a fact about a running
-    process, not a lifecycle claim (SA-0MVQ5AXLF002PAQ3, AC3).
+    process, not a lifecycle claim (SA-0MVQ5AXLF002PAQ3, AC3). A ``blocked``
+    child is only startable when its block is **stale** — every blocker
+    terminal (:func:`_blocked_child_state`); a block that cannot be validated
+    holds (fail closed, SA-0MVTUFL0U0000NV2 AC4).
+
+    This phase-level classification is refined for open/in-progress children
+    by :func:`_classify_child_worktree` at the two change-surface call sites in
+    ``phase_parent``: a worktree whose only change is the state file (or
+    non-attributable commits) is never presented as finishable
+    (SA-0MW74IKJE008JXDQ).
 
     Args:
         child: A child work-item dict from ``wl show --children``.
+        blockers: The child's outbound (``depends-on``) edges; omitted/empty
+            for a ``blocked`` child means the block is unvalidated and holds.
+        children: The parent's children, used to resolve in-chain edge status.
 
     Returns:
         The classification string.
@@ -1886,6 +2247,10 @@ def _classify_child(child: dict[str, Any]) -> str:
         return ACTION_SKIPPED_HELD
     if status in ("in-progress", "in_progress"):
         return "skip-in-progress"
+    if status == "blocked":
+        state = _blocked_child_state(child, blockers, children)
+        if state["holds"]:
+            return ACTION_SKIP_BLOCKED
     return "implement"
 
 
@@ -1969,8 +2334,11 @@ def _next_child_to_implement(
     order (see :func:`_resolve_implementation_order`). A child is startable
     only when every in-chain blocker (a blocker that is also one of these
     children) is already terminal — a blocked child is never implemented
-    before its blockers (AC-2). Independent siblings of an in-progress
-    child may still start.
+    before its blockers (AC-2). A child whose ``status`` is ``blocked`` is
+    re-validated with :func:`_blocked_child_state` and skipped while the
+    block holds, so this legacy path cannot diverge from ``phase_parent``
+    (SA-0MVTUFL0U0000NV2 AC6). Independent siblings of an in-progress child
+    may still start.
 
     Args:
         children: List of child work-item dicts in dependency order.
@@ -1980,7 +2348,7 @@ def _next_child_to_implement(
     Returns:
         The next child dict, or None when no child is startable (every
         remaining child is terminal, in progress elsewhere, or blocked by a
-        non-terminal sibling).
+        non-terminal sibling or by a still-valid ``blocked`` hold).
     """
     blockers_map = blockers_map or {}
     child_ids = {str(c.get("id")) for c in children}
@@ -1990,14 +2358,16 @@ def _next_child_to_implement(
         if _is_terminal_child(c)
     }
     for child in children:
-        action = _classify_child(child)
+        cid = str(child.get("id", ""))
+        action = _classify_child(child, blockers_map.get(cid, []), children)
         if action == "skip-terminal":
             continue
         if action == ACTION_SKIPPED_HELD:
             continue  # a live holder owns it; never a second session
         if action == "skip-in-progress":
             continue  # never clobber another agent's claim
-        cid = str(child.get("id", ""))
+        if action == ACTION_SKIP_BLOCKED:
+            continue  # a still-valid blocked hold; never started (AC1)
         in_chain_blockers = [
             str(b.get("id"))
             for b in blockers_map.get(cid, [])
@@ -4209,7 +4579,49 @@ def stage_tested_tree(cwd: str, tested_tree: str | None) -> dict[str, Any]:
     }
 
 
-def git_commit(cwd: str, message: str) -> bool:
+@dataclass
+class CommitOutcome:
+    """Structured outcome of :func:`git_commit`.
+
+    ``git_commit`` historically returned ``True`` both when it created a
+    commit **and** when the tree was already clean. That ambiguity let
+    ``phase_finish`` read the ambient ``dev`` HEAD (another item's commit) as
+    if it were the item's own commit, push a no-op and issue the terminal
+    ``completed``/``in_review`` write for an item that produced no work
+    (SA-0MW74IJWI009NRZ1 AC1/AC2).
+
+    ``committed`` distinguishes the two outcomes; ``hash`` names the commit
+    this call created (empty when nothing was committed). ``bool(outcome)``
+    stays the historical success/failure contract — both ``committed`` and the
+    clean no-op are successful — so call sites that only test truthiness keep
+    working unchanged.
+
+    Attributes:
+        success: True when the operation succeeded (committed or clean).
+        committed: True only when this call created a commit.
+        hash: The created commit hash (empty when nothing was committed).
+        reason: Machine-readable outcome (``committed``, ``no_changes``,
+            ``add_failed``, ``commit_failed``).
+    """
+
+    success: bool
+    committed: bool
+    hash: str = ""
+    reason: str = ""
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "committed": self.committed,
+            "hash": self.hash,
+            "reason": self.reason,
+        }
+
+
+def git_commit(cwd: str, message: str) -> CommitOutcome:
     """Stage all changes and commit in the given directory.
 
     Args:
@@ -4217,13 +4629,16 @@ def git_commit(cwd: str, message: str) -> bool:
         message: Commit message.
 
     Returns:
-        True if the commit succeeded.
+        A :class:`CommitOutcome`. ``bool(result)`` is ``True`` when the
+        operation succeeded (including the clean-tree no-op);
+        ``result.committed`` is ``True`` only when a commit was actually
+        created, and ``result.hash`` names it.
     """
     # Stage all changes (surgical: only what was modified)
     add_result = run_cmd(["git", "add", "-A"], cwd=cwd, check=False)
     if add_result.returncode != 0:
         LOG.error("git add failed: %s", add_result.stderr.strip())
-        return False
+        return CommitOutcome(success=False, committed=False, reason="add_failed")
 
     # Check if there's anything to commit
     diff_result = run_cmd(
@@ -4231,7 +4646,7 @@ def git_commit(cwd: str, message: str) -> bool:
     )
     if diff_result.returncode == 0:
         LOG.info("No changes to commit (clean working tree)")
-        return True
+        return CommitOutcome(success=True, committed=False, reason="no_changes")
 
     commit_result = run_cmd(
         ["git", "commit", "-m", message],
@@ -4240,8 +4655,13 @@ def git_commit(cwd: str, message: str) -> bool:
     )
     if commit_result.returncode != 0:
         LOG.error("git commit failed: %s", commit_result.stderr.strip())
-        return False
-    return True
+        return CommitOutcome(success=False, committed=False, reason="commit_failed")
+    return CommitOutcome(
+        success=True,
+        committed=True,
+        hash=git_get_commit_hash(cwd),
+        reason="committed",
+    )
 
 
 class PushTimeoutError(RuntimeError):
@@ -4276,6 +4696,44 @@ class PushNonFastForwardError(RuntimeError):
             f"Push to dev failed (non-fast-forward): {stderr}. "
             f"Commit {commit_hash} on branch {branch}. "
             f"Retry: {rebase_cmd}"
+        )
+
+
+class PushTransportLostError(RuntimeError):
+    """Raised when SSH closes before the ref update after a green suite.
+
+    The pre-push full-suite gate runs *after* git has opened the SSH
+    connection and produces no SSH traffic for its whole duration (measured
+    11 min warm, 35 min cold). A remote that closes the idle connection
+    (GitHub does) leaves git writing the ref update to a dead socket, so the
+    gate's green verdict is discarded and the push never lands
+    (SA-0MVWNHLQQ002TFZR).
+
+    This is deliberately **distinct** from a red suite
+    (``PushGateFailureError`` with ``gate_reason=test_failure``): nothing is
+    wrong with the code, so the operator must not read a green suite followed
+    by silence as a successful push. ``finish`` reports the reason
+    ``connection_closed`` (the existing infrastructure classification) and
+    keeps the commit on its feature branch.
+    """
+
+    def __init__(
+        self,
+        commit_hash: str,
+        branch: str,
+        stderr: str,
+        attempts: int,
+    ) -> None:
+        self.commit_hash = commit_hash
+        self.branch = branch
+        self.stderr = stderr
+        self.attempts = attempts
+        super().__init__(
+            f"Push to dev transport lost after {attempts} attempt(s): the SSH "
+            f"connection closed before the ref update, so a (possibly green) "
+            f"suite verdict was discarded. This is not a test failure. "
+            f"Commit {commit_hash} on branch {branch} is local. "
+            f"stderr: {stderr}"
         )
 
 
@@ -4406,7 +4864,9 @@ def _assert_remote_name_only(remote: str) -> None:
         )
 
 
-def _full_suite_cache_present(cwd: str) -> bool:
+def _full_suite_cache_present(
+    cwd: str, commit_hash: str | None = None
+) -> bool:
     """Whether a valid full-suite cache entry exists for *cwd*'s git state.
 
     Read-only: queries the test cache for each full-suite command the repo
@@ -4414,13 +4874,28 @@ def _full_suite_cache_present(cwd: str) -> bool:
     an indeterminate git state is a miss — never a silent green. Fail-soft:
     evidence plumbing may never decide a push's outcome
     (SA-0MVUTXJM8006PQY4 AC3/AC4).
+
+    The dev-push gate now binds its verdict to the pushed commit's **tree**
+    (SA-0MW7C6BMZ00931JG), so when *commit_hash* is supplied the tree-keyed
+    entry is queried first. The historical loose-worktree query is kept as a
+    fallback so legacy entries and pre-tree-keying repos still report evidence.
     """
     try:
         commands = _resolve_full_suite_commands(cwd) or []
     except Exception:  # noqa: BLE001 - evidence must never break a push
         return False
+    if not commands:
+        return False
+    tree = _resolve_commit_tree(cwd, commit_hash)
     for command in commands:
         try:
+            if tree is not None and query_cached(
+                command,
+                cwd=cwd,
+                fingerprint=tree,
+                fingerprint_kind=FINGERPRINT_KIND_TREE,
+            ) is not None:
+                return True
             if query_cached(command, cwd=cwd) is not None:
                 return True
         except Exception as exc:  # noqa: BLE001 - a corrupt entry is a miss
@@ -4452,14 +4927,15 @@ def _dev_push_gate_evidence(
         before_present: Whether a valid full-suite entry existed pre-push.
 
     Returns:
-        Dict with ``root``, ``head``, ``pushed`` and ``full_suite``.
+        Dict with ``root``, ``head``, ``pushed``, ``tree`` and ``full_suite``.
     """
     root = str(Path(cwd).resolve())
     head = _resolve_full_commit(cwd, "HEAD") or "unknown"
     pushed = (
         _resolve_full_commit(cwd, commit_hash) if commit_hash else None
     ) or (commit_hash or "unknown")
-    after_present = _full_suite_cache_present(cwd)
+    tree = _resolve_commit_tree(cwd, commit_hash)
+    after_present = _full_suite_cache_present(cwd, commit_hash)
     if before_present:
         classification = "cached"
     elif after_present:
@@ -4470,6 +4946,7 @@ def _dev_push_gate_evidence(
         "root": root,
         "head": head,
         "pushed": pushed,
+        "tree": tree,
         "full_suite": classification,
     }
     line = (
@@ -4541,7 +5018,7 @@ def _post_push_verification_commands(cwd: str) -> tuple[list[str], str]:
 
 
 def _resolve_post_push_verification(
-    worktree_path: str, repo_root: str
+    worktree_path: str, repo_root: str, commit_hash: str | None = None
 ) -> dict[str, Any]:
     """Read-only full-suite verdict for the just-pushed commit (design A).
 
@@ -4555,8 +5032,15 @@ def _resolve_post_push_verification(
     main checkout's cache (``repo_root``) as the documented fallback: the
     pre-push hook mirrors its entry into the main-checkout
     ``.worklog/cache``, while a worktree's own cache directory is separate.
-    The cache lookup binds the verdict to the current git state (HEAD + dirty
-    content), so an entry recorded for another tree can never be served.
+
+    **Tree-keyed first** (SA-0MWAXC5TD00461FN): the dev-push gate binds its
+    verdict to the pushed commit's tree SHA with ``fingerprint_kind="tree"``
+    (SA-0MW7C6BMZ00931JG), so the verification computes that tree from
+    *commit_hash* and queries the tree-keyed entry before falling back to the
+    historical loose-worktree key. Without this the gate's entry — keyed on
+    the tree, not the loose HEAD+dirty fingerprint — was never visible here
+    and every successful push reported a false ``missing`` verdict. The loose
+    query is retained so pre-tree-keying entries still count as evidence.
 
     Verdict vocabulary:
 
@@ -4573,17 +5057,26 @@ def _resolve_post_push_verification(
     Args:
         worktree_path: The checkout that holds the pushed commit.
         repo_root: The main checkout (cache mirror location).
+        commit_hash: The pushed commit (short or full). When given, its tree
+            SHA is the primary cache key; when omitted (or unresolvable) the
+            historical loose-worktree query is used only.
 
     Returns:
         A structured verdict dict (``verdict``, ``success``, ``executed``,
-        ``commands``, ``entries``, ``reason``, ``checked_at``).
+        ``commands``, ``tree``, ``entries``, ``reason``, ``checked_at``).
     """
     commands, reason = _post_push_verification_commands(worktree_path)
+    tree = _resolve_commit_tree(worktree_path, commit_hash) or (
+        _resolve_commit_tree(repo_root, commit_hash)
+        if commit_hash
+        else None
+    )
     verification: dict[str, Any] = {
         "verdict": POST_PUSH_VERDICT_NOT_APPLICABLE,
         "success": True,
         "executed": False,
         "commands": commands,
+        "tree": tree,
         "entries": [],
         "reason": reason,
         "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -4599,7 +5092,20 @@ def _resolve_post_push_verification(
         cached_at: str | None = None
         for cwd in (worktree_path, repo_root):
             try:
-                entry = query_cached(command, cwd=cwd)
+                if tree is not None:
+                    entry = query_cached(
+                        command,
+                        cwd=cwd,
+                        fingerprint=tree,
+                        fingerprint_kind=FINGERPRINT_KIND_TREE,
+                    )
+                    if entry is None:
+                        # Legacy/pre-tree-keying entry fallback: a loose
+                        # worktree entry still counts as evidence for the
+                        # pushed tree.
+                        entry = query_cached(command, cwd=cwd)
+                else:
+                    entry = query_cached(command, cwd=cwd)
             except Exception as exc:  # noqa: BLE001 - a broken cache is a miss
                 LOG.warning(
                     "Post-push verification: cache query failed for %s in "
@@ -4840,6 +5346,66 @@ PUSH_RETRY_MAX_ATTEMPTS = 3
 PUSH_RETRY_BASE_SECONDS = 2.0
 PUSH_RETRY_CAP_SECONDS = 30.0
 
+#: SSH keepalive options injected into the dev-push child environment
+#: (SA-0MVWNHLQQ002TFZR AC1/AC2). ``.githooks/pre-push`` runs the full suite
+#: *after* git has opened the SSH connection and produces no SSH traffic for
+#: the whole run, so the remote closes the idle connection and the ref update
+#: is written to a dead socket. A 30 s ``ServerAliveInterval`` keeps the
+#: connection alive for the duration of the gate; the OS-level
+#: ``TCPKeepAlive`` alone is far too coarse (default ~2 h).
+SSH_KEEPALIVE_OPTIONS: tuple[str, ...] = (
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=20",
+    "-o",
+    "TCPKeepAlive=yes",
+)
+
+
+def _ssh_keepalive_command(existing: str | None) -> str:
+    """Return a ``GIT_SSH_COMMAND`` that keeps the push SSH session alive.
+
+    The pre-push full-suite gate can idle the SSH connection for far longer
+    than a remote's idle timeout, so the dev push injects SSH keepalives into
+    its own child environment (SA-0MVWNHLQQ002TFZR AC1/AC2). The operator's
+    own ``GIT_SSH_COMMAND`` is preserved, never clobbered:
+
+    - unset: a plain ``ssh`` invocation with the keepalive options;
+    - set as an ``ssh`` invocation (optionally with args such as ``-i``): the
+      keepalive options are spliced in immediately after the ``ssh`` token so
+      the caller's arguments stay intact;
+    - already carrying ``ServerAliveInterval``: returned unchanged — the
+      operator configured keepalives deliberately;
+    - any other command (e.g. a wrapper script): returned unchanged. Options
+      cannot be spliced safely into an unknown wrapper, so the push keeps the
+      operator's command and logs a warning instead of risking a broken push.
+
+    Args:
+        existing: The ambient ``GIT_SSH_COMMAND`` value, or ``None``.
+
+    Returns:
+        The ``GIT_SSH_COMMAND`` to use for the push child process.
+    """
+    base = (existing or "").strip()
+    if "ServerAliveInterval" in base:
+        # The operator already configured keepalives; never second-guess them.
+        return base
+    if not base:
+        return " ".join(("ssh",) + SSH_KEEPALIVE_OPTIONS)
+    tokens = base.split()
+    if Path(tokens[0]).name == "ssh":
+        tokens[1:1] = list(SSH_KEEPALIVE_OPTIONS)
+        return " ".join(tokens)
+    LOG.warning(
+        "Cannot inject SSH keepalives into the custom GIT_SSH_COMMAND %r; "
+        "the dev-push gate may idle out the connection. Configure "
+        "ServerAliveInterval in that command to avoid it.",
+        base,
+    )
+    return base
+
+
 _GATE_REASON_LINE_RE = re.compile(r"^gate_reason=([a-z_]+)\s*$", re.MULTILINE)
 
 #: Reason reported when the repo-local pre-push **pushed-commit guard** refuses
@@ -4993,6 +5559,48 @@ def _push_retry_trail_fields(evidence: dict[str, Any] | None) -> dict[str, Any]:
     return fields
 
 
+def _transport_lost_comment(
+    exc: PushTransportLostError,
+    commit_hash: str,
+    branch: str,
+    worktree_path: str,
+) -> str:
+    """Build the work-item comment for a lost push transport (AC3).
+
+    The wording is deliberately explicit that a green suite is *not* a
+    successful push: the failure the operator must act on is the transport,
+    not the code (SA-0MVWNHLQQ002TFZR AC3).
+    """
+    return "\n".join(
+        [
+            "Dev push transport lost (reason: connection_closed).",
+            (
+                "The SSH connection closed before git could update the remote "
+                "ref, so the full-suite verdict (green or otherwise) was "
+                "discarded and nothing reached origin/dev. This is NOT a "
+                "test failure (`gate_reason=test_failure` means a red suite)."
+            ),
+            (
+                f"The push made {exc.attempts} attempt(s); the SSH keepalive "
+                "(ServerAliveInterval) is now applied to automated dev "
+                "pushes, so re-running finish should keep the connection "
+                "alive for the whole gate."
+            ),
+            "",
+            f"Commit: {commit_hash}",
+            f"Branch: {branch}",
+            f"Worktree: {worktree_path}",
+            (
+                "Local dev was restored to origin/dev (the commit stays on "
+                "its feature branch)."
+            ),
+            "",
+            "Gate output (tail):",
+            exc.stderr,
+        ]
+    )
+
+
 def _dev_push_gate_failure_comment(
     gate_reason: str,
     stderr_tail: str,
@@ -5082,7 +5690,9 @@ def git_push_to_dev(
     # executed-vs-cached verdict is observable afterwards (AC3). Read-only and
     # fail-soft: it never decides the push. Taken once so a transport retry is
     # never misreported as "cached" merely because the first attempt executed.
-    before_present = _full_suite_cache_present(cwd)
+    # The pushed commit already exists locally, so the tree-keyed entry the
+    # gate now writes (SA-0MW7C6BMZ00931JG) is visible here too.
+    before_present = _full_suite_cache_present(cwd, commit_hash)
 
     #: Every transport retry this push made, in order. Carried into
     #: ``evidence_out`` (and from there onto ``report["steps"]["push"]``) so a
@@ -5110,6 +5720,15 @@ def git_push_to_dev(
             _finish_tmpdir = _resolved_finish_tmpdir()
             if _finish_tmpdir is not None:
                 child_env["TMPDIR"] = _finish_tmpdir
+            # Keep the push SSH session alive for the duration of the
+            # pre-push full-suite gate: the hook runs *after* git opens the
+            # connection and produces no SSH traffic, so a remote that closes
+            # idle connections would discard the green gate
+            # (SA-0MVWNHLQQ002TFZR AC1/AC2). The operator's own
+            # GIT_SSH_COMMAND is preserved, never clobbered.
+            child_env["GIT_SSH_COMMAND"] = _ssh_keepalive_command(
+                os.environ.get("GIT_SSH_COMMAND")
+            )
             proc = subprocess.Popen(
                 ["git", "push", PUSH_REMOTE_NAME, f"{branch}:refs/heads/dev"],
                 cwd=cwd,
@@ -5200,6 +5819,40 @@ def git_push_to_dev(
                 _push_retry_sleep(delay)
                 continue
 
+            # The retries are exhausted and the failure is still a transport
+            # close: the suite may have been green, but the ref update never
+            # reached origin. Raise a *distinct* failure (AC3) instead of
+            # returning a generic False, so `finish` can report
+            # "transport lost" rather than silence after "full suite green".
+            if _is_retryable_push_transport(stderr_str):
+                if evidence_out is not None:
+                    evidence_out.clear()
+                    evidence_out.update(
+                        {
+                            "success": False,
+                            "reason": "connection_closed",
+                            "gate_reason": None,
+                            "transport_lost": True,
+                            "stderr_tail": _stderr_tail(stderr_str),
+                        }
+                    )
+                    _attach_trail(evidence_out, attempt)
+                LOG.error(
+                    "git push to dev transport lost (attempt %d/%d): the SSH "
+                    "connection closed before the ref update, so a green "
+                    "suite verdict (if any) was discarded. This is NOT a "
+                    "test failure. stderr: %s",
+                    attempt,
+                    PUSH_RETRY_MAX_ATTEMPTS,
+                    _stderr_tail(stderr_str),
+                )
+                raise PushTransportLostError(
+                    commit_hash or "unknown",
+                    branch,
+                    _stderr_tail(stderr_str),
+                    attempt,
+                )
+
             # The pushed-commit guard (§3a) refuses before the suite runs and
             # prints no ``gate_reason=`` line: recognise its stable diagnostic
             # so a guard refusal is reported distinctly, with the pushed sha /
@@ -5236,6 +5889,7 @@ def git_push_to_dev(
                     PushTimeoutError,
                     PushNonFastForwardError,
                     PushGateFailureError,
+                    PushTransportLostError,
                 ),
             ):
                 raise
@@ -6736,6 +7390,33 @@ def _resolve_full_commit(cwd: str, rev: str) -> str | None:
         cwd=cwd,
         check=False,
     )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _resolve_commit_tree(cwd: str, commit: str | None) -> str | None:
+    """The tree SHA of *commit* in *cwd*, or ``None`` when unresolvable.
+
+    The dev-push gate binds its full-suite verdict to the pushed commit's
+    tree (``git rev-parse <commit>^{tree}``, SA-0MW7C6BMZ00931JG), so a
+    read-only consumer that wants to find that verdict must query the cache
+    with exactly this fingerprint and ``fingerprint_kind="tree"``. Fail-soft:
+    an unresolvable tree (missing commit, non-repository, or a git subprocess
+    failure/timeout) returns ``None`` — the caller falls back to the
+    historical loose-worktree query rather than aborting a finish.
+    """
+    if not commit:
+        return None
+    try:
+        result = run_cmd(
+            ["git", "rev-parse", "--verify", f"{commit}^{{tree}}"],
+            cwd=cwd,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        LOG.debug("Cannot resolve the tree of %s in %s: %s", commit, cwd, exc)
+        return None
     if result.returncode != 0:
         return None
     return result.stdout.strip() or None
@@ -9714,6 +10395,7 @@ def phase_start(
     max_retry: int = DEFAULT_MAX_RETRY,
     verbose: bool = False,
     force: bool = False,
+    verification_only: bool = False,
 ) -> dict[str, Any]:
     """Phase 1: Setup the implementation environment.
 
@@ -9750,6 +10432,9 @@ def phase_start(
         max_retry: Max test-fix retries.
         verbose: Enable verbose logging.
         force: Acknowledge orphaned-stash warnings (--allow-orphaned-stashes) and proceed.
+        verification_only: Record the verification-only finalisation opt-in in
+            the state file so ``finish`` can finalise an item that produces no
+            commit (SA-0MW74IJWI009NRZ1 AC3).
 
     Returns:
         Dict with result information.
@@ -9848,6 +10533,7 @@ def phase_start(
             parent_branch=parent_branch,
             worktree_path_override=worktree_path_override,
             force=force,
+            verification_only=verification_only,
         )
     except Exception as exc:  # noqa: BLE001 - release the claim, then report
         # The claim is written before this point, so an *unexpected* failure
@@ -9886,6 +10572,7 @@ def _phase_start_locked(
     parent_branch: str,
     worktree_path_override: str | None,
     force: bool,
+    verification_only: bool = False,
 ) -> dict[str, Any]:
     """Steps 3-9 of :func:`phase_start`, executed under the child lock.
 
@@ -10328,6 +11015,7 @@ def _phase_start_locked(
         repo_root=repo_root,
         parent_branch=parent_branch,
         started_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        verification_only=bool(verification_only),
     )
     write_state(state, abs_wt_path)
 
@@ -10515,6 +11203,7 @@ def phase_finish(
     max_retry: int = DEFAULT_MAX_RETRY,
     verbose: bool = False,
     keep_worktree: bool = False,
+    verification_only: bool = False,
 ) -> dict[str, Any]:
     """Phase 2: Complete the implementation.
 
@@ -10596,6 +11285,12 @@ def phase_finish(
         verbose: Enable verbose logging.
         keep_worktree: Defer worktree removal (``--keep-worktree``); the
             caller then owns the cleanup so the session keeps its cwd.
+        verification_only: Opt in to finalising an item that produced **no**
+            commit (verification-only work). Without this signal (or the
+            ``verification_only`` recorded in the run's state file) a finish
+            that creates no commit is refused with
+            ``commit.reason = "no_commit_no_signal"``: no push, no terminal
+            write, no completion comment (SA-0MW74IJWI009NRZ1 AC1).
 
     Returns:
         Dict with result information.
@@ -10628,6 +11323,13 @@ def phase_finish(
 
     # Read state for metadata
     state = read_state(worktree_path)
+    # Verification-only finalisation is an explicit signal: the CLI/state flag
+    # OR the flag recorded by ``start`` (the state file is the single source
+    # of truth ``drive`` also reads). Absent it, a finish that produces no
+    # commit is refused (SA-0MW74IJWI009NRZ1 AC1).
+    verification_only = bool(
+        verification_only or (state.verification_only if state else False)
+    )
     # The shared parent branch this finish syncs and verifies against (dev).
     # Resolved once here so the verified fast-forward (Step 5), the restore
     # (Step 6) and the ancestry assertion (Step 6a) all use the same ref.
@@ -11111,11 +11813,12 @@ def phase_finish(
         return report
 
     try:
-        # Assignee release is the helper's default, but it only ever clears an
-        # assignee the context manager holds — so finish declares the agent
-        # claim it owns here and releases it with the terminal
-        # ``completed``/``in_review`` transition. A producer hold on the item
-        # is therefore never wiped by finishing it (SA-0MVVF6OJY000JZBL).
+        # Assignee release is the helper's default, and it clears any claim on
+        # the item — so finish declares the agent claim it owns here and
+        # releases it with the terminal ``completed``/``in_review`` transition.
+        # Every non-empty assignee, including the producer identity ``Map``, is
+        # released; the ``needsProducerReview`` flag is the only persistent
+        # hold and is left intact (SA-0MVVF6OJY000JZBL, SA-0MW7QTAHW0030FGV).
         with StatusLifecycle(
             work_item_id,
             assignee=os.environ.get("IMPLEMENT_AGENT_NAME") or "implement",
@@ -11157,7 +11860,8 @@ def phase_finish(
             # ── Step 4: Commit ─────────────────────────────────────────────
             commit_msg = commit_msg_override or f"{work_item_id}: Implementation complete"
             LOG.info("Committing changes...")
-            if not git_commit(worktree_path, commit_msg):
+            commit_outcome = git_commit(worktree_path, commit_msg)
+            if not commit_outcome:
                 # AC5 (LP-0MVWEP1MM0097RAT): structured steps entry so the
                 # classifier never needs the ``report["message"]`` prose.
                 report["steps"]["commit"] = {
@@ -11166,21 +11870,103 @@ def phase_finish(
                 }
                 raise RuntimeError("git commit failed")
 
-            commit_hash = git_get_commit_hash(worktree_path)
-            report["steps"]["commit"] = {
-                "hash": commit_hash,
-                "message": commit_msg,
-            }
-            LOG.info("Committed at %s", commit_hash)
+            # ``git_commit`` now distinguishes a created commit from a clean
+            # tree. A legacy/patched truthy return (the historical
+            # success/failure contract, still used by harnesses that stub the
+            # boundary) is treated as the commit path.
+            if isinstance(commit_outcome, CommitOutcome):
+                commit_created = commit_outcome.committed
+                created_hash = commit_outcome.hash
+            else:  # pragma: no cover - legacy/patched truthy return
+                commit_created = True
+                created_hash = ""
+
+            if commit_created:
+                commit_hash = created_hash or git_get_commit_hash(worktree_path)
+                report["steps"]["commit"] = {
+                    "success": True,
+                    "committed": True,
+                    "created": True,
+                    "hash": commit_hash,
+                    "message": commit_msg,
+                }
+                LOG.info("Committed at %s", commit_hash)
+            else:
+                # No commit was created. Never surface the ambient HEAD (which
+                # may be another item's published commit) as this item's
+                # commit (AC2): the hash stays empty and the machinery below
+                # uses the worktree HEAD only to fast-forward/push a no-op.
+                commit_hash = git_get_commit_hash(worktree_path)
+                report["steps"]["commit"] = {
+                    "success": verification_only,
+                    "committed": False,
+                    "created": False,
+                    "hash": "",
+                    "message": commit_msg,
+                    "reason": (
+                        "no_changes"
+                        if verification_only
+                        else "no_commit_no_signal"
+                    ),
+                }
+                if not verification_only:
+                    # AC1: refuse the terminal write by default. Raising here
+                    # aborts before the fast-forward/push, so nothing is
+                    # published and no completion comment is posted; the
+                    # outer handler releases the item to open. The report
+                    # names the retained worktree and the exact opt-in.
+                    msg = (
+                        f"Finish refused: no commit was created for "
+                        f"{work_item_id} (the worktree has no change set), and "
+                        f"no --verification-only signal is present.\n"
+                        f"- Worktree: {worktree_path} (retained, branch "
+                        f"{branch})\n"
+                        f"- Commit: none — nothing was committed or pushed.\n"
+                        f"- No terminal transition was written; the item stays "
+                        f"in its prior state (released to open).\n"
+                        f"If this item genuinely needs no code change (evidence "
+                        f"lives elsewhere), finalise it deliberately with:\n"
+                        f"  python3 skill/implement/scripts/implement.py finish "
+                        f"{work_item_id} --verification-only"
+                    )
+                    report["success"] = False
+                    report["message"] = msg
+                    report["worktree_path"] = worktree_path
+                    # Structured evidence of the retained tree alongside the
+                    # machine-readable reason (AC1) — no prose parsing.
+                    report["steps"]["commit"]["worktree_path"] = worktree_path
+                    wl_add_comment(
+                        work_item_id,
+                        "Finish refused (no_commit_no_signal): no commit "
+                        "was created for this item.\n"
+                        f"- Worktree: {worktree_path} (retained)\n"
+                        "- Commit: none — nothing was committed or "
+                        "pushed.\n"
+                        "- No terminal transition was written; the item "
+                        "is released to open.\n"
+                        "If the item genuinely needs no code change, "
+                        "finalise it deliberately with:\n"
+                        "  python3 skill/implement/scripts/implement.py "
+                        f"finish {work_item_id} --verification-only",
+                    )
+                    raise RuntimeError(msg)
+                LOG.info(
+                    "No changes to commit; --verification-only finalisation "
+                    "proceeds without a commit (worktree %s).",
+                    worktree_path,
+                )
             # Interruption context (SA-0MVXUSJJY009HMQ0 AC2): a signal from
             # here on names the committed (and, after Step 6, published) work
             # in its retained-state record instead of releasing the item
-            # unexplained. ``pushed`` is set once Step 6 confirms the push.
+            # unexplained. On the no-commit path there is no item commit to
+            # name — ``commit`` stays empty so the record never misattributes
+            # the ambient HEAD. ``pushed`` is set once Step 6 confirms the
+            # push.
             _set_finish_progress(
                 work_item_id=work_item_id,
                 worktree_path=worktree_path,
                 branch=branch,
-                commit=commit_hash,
+                commit=commit_hash if commit_created else "",
                 pushed=False,
             )
 
@@ -11375,6 +12161,44 @@ def phase_finish(
                 # An interruption from here on names the rebased replacement
                 # hash, which is the commit that actually landed.
                 _set_finish_progress(commit=commit_hash, pushed=True)
+            except PushTransportLostError as exc:
+                # AC3 (SA-0MVWNHLQQ002TFZR): the SSH transport closed before
+                # the ref update. The suite may have been green, but the ref
+                # never reached origin, so the verdict was discarded. Report
+                # this *distinctly* from a red suite: `reason:
+                # connection_closed` is already an infrastructure failure for
+                # the drive retry classifier, and the comment/error say
+                # "transport lost", never "full suite green".
+                push_step = {
+                    "success": False,
+                    "reason": "connection_closed",
+                    "hash": commit_hash,
+                    "transport_lost": True,
+                    "attempts": exc.attempts,
+                    "gate_stderr_tail": exc.stderr,
+                }
+                push_step.update(_push_retry_trail_fields(push_evidence))
+                report["steps"]["push"] = push_step
+                report["steps"]["local_dev_restore"] = (
+                    _restore_local_dev_after_failed_push(
+                        repo_root, local_dev_fast_forward, parent_branch
+                    )
+                )
+                wl_add_comment(
+                    work_item_id,
+                    _transport_lost_comment(
+                        exc, commit_hash, branch, worktree_path
+                    ),
+                )
+                raise RuntimeError(
+                    f"git push to dev transport lost: the SSH connection "
+                    f"closed before the ref update after {exc.attempts} "
+                    f"attempt(s), so a green suite verdict (if any) was "
+                    f"discarded. This is NOT a test failure. Commit "
+                    f"{commit_hash} stays local on branch {branch}. "
+                    f"Remedy: retry finish (the SSH keepalive is now applied "
+                    f"automatically)."
+                ) from exc
             except PushGateFailureError as exc:
                 # AC2: the pre-push gate said *why* the push failed. Report the
                 # machine-readable reason in the finish report and post it on
@@ -11478,7 +12302,7 @@ def phase_finish(
             # runs inside the held, non-terminal ``StatusLifecycle`` window so
             # the item is never an audit-dispatch candidate while it runs.
             post_push_verification = _resolve_post_push_verification(
-                worktree_path, repo_root
+                worktree_path, repo_root, commit_hash
             )
             report["steps"]["post_push_verification"] = post_push_verification
             if post_push_verification["verdict"] not in (
@@ -11640,8 +12464,18 @@ def phase_finish(
             # it after the terminal write would bump ``updatedAt`` on an
             # already audit-ready item (and race the dispatcher).
             verdict_lines = "\n".join(_verdict_provenance_lines(report))
+            if commit_created:
+                commit_line = f"- Commit: {commit_hash}\n"
+            else:
+                # AC2: never name the ambient HEAD as this item's commit. A
+                # verification-only finalisation names the absence of a commit
+                # and the retained worktree (named again below).
+                commit_line = (
+                    "- No changes: no commit was created "
+                    "(verification-only finalisation).\n"
+                )
             completion_comment = (
-                f"Implementation complete.\n- Commit: {commit_hash}\n"
+                f"Implementation complete.\n{commit_line}"
                 f"- Branch: {branch}\n- Worktree: {worktree_path}\n"
                 f"{verdict_lines}"
             )
@@ -11685,19 +12519,23 @@ def phase_finish(
             completion_already_recorded = _comment_already_recorded(
                 work_item_id,
                 COMPLETION_COMMENT_MARKER,
-                f"Commit: {commit_hash}",
+                (
+                    f"Commit: {commit_hash}"
+                    if commit_created
+                    else "No changes: no commit was created"
+                ),
             )
             report["steps"]["completion_comment"] = {
                 "posted": not completion_already_recorded,
                 "deduplicated": completion_already_recorded,
-                "commit": commit_hash,
+                "commit": commit_hash if commit_created else "",
             }
             if completion_already_recorded:
                 LOG.info(
-                    "Completion comment for %s (commit %s) is already "
+                    "Completion comment for %s (%s) is already "
                     "recorded; skipping the duplicate on the re-run.",
                     work_item_id,
-                    commit_hash,
+                    f"commit {commit_hash}" if commit_created else "no commit",
                 )
             else:
                 wl_add_comment(work_item_id, completion_comment)
@@ -11884,8 +12722,19 @@ def phase_finish(
     removal_step = report["steps"].get("worktree_removal") or {}
 
     report["success"] = True
-    report["hash"] = commit_hash
-    report["message"] = f"Implementation complete. Commit {commit_hash} pushed to dev."
+    if commit_created:
+        report["hash"] = commit_hash
+        report["message"] = (
+            f"Implementation complete. Commit {commit_hash} pushed to dev."
+        )
+    else:
+        # AC2: a verification-only finalisation says "no changes / no commit"
+        # and never names an ambient hash as the item's commit.
+        report["hash"] = ""
+        report["message"] = (
+            "Implementation complete. No changes — no commit was created "
+            f"(verification-only). Worktree: {worktree_path}."
+        )
 
     if json_output:
         print(format_json_output(report))
@@ -11894,7 +12743,10 @@ def phase_finish(
         print("=" * 60)
         print(f"  ✅ Implementation complete for {work_item_id}")
         print("=" * 60)
-        print(f"  Commit: {commit_hash}")
+        if commit_created:
+            print(f"  Commit: {commit_hash}")
+        else:
+            print("  No changes — no commit was created (verification-only).")
         print(f"  Branch: {branch}")
         print("  Status: in_review")
         if removal_step.get("deferred"):
@@ -12452,7 +13304,13 @@ def phase_parent(
        are reported as coordination notes.
     5. Classify children: terminal → skip; a live lock holder →
        ``skipped-held`` (report the holder and stop cleanly); in_progress
-       elsewhere → skip+report; blocked by a non-terminal sibling or by a
+       elsewhere → skip+report; ``status: blocked`` → re-validated against
+       the outbound dependency edges (``skip-blocked`` with ``blocking_ids``
+       while the block holds, a ``stale_blocks`` entry and a startable child
+       once every blocker is terminal, ``unvalidated_blocks`` when no edge
+       resolves it — SA-0MVTUFL0U0000NV2); a worktree with no attributable
+       work → ``not-finalisable`` (child stays open, parent never advances;
+       SA-0MW74IKJE008JXDQ); blocked by a non-terminal sibling or by a
        same-project item outside the epic → not startable (reported);
        otherwise → implementable.
     6. All children terminal → advance the parent to ``completed``/``in_review``
@@ -12630,16 +13488,38 @@ def phase_parent(
     # ── Step 5: Classify children ──────────────────────────────────
     classifications: list[dict[str, Any]] = []
     blockers_map: dict[str, list[dict[str, Any]]] = {}
+    # Re-validated ``blocked`` holds, keyed by child id (AC1/AC2/AC4).
+    blocked_states: dict[str, dict[str, Any]] = {}
+    # The blocker set that gates each child (declared edges plus the explicit
+    # prose ``Blocked by`` ids), so the classification in Step 5 and the start
+    # decision in Step 6 can never disagree (SA-0MVTUFL0U0000NV2 AC3).
+    gate_blockers: dict[str, list[dict[str, Any]]] = {}
+    stale_blocks: list[dict[str, Any]] = []
+    unvalidated_blocks: list[dict[str, Any]] = []
     # Same-project blockers OUTSIDE the children set: they cannot be ordered
     # within the epic, but they still gate the child (consistent with the
     # ``phase_start`` leaf gate). Cross-project edges stay coordination notes
-    # (SA-0MSQBM2FK005NW1T).
+    # for children that are *not* ``blocked`` (SA-0MSQBM2FK005NW1T).
     out_of_chain_blocked: dict[str, list[dict[str, str]]] = {}
+    # Prose-declared blockers that could not be resolved, keyed by child id.
+    unresolved_prose: dict[str, list[str]] = {}
     for child in children:
         cid = str(child.get("id", ""))
-        # Outbound (depends-on) edges: what this child is blocked by.
+        child_status = str(child.get("status", ""))
+        # Outbound (depends-on) edges: what this child is blocked by. Declared
+        # edges are authoritative; the prose ``Blocked by`` line is the narrow
+        # cross-project path consulted only for a ``blocked`` child
+        # (SA-0MVTUFL0U0000NV2 AC3).
         child_blockers = wl_dep_blockers(cid) if cid else []
         blockers_map[cid] = child_blockers
+        prose_blockers = _prose_blockers(child) if child_status == "blocked" else []
+        merged_blockers = list(child_blockers)
+        for payload in prose_blockers:
+            if not any(
+                str(b.get("id", "")) == str(payload.get("id", ""))
+                for b in merged_blockers
+            ):
+                merged_blockers.append(payload)
         # Blockers outside the children set (e.g. cross-project) are
         # coordination notes, not in-chain edges (SA-0MSQBM2FK005NW1T).
         in_chain_ids = {str(c.get("id")) for c in children}
@@ -12651,6 +13531,10 @@ def phase_parent(
             for b in out_of_chain
             if not _is_same_project(cid, str(b.get("id", "")))
         ]
+        for payload in prose_blockers:
+            blocker_id = str(payload.get("id", ""))
+            if blocker_id not in external:
+                external.append(blocker_id)
         unmet_same_project = [
             _blocker_payload(b)
             for b in out_of_chain
@@ -12659,20 +13543,84 @@ def phase_parent(
         ]
         if unmet_same_project:
             out_of_chain_blocked[cid] = unmet_same_project
-        classifications.append({
+        gate_blockers[cid] = merged_blockers
+        entry: dict[str, Any] = {
             "id": cid,
             "title": child.get("title", ""),
-            "status": child.get("status", ""),
-            "action": _classify_child(child),
+            "status": child_status,
+            "action": _classify_child(child, merged_blockers, children),
             "external_blockers": external,
-        })
-        entry = classifications[-1]
+        }
+        classifications.append(entry)
         if unmet_same_project:
             entry["out_of_chain_blockers"] = unmet_same_project
         if entry["action"] == ACTION_SKIPPED_HELD:
             # Surface the live holder's identity so the operator can diagnose
             # who owns the child (AC3).
             entry["held_by"] = _probe_child_lock(cid)
+        if child_status == "blocked":
+            # Re-validate the hold on every run: a producer's ``blocked``
+            # status is re-evaluated against the outbound edges and the
+            # explicit ``Blocked by`` line so a landed prerequisite cannot
+            # strand its dependent, and a block that cannot be validated
+            # holds instead of defaulting to startable (SA-0MVTUFL0U0000NV2
+            # AC2/AC3/AC4).
+            state = _blocked_child_state(child, merged_blockers, children)
+            blocked_states[cid] = state
+            entry["blocker_details"] = [
+                _blocker_detail(
+                    payload,
+                    resolved_in_chain=str(payload.get("id", "")) in in_chain_ids,
+                )
+                for payload in merged_blockers
+            ]
+            unresolved = [
+                str(payload.get("id", ""))
+                for payload in merged_blockers
+                if payload.get("unresolved")
+            ]
+            if unresolved:
+                unresolved_prose[cid] = unresolved
+                entry["unresolved_blockers"] = [
+                    detail
+                    for detail in entry["blocker_details"]
+                    if detail["status"] == "unresolved"
+                ]
+            if state["blocking_ids"]:
+                entry["blocking_ids"] = list(state["blocking_ids"])
+            if state["unvalidated"]:
+                entry["unvalidated"] = True
+                unvalidated_blocks.append({
+                    "id": cid,
+                    "reason": (
+                        "status is 'blocked' but no outbound dependency edge "
+                        "and no parseable 'Blocked by' line resolves the "
+                        "blocker; treated as holding (fail closed)"
+                    ),
+                })
+            if state["stale_block_ids"]:
+                entry["stale_block_ids"] = list(state["stale_block_ids"])
+                stale_blocks.append({
+                    "id": cid,
+                    "blocking_ids": list(state["stale_block_ids"]),
+                })
+                LOG.info(
+                    "Child %s has a stale block: every blocker (%s) is "
+                    "terminal, so the child is startable again.",
+                    cid,
+                    _format_blockers(
+                        [
+                            {"id": bid, "status": "terminal"}
+                            for bid in state["stale_block_ids"]
+                        ]
+                    ),
+                )
+    if stale_blocks:
+        report["stale_blocks"] = stale_blocks
+    if unvalidated_blocks:
+        report["unvalidated_blocks"] = unvalidated_blocks
+    if unresolved_prose:
+        report["unresolved_blockers"] = unresolved_prose
     report["children"] = classifications
 
     # ── Step 5.5: Resolve dependency order (blockers first) ────────
@@ -12708,6 +13656,7 @@ def phase_parent(
     }
     pending_ids: list[str] = []
     blocked_ids: list[str] = []
+    no_work_ids: list[str] = []
 
     def _in_chain_blockers(child_id: str) -> list[str]:
         return [
@@ -12716,11 +13665,32 @@ def phase_parent(
             if str(b.get("id")) in child_ids
         ]
 
+    def _note_stale_block(cid: str) -> None:
+        """Record a stale-block finding on the child before it is handed off.
+
+        Q2 = A (SA-0MVTUFL0U0000NV2): the phase reports and logs the stale
+        block, then lets the child start — it never rewrites the child's
+        ``blocked`` lifecycle status, because that status is the lifecycle
+        owner's decision (and ``wl update --status blocked`` is unreliable,
+        WL-0MVTUKSJZ003WK82).
+        """
+        stale = list(blocked_states.get(cid, {}).get("stale_block_ids") or [])
+        if not stale:
+            return
+        wl_add_comment(
+            cid,
+            f"Stale block re-validated by {work_item_id}: every blocker "
+            f"({', '.join(stale)}) is terminal, so the child is startable "
+            "again. The `blocked` lifecycle status is left unchanged "
+            "(lifecycle owner's decision).",
+        )
+
     def _report_implement_next(
         cid: str, worktree_path: str, branch: str, message: str,
         start_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Populate and return the report for a child awaiting implementation."""
+        _note_stale_block(cid)
         if _forward_child_lock_reclamation(report, cid, start_result):
             message = (
                 f"{message} {cid} lock reclaimed from a dead holder "
@@ -12827,10 +13797,57 @@ def phase_parent(
         })
         return finish_result
 
+    def _record_not_finalisable(
+        cid: str, title: str, status: str, worktree_path: str | None,
+    ) -> None:
+        """Record a child classified as not-finalisable (no work).
+
+        The child stays open, is never handed to ``finish`` and never
+        contributes to parent advancement (SA-0MW74IKJE008JXDQ AC4). The
+        structured entry in ``children_processed`` carries the verdict and
+        the reason so ``drive`` can surface it without prose parsing.
+        """
+        no_work_ids.append(cid)
+        entry: dict[str, Any] = {
+            "id": cid, "title": title,
+            "action": "not-finalisable",
+            "status": status,
+            "reason": (
+                "worktree exists but carries no commit attributable to "
+                "the item and no verification-only signal"
+            ),
+        }
+        if worktree_path:
+            entry["worktree_path"] = worktree_path
+        child_results.append(entry)
+
+    # A held ``blocked`` child is a verdict about this pass, not work in
+    # progress: record every one before the loop so a report that stops at the
+    # started child still names every block and the ids that hold it
+    # (SA-0MVTUFL0U0000NV2 AC1/AC3).
+    for entry in classifications:
+        if entry["action"] != ACTION_SKIP_BLOCKED:
+            continue
+        held_id = str(entry["id"])
+        pending_ids.append(held_id)
+        blocked_ids.append(held_id)
+        held_entry: dict[str, Any] = {
+            "id": held_id,
+            "title": entry.get("title", ""),
+            "action": ACTION_SKIP_BLOCKED,
+            "status": entry.get("status", ""),
+            "blocking_ids": list(entry.get("blocking_ids") or []),
+        }
+        if entry.get("unvalidated"):
+            held_entry["unvalidated"] = True
+        child_results.append(held_entry)
+
     for child in ordered_children:
         cid = str(child.get("id", ""))
         title = child.get("title", "")
-        action = _classify_child(child)
+        action = _classify_child(
+            child, gate_blockers.get(cid, blockers_map.get(cid, [])), children
+        )
 
         if action == "skip-terminal":
             child_results.append({
@@ -12840,6 +13857,10 @@ def phase_parent(
             })
             continue
 
+        if action == ACTION_SKIP_BLOCKED:
+            # Already recorded up-front with its ``blocking_ids``: a still
+            # valid ``blocked`` hold is never started (AC1).
+            continue
         if action == ACTION_SKIPPED_HELD:
             # A live holder owns this child's critical section. Stop cleanly
             # with the holder's identity instead of spawning a second session
@@ -12873,11 +13894,26 @@ def phase_parent(
         has_changes = bool(
             worktree_path and _has_worktree_changes(worktree_path, parent_branch)
         )
+        # The work-state verdict decides whether a present worktree's change
+        # surface is real work. ``no-work`` is never finishable (AC4).
+        worktree_verdict = ""
+        if worktree_path:
+            worktree_verdict = _classify_child_worktree(
+                cid, worktree_path, parent_branch
+            )
 
         if action == "skip-in-progress":
             # A started child may be ours (worktree exists) or another
             # agent's claim (no worktree → never clobbered).
             if has_changes:
+                # AC4: the change surface is only the state file (or a
+                # non-attributable commit) — the child did no work, so it is
+                # never presented as finishable (SA-0MW74IKJE008JXDQ).
+                if worktree_verdict == CHILD_NO_WORK:
+                    _record_not_finalisable(
+                        cid, title, child.get("status", ""), worktree_path
+                    )
+                    continue
                 if _run_finish(cid, title) is None:
                     return report
             elif worktree_path:
@@ -12929,6 +13965,13 @@ def phase_parent(
             continue
 
         if has_changes:
+            # AC4: only the state file is dirty (or a non-attributable commit)
+            # — never present zero work as finishable (SA-0MW74IKJE008JXDQ).
+            if worktree_verdict == CHILD_NO_WORK:
+                _record_not_finalisable(
+                    cid, title, child.get("status", ""), worktree_path
+                )
+                continue
             if _run_finish(cid, title) is None:
                 return report
             continue
@@ -12974,15 +14017,51 @@ def phase_parent(
         )
 
     # ── Step 7: Advance only when every child is terminal ──────────
-    if pending_ids:
+    if pending_ids or no_work_ids:
+        reasons: list[str] = []
+        if no_work_ids:
+            reasons.append(
+                f"{len(no_work_ids)} child(ren) classified as not-finalisable "
+                f"(no attributable work)"
+            )
+        if pending_ids:
+            reasons.append(
+                "non-terminal children not in progress are blocked by "
+                "non-terminal siblings or another agent holds them"
+            )
+        if blocked_ids:
+            # Name the ids that hold each child so an unattended operator can
+            # see what to wait for without re-reading the child's description
+            # (SA-0MVTUFL0U0000NV2 AC3).
+            details = []
+            for cid in blocked_ids:
+                ids = list(
+                    blocked_states.get(cid, {}).get("blocking_ids") or []
+                )
+                if not ids:
+                    out_of_chain = out_of_chain_blocked.get(cid) or []
+                    ids = [str(b.get("id", "")) for b in out_of_chain]
+                detail = (
+                    f"{cid} (blocked by {', '.join(ids)})"
+                    if ids else f"{cid} (unvalidated block)"
+                )
+                unresolved = unresolved_prose.get(cid) or []
+                if unresolved:
+                    detail += (
+                        "; unresolved id(s) " + ", ".join(unresolved)
+                        + " — check the owning project's worklog"
+                    )
+                details.append(detail)
+            reasons.append("blocked children: " + "; ".join(details))
         report["message"] = (
             f"No child of {work_item_id} is currently startable: "
-            f"non-terminal children not in progress are blocked by "
-            f"non-terminal siblings or another agent holds them. Re-run "
-            f"this phase after one completes."
+            + "; ".join(reasons) + ". "
+            "Re-run this phase after one completes."
         )
         if blocked_ids:
             report["blocked_children"] = blocked_ids
+        if no_work_ids:
+            report["not_finalisable_children"] = no_work_ids
         report["children_processed"] = child_results
         if json_output:
             print(format_json_output(report))
@@ -13902,10 +14981,9 @@ def _release_orphaned_child_claim(child_id: str) -> dict[str, Any]:
     paths still apply — ``phase_parent`` re-finishes a child whose worktree
     holds the work, and ``drive --finalise-stranded`` still recognises the
     child as ``in-progress``. Every other state holds no claim this workflow
-    owns, so a producer ``Map`` hold or a terminal item is never disturbed,
-    and a child whose own failure path already reset it is left alone — the
-    helper is therefore idempotent and never masks the original failure (the
-    caller keeps reporting it).
+    owns, so a terminal item is never disturbed, and a child whose own failure
+    path already reset it is left alone — the helper is therefore idempotent
+    and never masks the original failure (the caller keeps reporting it).
 
     Args:
         child_id: The child work item whose claim may be orphaned.
@@ -15257,6 +16335,69 @@ def _sweep_terminal_child_worktrees(
         report["worktree_sweep"] = sweep
 
 
+def _skip_blocked_details(parent_report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-child ``skip-blocked`` verdicts carried by a parent report.
+
+    ``phase_parent`` reports a still-valid ``blocked`` hold as
+    ``action: "skip-blocked"`` with the ``blocking_ids`` that hold it. The
+    drive loop must carry those verdicts — with the child id, status, ids and
+    the stale/unvalidated flags — into its own report, and must never spawn a
+    session for such a child (SA-0MVTUFL0U0000NV2 AC1/AC2/AC3).
+
+    Args:
+        parent_report: A ``phase_parent`` report.
+
+    Returns:
+        One entry per ``skip-blocked`` child (empty when none was reported).
+    """
+    stale: dict[str, list[str]] = {
+        str(entry.get("id")): list(entry.get("blocking_ids") or [])
+        for entry in parent_report.get("stale_blocks") or []
+        if isinstance(entry, dict)
+    }
+    details: list[dict[str, Any]] = []
+    for entry in parent_report.get("children_processed") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("action")) != ACTION_SKIP_BLOCKED:
+            continue
+        child_id = str(entry.get("id") or "")
+        detail: dict[str, Any] = {
+            "id": child_id,
+            "status": str(entry.get("status", "")),
+            "action": ACTION_SKIP_BLOCKED,
+            "blocking_ids": list(entry.get("blocking_ids") or []),
+            "unvalidated": bool(entry.get("unvalidated")),
+        }
+        if child_id in stale:
+            detail["stale"] = True
+            detail["stale_block_ids"] = stale[child_id]
+        details.append(detail)
+    return details
+
+
+def _skip_blocked_verdict(
+    parent_report: dict[str, Any], child_id: str,
+) -> dict[str, Any] | None:
+    """The ``skip-blocked`` verdict for *child_id*, if the parent reported one."""
+    for detail in _skip_blocked_details(parent_report):
+        if detail["id"] == child_id:
+            return detail
+    return None
+
+
+def _describe_skip_blocked(details: list[dict[str, Any]]) -> str:
+    """Render blocked verdicts as ``id (blocked by …)`` for a drive message."""
+    rendered = []
+    for detail in details:
+        ids = ", ".join(detail.get("blocking_ids") or [])
+        rendered.append(
+            f"{detail['id']} (blocked by {ids})" if ids
+            else f"{detail['id']} (unvalidated block)"
+        )
+    return "; ".join(rendered)
+
+
 def _finalise_stranded_child(
     child_id: str,
     evidence: dict[str, Any],
@@ -15580,7 +16721,12 @@ def phase_drive(
         (parent AC3, LP-0MVWEP2KB002WMRY). A child whose per-work-item lock is held by
         another live session is reported with ``action: "skipped-held"``,
         ``skipped_held: True``, ``held_by`` and ``held_children`` — and no
-        session is spawned for it (SA-0MVQ5AXLF002PAQ3). Worktree removal is
+        session is spawned for it (SA-0MVQ5AXLF002PAQ3). The driver itself
+        owns a child's lock for the whole spawned session — the lock file
+        records the live driver pid, the kernel ``flock`` stays held and the
+        session is handed the matching ownership token — releasing it as soon
+        as the session exits, whatever its outcome (success, non-zero exit or
+        timeout) (SA-0MW7LMUUQ00701KJ). Worktree removal is
         driver-owned: each driven child's ``finish`` defers it, so a terminal
         child's clean tree is removed once its session exits and the entry
         records ``worktree_removed`` plus its ``worktree_cleanup`` outcome;
@@ -16152,6 +17298,25 @@ def phase_drive(
             report, str(parent_report.get("next_child") or ""), parent_report
         )
 
+        # AC4: the parent classified one or more children as not-finalisable
+        # (no attributable work). Surface the verdict, keep the parent
+        # un-advanced, spawn nothing (SA-0MW74IKJE008JXDQ).
+        not_finalisable = parent_report.get("not_finalisable_children")
+        if not_finalisable:
+            report["not_finalisable_children"] = not_finalisable
+            report["parent_advanced"] = False
+            report["success"] = True
+            report["children_processed"] = parent_report.get(
+                "children_processed", []
+            )
+            report["message"] = parent_report.get(
+                "message",
+                f"Child(ren) of {work_item_id} classified as not-finalisable "
+                f"(no attributable work): {', '.join(not_finalisable)}. "
+                f"The parent was not advanced.",
+            )
+            break
+
         child_id = parent_report.get("next_child")
         if not child_id:
             report["message"] = parent_report.get(
@@ -16160,7 +17325,50 @@ def phase_drive(
                 "by another agent.",
             )
             if parent_report.get("blocked_children"):
-                report["blocked_children"] = parent_report["blocked_children"]
+                report["blocked_children"] = list(
+                    parent_report["blocked_children"]
+                )
+            if parent_report.get("children_processed"):
+                report["children_processed"] = parent_report[
+                    "children_processed"
+                ]
+            for key in (
+                "stale_blocks", "unvalidated_blocks", "unresolved_blockers",
+            ):
+                if parent_report.get(key):
+                    report[key] = parent_report[key]
+            # Carry the blocked verdicts with their blocking ids, so an
+            # unattended dispatcher can see which id to wait for without
+            # re-reading each child's description (AC2/AC3).
+            blocked_details = _skip_blocked_details(parent_report)
+            if blocked_details:
+                report["blocked_child_details"] = blocked_details
+                named = _describe_skip_blocked(blocked_details)
+                missing = [
+                    detail["id"]
+                    for detail in blocked_details
+                    if detail["id"] not in report["message"]
+                ]
+                if missing:
+                    report["message"] = (
+                        f"{report['message']} Blocked children: {named}."
+                    )
+            break
+
+        # Defence in depth (AC1): a child the parent classified ``skip-blocked``
+        # is never spawned — not even if a future parent implementation offered
+        # it as ``next_child``. The block is reported with its ids instead.
+        verdict = _skip_blocked_verdict(parent_report, child_id)
+        if verdict is not None:
+            report["success"] = False
+            report["parent_advanced"] = False
+            report["blocked_children"] = [verdict["id"]]
+            report["blocked_child_details"] = [verdict]
+            report["message"] = (
+                f"No session spawned for {verdict['id']}: its block still "
+                f"holds ({_describe_skip_blocked([verdict])})."
+            )
+            LOG.warning("%s", report["message"])
             break
 
         worktree_path = (
@@ -16185,12 +17393,81 @@ def phase_drive(
             report["failed_child"] = child_id
             break
 
-        env = _child_session_env(worktree_path=worktree_path)
-        LOG.info(
-            "Driving child %s (session %d/%d) in %s",
-            child_id, attempts[child_id], max_child_sessions, worktree_path,
-        )
-        spawn_result = spawner(child_id, worktree_path, timeout, env)
+        # ── Hold the per-child lock for the spawned session's lifetime ──
+        # ``parent`` runs ``start`` as a short-lived subprocess, so the lock it
+        # takes is released before the driven session begins: while the session
+        # is alive the lock file would record a dead ``start`` pid and no kernel
+        # ``flock`` would exist, so the herdr hydrator demotes the child to
+        # ``open`` mid-implementation. The driver therefore owns the lock across
+        # the spawn (SA-0MW7LMUUQ00701KJ): the recorded pid is this live driver,
+        # the flock is held for the session's whole life, and the session
+        # re-enters by ownership token (:func:`_child_session_env` propagates
+        # it from the module-level handle).
+        try:
+            lock = _new_child_lock(child_id)
+            lock_result = lock.acquire()
+        except (OSError, RuntimeError) as exc:
+            report["message"] = (
+                f"Cannot acquire the per-child lock for {child_id}: {exc}. "
+                "Refusing to spawn its session (fail closed) because "
+                "exclusive ownership cannot be guaranteed."
+            )
+            report["failed_child"] = child_id
+            LOG.error("%s", report["message"])
+            break
+
+        if not lock_result.acquired:
+            # A different *live* owner holds the child's critical section: spawn
+            # nothing and report the holder, exactly like a refused ``start``
+            # (AC4). A token-propagated holder chain (this process re-entering)
+            # is reported as acquired, never as contention.
+            report["action"] = ACTION_SKIPPED_HELD
+            report["skipped_held"] = True
+            report["held_by"] = lock_result.held_by
+            report["held_children"] = [child_id]
+            report["lock_path"] = (
+                str(lock_result.path) if lock_result.path is not None else ""
+            )
+            report["children_processed"] = parent_report.get(
+                "children_processed", []
+            )
+            report["message"] = (
+                f"Child {child_id} of {work_item_id} is held by "
+                f"{_describe_child_lock_holder(lock_result.held_by)}; no "
+                "session was spawned for it."
+            )
+            lock.release()  # a losing handle held no kernel lock: no-op
+            LOG.warning("%s", report["message"])
+            break
+
+        if lock_result.reentrant:
+            LOG.info(
+                "Re-entered the per-child lock for %s by ownership token "
+                "(holder chain); not blocked.",
+                child_id,
+            )
+        elif lock_result.reclaimed:
+            # Logged AND surfaced in the drive report (never only in the log).
+            LOG.warning(
+                "%s",
+                _record_child_lock_reclamation(report, child_id, lock_result),
+            )
+
+        _set_child_lock(lock)
+        try:
+            env = _child_session_env(worktree_path=worktree_path)
+            LOG.info(
+                "Driving child %s (session %d/%d) in %s",
+                child_id, attempts[child_id], max_child_sessions,
+                worktree_path,
+            )
+            spawn_result = spawner(child_id, worktree_path, timeout, env)
+        finally:
+            # AC3: the release is bounded to the session, on every outcome —
+            # success, non-zero exit and timeout all leave no stale flock, so
+            # the next ``parent``/``start`` acquires the lock cleanly. Only the
+            # spawn is wrapped: the lock exists to cover the session itself.
+            _release_child_lock()
         report["sessions_spawned"] += 1
         entry = {
             "id": child_id,
@@ -16773,6 +18050,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--verification-only",
+        action="store_true",
+        help=(
+            "finalise an item that produces no commit (verification-only "
+            "work). Recorded by `start` in the state file and read by "
+            "`finish`; without it a finish that creates no commit is refused "
+            "(commit.reason = no_commit_no_signal) instead of writing the "
+            "terminal completed/in_review transition."
+        ),
+    )
+    parser.add_argument(
         "--worktree-path",
         default=None,
         help="Override worktree path",
@@ -16920,6 +18208,7 @@ def _main(argv: list[str] | None = None) -> int:
                 max_retry=args.max_retry,
                 verbose=args.verbose,
                 force=args.allow_orphaned_stashes,
+                verification_only=args.verification_only,
             )
             _emit_timing(_root_timer)
     elif args.action == "finish":
@@ -16932,6 +18221,7 @@ def _main(argv: list[str] | None = None) -> int:
                 max_retry=args.max_retry,
                 verbose=args.verbose,
                 keep_worktree=args.keep_worktree,
+                verification_only=args.verification_only,
             )
             _emit_timing(_root_timer)
     elif args.action == "abort":

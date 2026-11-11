@@ -52,6 +52,8 @@ if str(_RUNNER_DIR) not in sys.path:
     sys.path.insert(0, str(_RUNNER_DIR))
 
 from run_tests import (
+    NOTICE_SLOT_BUSY,
+    SLOT_BUSY_NOTICE_PREFIX,
     TEST_LOCK_JITTER_DEFAULT,
     TEST_LOCK_JITTER_ENV,
     TEST_LOCK_TIMEOUT_DEFAULT,
@@ -240,6 +242,42 @@ def test_saturation_notice_has_stagger_guidance(monkeypatch, tmp_path):
 
     assert result["success"] is False
     notice = result["notice"]
+    assert "no free slot within 0s" in notice, notice
+    assert "staggered delay" in notice, notice
+    assert "retrying" in notice, notice
+
+
+def test_saturation_with_all_present_slots_reports_slot_busy(
+    monkeypatch, tmp_path
+):
+    """AC3: genuinely full pool still reports the unchanged ``slot_busy``.
+
+    Every slot present in the namespace — including higher indices 2..7 the
+    waiter's own ceiling never creates — is held for the whole
+    ``TEST_LOCK_TIMEOUT``. The run must still raise ``TestConcurrencyTimeout``
+    carrying the shipped ``slot_busy`` code and the existing staggered-retry
+    guidance, so ``slot_busy`` keeps meaning genuine saturation (never "the
+    waiter failed to discover capacity").
+    """
+    monkeypatch.setenv(TEST_MAX_CONCURRENCY_ENV, "2")
+    monkeypatch.setenv(TEST_LOCK_TIMEOUT_ENV, "0.2")
+
+    # Create slots 0..7 and hold every one of them.
+    holders = []
+    for _ in range(8):
+        sem = Semaphore(TEST_SEMAPHORE_NAME, max_workers=8, timeout=5)
+        sem.acquire()
+        holders.append(sem)
+    try:
+        result = run_suite("pytest", cwd=tmp_path, use_cache=False, force=True)
+    finally:
+        for sem in holders:
+            sem.release()
+
+    assert result["success"] is False, result
+    assert result.get("notice_code") == NOTICE_SLOT_BUSY, result
+    notice = result["notice"]
+    assert notice.startswith(SLOT_BUSY_NOTICE_PREFIX), notice
     assert "no free slot within 0s" in notice, notice
     assert "staggered delay" in notice, notice
     assert "retrying" in notice, notice

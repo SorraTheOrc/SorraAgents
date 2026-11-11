@@ -147,16 +147,50 @@ a run to a caller-supplied fingerprint (normally a would-be-commit tree SHA):
 - the supplied value is stored **as-is** after the run — it describes the tree
   the caller named and cannot be recomputed from a possibly-churned worktree;
 - callers that pass nothing keep the historical worktree keys byte for byte
-  (test-skill CLI, audit). The pre-push gate is the one worktree-kind caller
-  that *is* bound to a subject: it passes `--gate-commit <sha>` (see
-  *0.4 Pre-push gate subject binding* below) and its key is the pushed
-  commit's own clean worktree state.
+  (test-skill CLI, audit). The pre-push gate is a *tree-keyed* caller
+  (SA-0MW7C6BMZ00931JG): it derives the pushed commit's tree SHA and passes
+  it as `fingerprint` (see *0.4 Pre-push gate subject binding* below), so its
+  verdict lands in the same `fingerprint_kind="tree"` namespace as the finish
+  gate's tree verdicts and either consumer's verdict serves the other for the
+  same tree.
 
 `lookup(..., fingerprint_kind=...)` and `store(..., fingerprint_kind=...)`
 expose the same distinction to callers that manage execution themselves.
 `run_suite()` / `run_all()` / `guarded_run_all()` thread an optional
 `fingerprint` through to the cache, so the finish gate reaches it through the
 same canonical runner as every other consumer.
+
+**CLI surface — `run_tests.py --scope full --fingerprint <sha>`**
+(SA-0MW7C6AYO0062GJB). The flag binds a full-suite run to an explicit
+tree SHA (the value `git write-tree` reports for a staged change set): the
+run is looked up and stored under that SHA with `fingerprint_kind="tree"`,
+and the loose `compute_git_state` value is never computed. The surface is
+**fail-closed**:
+
+- *Validation.* The value must be a full 40-character (SHA-1) or 64-character
+  (SHA-256) hexadecimal object name, and `git cat-file -t` in the resolved
+  project root must report a **tree** — a malformed string, an object the
+  repository does not hold, or a commit/blob/tag SHA is rejected with exit 2
+  and an actionable message. The value is normalised to lower case before it
+  keys the entry.
+- *Modes it cannot bind.* `--fingerprint` with `--scope changed` (a partial
+  run is not full-suite evidence for the tree), `--summary` (a read-only
+  loose-worktree query that never sees tree-bound entries) or `--no-cache`
+  (neither looks up nor stores an entry) is rejected with exit 2. Nothing
+  executes and nothing is stored.
+- *No silent fallback.* A rejected value or combination never degrades to a
+  loose worktree key: the run stops, so a tree-requesting consumer can never
+  be handed a verdict recorded for a different state.
+- *Misses execute fresh.* A valid tree request with no matching stored entry
+  (different tree, different `fingerprint_kind`, legacy provenance-less entry,
+  expired TTL) executes the suite and records the entry with
+  `fingerprint_kind="tree"`. A tree entry never satisfies a worktree request,
+  and never the reverse.
+- *Unchanged default.* Omitting the flag keeps the historical loose-worktree
+  keys byte for byte (`command + fingerprint (+ test_type)`, kind
+  `"worktree"`) for every existing caller — the test-skill CLI and audit.
+  The pre-push gate is tree-keyed (it derives the pushed tree), not a
+  worktree caller; see *0.4*.
 
 **Legacy and foreign entries miss (fail closed).** A cache hit requires the
 command, `test_type`, `fingerprint_kind` and fingerprint to match, plus the
@@ -167,12 +201,15 @@ TTL (and, for exactness, the recorded `scope`). Therefore:
 - an entry recorded for a **different kind** or a **different tree** is a
   miss;
 - a corrupt or unreadable entry is a miss and never raises into the caller;
-- `query_cached()` remains a read-only **worktree** query: the finish gate's
-tree-bound entry is intentionally not visible to it (the audit's full-suite
-evidence is recorded at the pushed commit's loose state, not at a
-pre-commit staged tree).
+- `query_cached()` remains a read-only query whose **default** is the loose
+  **worktree** fingerprint (byte-for-byte historical behaviour). A tree-aware
+  consumer passes an explicit `fingerprint=<tree sha>` +
+  `fingerprint_kind="tree"` to read a tree-bound entry; the dev-push gate now
+  records its verdict tree-keyed (SA-0MW7C6BMZ00931JG), so post-push
+  verification resolves the pushed commit's tree and queries that entry before
+  falling back to the loose key (SA-0MWAXC5TD00461FN).
 
-### 0.4. Pre-push gate subject binding (SA-0MVTRBT50005DUEH)
+### 0.4. Pre-push gate subject binding (SA-0MVTRBT50005DUEH, tree-keyed by SA-0MW7C6BMZ00931JG)
 
 SA-0MVTRBT50005DUEH. The dev-push pre-push gate is evidence about the commit
 it pushes. `git` hands the hook `<local_ref> <local_sha> <remote_ref>
@@ -189,31 +226,55 @@ runner resolves **which checkout to measure** before anything else:
    candidate tried and why it was rejected, and `TEST_SCOPE_SKIP=1`.
 
 The resolved checkout replaces the project root for the whole run, so command
-resolution, the per-command timeout, the suite execution and the **cache key**
-all describe the pushed commit. A green entry recorded for any other state —
-including the main checkout's own `HEAD` plus its dirty `.worklog/` churn —
-is therefore a miss and the suite executes. No temporary worktree is
-materialised (a fresh checkout has no installed dependencies, so a suite
-failure there would not be about the pushed tree); pushing from a clean
-worktree of the commit, or from a clean checkout at it, is the supported
-remedy.
+resolution, the per-command timeout and the suite execution all describe the
+pushed commit.
 
-The gate reports the state it validated on **stderr** (stable prefixes; the
-hook echoes them to the pusher):
+**The verdict is keyed on the pushed commit's tree** (SA-0MW7C6BMZ00931JG).
+`resolve_gate_subject()` derives `git rev-parse <commit>^{tree}` and the runner
+passes it as the explicit `fingerprint`, so the entry is stored and looked up
+with `fingerprint_kind="tree"` — the same namespace as the finish gate's tree
+verdicts. A full-suite verdict recorded for tree *T* by either consumer is
+served to the other for the same *T* (a second push for an unchanged commit
+reuses the finish gate's verdict instead of running the suite again); a
+different tree *T′* misses and executes fresh. A pushed commit whose tree SHA
+**cannot be computed** is a refusal (exit 2), never a fallback to a loose
+worktree key. A green entry recorded for any other state — including the main
+checkout's own `HEAD` plus its dirty churn, a loose worktree entry, or another
+tree — is a miss.
+
+No temporary worktree is materialised (a fresh checkout has no installed
+dependencies, so a suite failure there would not be about the pushed tree);
+pushing from a clean worktree of the commit, or from a clean checkout at it,
+is the supported remedy.
+
+The gate reports the tree and the cache verdict on **stderr** (stable
+prefixes; the hook echoes them to the pusher):
 
 ```text
-run_tests: gate-subject pushed=<sha> checkout=<in-place|worktree> fingerprint_kind=worktree
+run_tests: gate-subject pushed=<sha> checkout=<in-place|worktree> fingerprint_kind=tree tree=<tree sha>
 run_tests: gate-root <absolute path of the resolved checkout>
-run_tests: gate-verdict verdict=<cached|executed> sha=<sha> git_state=<state> fingerprint_kind=worktree entries=<n> cached=<n>
+run_tests: gate-verdict verdict=<cached|executed> sha=<sha> tree=<tree sha> fingerprint_kind=tree cache_hit=<true|false> cache_age_seconds=<age|n/a> entries=<n>
 run_tests: gate-refused <actionable message including TEST_SCOPE_SKIP=1>
 ```
 
+`cache_hit` is `true` when the verdict was served from the cache, and
+`cache_age_seconds` is the age of the oldest reused entry (`n/a` on a miss —
+nothing was reused). The same facts appear in the JSON report under `gate`
+(`cache_hit`, `cache_age_seconds`, `fingerprint_kind`, `tree`, `pushed`,
+`entries`) and in each `cache_entries[]` item (`git_state`, `cache_age_seconds`).
+
+Every refusal path fails closed — a pushed-commit guard failure (`HEAD !=
+local_sha` with no clean checkout holding the commit, a dirty checkout) or an
+uncomputable tree SHA — with a non-zero exit, nothing executed, and a message
+naming the commit, the resolved `HEAD`, the remedy and `TEST_SCOPE_SKIP=1`;
+none falls back to a loose worktree key.
+
 The `gate-root` line is a contract with `.githooks/pre-push`, which mirrors
-that checkout's cache entries into the main checkout's `.worklog/cache` —
-keys are content-addressed, so copying an entry the main cache lacks is
-always safe. Without `--gate-commit` the runner behaves exactly as before
-(no subject resolution, no refusal, no `gate-*` lines), so every other
-caller and every hook that does not forward the sha is unchanged.
+that checkout's cache entries (tree-kind included) into the main checkout's
+`.worklog/cache` — keys are content-addressed, so copying an entry the main
+cache lacks is always safe. Without `--gate-commit` the runner behaves exactly
+as before (no subject resolution, no refusal, no `gate-*` lines), so every
+other caller and every hook that does not forward the sha is unchanged.
 
 **Propagation is per project.** `core.hooksPath=.githooks` makes the hook a
 per-project file, so only a hook that forwards the sha is protected; the
@@ -405,6 +466,35 @@ the mapping — and the action per reason — in
 and in `skill/implement/SKILL.md` (“Reading a gate failure”); a docs-vs-source
 consistency test keeps the three documents and the producing constants in step.
 
+#### Failure parsing — which output shapes produce structured failures
+
+`failures` is populated by the parser that matches the command's **reporter**,
+selected by one shared routing function (`run_tests.parse_failures`) so the
+runner and the audit skill can never drift apart:
+
+| Command shape | Parser | Recognised failures |
+| --- | --- | --- |
+| `pytest …` | `parse_pytest_failures` | `FAILED <nodeid> - <message>` and `ERROR <nodeid>` short-summary lines, with the FAILURES/ERRORS section as the stack. |
+| vitest (`vitest`, `npx vitest`, `…/.bin/vitest`) | `parse_vitest_failures` | Vitest's default reporter: the `Failed Tests` block (`FAIL  \|<project>\| <file> > <suite> > <test>` plus the error, code frame and stack) **and** the per-file tree (`❯ \|<project>\| <file> (N tests \| M failed)` with `× <suite> > <test>` markers and their `→ <message>` lines). A test reported in both places yields one record; `Test Files …`/`Tests …` summary lines never produce one. |
+| anything else (TAP) | `parse_node_failures`, then the Vitest parser when TAP yields nothing | `not ok N - <name>` TAP failures. The Vitest fallback covers wrapper commands (`npm --silent test`) whose reporter cannot be inferred from the command line. |
+
+Every record carries `test_name` (for Vitest: file, suite and test),
+`stdout_excerpt` (≤1000 chars) and `stack_trace` — the trio triage's
+`check_or_create.py` and the audit consume. Markers are matched after ANSI
+colour codes are stripped, and the ASCII transliterations of the tree markers
+(`❯`→`>`, `×`→`x`) are accepted, so a captured or Windows-rendered log still
+parses (MS-0MW3UR8SX009YZWS).
+
+Before MS-0MW3UR8SX009YZWS only TAP was parsed, so a genuine **Vitest browser
+or unit assertion failure** produced `failures: []` and was classified
+`unparsed_failure` → gate `reason: unparsed`: the operator was told the command
+or configuration was broken when the *code* was at fault, and triage fell back
+to a `<suite exited 1>: …` placeholder instead of naming the test. A regression
+pin replays the captured browser-mode output
+(`skill/shared/tests/gate_failure_fixtures.py::VITEST_BROWSER_FAILURE_OUTPUT`) in
+`skill/test/tests/test_run_tests_vitest_parser.py` and
+`skill/test/tests/test_run_tests_failure_notices.py`.
+
 #### Notice codes (stable strings)
 
 | Code | Meaning |
@@ -413,7 +503,7 @@ consistency test keeps the three documents and the producing constants in step.
 | `command_not_found` | The suite binary/executable could not be spawned. |
 | `suite_timeout` | The command exceeded `timeoutPerCommand` (`TimeoutExpired`). |
 | `killed` | The child was terminated by a signal (`returncode < 0`, e.g. an OOM kill or a worker crash) and produced no parsable failure. |
-| `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). |
+| `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). Vitest's default reporter — including browser mode — **is** parsed (see *Failure parsing* above), so a failing Vitest test is a structured failure, never this code. |
 | `state_changed_during_run` | The guarded checkout moved while a command executed (HEAD and/or the tracked tree it resolves to changed mid-run, e.g. a concurrent `implement.py finish` fast-forward); the mixed-tree verdict is quarantined (no cache entry under either state), the command's parsed failures are dropped and the suite is reported non-green with the distinct exit status 75 (`EX_TEMPFAIL`). The result carries the detail (checkout path + before/after commits) on `state_changed_during_run` — a non-empty dict for the suite, a list under the `run_all` aggregate; the human output prints a `notice: [state_changed_during_run] …` line naming the checkout movement and the required re-run. Runs whose only difference is churn attributable to another session (start-of-run-dirty → end-clean resolutions) are never flagged (SA-0MW3FF18I003KGZE AC3). |
 
 **Precedence.** Structured (parsable) test failures always win: `killed` and
@@ -494,6 +584,37 @@ is unchanged — fairness is about **ordering**, not capacity — and the fast p
 adds one counter `flock` per acquire plus a single non-blocking scan when no
 lower ticket is outstanding.
 
+**Slot discovery and the effective ceiling (SA-0MVWKZ4QD006L2E0).** A waiter
+**discovers** capacity dynamically: every acquisition attempt enumerates the
+numeric slot files currently present in its namespace and takes the lowest
+free one. It is therefore not limited to the slots that existed (or the
+ceiling it resolved) when it started — a slot file created by a **later,
+higher-ceiling process** is usable immediately, within one poll interval plus
+one `flock` attempt. This fixes the snapshot-ceiling starvation where a
+`TEST_MAX_CONCURRENCY_FAST=2` waiter probed only slots `0` and `1` and could
+wait out its entire `TEST_LOCK_TIMEOUT` while slots `2..7` sat free (measured:
+a 105-minute stall with 5 of 8 host slots free).
+
+The **effective pool is the union of slot files present** in the namespace.
+A caller's own ceiling (`TEST_MAX_CONCURRENCY` / `TEST_MAX_CONCURRENCY_FAST`)
+is a **floor it guarantees** — it always creates slots `0..max_workers-1` — but
+**never a host-wide limit it may exceed**: a waiter never creates a slot file
+with an index `>= max_workers`, so a low-ceiling run can use capacity another
+process created but cannot manufacture more. The configured ceiling semantics
+are unchanged; discovery only makes existing capacity usable.
+
+**Maximum poll interval.** The retry cadence is bounded and **never grows**:
+50 ms base with jitter off, or `[0.5, 1.5] ×` the base (maximum **75 ms**) when
+jitter is enabled. There is no backoff, so a long-waiting consumer performs many
+poll attempts and always observes slots created after it began waiting. A new
+backoff must not be introduced without a documented cap.
+
+**`slot_busy` means genuine saturation.** Because discovery scans every slot
+file present, the `slot_busy` code means every slot in the namespace was held
+for the **whole** `TEST_LOCK_TIMEOUT` — never "the waiter failed to discover
+free capacity". An operator can therefore treat `slot_busy` as "retry later"
+without inspecting `/proc`.
+
 **Cache hits never block:** the semaphore is acquired ONLY when an actual
 execution is about to happen (cache miss path). A cached result is served
 without acquiring a slot, so read-only `--summary` queries and fast cached
@@ -530,6 +651,64 @@ that must never overlap another suite's browser stage should set
 `TEST_MAX_CONCURRENCY=1` in the environment (env-var mechanism only; no config
 file). Slot-file pruning beyond the ceiling is tracked separately
 (ContextHub WL-0MUL1DSEF004IJU9).
+
+### Re-measuring post-fix slot wait (SA-0MW7C69KU008ZT5K)
+
+`scripts/measure_slot_wait.py` reproduces the post-fix contention measurement
+from the committed read-only harness, so the RCA can be closed with counted
+data instead of an anecdote. The method and classification rules live here so a
+re-check needs no re-derivation.
+
+```bash
+python3 scripts/measure_slot_wait.py --json          # machine-readable report
+python3 scripts/measure_slot_wait.py                 # human table + verdict
+python3 scripts/measure_slot_wait.py --since 2026-11-01T00:00:00Z --sessions-root ~/.pi/agent/sessions
+```
+
+It parses every `*.jsonl` pi session log under `--sessions-root` (default
+`~/.pi/agent/sessions`) and reports, per wait category, the call count and
+p50/p90/max of the queue wait. The window starts at `--since` (default the
+fast-lane fix commit time, `2026-10-31T23:21:00Z`); every record carries its
+own timestamp, so a session that straddles the boundary is split correctly.
+
+**Categories and their sources.** Four call sites are attributed — never two
+at once — so a single acquisition is counted once:
+
+| Category | Source | Lane |
+|---|---|---|
+| `run_tests_full` | bare `run_tests.py` result, per-suite `slot_wait_seconds`/`slot_lane` = `full` | `test` (full) |
+| `run_tests_fast` | bare `run_tests.py` result, per-suite `slot_wait_seconds`/`slot_lane` = `fast` | `test-fast` (partial) |
+| `implement_finish` | `Implement run_tests: test slot acquired — queued_at=… wait_seconds=…` | — |
+| `dev_push_gate` | aggregate `slot_wait_seconds` of a block carrying `run_tests: gate-*` / `pre-push: full-suite gate` provenance | — |
+
+**Double-count avoidance.** A `run_tests.py` `--json` result carries both
+per-suite samples *and* their aggregate; only the per-suite entries are used
+(the aggregate only when no per-suite entry exists and it names a single lane).
+A finish/gate block also contains the inner `run_tests.py` result; for a finish
+block the telemetry line wins, and for a gate block the aggregate wins, so the
+run is counted once. Finish lines repeat whenever a `wait_for_job` tail re-prints
+the log, so finish samples are de-duplicated by `queued_at`.
+
+**Genuine-run filter.** Session logs contain echoed fragments (a `grep` of
+another log, a `python3` probe, a `cat` of the runner source) that reproduce
+`slot_wait_seconds` / `queued N s` text without being a real run. A tool result
+is trusted only when its assistant `toolCall` command is a slot consumer
+(`run_tests.py`, `implement.py`, `git push`, `wait_for_job.py`); results with no
+resolvable command are kept only when the text carries a structural run marker.
+This is what stops a log-tail from inventing a > 120 s sample.
+
+**Pass/fail (parent SA-0MVXUCGPK003G2KV AC3).** The report evaluates three
+thresholds and its exit status is non-zero on any failure:
+
+1. no run reports `slot_wait_seconds > 120 s` (max across every category);
+2. `test-fast` (partial) p90 `< 30 s`;
+3. no `queued N s` notice `>= 30 s`.
+
+A category with fewer than `--min-samples` (default 10) is labelled
+`no regression observed in N samples; re-check after <date>` rather than
+quoted as a percentile (its max is still reported, so a lone outlier is never
+hidden). Any genuine threshold miss is filed as a follow-up work item, not
+smoothed over.
 
 ### 0.6. Nested-run isolation (SA-0MUY6U05F008RG86)
 

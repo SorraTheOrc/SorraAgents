@@ -17,7 +17,7 @@ Work-item skills end their session with the canonical report whose
 ``## Producer Actions`` section must carry **only** actions the producer must
 take to complete the *current* stage. Routine workflow progression — ``run
 /skill:<next>``, ``proceed to <next stage>``, ``review the brief, then …`` —
-belongs in the Conclusion's ``Ready for <next_action>`` line, never in
+belongs in the Conclusion's standalone ready/not-ready verdict line, never in
 Producer Actions (SA-0MVNQ3RLW006XEFW).
 
 This script scans every ``skill/*/SKILL.md`` **final-step report template**

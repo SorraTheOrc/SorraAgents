@@ -121,10 +121,10 @@ class TestEveryWorkItemSkillWired:
 # ─── Plan skill: skill-session ACs vs work-item feature ACs ────────────────
 #
 # Regression guard for the operator finding that `/skill:plan` ended with
-# "Plan session for <id> (<title>) is incomplete. Requires attention
-# (implement)." even though planning completed and implement is simply the
-# next phase (SA-0MUYADP50005EYA2). The renderer derives session status from
-# the supplied `--ac` verdicts, so the plan skill must pass its *own*
+# a red "Plan session for <id> (<title>) is incomplete." verdict even though
+# planning completed and implement is simply the next phase
+# (SA-0MUYADP50005EYA2). The renderer derives session status from the
+# supplied `--ac` verdicts, so the plan skill must pass its *own*
 # planning-phase deliverables (all `met`), not the work item's feature ACs.
 
 _FINAL_STEP_SECTION_RE = re.compile(
@@ -187,9 +187,13 @@ class TestPlanSkillPassesPlanningPhaseAcs:
             "plan: final step must warn against passing the work item's feature ACs"
         )
 
-    def test_documented_planning_phase_acs_render_as_completed(self):
+    def test_documented_planning_phase_acs_render_as_completed(self, monkeypatch):
         """The ACs the skill tells agents to pass must render as a completed
         plan — this is the operator-visible behaviour under test."""
+        # The renderer only emits ANSI colour into a colour-capable sink
+        # (AC3, SA-0MVYEZ3V3004AQXN); pytest's captured stdout is not one.
+        monkeypatch.setenv("FORCE_COLOR", "1")
+        monkeypatch.delenv("NO_COLOR", raising=False)
         acs = _documented_acs(_final_step_section("plan"))
         criteria = [
             (str(i), desc, metric, verdict)
@@ -215,7 +219,7 @@ class TestPlanSkillPassesPlanningPhaseAcs:
             next_action="implement",
         )
         assert report.startswith("# Completed plan")
-        assert "Ready for implement." in report
+        assert "\033[32m\u2705 Ready to ship\033[0m" in report
         assert "incomplete" not in report.lower()
 
 
