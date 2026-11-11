@@ -2116,7 +2116,7 @@ describe('attemptAuditRemediation - post-remediation content freshness (parent A
 
     assert.equal(result.status, 'blocking');
     assert.match(result.reason, /time-stale but content changed/);
-    assert.match(result.reason, /issue SA-PROBE-1 --force/);
+    assert.match(result.reason, /issue SA-PROBE-1 (?:--strict )?--force/);
   });
 });
 
@@ -2181,7 +2181,7 @@ describe('checkAuditReadyToClose - no contradictory block invariant (parent AC3)
           );
           assert.match(
             String(entry.reason),
-            /issue SA-PROBE-1 --force/,
+            /issue SA-PROBE-1 (?:--strict )?--force/,
             `${label}: the reason must carry the --force remedy`,
           );
         }
@@ -2259,7 +2259,7 @@ describe('checkAuditReadyToClose - passing+stale block reasons (parent AC3)', ()
     const entry = report.blockingItems[0];
     assert.doesNotMatch(String(entry.reason), /Ready to close/);
     assert.match(String(entry.reason), /time-stale but content changed/);
-    assert.match(String(entry.reason), /issue SA-PROBE-1 --force/);
+    assert.match(String(entry.reason), /issue SA-PROBE-1 (?:--strict )?--force/);
     assert.equal(entry.summary, null, 'a blocking entry must not report a passing verdict');
   });
 });

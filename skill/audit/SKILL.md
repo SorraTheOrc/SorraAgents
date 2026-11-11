@@ -203,6 +203,17 @@ Short-circuits item-level audits when a recent, valid audit exists. Full behavio
 3. Fresh → skip fast-path notice (e.g. `Skipping: audit still fresh — Ready to close: Yes (audited <ISO timestamp>)`), exit 0, **no** lifecycle/persistence. **Exception — outstanding child screens:** a stored report whose in-main-slot child screens are still outstanding is **not** a fresh final verdict. While `<id>.pending-screens.json` names any child, `cmd_issue` does **not** take this short-circuit: it prints a `Freshness gate bypassed: N child screen(s) still pending main-slot review (<ids>)` diagnostic to stderr and resumes the pipeline so the serviced child audits can be collected (SA-0MVSTZ71J001P67S; in-main-slot resume contract above). `--no-checkpoint` reads no signal, so its behaviour is unchanged.
 4. `--force` bypasses. Config: `AUDIT_FRESHNESS_BUFFER_SECONDS = 60` (legacy floor), `AUDIT_CONTENT_FINGERPRINT_PREFIX = "Audit content fingerprint (v2): "`.
 5. **Fail-open:** the fingerprint is `None` (→ pipeline re-runs) only when `wl show` fails or the payload cannot be built; a garbage title/description still hashes deterministically. Stale ⇒ re-run, never fail fresh.
+6. **Mode strength (SA-0MW0JJ36Z000AF57).** A stored passing audit records the test-failure mode that produced it (`Test failure mode: <mode> (source: …)`). A **strict** re-run never reuses a stored **permissive** “Yes” (it re-runs); a **permissive** run may reuse a stored **strict** “Yes”. Legacy reports with no mode line are treated as permissive, so a strict run re-runs them.
+
+## Test Failure Modes (SA-0MW0JJ36Z000AF57)
+
+The audit has two test-failure modes, resolved **once** with precedence
+`--strict`/`--no-strict` flag > `AUDIT_STRICT` env > default:
+
+- **permissive** (default): a red suite whose failures are **all** unit-classified **and** proven unrelated to the item's changes does not fail the audit. Excused failures inject an `EXCUSED-RED SUITE` evidence block so execution-dependent ACs may be marked `met`; the report gains a `## Test Failure Mode` section listing every excused failure with its classification and relatedness evidence, and the `--json` payload carries `test_failure_mode`.
+- **strict**: any failing test fails the audit (today's behaviour). The [ship skill](../ship/SKILL.md) release gate always passes `--strict`.
+
+**Fail-closed rules** (both modes): integration/end-to-end failures always fail; a unit failure *affected* by the item's changes fails; an inconclusive failure with no usable baseline fails. Classification is by path convention (`tests/integration/**`, `tests/e2e/**`, `tests/manual/**`, `**/*_e2e*`, `**/*integration*` ⇒ integration; unclassifiable ⇒ integration). Relatedness is decided deterministically (test file changed, a changed module the test imports, a changed shared test-infra file) and, only for inconclusive failures, by a baseline re-run of just those failures in a scratch worktree at the pre-change commit (fails identically ⇒ unrelated; passes ⇒ affected). Excused failures are still triaged into critical `test-failure` work items. The mode, its source, and per-failure evidence are persisted so the excusal decision is reproducible. Full contract: [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md).
 
 ## Re-audit coordination check (SA-0MSQIA84B005NHWC)
 

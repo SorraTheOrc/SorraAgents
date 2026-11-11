@@ -1138,7 +1138,7 @@ describe('checkFinalValidation - no contradictory block invariant (parent AC3)',
           );
           assert.match(
             String(entry.reason),
-            /issue SA-FV-PROBE-1 --force/,
+            /issue SA-FV-PROBE-1 (?:--strict )?--force/,
             `${label}: the reason must carry the --force remedy`,
           );
         }

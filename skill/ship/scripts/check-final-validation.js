@@ -477,7 +477,7 @@ export async function checkFinalValidation(options = {}) {
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
     runAuditCommand = (runnerPath, workItemId, timeoutMs) => execSync(
-      `python3 "${runnerPath}" issue ${workItemId}`,
+      `python3 "${runnerPath}" issue ${workItemId} --strict`,
       // Per-item timeout guard, consistent with the audit gate's cap.
       // Configurable via SHIP_AUDIT_REMEDIATION_TIMEOUT_MS
       // (SA-0MUOO5V0P00461X8) and clamped to the remaining budget by the

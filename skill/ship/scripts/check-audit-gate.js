@@ -393,7 +393,7 @@ export function buildRemediationCommand(workItemId) {
   return [
     `  # Re-run audit for ${workItemId}:`,
     `  wl audit-show ${workItemId} --json`,
-    `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId}`,
+    `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId} --strict`,
   ].join('\n');
 }
 
@@ -525,7 +525,7 @@ export function buildProducerReviewRemediationCommand(workItemId) {
     `  # Clear the producer-review flag for ${workItemId}:`,
     `  wl update ${workItemId} --needs-producer-review false --json`,
     `  # Or re-run audit to auto-resolve:`,
-    `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId}`,
+    `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId} --strict`,
   ].join('\n');
 }
 
@@ -645,7 +645,7 @@ export function checkProducerReviewStatus(items) {
 export function stalePassingBlockReason(workItemId, freshness = null) {
   const detail = freshness && freshness.reason ? ` — ${freshness.reason}` : '';
   return `Audit is time-stale but content changed (or could not be confirmed unchanged)${detail}; `
-    + `re-audit with: python3 skill/audit/scripts/audit_runner.py issue ${workItemId} --force`;
+    + `re-audit with: python3 skill/audit/scripts/audit_runner.py issue ${workItemId} --strict --force`;
 }
 
 // ── attemptAuditRemediation ──────────────────────────────────────────────────
@@ -849,7 +849,7 @@ export async function checkAuditReadyToClose(options = {}) {
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
     runAuditCommand = (runnerPath, workItemId, timeoutMs) => execSync(
-      `python3 "${runnerPath}" issue ${workItemId}`,
+      `python3 "${runnerPath}" issue ${workItemId} --strict`,
       // Per-item timeout guard (SA-0MSUT8GQP004WSYN AC6 / R1): a hung audit
       // runner must not stall the whole release gate. The default audit
       // runner hard-times-out internally, so this is a belt-and-braces cap.

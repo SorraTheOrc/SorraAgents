@@ -55,7 +55,7 @@ export const REMEDIATION_MAX_ITEMS_ENV = 'SHIP_AUDIT_REMEDIATION_MAX_ITEMS';
  */
 export const OFFLINE_AUDIT_REFRESH_HINT =
   'Refresh audits outside the release: '
-  + 'python3 skill/audit/scripts/audit_runner.py batch '
+  + 'python3 skill/audit/scripts/audit_runner.py batch --strict '
   + '(or run the audits individually), then re-run the release.';
 
 /**

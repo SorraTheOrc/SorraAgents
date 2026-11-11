@@ -317,6 +317,98 @@ callers instead of failing with ``unrecognized arguments: --json``.
 
 **Child verdict reuse uses the same content gate (primary):** the content-based fingerprint gate is the PRIMARY freshness test for child verdict reuse in parent audits, not just item-level audits (LP-0MSQ32MF200675AR). Children use the **same simplified item-data-only fingerprint**: a child whose stored audit carries an unchanged v2 fingerprint AND a parseable verdict is reused — its persisted AC verdict table appears in the parent report (with a ``Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`` marker) and NO pi calls are issued for that child — no child Phase 1 screening, no child Phase 2 deep/batch entry. The time gate remains the legacy floor for fingerprint-less child reports. ``--force`` bypasses child reuse exactly as it bypasses the item-level gate.
 
+## Test-failure modes — strict and permissive (SA-0MW0JJ36Z000AF57)
+
+Full contract for the `--strict` / `AUDIT_STRICT` audit mode. Summary in
+[`skill/audit/SKILL.md`](../../skill/audit/SKILL.md#test-failure-modes-sa-0mw0jj36z000af57).
+
+### Mode resolution and default (AC1)
+
+Precedence **`--strict`/`--no-strict` flag > `AUDIT_STRICT` env > permissive
+default**, resolved once in `cmd_issue` into `_AuditContext.strict` /
+`.strict_source` (`"flag"`/`"env"`/`"default"`). Truthy env values are
+`1`/`true`/`yes`/`on`; any other non-empty value forces permissive. Both
+`issue` and `batch` accept the flags.
+
+### Verdict: `_evaluate_red_suite` (AC2/AC3)
+
+A single helper consumes a red suite in both the F3 auto-execution path
+(`_run_tests_via_test_skill`) and the Phase 1 merge gate (`_integrate_into_dev`):
+
+- **strict** → every failure blocks; the verdict matches today byte-for-byte.
+- **permissive** → only *unrelated unit* failures are excused; integration,
+  affected and unresolved-inconclusive failures block (fail closed). The
+  merge gate uses the pre-integration `origin/dev` sha as the baseline, so a
+  failure that reproduces there is pre-existing and unrelated.
+
+An excused red run injects the `EXCUSED-RED SUITE` prompt block analogous to
+the GREEN-RUN blocks so execution-dependent ACs may be marked `met`.
+
+### Classification (AC4)
+
+`_classify_test_failure_scope(failure)` → `unit` / `integration` by path
+convention, matched case-insensitively against the POSIX failure path:
+
+| Pattern | Class |
+|---|---|
+| `tests/integration/**`, `tests/e2e/**`, `tests/manual/**` | integration |
+| `**/*_e2e*`, `**/*integration*` | integration |
+| everything else | unit |
+| unclassifiable path | **integration** (fail closed) |
+
+### Relatedness (AC4)
+
+`_failure_relatedness(failure, touched_files, key_files, project_root)` →
+`affected` / `unrelated` / `inconclusive`. Deterministic mapping first:
+
+1. a changed **shared test-infrastructure** file (`conftest.py`,
+   `tests/helpers/**`, `tests/fixtures/**`, `tests/support/**`) → *affected*;
+2. the failing test file is itself a changed file → *affected*;
+3. a changed source module the test imports → *affected*;
+4. otherwise *inconclusive*.
+
+Only inconclusive failures reach `_baseline_unrelated`, which re-runs **just
+those failures** in a scratch worktree (`git worktree add --detach`) at the
+pre-change commit (`_resolve_baseline_commit` = `git merge-base HEAD
+origin/dev`):
+
+- fails identically at baseline → **unrelated** (excused);
+- passes at baseline → **affected** (the change broke it);
+- baseline cannot run → **affected** (fail closed).
+
+Execution goes through `paced_runner()` and stands down under
+`LIVE_REPO_GUARD_ACTIVE`, so nested suite runs cannot recurse. Any git/exec
+error degrades to *affected* — never a crash (Never-block F4).
+
+### Persistence (AC5/AC7)
+
+The report gains a `Test failure mode: <mode> (source: <src>)` metadata line
+and a `## Test Failure Mode` section (table of scope/relatedness/blocking +
+evidence, plus the baseline commit used). The `--json` payload carries
+`test_failure_mode: {mode, strict, source, evaluation}`. The freshness gate
+compares mode strength: strict never reuses a permissive pass; permissive may
+reuse a strict pass (legacy/mode-less reports are treated as permissive).
+
+### Cached-red handling
+
+In permissive mode a `red` cached full-suite entry is classified from the
+cached output rather than accepted as blocking-by-default; if the cached
+output yields no parseable failure records the runner executes the suite as on
+a miss. Strict mode keeps today's cached-red behaviour unchanged.
+
+### Excused failures are still triaged (AC5)
+
+Triage into critical `test-failure` work items is unchanged and runs for
+excused failures exactly as for blocking ones (same dedup + cap semantics).
+
+### Caller matrix (AC6)
+
+| Caller | Mode |
+|---|---|
+| `ship` — `check-audit-gate.js`, `check-final-validation.js`, `refresh-audits.js`, surfaced manual commands | `--strict` |
+| interactive/agent `/skill:audit`, `batch` | permissive (default) unless `--strict`/`AUDIT_STRICT` |
+| dev-push pre-push full-suite gate | unchanged (permissive never weakens it) |
+
 ## Producer-review flag lifecycle (SA-0MVR9B1UH002BUST, Option B+)
 
 `needsProducerReview` is a bare boolean, so it cannot answer *"was this
