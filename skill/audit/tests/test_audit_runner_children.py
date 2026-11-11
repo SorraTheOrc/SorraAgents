@@ -2186,6 +2186,7 @@ class TestGapMappedChildAuditReuse:
                         "success": True,
                         "workItem": {
                             "id": child_id,
+                            "title": f"Child {child_id}",
                             "description": self.CHILD_DESC,
                             "updatedAt": updated_at,
                         },
@@ -2229,7 +2230,7 @@ class TestGapMappedChildAuditReuse:
     def _run(self, children, *, parent_verdict="unmet",
              gap_file=None, persist=False, audit_children=False,
              child_audit_raw=None, child_updated_at=None,
-             persist_calls=None):
+             persist_calls=None, in_main_slot=False):
         """Run cmd_issue in the parent-first (or opt-in) flow."""
         captured = {}
         pi_calls = []
@@ -2247,6 +2248,9 @@ class TestGapMappedChildAuditReuse:
                 {"index": 0, "verdict": "partial",
                  "evidence": "child pending"},
             ])}
+
+        def _passthrough_phase2(work_item, ac_results, child_results, **kwargs):
+            return (ac_results, child_results, True)
 
         original_assemble = audit_runner._assemble_issue_report
 
@@ -2284,6 +2288,9 @@ class TestGapMappedChildAuditReuse:
                 audit_runner, "_assemble_issue_report",
                 side_effect=_capturing_assemble))
             stack.enter_context(mock.patch.object(
+                audit_runner, "_run_phase2_deep_analysis",
+                side_effect=_passthrough_phase2))
+            stack.enter_context(mock.patch.object(
                 audit_runner.subprocess, "run",
                 side_effect=_fake_subprocess_run))
             stack.enter_context(mock.patch.object(
@@ -2295,6 +2302,7 @@ class TestGapMappedChildAuditReuse:
                 "TEST-1", persist=persist, force=False, runner=runner,
                 json_mode=False, parent_timeout=None,
                 audit_children=audit_children,
+                child_in_main_slot=in_main_slot,
             )
         captured["pi_calls"] = pi_calls
         captured["triggered"] = triggered
@@ -2387,54 +2395,38 @@ class TestGapMappedChildAuditReuse:
     # ------------------------------------------------------------------
 
     def test_ac2_persist_does_not_overwrite_fresh_child_audit(self):
-        """AC2: when a child already has a content-fresh stored audit with a
-        real verdict, the parent persist path skips writing the parent's
-        pending report over it.
+        """AC2: a parent run must never persist a pending-``partial`` child
+        report over a child audit that is content-fresh (matching v2
+        fingerprint) and carries real, non-pending verdicts.
 
-        We drive the persist path with a stale-fingerprint child (so AC1
-        cannot reuse it in the loop) but patch ``_get_child_audit_verdict``
-        at persist time to report a fresh verdict, simulating the case where
-        the child was serviced between the screening decision and the persist
-        step (e.g. an in-main-slot screen that landed a real verdict).
+        The parent passes (no gaps) and the child is pre-review, so the child
+        is screened in-main-slot and its ACs are pending main-session review.
+        The stored child audit is fingerprint-fresh, so the pending report
+        must NOT overwrite it. AC1 is not involved (no gap mapping).
         """
         ar = audit_runner
         persist_calls: list[tuple[str, str]] = []
-        child = self._child("CHILD-1", key_file=self.CHILD_KEY_FILE)
-        fresh_raw = self._fingerprinted_raw(
-            ar, "CHILD-1", verdict="Yes",
-            desc=(self.CHILD_DESC +
-                  f"\n\n## Key Files\n- {self.CHILD_KEY_FILE}"),
-        )
-
-        # AC1 sees no fresh audit (stale) so the child is screened; AC2 at
-        # persist time sees a fresh audit and must skip persisting.
-        stale_raw = {
+        child = self._child("CHILD-1", stage="in_progress")
+        # Stored audit is content-fresh: fingerprint over the SAME data the
+        # guard recomputes from ``wl show`` (title + CHILD_DESC).
+        fresh_raw = {
             "CHILD-1": self._fingerprinted_raw(
-                ar, "CHILD-1", verdict="Yes", desc="## Old child content",
+                ar, "CHILD-1", verdict="Yes", desc=self.CHILD_DESC,
             ),
         }
-        verdict_calls = {"n": 0}
-        original_get_verdict = ar._get_child_audit_verdict
 
-        def _fake_get_verdict(runner, child_id, **kwargs):
-            verdict_calls["n"] += 1
-            if verdict_calls["n"] == 1:
-                # AC1 loop check: stale → not reusable.
-                return None, "stale", self.AUDITED_AT
-            # Persist guard check: fresh serviced audit exists.
-            return True, "ready", self.AUDITED_AT
-
-        with mock.patch.object(
-            ar, "_get_child_audit_verdict", side_effect=_fake_get_verdict,
-        ):
-            rc, captured = self._run(
-                [child], parent_verdict="unmet",
-                gap_file=self.CHILD_KEY_FILE, persist=True,
-                audit_children=False, child_audit_raw=stale_raw,
-                persist_calls=persist_calls,
-            )
+        rc, captured = self._run(
+            [child], parent_verdict="met", persist=True,
+            audit_children=False, child_audit_raw=fresh_raw,
+            persist_calls=persist_calls, in_main_slot=True,
+        )
 
         assert rc == 0
+        # The child's ACs are pending main-session review (in-main-slot).
+        assert audit_runner._pending_main_slot_child_ids(
+            captured["child_results"]), (
+            "test precondition: child screen must be pending in-main-slot"
+        )
         persisted_ids = [i for i, _ in persist_calls]
         assert "CHILD-1" not in persisted_ids, (
             "parent persist must NOT overwrite a content-fresh serviced "
@@ -2443,22 +2435,51 @@ class TestGapMappedChildAuditReuse:
         # The parent report itself still persists.
         assert "TEST-1" in persisted_ids
 
-    def test_ac2_persist_writes_when_no_fresh_child_audit(self):
-        """AC2 negative control: when the child has NO fresh stored audit,
-        the parent persist path writes the child audit normally."""
+    def test_ac2_persist_writes_when_stored_audit_not_content_fresh(self):
+        """AC2 negative control: a legacy stored audit with NO v2
+        fingerprint is not provably content-fresh, so the parent persists
+        its pending child report exactly as before (backwards compatible)."""
         ar = audit_runner
         persist_calls: list[tuple[str, str]] = []
-        child = self._child("CHILD-1", key_file=self.CHILD_KEY_FILE)
+        child = self._child("CHILD-1", stage="in_progress")
+        legacy_raw = {
+            "CHILD-1": (
+                "Audit report for work item CHILD-1\n"
+                "Ready to close: Yes\n\n## Summary\nlegacy, no fingerprint"
+            ),
+        }
 
         rc, captured = self._run(
-            [child], parent_verdict="unmet", gap_file=self.CHILD_KEY_FILE,
-            persist=True, audit_children=False, child_audit_raw=None,
-            persist_calls=persist_calls,
+            [child], parent_verdict="met", persist=True,
+            audit_children=False, child_audit_raw=legacy_raw,
+            persist_calls=persist_calls, in_main_slot=True,
+        )
+
+        assert rc == 0
+        assert audit_runner._pending_main_slot_child_ids(
+            captured["child_results"])
+        persisted_ids = [i for i, _ in persist_calls]
+        assert "CHILD-1" in persisted_ids, (
+            "a legacy fingerprint-less audit must not block persistence "
+            f"(pre-existing behaviour): {persisted_ids}"
+        )
+        assert "TEST-1" in persisted_ids
+
+    def test_ac2_persist_writes_when_no_stored_child_audit(self):
+        """AC2 negative control: when the child has NO stored audit at all,
+        the parent persist path writes the child audit normally."""
+        persist_calls: list[tuple[str, str]] = []
+        child = self._child("CHILD-1", stage="in_progress")
+
+        rc, captured = self._run(
+            [child], parent_verdict="met", persist=True,
+            audit_children=False, child_audit_raw=None,
+            persist_calls=persist_calls, in_main_slot=True,
         )
         assert rc == 0
         persisted_ids = [i for i, _ in persist_calls]
         assert "CHILD-1" in persisted_ids, (
-            "child without a fresh audit must be persisted by the parent: "
+            "child without any stored audit must be persisted by the parent: "
             f"{persisted_ids}"
         )
         assert "TEST-1" in persisted_ids

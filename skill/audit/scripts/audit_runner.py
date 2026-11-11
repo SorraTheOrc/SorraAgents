@@ -8313,6 +8313,57 @@ def _parse_child_audit_verdict(raw_output: str,
     return False, "not_ready", audited_at
 
 
+def _get_child_content_fresh_verdict(
+    runner: Runner, child_id: str,
+    worklog_dir: str | None = None,
+    child: dict | None = None,
+) -> tuple[bool | None, str | None]:
+    """Return ``(verdict, audited_at)`` for a CONTENT-fresh stored child audit.
+
+    Strict content gate (SA-0MVZ3SMK6007431I AC1/AC2): the stored report must
+    carry a **v2 content fingerprint** that matches the child's current
+    content (title + description) AND parse a ``Ready to close:`` verdict.
+    Unlike :func:`_get_child_audit_verdict` this never trusts a legacy
+    fingerprint-less report through the fail-open time-gate floor — such a
+    report is not provably content-fresh, so callers fall back to a real
+    screen (backwards compatible with the pre-existing behaviour).
+
+    *child* may be supplied when the caller already holds the item data
+    (avoids a redundant ``wl show``); otherwise the current fingerprint is
+    computed from ``wl show`` — the same source :func:`_persist_child_audit`
+    used to embed the stored fingerprint.
+
+    Returns ``(None, None)`` when the child has no audit, the audit is
+    legacy/unversioned, the content changed, or no verdict parses.
+    """
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"],
+                       worklog_dir=worklog_dir)
+    except RuntimeError:
+        return None, None
+    audit = data.get("audit") if isinstance(data, dict) else None
+    if not audit:
+        return None, None
+    raw_output = audit.get("rawOutput")
+    audited_at = audit.get("auditedAt")
+    if not raw_output or not audited_at:
+        return None, None
+    stored_fingerprint = _extract_content_fingerprint(raw_output)
+    if stored_fingerprint is None:
+        return None, None  # legacy / unversioned → not provably content-fresh
+    current_fingerprint = _compute_content_fingerprint(
+        runner, child_id, worklog_dir=worklog_dir, work_item=child,
+    )
+    if current_fingerprint is None or current_fingerprint != stored_fingerprint:
+        return None, None
+    verdict, _reason, _audited_at = _parse_child_audit_verdict(
+        raw_output, audited_at,
+    )
+    if verdict is None:
+        return None, None
+    return verdict, audited_at
+
+
 def _fetch_audited_at(runner: Runner, issue_id: str,
                       worklog_dir: str | None = None) -> str | None:
     """Return the audit's ``auditedAt`` for a work item (None when unavailable).
@@ -14322,12 +14373,15 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         # has a content-fresh stored audit (AC1): if so the
                         # child's own audit already evaluated its ACs and the
                         # parent can reuse those verdicts without a fresh
-                        # Phase 1 screen (same pattern as the
-                        # --audit-children pre-pass at ~line 13756).
-                        verdict, _reason, audited_at = _get_child_audit_verdict(
-                            runner, child["id"], worklog_dir=worklog_dir,
-                            force=force, child=child,
-                        )
+                        # Phase 1 screen. The content-fingerprint gate is
+                        # required here (strict — legacy fingerprint-less
+                        # audits are re-screened, preserving prior behaviour).
+                        verdict, audited_at = (None, None)
+                        if not force:
+                            verdict, audited_at = _get_child_content_fresh_verdict(
+                                runner, child["id"], worklog_dir=worklog_dir,
+                                child=child,
+                            )
                         if verdict is not None:
                             # Content-fresh stored audit — adopt its verdicts
                             # and skip re-screening (AC1).
@@ -14338,7 +14392,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                 child, runner, worklog_dir=worklog_dir,
                             )
                         else:
-                            # No fresh audit — full audit required (AC3).
+                            # No content-fresh audit — full audit required (AC3).
                             cr["child_audit_ready"] = False
                             pending_children.append((len(child_results), child))
                     else:
@@ -14464,23 +14518,21 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         # fingerprint-bearing report and break future
                         # content-gate reuse.
                         continue
-                    # AC2 guard: if the child already has a content-fresh stored
-                    # audit with real (non-pending) verdicts, skip persisting
-                    # the parent-generated report.  This prevents a parent run
-                    # from overwriting a child's own serviced audit — whether
-                    # the parent set ``reused_from`` in this run (handled above)
-                    # or the fresh audit was written by a prior/independent run
-                    # (e.g. the child was independently audited while the parent
-                    # was not running).
-                    fresh_verdict, _fresh_reason, _fresh_audited_at = _get_child_audit_verdict(
-                        runner, child["id"], worklog_dir=worklog_dir,
-                        force=force, child=child,
-                    )
-                    if fresh_verdict is not None:
-                        # The child has a content-fresh stored audit with a
-                        # real verdict — the child's own audit is the
-                        # authoritative source; skip the parent-generated
-                        # persist (AC2).
+                    # AC2 guard: never persist a PENDING (unserviced
+                    # in-main-slot) child report over a child audit that is
+                    # content-fresh (matching v2 fingerprint) and carries
+                    # real, non-pending verdicts. This is the loop-breaking
+                    # guard: a serviced child's authoritative audit must
+                    # survive a parent re-run that merely re-emitted its
+                    # screens. A genuine (non-pending) re-audit result still
+                    # persists, and legacy fingerprint-less audits keep their
+                    # pre-existing behaviour.
+                    if (not force
+                            and _pending_main_slot_child_ids([child])
+                            and _get_child_content_fresh_verdict(
+                                runner, child["id"],
+                                worklog_dir=worklog_dir,
+                            )[0] is not None):
                         continue
                     child_fingerprint = _compute_content_fingerprint(
                         runner, child["id"], worklog_dir=worklog_dir,
