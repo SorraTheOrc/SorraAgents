@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.1.27 (2026-11-11)
+> **Release focus:** This release focuses on making audits and task tracking more reliable, with clearer ready-to-ship verdicts, correct reading of acceptance criteria and verification evidence, and fewer false blocks or duplicate chores. It also speeds up runs through reduced context loading, reused passing test results, and better test slot allocation, while fixing hangs, dropped connections, and stuck or prematurely started tasks.
+### Features
+- Audit results now show a clear ✅ Ready to ship or 🚫 Not ready to ship verdict at a glance. (SA-0MVYEZ3V3004AQXN)
+- Implement runs now start with far less context, loading faster and leaving more room for actual work. (SA-0MVYDCUWA001Z8K0)
+- Pushing to dev now reuses a passing test result for the same code, so you no longer wait twice. (SA-0MVXUCGPK003G2KV)
+- Watch each epic child run live in its own pane, with full transcripts kept for review. (SA-0MVLKHY27005UK40)
+### Bug Fixes
+- Git hooks now work on any machine, so worktree creation and worklog sync no longer fail. (SA-0MVK1Q30O0067NXX)
+- Long dev pushes no longer lose a green test run to a dropped connection, and transport failures now fail loudly instead of falsely reporting success. (SA-0MVWNHLQQ002TFZR)
+- Audits no longer create duplicate chores or block releases on accepted false positives. (SA-0MVZNECSD005XB42)
+- Tests no longer hang for hours when lock timeout settings are present in your environment. (SA-0MVY0G5EH000LIMB)
+- Release notes now always appear in Discord announcements and the changelog. (SA-0MVXY0VPC002B0MO)
+- Active tasks now stay marked in-progress instead of reverting and being re-dispatched. (SA-0MVXWMVTH007MNJR)
+- Items with qualified acceptance criteria headings now audit correctly instead of being wrongly demoted. (SA-0MVY6O4WU0022DNA)
+- Finished work items are no longer stuck waiting for the producer and get picked up again. (SA-0MW7QTAHW0030FGV)
+- Audits now correctly read acceptance criteria even when the description mentions them in passing. (SA-0MWB84J17008N4QF)
+- Audits now correctly recognize verification evidence recorded in comments, so completed work is no longer wrongly marked unmet. (SA-0MW742YZS002TZ9F)
+- Items with no actual work can no longer be silently marked complete, so "in review" now truly means done. (SA-0MVYYL7X9008MGA1)
+- Blocked tasks are no longer started until their blockers are truly resolved. (SA-0MVTUFL0U0000NV2)
+- Test runs now grab any free slot instead of waiting hours while capacity sits idle. (SA-0MVWKZ4QD006L2E0)
+- Refactor tasks now point to real files, so agents stop chasing work that no longer exists. (SA-0MW7Z11PV003V7O2)
+### Other
+- Cleaner code means faster fixes and fewer bugs in future updates. (SA-0MVZFQCA20063AKV)
+- Cleaned up the backlog so it only shows work that still needs doing. (SA-0MW7Z1YE9004P41D)
+
 ## v0.1.26 (2026-11-07)
 > **Release focus:** This release focuses on making the dev push and test pipeline more reliable and trustworthy, ensuring tests run against the exact code being pushed and that pushes only pass after a full suite runs on that commit. It also hardens the system against concurrency issues, temporary failures, and false test results, while improving audit queue handling and engine version consistency.
 ### Features
