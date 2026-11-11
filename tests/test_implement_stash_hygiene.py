@@ -27,6 +27,7 @@ sys.path.insert(0, str(_SKILLS_ROOT))
 
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
 _SKILL_MD = _REPO_ROOT / "skill" / "implement" / "SKILL.md"
+_REFERENCE_MD = _REPO_ROOT / "docs" / "dev" / "implement-skill-reference.md"
 _HYGIENE_SCRIPT = _REPO_ROOT / "scripts" / "hygiene_check.sh"
 _AGENTS_MD = _REPO_ROOT / "AGENTS.md"
 
@@ -291,31 +292,35 @@ class TestHygieneCheckScript:
 
 
 class TestRecoveryPlaybook:
-    """Tests for the recovery playbook documentation (AC5)."""
+    """Tests for the recovery playbook documentation (AC5).
+
+    The playbook was relocated verbatim from ``skill/implement/SKILL.md`` to
+    ``docs/dev/implement-skill-reference.md`` (SA-0MVYDCUWA001Z8K0, AC5).
+    """
 
     def test_skill_md_has_recovery_playbook_section(self):
-        """The implement skill should have a recovery playbook section."""
-        content = _SKILL_MD.read_text(encoding="utf-8")
+        """The implement reference should have a recovery playbook section."""
+        content = _REFERENCE_MD.read_text(encoding="utf-8")
         assert "## Dirty main-checkout recovery playbook" in content, (
-            "Implement skill must contain a recovery playbook section"
+            "Implement reference must contain a recovery playbook section"
         )
 
     def test_skill_md_recovery_decision_tree(self):
         """The recovery playbook should contain decision trees."""
-        content = _SKILL_MD.read_text(encoding="utf-8")
+        content = _REFERENCE_MD.read_text(encoding="utf-8")
         assert "Decision tree: dirty working tree" in content
         assert "Decision tree: orphaned stashes" in content
 
     def test_skill_md_recovery_examples(self):
         """The recovery playbook should contain recovery examples."""
-        content = _SKILL_MD.read_text(encoding="utf-8")
+        content = _REFERENCE_MD.read_text(encoding="utf-8")
         assert "## Dirty main-checkout recovery playbook" in content
         assert "git stash apply" in content
         assert "git stash drop" in content
 
     def test_skill_md_recovery_key_rules(self):
         """The recovery playbook should contain key rules."""
-        content = _SKILL_MD.read_text(encoding="utf-8")
+        content = _REFERENCE_MD.read_text(encoding="utf-8")
         assert "Key rules" in content
         assert "never stash" in content.lower()
         assert "without explicit permission" in content.lower()

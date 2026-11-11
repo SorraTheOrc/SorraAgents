@@ -329,6 +329,23 @@ class TestExtractAcceptanceCriteria:
         acs = extract_acceptance_criteria(desc)
         assert acs == []
 
+    def test_prose_mentioning_phrase_before_heading_does_not_hijack(self):
+        """Prose mentioning the phrase cannot start the AC section.
+
+        SA-0MWB84J17008N4QF: the audit extractor hijacked a prose line as the
+        heading; this shared helper must stay anchored to a real markdown
+        heading so the plan and audit pipelines cannot drift.
+        """
+        desc = """## Problem
+
+some prose mentioning acceptance criteria in passing.
+
+## Acceptance criteria
+- AC 1
+- AC 2
+"""
+        assert extract_acceptance_criteria(desc) == ["AC 1", "AC 2"]
+
     def test_empty_section_returns_empty(self):
         """An AC section with no bullets returns an empty list."""
         desc = """## Acceptance Criteria

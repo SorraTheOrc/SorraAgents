@@ -155,8 +155,7 @@ from test.scripts.run_tests import (
     full_suite_commands,
     group_commands,
     paced_runner,
-    parse_node_failures,
-    parse_pytest_failures,
+    parse_failures,
     resolve_type_commands,
     suite_timeout_per_command,
 )
@@ -818,6 +817,40 @@ FP_CHORE_ANNOTATION = FP_CANDIDATE_ANNOTATION
 
 The chore links the finding for a producer decision but carries NO commit
 link (no config change happened — SA-0MST01PQQ009T0CI AC2).
+"""
+
+CFP_CHORE_KEY_PREFIX = "CFP-Chore-Key:"
+"""Stable deduplication marker carried by candidate-false-positive chores.
+
+Every tracking chore created for a medium/low confident-false-positive
+finding carries ``CFP-Chore-Key: <linter>:<rule>:<file>:<line>`` in its
+description. A later audit run searches the worklog for that marker
+(``wl list`` matches title/description substrings) and REUSES the existing
+chore instead of creating a duplicate, so repeated audits of unchanged code
+are idempotent (SA-0MVZNECSD005XB42 AC1).
+"""
+
+_CFP_CHORE_KEY_RE = re.compile(r"CFP-Chore-Key:\s*(\S+)", re.IGNORECASE)
+"""Extracts the dedup key that follows the marker in a chore description."""
+
+CFP_CHORE_KEY_TERMINAL_STATUSES = frozenset({"completed", "deleted"})
+"""Chore statuses that no longer track a finding.
+
+A terminal chore (closed/completed/deleted) means the finding came back
+without an accepted waiver, so a fresh chore is created instead of reusing
+the stale one (SA-0MVZNECSD005XB42 AC1).
+"""
+
+AUDIT_WAIVER_MARKER = "AUDIT-FP-WAIVER:"
+"""Comment marker that records a producer-accepted false positive.
+
+The worklog's ``auditWaiver`` column is a single-slot audit-gap waiver
+object (``{reason, author, waivedAt}``) and the CLI cannot store a per-
+finding list there, so a producer records an accepted finding by commenting
+``AUDIT-FP-WAIVER: {"rule": ..., "file": ..., "line": ...,
+"justification": ...}`` on the audited item (helper:
+``$(skill_path audit)/scripts/audit_waiver.py add``). Waived findings are excluded
+from chore creation and from blocking checks (SA-0MVZNECSD005XB42 AC3).
 """
 
 FP_SCREEN_MISSING_JUSTIFICATION = (
@@ -2452,6 +2485,77 @@ def _producer_review_required_reason(wi: dict | None,
     return "content changed since the last passing audit"
 
 
+def _passing_audit_producer_decision(
+    ctx: _AuditContext,
+) -> tuple[bool, str | None]:
+    """Whether a passing top-level audit still needs a producer decision.
+
+    Returns ``(needs_decision, reason)``; *reason* is ``None`` when the
+    caller should fall back to the content-scoped reason
+    (``_producer_review_required_reason``) — i.e. the pass is simply
+    unreviewed or the item's content changed since the last review.
+
+    A pass needs NO decision when its only findings are medium/low
+    candidate false positives that are already tracked by a live chore or
+    accepted by the producer (waiver) and this run created no new chores:
+    the producer has nothing new to decide, so the flag must not be
+    re-armed on every audit cycle (SA-0MVZNECSD005XB42 AC2). An
+    audit-generated tracking chore never needs a decision either — it is
+    bookkeeping for a finding already reported on the audited item
+    (AC4). Everything else (new chores, uncertain classifications,
+    genuine blocking findings) still surfaces to the producer.
+    """
+    remediation = (
+        ctx.remediation_results
+        if isinstance(ctx.remediation_results, dict) else {}
+    )
+    created = remediation.get("chores_created") or 0
+    if created:
+        return True, (
+            f"{created} new candidate false-positive chore(s) created — "
+            "producer decision required"
+        )
+    entries = ctx.fp_screen_results or []
+    if any(
+        isinstance(e, dict) and e.get("classification") == "uncertain"
+        for e in entries
+    ):
+        return True, (
+            "uncertain false-positive candidate requires a producer decision"
+        )
+    blocking, blocking_reason = _has_phase1_blocking_issues(
+        ctx.cq_findings or [], ctx.child_results or [],
+        fp_screen_results=entries,
+        snapshot_exempt=ctx.snapshot_exempt_children,
+    )
+    if blocking:
+        return True, blocking_reason
+    cfp_entries = [
+        e for e in entries
+        if isinstance(e, dict)
+        and e.get("classification") == "confident-false-positive"
+        and (e.get("finding") or {}).get("severity") in ("medium", "low")
+        and not e.get("remediation_exhausted")
+    ]
+    if cfp_entries:
+        pending = [
+            e for e in cfp_entries
+            if not (e.get("waived") or e.get("tracked_chore_id"))
+        ]
+        if pending:
+            return True, "candidate false-positive findings are not yet tracked"
+        return False, (
+            "only tracked/accepted medium/low false positives — "
+            "no producer decision required"
+        )
+    if _is_cfp_tracker_item(ctx.wi):
+        return False, (
+            "audit-generated candidate-false-positive tracker — covered by "
+            "the audited item's review"
+        )
+    return True, None
+
+
 def _resolve_producer_review_decision(ctx: _AuditContext,
                                       verdict: str | None) -> dict:
     """Resolve the producer-review flag action for this audit run.
@@ -2462,6 +2566,12 @@ def _resolve_producer_review_decision(ctx: _AuditContext,
     - ``Yes`` + top-level + reviewed unchanged → ``preserved`` (AC1)
     - ``Yes`` + top-level + never reviewed / content changed → ``required``
       (AC2)
+    - ``Yes`` + top-level + only tracked/accepted medium/low candidate
+      false positives (no new chores this run) → ``untouched`` — the
+      producer already decided, so the release gate is not re-armed
+      (SA-0MVZNECSD005XB42 AC2)
+    - ``Yes`` on an audit-generated candidate-false-positive tracker chore →
+      ``untouched`` (AC4)
     - ``No`` + independent (not cascade-demotion-suppressed) + top-level →
       ``required`` regardless of ``merge_gate_blocker`` (AC3)
     - ``No`` + cascade-demotion-suppressed → ``untouched`` (producer Q2)
@@ -2513,9 +2623,24 @@ def _resolve_producer_review_decision(ctx: _AuditContext,
                 ),
                 "fingerprint": fingerprint,
             }
+        needs_decision, decision_reason = _passing_audit_producer_decision(ctx)
+        if not needs_decision:
+            # The producer has nothing new to decide (only tracked/accepted
+            # medium/low false positives, or a tracker chore): leave the
+            # stored flag alone instead of re-arming the release gate
+            # (SA-0MVZNECSD005XB42 AC2/AC4).
+            return {
+                "action": PRODUCER_REVIEW_UNTOUCHED,
+                "reason": decision_reason or (
+                    "no producer decision required"
+                ),
+                "fingerprint": fingerprint,
+            }
         return {
             "action": PRODUCER_REVIEW_REQUIRED,
-            "reason": _producer_review_required_reason(wi, prior),
+            "reason": decision_reason or _producer_review_required_reason(
+                wi, prior
+            ),
             "fingerprint": fingerprint,
         }
 
@@ -3881,10 +4006,10 @@ def _run_tests_via_test_skill(
                 file=sys.stderr,
             )
             continue
-        if "pytest" in command:
-            cmd_failures = parse_pytest_failures(output)
-        else:
-            cmd_failures = parse_node_failures(output)
+        # Shared routing (MS-0MW3UR8SX009YZWS): the audit must classify a
+        # Vitest failure exactly as the runner does, or it emits a
+        # ``<suite exited N>`` placeholder where the test name belongs.
+        cmd_failures = parse_failures(command, output)
         for failure in cmd_failures:
             failure["suite_command"] = command
         failures.extend(cmd_failures)
@@ -5937,22 +6062,62 @@ def _normalize_heading_line(line: str) -> str:
     pattern (SA-0MSJLC8XA00178YD).
     """
     line = line.strip()
-    line = re.sub(r"^#{0,3}\s*", "", line)
+    line = re.sub(r"^#{1,6}\s+", "", line)
     line = line.replace("**", "")
     line = re.sub(r"<<([^>]*)>>", r"\1", line)
     return line.strip()
 
 
+# Heading forms that may legitimately introduce the acceptance-criteria
+# section: a real markdown heading, a bold-only line (``**Acceptance
+# criteria:**``), the angle-bracket convention (``<<Acceptance>>
+# <<criteria>>``), or the bare ``Acceptance Criteria:`` pseudo-heading used by
+# AGENTS.md. A prose sentence that merely mentions the phrase is rejected so
+# it can never start the section (SA-0MWB84J17008N4QF).
+_MARKDOWN_HEADING_LINE_RE = re.compile(r"^#{1,6}\s+\S")
+_BOLD_HEADING_LINE_RE = re.compile(r"^\*\*[^*]+\*\*:?$")
+_ANGLE_HEADING_LINE_RE = re.compile(r"^(?:<<[^>]+>>\s*)+:?$")
+_BARE_HEADING_LINE_RE = re.compile(
+    r"^(?:Acceptance|Success)\s+Criteria\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_heading(line: str) -> bool:
+    """Return True when *line* is a heading form, not prose.
+
+    Only a heading-form line may introduce the AC section; normalising and
+    prefix-matching every line let a wrapped prose line beginning with
+    "acceptance criteria …" masquerade as the heading and silently drop every
+    real AC (SA-0MWB84J17008N4QF).
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return bool(
+        _MARKDOWN_HEADING_LINE_RE.match(stripped)
+        or _BOLD_HEADING_LINE_RE.match(stripped)
+        or _ANGLE_HEADING_LINE_RE.match(stripped)
+        or _BARE_HEADING_LINE_RE.match(stripped)
+    )
+
+
 def _extract_acs(description: str) -> list[str]:
     """Extract acceptance criteria lines from a markdown description."""
+    # Prefix match — allows trailing qualifier text (e.g. "for this project").
+    # Aligns with tree_coverage.extract_acceptance_criteria which uses the
+    # same prefix pattern, so the audit and plan pipelines agree on what is
+    # an AC section (SA-0MVY6O4WU0022DNA).
     heading_re = re.compile(
-        r"^(?:Acceptance|Success)\s+Criteria:?\s*(?:\([^)]*\))?\s*$",
+        r"^(?:Acceptance|Success)\s+Criteria",
         re.IGNORECASE,
     )
     lines = description.splitlines()
     heading_idx = None
     for idx, raw in enumerate(lines):
-        if heading_re.search(_normalize_heading_line(raw)):
+        if not _looks_like_heading(raw):
+            continue
+        if heading_re.match(_normalize_heading_line(raw)):
             heading_idx = idx
             break
     if heading_idx is None:
@@ -6333,6 +6498,76 @@ def _phase1_evidence_refs(ac_results: list[dict],
         if len(refs) >= max_refs:
             break
     return refs
+
+
+_WORK_ITEM_EVIDENCE_MAX_CHARS = 12000
+"""Cap for the work-item comments evidence block injected into audit prompts.
+
+Bounded so a long comment history cannot inflate the Phase 1 / Phase 2 prompt
+without limit; comments are reproduced in order up to this many characters.
+"""
+
+
+def _build_work_item_evidence_block(
+    comments: Sequence[dict] | None,
+    *,
+    max_chars: int = _WORK_ITEM_EVIDENCE_MAX_CHARS,
+) -> str:
+    """Render the item's own comments as a bounded read-only evidence block.
+
+    Some acceptance criteria are satisfied by evidence recorded on the work
+    item itself rather than in the codebase — e.g. an execution-log criterion
+    ("the rc=0 results are recorded as a comment on this item") or a runtime
+    command result (``wl doctor upgrade --dry-run --json``). The Phase 1 parent
+    screen and the Phase 2 parent deep analysis historically carried only the
+    FILE SCOPE manifest + the AC list, so such a criterion could never be
+    verified and was graded a false-negative ``unmet``.
+
+    Read-only: the block never mutates parsed verdicts. Returns ``""`` when
+    there are no comments so those prompts stay byte-for-byte unchanged.
+    """
+    if not comments:
+        return ""
+    entries: list[str] = []
+    total = 0
+    for comment in comments:
+        if isinstance(comment, dict):
+            text = str(comment.get("comment", "") or "").strip()
+            author = str(comment.get("author", "") or "").strip() or "unknown"
+            created = str(comment.get("createdAt", "") or "").strip()
+        else:
+            text = str(comment).strip()
+            author, created = "unknown", ""
+        if not text:
+            continue
+        header = f"--- comment by {author}"
+        if created:
+            header += f" ({created})"
+        entry = f"{header} ---\n{text}"
+        remaining = max_chars - total
+        if remaining <= 0:
+            break
+        if len(entry) > remaining:
+            suffix = "\n…[truncated]"
+            keep = max(0, remaining - len(suffix))
+            entry = entry[:keep] + suffix
+        entries.append(entry)
+        total += len(entry)
+        if total >= max_chars:
+            break
+    if not entries:
+        return ""
+    return (
+        "WORK ITEM EVIDENCE — comments recorded on this item are reproduced "
+        "below as read-only evidence. If a criterion requires a verification "
+        "result that is recorded in a comment (for example a command exit "
+        "code, a drifted-DB exercise, or a `wl doctor --dry-run` output), "
+        "treat that comment as valid evidence and do NOT mark the criterion "
+        "'unmet' merely because the evidence lives in a comment rather than "
+        "in a code file.\n\n"
+        + "\n\n".join(entries)
+        + "\n\n"
+    )
 
 
 def _build_file_scope_manifest(issue: dict, ac_results: list[dict],
@@ -7366,7 +7601,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
     # Rendered outside the findings branch so a successful remediation
     # (which clears the findings) still surfaces the loop record.
     if (rem.get("iterations") or rem.get("exhausted")
-            or rem.get("chore_items") or rem.get("chore_failures")):
+            or rem.get("chore_items") or rem.get("chore_failures")
+            or rem.get("chores_reused") or rem.get("waived_findings")):
         lines.append("")
         lines.append("#### Remediation loop")
         lines.append("")
@@ -7398,6 +7634,17 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                     f"- Chore work item {ci.get('id', '?')} tracks a "
                     f"medium/low false positive — {FP_CHORE_ANNOTATION}"
                 )
+        for cr in rem.get("chores_reused", []):
+            lines.append(
+                f"- Chore work item {cr.get('id', '?')} already tracks "
+                f"{cr.get('key', '?')} — reused, no duplicate created"
+            )
+        for wf in rem.get("waived_findings", []):
+            justification = wf.get("justification") or "accepted"
+            lines.append(
+                f"- {wf.get('key', '?')} accepted as a false positive "
+                f"({justification}) — no chore, not blocking"
+            )
         for f in rem.get("chore_failures", []):
             ref = (f.get("change")
                    or (f.get("finding", {}).get("code", "?") if isinstance(
@@ -8780,6 +9027,10 @@ def _has_phase1_blocking_issues(
     fp_results = fp_screen_results or []
     for f in cq_findings:
         if f.get("severity") in ("critical", "high"):
+            if _fp_entry_waived(f, fp_results):
+                # Accepted false positive — never blocks (AC3,
+                # SA-0MVZNECSD005XB42).
+                continue
             classification = _fp_classification_for(f, fp_results)
             if classification == "confident-false-positive":
                 continue
@@ -9446,6 +9697,7 @@ def _run_phase2_deep_analysis(
     worklog_dir: str | None = None,
     ac_fallback_used: threading.Event | None = None,
     green_run_block: str | None = None,
+    comments: Sequence[dict] | None = None,
     skip_parent_deep: bool = False,
     owning_root: Path | None = None,
     max_citations_per_ac: int | None = None,
@@ -9623,6 +9875,7 @@ def _run_phase2_deep_analysis(
             f"{_SCANNING_BLOCK}"
             f"{green_run_block or ''}"
             f"{_max_citations_prompt_snippet(max_citations_per_ac)}"
+            f"{_build_work_item_evidence_block(comments)}"
             "For each acceptance criterion:\n"
             "1. **Read the actual implementation files** mentioned in or implied by the criterion.\n"
             "2. **Verify the code actually does what the criterion claims.**\n"
@@ -10142,6 +10395,14 @@ class _AuditContext:
     cq_skipped_reason: str | None = None
     fp_screen_results: list = field(default_factory=list)
     remediation_results: dict = field(default_factory=dict)
+    audit_waivers: list = field(default_factory=list)
+    """Producer-accepted false positives for this item (AC3,
+    SA-0MVZNECSD005XB42).
+
+    Collected from the item's ``AUDIT-FP-WAIVER:`` comment markers (see
+    ``_collect_audit_waivers``); a waived finding is excluded from chore
+    creation and from blocking checks.
+    """
     ac_results: list = field(default_factory=list)
     child_results: list = field(default_factory=list)
     ac_fallback_used: threading.Event = field(default_factory=threading.Event)
@@ -10754,7 +11015,8 @@ def _phase_merge_gate(ctx: _AuditContext) -> int | None:
     Returns None when the gate passes (work merged or never resolvable —
     see below) or when integration succeeded; returns 1 when integration
     is REQUIRED but FAILED (the audit must fail with "Ready to close: No"
-    + the producer hold — AC3, never proceeds past Phase 1 with
+    + the producer-review hold (``needsProducerReview``) — AC3, never proceeds
+    past Phase 1 with
     unmerged work). A gate with no resolvable evidence is NOT a blocker:
     the item may have no code changes at all (docs-only, no feature
     branch, no commits referenced) — verification degrades to a recorded
@@ -11314,7 +11576,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # terminal lifecycle keep/restore `done` (SA-0MUWKGW9W004QXQZ).
     #
     # The claim is status-only and sets no assignee, so it never establishes a
-    # scheduling hold and never overwrites a pre-existing producer hold (the
+    # scheduling hold and never overwrites a pre-existing claim (the
     # status-neutral claim convention documented in AGENTS_GLOBAL.md). The
     # release of the audit agent's own claim happens on the terminal-write path
     # below (SA-0MVVF6Y38004T5OZ).
@@ -11455,10 +11717,232 @@ def _parse_fp_screen_response(raw_text: str,
 def _fp_classification_for(finding: dict, fp_screen_results: list[dict]) -> str | None:
     """Return the screen classification for *finding*, or None when the
     finding was not screened (non-ruff finding, or screen skipped)."""
+    entry = _fp_entry_for(finding, fp_screen_results)
+    return entry.get("classification") if entry else None
+
+
+def _fp_entry_for(finding: dict,
+                  fp_screen_results: list[dict] | None) -> dict | None:
+    """The screen entry for *finding* (identity or equality match), else None."""
     for entry in fp_screen_results or []:
         if entry.get("finding") is finding or entry.get("finding") == finding:
-            return entry.get("classification")
+            return entry
     return None
+
+
+def _fp_entry_waived(finding: dict,
+                     fp_screen_results: list[dict] | None) -> bool:
+    """Whether the producer accepted *finding* as a false positive."""
+    entry = _fp_entry_for(finding, fp_screen_results)
+    return bool(entry and entry.get("waived"))
+
+
+def _fp_finding_key(finding: dict) -> str:
+    """Stable deduplication key for a screened finding.
+
+    ``<linter>:<rule>:<file>:<line>`` — the identity a tracking chore is
+    deduplicated on (SA-0MVZNECSD005XB42 AC1). The key is recorded verbatim
+    after ``CFP-Chore-Key:`` in the chore description and searched for with
+    ``wl list`` (case-insensitive substring over id/title/description).
+    """
+    linter = (finding.get("linter") or "ruff").strip().lower()
+    code = (finding.get("code") or "?").strip()
+    file = finding.get("file") or "?"
+    try:
+        line = int(finding.get("line") or 0)
+    except (TypeError, ValueError):
+        line = 0
+    return f"{linter}:{code}:{file}:{line}"
+
+
+def _normalise_waiver(data: object) -> dict | None:
+    """Normalise a waiver record to ``{linter, rule, file, line,
+    justification, author}``; ``None`` when unusable.
+
+    A waiver without a rule or a file cannot identify a finding, so it is
+    dropped (never a blanket suppression). ``line`` is optional: a waiver
+    without a line accepts that rule for the whole file, which survives
+    unrelated line drift.
+    """
+    if not isinstance(data, dict):
+        return None
+    rule = data.get("rule") or data.get("code")
+    file = data.get("file")
+    if not rule or not file:
+        return None
+    line: object = data.get("line")
+    if isinstance(line, str) and line.strip().isdigit():
+        line = int(line.strip())
+    if not isinstance(line, int) or line < 0:
+        line = 0
+    return {
+        "linter": str(data.get("linter") or "ruff").strip().lower(),
+        "rule": str(rule).strip(),
+        "file": str(file),
+        "line": line,
+        "justification": str(
+            data.get("justification") or data.get("reason") or ""
+        ),
+        "author": str(data.get("author") or ""),
+    }
+
+
+def _parse_audit_waivers(comments: Sequence[dict] | None) -> list[dict]:
+    """Collect accepted-false-positive waivers from item *comments*.
+
+    Each waiver is a comment line ``AUDIT-FP-WAIVER: <json>`` (see
+    ``AUDIT_WAIVER_MARKER``). Malformed payloads are ignored silently — a
+    broken waiver must never suppress a finding.
+    """
+    waivers: list[dict] = []
+    for comment in comments or []:
+        text = comment.get("comment") if isinstance(comment, dict) else comment
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            if not line.startswith(AUDIT_WAIVER_MARKER):
+                continue
+            payload = line[len(AUDIT_WAIVER_MARKER):].strip()
+            try:
+                data = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+            waiver = _normalise_waiver(data)
+            if waiver is not None:
+                waivers.append(waiver)
+    return waivers
+
+
+def _collect_audit_waivers(wi: dict | None,
+                           comments: Sequence[dict] | None) -> list[dict]:
+    """Every accepted-false-positive waiver attached to *wi*.
+
+    Reads the comment markers (the transport the worklog CLI supports
+    today) and, defensively, a ``findings`` list on the item's
+    ``auditWaiver`` field should a future store come to persist one. The
+    parser only keeps ``{reason, author, waivedAt}`` today, so the field is
+    normally empty and comments are authoritative.
+    """
+    waivers = _parse_audit_waivers(comments)
+    if isinstance(wi, dict):
+        field = wi.get("auditWaiver")
+        if isinstance(field, dict):
+            for raw in field.get("findings") or []:
+                waiver = _normalise_waiver(raw)
+                if waiver is not None:
+                    waivers.append(waiver)
+    return waivers
+
+
+def _matching_waiver(finding: dict, waivers: Sequence[dict] | None) -> dict | None:
+    """The waiver accepting *finding* as a false positive, or ``None``.
+
+    Matches on rule + file (+ linter when given). A waiver with no line
+    accepts the rule for the whole file; a waiver with a line matches that
+    line only.
+    """
+    code = (finding.get("code") or "").strip().upper()
+    file = finding.get("file") or ""
+    linter = (finding.get("linter") or "ruff").strip().lower()
+    try:
+        line = int(finding.get("line") or 0)
+    except (TypeError, ValueError):
+        line = 0
+    for waiver in waivers or []:
+        if not isinstance(waiver, dict):
+            continue
+        # Rule codes are case-insensitive (ruff emits upper case).
+        if str(waiver.get("rule") or "").strip().upper() != code:
+            continue
+        if waiver.get("file") != file:
+            continue
+        if waiver.get("linter") and waiver["linter"] != linter:
+            continue
+        if waiver.get("line") and int(waiver["line"]) != line:
+            continue
+        return waiver
+    return None
+
+
+def _apply_audit_waivers(entries: list[dict],
+                         waivers: Sequence[dict] | None) -> int:
+    """Mark screen entries whose finding a producer accepted as waived.
+
+    Idempotent: marks ``waived``/``waived_justification`` on the entry and
+    returns the number of entries newly marked. Callers re-run this after
+    the remediation loop's re-screen so a waiver survives a re-classified
+    finding (SA-0MVZNECSD005XB42 AC3).
+    """
+    marked = 0
+    for entry in entries or []:
+        if not isinstance(entry, dict) or entry.get("waived"):
+            continue
+        finding = entry.get("finding")
+        if not isinstance(finding, dict):
+            continue
+        waiver = _matching_waiver(finding, waivers)
+        if waiver is None:
+            continue
+        entry["waived"] = True
+        entry["waived_justification"] = waiver.get("justification", "")
+        marked += 1
+    return marked
+
+
+def _load_tracked_cfp_chores(runner: Runner,
+                             worklog_dir: str | None) -> dict[str, str]:
+    """Live candidate-false-positive chores, keyed by ``CFP-Chore-Key``.
+
+    One ``wl list "<marker>" --json`` call (a case-insensitive substring
+    match over id/title/description) returns every tracking chore; the
+    marker following each ``CFP-Chore-Key:`` is parsed out locally, so a run
+    with many findings still pays exactly one lookup. Only non-terminal
+    ``chore`` items count: a completed/deleted chore no longer tracks a
+    finding (SA-0MVZNECSD005XB42 AC1).
+
+    A failed lookup returns an empty mapping: failing safe means creating a
+    tracking chore rather than losing one.
+    """
+    try:
+        data = _run_wl(
+            runner, ["wl", "list", CFP_CHORE_KEY_PREFIX, "--json"],
+            worklog_dir=worklog_dir,
+        )
+    except RuntimeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    tracked: dict[str, str] = {}
+    for item in data.get("workItems") or []:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("issueType") or "").strip().lower() != "chore":
+            continue
+        status = (item.get("status") or "").strip().lower()
+        if status in CFP_CHORE_KEY_TERMINAL_STATUSES:
+            continue
+        chore_id = item.get("id")
+        if not chore_id:
+            continue
+        haystack = f"{item.get('title', '')}\n{item.get('description', '')}"
+        for found in _CFP_CHORE_KEY_RE.findall(haystack):
+            tracked.setdefault(found, chore_id)
+    return tracked
+
+
+def _is_cfp_tracker_item(wi: dict | None) -> bool:
+    """Whether *wi* is an audit-generated candidate-false-positive tracker.
+
+    Tracking chores are bookkeeping for a finding the audit already reported
+    on the audited item; flagging them for producer review re-arms the
+    release gate on every audit cycle without asking the producer anything
+    new (SA-0MVZNECSD005XB42 AC2/AC4).
+    """
+    if not isinstance(wi, dict):
+        return False
+    if (wi.get("issueType") or "").strip().lower() != "chore":
+        return False
+    haystack = f"{wi.get('title') or ''}\n{wi.get('description') or ''}"
+    return CFP_CHORE_KEY_PREFIX in haystack or FP_CHORE_ANNOTATION in haystack
 
 
 def _resolve_fp_screen_batch_size() -> int:
@@ -11691,6 +12175,10 @@ def _effective_blocking_findings(cq_findings: list[dict],
             continue
         if _fp_classification_for(f, fp_screen_results or []) == "confident-false-positive":
             continue
+        if _fp_entry_waived(f, fp_screen_results):
+            # Producer accepted this finding as a false positive
+            # (SA-0MVZNECSD005XB42 AC3) — excluded from blocking checks.
+            continue
         blocking.append(f)
     return blocking
 
@@ -11785,6 +12273,33 @@ def _create_chore_item(runner: Runner, *, title: str, description: str,
     return wi.get("id") or None
 
 
+def _chore_description_for_cfp_decision(
+    finding: dict, entry: dict, key: str, issue_id: str | None = None,
+) -> str:
+    """Description for a medium/low candidate-false-positive chore.
+
+    Carries the machine-readable ``CFP-Chore-Key`` dedup marker
+    (``CFP_CHORE_KEY_PREFIX``) and the one-off acceptance recipe, so the
+    finding is tracked exactly once (SA-0MVZNECSD005XB42 AC1/AC3).
+    """
+    code = finding.get("code", "?")
+    file = finding.get("file", "?")
+    line = finding.get("line", 0)
+    waiver_target = issue_id or "<audited-item-id>"
+    return (
+        f"False-positive candidate (medium/low severity). "
+        f"{code} in {file}:{line} — {entry.get('justification', '')}. "
+        f"{FP_CHORE_ANNOTATION}.\n\n"
+        f"{CFP_CHORE_KEY_PREFIX} {key}\n\n"
+        "Accept it once with:\n"
+        f"`python3 $(skill_path audit)/scripts/audit_waiver.py add {waiver_target} "
+        f"--rule {code} --file {file} --line {line} "
+        "--justification \"<why this is a false positive>\"`\n\n"
+        "An accepted finding no longer creates a chore and no longer enters "
+        "the producer-review queue."
+    )
+
+
 def _chore_description_for_fix(entries: list[dict], sha: str) -> str:
     """Description for a config-fix chore: links each remediated false-
     positive finding (file, rule, justification) and the local commit sha
@@ -11817,6 +12332,7 @@ def _run_remediation_loop(
     worklog_dir: str | None,
     work_item: dict,
     content_fingerprint: str | None,
+    waivers: Sequence[dict] | None = None,
 ) -> dict:
     """Confident-false-positive config remediation loop (F2 scope).
 
@@ -11839,7 +12355,12 @@ def _run_remediation_loop(
         [{"sha", "file", "fingerprint_after"}], "fingerprint_before",
         "fingerprint_after", "cq_findings", "fp_screen_results",
         "chore_items": [{"id", "commit_sha"}],
+        "chores_created", "chores_reused": [{"id", "key"}],
+        "waived_findings": [{"key", "finding", "justification"}],
         "chore_failures": [{"commit_sha"|"finding", "error"}]}``
+
+    *waivers* are producer-accepted false positives; waived findings never
+    get a tracking chore and never block (SA-0MVZNECSD005XB42 AC3).
     """
     max_iterations = _default_max_remediation_iterations()
     results: dict = {
@@ -11848,12 +12369,16 @@ def _run_remediation_loop(
         "exhausted": False,
         "commits": [],
         "chore_items": [],
+        "chores_created": 0,
+        "chores_reused": [],
+        "waived_findings": [],
         "chore_failures": [],
         "fingerprint_before": content_fingerprint,
         "fingerprint_after": content_fingerprint,
         "cq_findings": cq_findings,
         "fp_screen_results": fp_screen_results,
     }
+    _apply_audit_waivers(results["fp_screen_results"], waivers)
     try:
         from code_review.scripts.code_quality import run_code_quality
         from code_review.scripts.linter_runner import (
@@ -11954,6 +12479,9 @@ def _run_remediation_loop(
             issue_id, results["cq_findings"], pi_bin, resolved_model,
             debug_log, timeout, ac_fallback_used,
         )
+        # A waiver survives the re-screen: the finding is re-classified
+        # from scratch, so re-mark the accepted ones (AC3).
+        _apply_audit_waivers(results["fp_screen_results"], waivers)
         results["fingerprint_after"] = new_fp
         iteration += 1
 
@@ -11981,33 +12509,61 @@ def _run_remediation_loop(
     # AC2: every medium/low confident-false-positive finding gets a
     # tracking chore (no config change, no commit link) annotated for a
     # producer decision. AC3: uncertain and genuine findings never get a
-    # work item (they are not confident-false-positive).
+    # work item (they are not confident-false-positive). A finding the
+    # producer accepted as a false positive (waiver) gets NO chore, and a
+    # finding already tracked by a live chore is REUSED rather than
+    # duplicated — repeated audit runs are idempotent
+    # (SA-0MVZNECSD005XB42 AC1/AC3).
+    seen_chores: dict[str, str] = {}
+    tracked_chores: dict[str, str] | None = None
     for e in results["fp_screen_results"]:
         finding = e.get("finding", {}) if isinstance(e, dict) else {}
-        if (
+        if not (
             e.get("classification") == "confident-false-positive"
             and finding.get("severity") in ("medium", "low")
             and not e.get("remediation_exhausted")
         ):
-            code = finding.get("code", "?")
-            file = finding.get("file", "?")
-            chore_id = _create_chore_item(
-                runner,
-                title=f"ruff {code} in {file} — {FP_CHORE_ANNOTATION}",
-                description=(
-                    f"False-positive candidate (medium/low severity). "
-                    f"{code} in {file}:{finding.get('line', 0)} — "
-                    f"{e.get('justification', '')}. {FP_CHORE_ANNOTATION}."
-                ),
-                worklog_dir=worklog_dir,
-            )
-            if chore_id:
-                results["chore_items"].append({"id": chore_id})
-            else:
-                results["chore_failures"].append({
-                    "finding": finding,
-                    "error": "wl create failed",
-                })
+            continue
+        key = _fp_finding_key(finding)
+        if e.get("waived"):
+            results["waived_findings"].append({
+                "key": key,
+                "finding": finding,
+                "justification": e.get("waived_justification", ""),
+            })
+            continue
+        if tracked_chores is None:
+            # One worklog lookup per run, on first need (AC1).
+            tracked_chores = _load_tracked_cfp_chores(runner, worklog_dir)
+        chore_id = seen_chores.get(key) or tracked_chores.get(key)
+        if chore_id:
+            seen_chores[key] = chore_id
+            e["tracked_chore_id"] = chore_id
+            results["chores_reused"].append({"id": chore_id, "key": key})
+            continue
+        code = finding.get("code", "?")
+        file = finding.get("file", "?")
+        chore_id = _create_chore_item(
+            runner,
+            title=(
+                f"ruff {code} in {file}:{finding.get('line', 0)}"
+                f" — {FP_CHORE_ANNOTATION}"
+            ),
+            description=_chore_description_for_cfp_decision(
+                finding, e, key, issue_id,
+            ),
+            worklog_dir=worklog_dir,
+        )
+        if chore_id:
+            seen_chores[key] = chore_id
+            e["tracked_chore_id"] = chore_id
+            results["chore_items"].append({"id": chore_id})
+            results["chores_created"] += 1
+        else:
+            results["chore_failures"].append({
+                "finding": finding,
+                "error": "wl create failed",
+            })
 
     # ── Fail-safe (F3 AC5) ────────────────────────────────────────────────
     # A failed config-fix chore leaves the affected finding blocking
@@ -12159,6 +12715,15 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     acs = _extract_acs(description)
 
     # ------------------------------------------------------------------
+    # Accepted false positives (SA-0MVZNECSD005XB42 AC3): a producer who
+    # accepted a finding records a waiver on the item (comment marker
+    # ``AUDIT-FP-WAIVER:``). Waived findings never create a tracking chore
+    # and never block closure, so re-audits of deliberate lint patterns
+    # stay quiet instead of re-arming the release gate every cycle.
+    # ------------------------------------------------------------------
+    ctx.audit_waivers = _collect_audit_waivers(work_item, ctx.comments)
+
+    # ------------------------------------------------------------------
     # False-positive screen (SA-0MST01NPD007MYG4 / SA-0MST01O4G002VPBR):
     # model-judged classification of ruff findings via a single batched Pi
     # call, BEFORE the Phase-1 blocking check consumes cq_findings. The
@@ -12193,6 +12758,12 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
             e for e in entries if e.get("finding", {}).get("linter") == "ruff"
         ]
 
+    # Mark accepted false positives on the freshly screened entries so the
+    # Phase-1 blocking check and the report never see a waived finding as
+    # blocking, even when the remediation loop is skipped
+    # (SA-0MVZNECSD005XB42 AC3). Idempotent with the loop's own marking.
+    _apply_audit_waivers(fp_screen_results, ctx.audit_waivers)
+
     # ------------------------------------------------------------------
     # Config remediation loop (SA-0MST01OIN008MXYT / F2): confident-
     # false-positive critical/high ruff findings get a MINIMAL per-file-
@@ -12216,6 +12787,7 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
         worklog_dir=worklog_dir,
         work_item=work_item,
         content_fingerprint=content_fingerprint,
+        waivers=ctx.audit_waivers,
     )
     cq_findings = remediation_results.get("cq_findings", cq_findings)
     fp_screen_results = remediation_results.get(
@@ -12715,6 +13287,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             f"{file_scope}\n\n"
             f"{_SCANNING_BLOCK}"
             f"{green_run_block or ''}"
+            f"{_build_work_item_evidence_block(ctx.comments)}"
             f"Criteria: {ac_list_json}"
         )
         result, batch, raw_text = _call_phase1_screen(
@@ -13558,6 +14131,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     worklog_dir=worklog_dir,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    comments=ctx.comments,
                     skip_parent_deep=True,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
@@ -13581,6 +14155,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     worklog_dir=worklog_dir,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    comments=ctx.comments,
                     # A phase2-completed resume that is only re-auditing
                     # budget-exceeded children must NOT re-run the parent
                     # deep analysis (AC3) — children only.
@@ -13654,6 +14229,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         worklog_dir=worklog_dir,
                         ac_fallback_used=ac_fallback_used,
                         green_run_block=green_run_block,
+                        comments=ctx.comments,
                         owning_root=owning_root,
                         max_citations_per_ac=max_citations_per_ac,
                         child_in_main_slot=ctx.child_in_main_slot,
@@ -13847,6 +14423,7 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                     worklog_dir=worklog_dir,
                     ac_fallback_used=ac_fallback_used,
                     green_run_block=green_run_block,
+                    comments=ctx.comments,
                     skip_parent_deep=True,
                     owning_root=owning_root,
                     max_citations_per_ac=max_citations_per_ac,
@@ -14448,8 +15025,8 @@ def _cascade_descendants_terminal(
     - Non-fatal: a per-child ``wl`` failure is logged loudly and does not
       abort the audit; the next passing audit completes the cascade.
     - Releases the descendant's scheduling hold: the terminalise write also
-      clears a non-producer ``assignee`` (SA-0MW0F91KN004J06U), so a cascaded
-      child is never left on a lingering agent claim.
+      clears the ``assignee`` (SA-0MW0F91KN004J06U), so a cascaded child is
+      never left on a lingering claim.
 
     Args:
         parent_id: The audited parent whose subtree is being terminalised.
@@ -14679,12 +15256,14 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                 cmd += ["--status", "completed", "--stage", "in_review"]
             cmd += ["--assignee", ""]
             if (not ctx.wi or not ctx.wi.get("parentId")) and (
-                producer_review["action"] != PRODUCER_REVIEW_PRESERVED
+                producer_review["action"] == PRODUCER_REVIEW_REQUIRED
             ):
-                # A producer review of unchanged content is preserved
-                # (SA-0MVR9B1UH002BUST AC1); every other top-level pass
-                # still enters the producer queue (AC2). The runner never
-                # clears the flag — it only writes "yes" or nothing.
+                # Only a genuine producer decision enters the queue. A
+                # preserved review (AC1) and a pass whose only findings are
+                # already tracked/accepted candidate false positives
+                # (SA-0MVZNECSD005XB42 AC2) leave the stored flag untouched.
+                # The runner never clears the flag — it only writes "yes"
+                # or nothing.
                 cmd += ["--needs-producer-review", "yes"]
             cmd.append("--json")
             restore_cmd = cmd
@@ -15177,7 +15756,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         # check, or surface AC assessment): the item's work must be merged
         # into the owning repo's dev, and is integrated when missing. A
         # blocked gate (integration failed) emits a fail-closed report here
-        # ("Ready to close: No" + the producer hold) — the pipeline
+        # ("Ready to close: No" + ``needsProducerReview``) — the pipeline
         # never proceeds past Phase 1 with unmerged work (AC3).
         rc = _phase_fetch_and_cq(ctx)
         if rc is not None:

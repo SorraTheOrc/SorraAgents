@@ -8,6 +8,7 @@ by the guard suite.
 """
 
 
+import os
 import random
 import sys
 import threading
@@ -297,3 +298,200 @@ def test_turnstile_reclaims_a_lower_ticket_left_by_a_dead_waiter(tmp_path):
 
     assert time.monotonic() - t0 < 1.0
     assert not stale.exists(), "an unlocked lower ticket must be reclaimed"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic slot discovery (SA-0MVWKZ4QD006L2E0) — failing-first regressions
+#
+# A waiter that started when the namespace held only slots ``0..N-1`` must
+# still acquire a slot created later by a higher-ceiling process. The discovery
+# assertions below run against the dynamic-discovery implementation; the
+# strict ``xfail`` markers that pinned them test-first have been removed by the
+# implementation child. The cadence and own-ceiling assertions stay active too,
+# so a reversion to the snapshot-ceiling probe fails loudly.
+# ---------------------------------------------------------------------------
+
+
+def _hold_slots(sem_name, max_workers, count):
+    """Acquire *count* distinct slots of *sem_name*; return the holders."""
+    holders = []
+    for _ in range(count):
+        sem = Semaphore(sem_name, max_workers=max_workers, timeout=5)
+        sem.acquire()
+        holders.append(sem)
+    return holders
+
+
+def _create_free_slots(sem, indices):
+    """Create unheld slot files for *indices* in *sem*'s namespace."""
+    sem._slot_dir.mkdir(parents=True, exist_ok=True)
+    for index in indices:
+        fd = os.open(sem._slot_path(index), os.O_CREAT | os.O_RDWR, 0o644)
+        os.close(fd)
+
+
+def _count_attempts(sem):
+    """Wrap *sem*'s slot probe so the number of poll attempts is observable."""
+    attempts: list[float] = []
+    original = sem._try_acquire_slot
+
+    def counting():
+        attempts.append(time.monotonic())
+        return original()
+
+    sem._try_acquire_slot = counting  # instance override shadows the method
+    return attempts
+
+
+def _wait_for_attempts(attempts, minimum, timeout=10.0):
+    """Block until *attempts* has at least *minimum* entries (or time out)."""
+    deadline = time.monotonic() + timeout
+    while len(attempts) < minimum and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert len(attempts) >= minimum, (
+        f"waiter made only {len(attempts)} poll attempts, expected >= {minimum}"
+    )
+
+
+def test_waiter_acquires_slot_created_after_it_started_polling():
+    """AC1: a max_workers=2 waiter acquires a slot created after it began.
+
+    The waiter starts when only slots 0 and 1 exist (and are held). Slots 2..7
+    are then created free; the waiter must acquire one of the new slots well
+    inside its timeout, rather than probing only ``range(2)`` and waiting out
+    the entire bound.
+    """
+    name = "unit-discovery-late"
+    holders = _hold_slots(name, max_workers=2, count=2)
+    waiter = Semaphore(name, max_workers=2, timeout=10)
+    attempts = _count_attempts(waiter)
+    acquired: list[bool] = []
+
+    def _wait() -> None:
+        try:
+            waiter.acquire()
+            acquired.append(True)
+        except TimeoutError:
+            acquired.append(False)
+
+    thread = threading.Thread(target=_wait, daemon=True)
+    try:
+        thread.start()
+        # Let it poll the two held slots at least twice before capacity grows.
+        _wait_for_attempts(attempts, 2)
+        _create_free_slots(waiter, range(2, 8))
+
+        deadline = time.monotonic() + 5.0
+        while not acquired and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert acquired == [True], (
+            "waiter never probed slots created after it started"
+        )
+    finally:
+        for holder in holders:
+            holder.release()
+        thread.join(timeout=10)
+        waiter.release()
+
+
+def test_waiter_acquires_slot_created_after_many_poll_cycles():
+    """AC4: a slot created after at least three poll cycles is still observed."""
+    name = "unit-discovery-many-polls"
+    holders = _hold_slots(name, max_workers=2, count=2)
+    waiter = Semaphore(name, max_workers=2, timeout=10)
+    attempts = _count_attempts(waiter)
+    acquired: list[bool] = []
+
+    def _wait() -> None:
+        try:
+            waiter.acquire()
+            acquired.append(True)
+        except TimeoutError:
+            acquired.append(False)
+
+    thread = threading.Thread(target=_wait, daemon=True)
+    try:
+        thread.start()
+        _wait_for_attempts(attempts, 3)
+        _create_free_slots(waiter, range(2, 6))
+
+        deadline = time.monotonic() + 5.0
+        while not acquired and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert acquired == [True], (
+            "waiter stopped observing slots after many poll cycles"
+        )
+    finally:
+        for holder in holders:
+            holder.release()
+        thread.join(timeout=10)
+        waiter.release()
+
+
+def test_max_poll_interval_is_bounded():
+    """AC2: the poll cadence is 50 ms base, at most 75 ms jittered.
+
+    No backoff may grow without a documented cap; the maximum interval is
+    pinned so a future semaphore change cannot silently introduce unbounded
+    waiting.
+    """
+    from shared.process_semaphore import (
+        _RETRY_DELAY_SECONDS,
+        _jittered_retry_delay,
+    )
+
+    assert _RETRY_DELAY_SECONDS == 0.05
+    rng = random.Random(0)
+    for _ in range(500):
+        delay = _jittered_retry_delay(rng)
+        assert 0.5 * _RETRY_DELAY_SECONDS <= delay <= 1.5 * _RETRY_DELAY_SECONDS
+        assert delay <= 0.075, f"poll interval exceeds the documented cap: {delay}"
+
+
+def test_long_waiter_makes_many_poll_attempts():
+    """AC2: a bounded waiter polls many times, not once."""
+    name = "unit-poll-many"
+    holder = Semaphore(name, max_workers=1, timeout=5)
+    holder.acquire()
+    waiter = Semaphore(name, max_workers=1, timeout=1.0)
+    attempts = _count_attempts(waiter)
+    try:
+        with pytest.raises(TimeoutError):
+            waiter.acquire()
+    finally:
+        holder.release()
+    assert len(attempts) > 3, f"waiter made only {len(attempts)} poll attempts"
+
+
+def test_waiter_creates_no_slots_beyond_its_own_ceiling():
+    """AC3: a max_workers=2 waiter creates only slots 0 and 1.
+
+    Discovery may use slots another process created, but a waiter must never
+    create more slot files than its own ``max_workers`` — its ceiling is a
+    floor it guarantees, not a host-wide limit it may exceed.
+    """
+    waiter = Semaphore("unit-own-ceiling", max_workers=2, timeout=1)
+    waiter._ensure_slots()
+    created = sorted(
+        int(p.name) for p in waiter._slot_dir.iterdir() if p.name.isdigit()
+    )
+    assert created == [0, 1]
+
+
+def test_fail_fast_timeout_zero_is_one_scan_and_one_attempt(monkeypatch):
+    """AC3: ``timeout=0`` stays fail-fast — one scan plus one attempt, no sleep.
+
+    The dynamic discovery scan must not add blocking work to the first
+    attempt: ``audit_runner`` enters with ``timeout=0`` and relies on an
+    immediate succeed-or-raise.
+    """
+    sleeps: list[float] = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    sem = Semaphore("unit-failfast-once", max_workers=2, timeout=0)
+    attempts = _count_attempts(sem)
+    assert sem.acquire() is True
+    sem.release()
+
+    assert len(attempts) == 1, f"fail-fast made {len(attempts)} slot probes"
+    assert sleeps == [], f"fail-fast slept: {sleeps}"

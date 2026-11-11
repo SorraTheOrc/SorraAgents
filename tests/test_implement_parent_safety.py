@@ -72,13 +72,34 @@ def _child(
 class ParentHarness:
     """Canned wl/phase plumbing for phase_parent scenarios."""
 
-    def __init__(self, mod, children, *, blockers_map=None, phase_start_results=None):
+    def __init__(
+        self, mod, children, *, blockers_map=None, phase_start_results=None,
+        items=None,
+    ):
         self.mod = mod
         self.children = children
         self.blockers_map = blockers_map or {}
         # phase_start_results: dict child_id → result dict (default success)
         self.phase_start_results = phase_start_results or {}
+        # items: dict work-item id → item dict, for resolving declared ids by
+        # ``wl_show`` (e.g. the prose ``Blocked by`` blockers of a child).
+        # Ids that are not listed are unresolvable, exactly as a cross-project
+        # id without a matching sibling worklog is.
+        self.items = items or {}
+        self._parent_id = ""
         self.calls = {"phase_start": [], "update_status": [], "comments": [], "abort": []}
+
+    def _fake_wl_show(self, work_item_id, **_):
+        """Resolve an id: the parent, a listed item, or nothing at all.
+
+        An unlisted id is unresolvable, exactly as a cross-project id with no
+        matching sibling worklog is — that is the fail-closed path.
+        """
+        if self._parent_id and work_item_id == self._parent_id:
+            return {"id": work_item_id, "title": "P"}
+        if work_item_id in self.items:
+            return dict(self.items[work_item_id])
+        return {}
 
     def _fake_phase_start(self, child_id, **kwargs):
         self.calls["phase_start"].append(child_id)
@@ -120,8 +141,9 @@ class ParentHarness:
         raise AssertionError(f"unexpected action {action}")
 
     def run(self, parent_id: str = "SA-PARENT001") -> dict:
+        self._parent_id = parent_id
         with (
-            mock.patch.object(self.mod, "wl_show", return_value={"id": parent_id, "title": "P"}),
+            mock.patch.object(self.mod, "wl_show", side_effect=self._fake_wl_show),
             mock.patch.object(self.mod, "wl_show_children", return_value=self.children),
             mock.patch.object(self.mod, "wl_dep_blockers", side_effect=self._fake_wl_dep_blockers),
             mock.patch.object(self.mod, "phase_start", side_effect=self._fake_phase_start),

@@ -353,7 +353,7 @@ def test_failed_advance_without_sync_output_is_handled(tmp_path, monkeypatch):
     block is emitted (AC5).
     """
     monkeypatch.delenv("IMPLEMENT_TEST_COMMAND", raising=False)
-    game, engine_v1, engine_v2 = _build_composition_fixture(tmp_path)
+    game, _engine_v1, engine_v2 = _build_composition_fixture(tmp_path)
 
     with _finish_harness(
         game,

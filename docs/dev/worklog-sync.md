@@ -229,10 +229,11 @@ sweep is guaranteed to run without any herdr/ContextHub change.
 
 - **TTL default 24 h**, configurable with `WORKLOG_CLAIM_REAPER_TTL_HOURS`
   (or `reap_stale_claims(ttl_hours=…)`).
-- Only **non-producer** claims on **non-terminal** items older than the TTL
-  are released. Producer `Map` holds, `needsProducerReview` items, and
-  `completed`/`done`/`deleted` items are never touched; an item without a
-  parseable `activityAt`/`updatedAt` is never released blind.
+- Only claims on **non-terminal** items older than the TTL are released
+  (every non-empty assignee, including `Map`). The `needsProducerReview`
+  **flag** is never cleared, and `completed`/`done`/`deleted` items are never
+  touched; an item without a parseable `activityAt`/`updatedAt` is never
+  released blind.
 - Each release is a `wl update --assignee ""` plus a worklog comment naming
   the previous assignee, so an automated cleanup is auditable and recoverable.
   The sweep is idempotent — a second pass finds nothing to release.

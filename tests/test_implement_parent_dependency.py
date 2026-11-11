@@ -205,17 +205,23 @@ class TestParentDependencyOrder:
         assert report["_calls"]["update_status"] == []
         assert "cycle" in report.get("message", "").lower() or "loop" in report.get("message", "").lower()
 
-    def test_external_blocker_reported_not_started_early(self, implement_mod):
-        """Cross-project blockers are reported as coordination notes; the
-        child is still orderable among its siblings."""
+    def test_out_of_chain_blocker_holds_a_blocked_child(self, implement_mod):
+        """Superseded contract (SA-0MVUTD3IX004E03C, parent SA-0MVTUFL0U0000NV2).
+
+        An out-of-chain blocker with no resolvable status now **holds** the
+        blocked child instead of being a coordination note only: the child is
+        reported ``skip-blocked`` and the startable sibling is started. This
+        replaces the old "coordination note only, child started" behaviour
+        (SA-0MSQBM2FK005NW1T).
+        """
         children = [_child("SA-A", status="blocked"), _child("SA-B")]
         blockers_map = {"SA-A": [_blocker("OSL-EXTERNAL")]}
         report = self._run_parent(implement_mod, children, blockers_map)
         assert report["success"] is True
-        # No in-chain edge — the first implementable child is SA-A or SA-B
-        # depending on order; both are non-terminal so SA-A comes first
-        # (stable order) and is started.
-        assert report["_calls"]["phase_start"] == ["SA-A"]
+        # The blocked child is held; the startable sibling runs instead.
+        assert report["_calls"]["phase_start"] == ["SA-B"]
+        entry = {e["id"]: e for e in report.get("children_processed", [])}["SA-A"]
+        assert entry["action"] == "skip-blocked"
 
     def _run_parent(self, mod, children, blockers_map):
         """Run phase_parent with mocked wl/phase_start and a per-child

@@ -135,6 +135,25 @@ class TestThresholdExceedBlocksPush:
         assert "context-budget.thresholds.json" in invocation, invocation
 
 
+# ── AC4: the implement SKILL.md body threshold is committed ────────────────
+
+
+class TestImplementBodyThresholdCommitted:
+    def test_thresholds_file_gates_the_implement_skill_body(self):
+        """SA-0MVYDCUWA001Z8K0 AC4: the committed thresholds gate the brief."""
+        import json
+
+        thresholds = REPO_ROOT / "docs" / "dev" / "context-budget.thresholds.json"
+        data = json.loads(thresholds.read_text(encoding="utf-8"))
+        assert "skill_implement_md" in data, (
+            "context-budget.thresholds.json must gate skill_implement_md so the "
+            "implement SKILL.md body cannot silently regrow"
+        )
+        # 20,000 B originally (SA-0MVYDCUWA001Z8K0); 22,000 B after the
+        # no-op finish contract moved into the brief (SA-0MW74IL6B001AMQN).
+        assert data["skill_implement_md"] <= 22000
+
+
 # ── Bypass and fail-open behaviour ──────────────────────────────────────────
 
 

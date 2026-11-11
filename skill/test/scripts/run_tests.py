@@ -84,6 +84,22 @@ Usage:
   run_tests.py [--suite pytest|node|all] [--json] [--parent-work-item-id ID] [--rerun-failures]
   run_tests.py --summary [--summary-grep PATTERN]   (read cached summary lines, no execution)
   run_tests.py --force | --no-cache                (bypass the cache)
+  run_tests.py --scope full --fingerprint SHA      (bind the run to an explicit
+                                                     would-be-commit tree SHA)
+
+Explicit tree fingerprint (--fingerprint):
+  A ``--scope full`` run may be bound to an explicit would-be-commit tree SHA
+  (the value ``git write-tree`` reports for a staged change set): the run is
+  stored and looked up with ``fingerprint_kind="tree"``, keyed on that SHA
+  and never on the loose worktree state. The binding is **fail-closed**: a
+  value that is not a usable tree SHA, or a combination with a mode that
+  cannot bind it (``--scope changed``, ``--summary``, ``--no-cache``), is
+  rejected with exit 2 and an actionable message — never a silent fallback
+  to a loose worktree key. A tree entry never satisfies a worktree request
+  (and vice versa), and a tree request with no stored entry executes fresh
+  and records the entry under ``fingerprint_kind="tree"`` (SA-0MW7C6AYO0062GJB).
+  Callers that pass nothing keep the historical loose-worktree keys byte for
+  byte.
 
 Exit codes:
   0 - all suites passed
@@ -138,10 +154,8 @@ from test_cache import (
     DEFAULT_TTL_SECONDS,
     STATE_CHANGED_EXIT_CODE,
     STATE_CHANGED_NOTICE_CODE,
-    GitStateUnavailable,
     Runner,
     _default_runner,
-    compute_git_state,
     is_worktree_clean,
     query_cached,
     run_cached,
@@ -151,6 +165,7 @@ from test_runner import (
     canonicalize_quiet_test_command,
     executable_test_command,
     is_pytest_command,
+    is_vitest_command,
     log_repository_override_scrub,
     repository_override_vars_present,
     resolve_pytest_executable,
@@ -1969,6 +1984,154 @@ def _extract_yaml_block(block: str, key: str) -> str:
     return "\n".join(collected).strip()
 
 
+# Vitest default-reporter markers (MS-0MW3UR8SX009YZWS). Both shapes are
+# matched because a real run prints the same failing test twice: once in the
+# per-file tree and once in the ``Failed Tests`` block. ANSI colour codes are
+# stripped first, and the ASCII transliterations of the tree markers
+# (``❯``→``>``, ``×``→``x``) are accepted so a captured or Windows-rendered log
+# still parses.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+#: `` FAIL  |<project>| <file> > <suite> > <test>`` — the Failed Tests header.
+_VITEST_FAIL_HEADER_RE = re.compile(
+    r"^\s*FAIL\s+\|(?P<project>[^|\n]*)\|\s*(?P<name>\S[^\n]*?)\s*$",
+    re.MULTILINE,
+)
+#: `` ❯ |<project>| <file> (N tests | M failed) 1234ms`` — the per-file header.
+_VITEST_FILE_HEADER_RE = re.compile(
+    r"^\s*(?:❯|>)\s+\|(?P<project>[^|\n]*)\|\s*(?P<file>[^\s()]+)",
+    re.MULTILINE,
+)
+#: ``   × <suite> > <test> 29146ms`` — a failed test inside a file's tree.
+_VITEST_TREE_FAIL_RE = re.compile(
+    r"^\s*(?P<marker>[×✗x])\s+(?P<name>\S[^\n]*?)"
+    r"(?:\s+\d+(?:\.\d+)?\s*(?:ms|s))?\s*$",
+    re.MULTILINE,
+)
+#: Any line that starts a new tree/test entry (used to bound detail capture).
+_VITEST_TREE_ENTRY_RE = re.compile(r"^\s*[×✗x✓↓❯>]\s")
+#: Lines that end a failure block or a tree section: the heavy rule Vitest
+#: prints between blocks, the run summary, and the retry-runner trailer.
+_VITEST_BLOCK_END_RE = re.compile(
+    r"^\s*(?:⎯{3,}|─{3,}|Test Files\s|Tests\s|Start at\s|Duration\s|\[vitest-runner\])"
+)
+
+
+def parse_vitest_failures(output: str) -> list[dict[str, str]]:
+    """Parse Vitest's default-reporter output into structured failure records.
+
+    Vitest names a failing test after its file and suite — ``FAIL  |<project>|
+    <file> > <suite> > <test>`` in the ``Failed Tests`` block and ``× <suite> >
+    <test>`` under the ``❯ |<project>| <file>`` tree header. Before
+    MS-0MW3UR8SX009YZWS the runner understood only TAP, so every Vitest
+    failure produced ``failures: []`` and was classified ``unparsed_failure``
+    (gate ``reason: unparsed``): the operator was told the *command or
+    configuration* was broken when the *code* was at fault, and triage fell
+    back to a ``<suite exited N>`` placeholder instead of the test name.
+
+    The ``Failed Tests`` block is parsed first (it carries the error, code
+    frame and stack), then the per-file tree; a test reported in both places
+    yields **one** record. Summary lines (``Test Files …``/``Tests …``) never
+    produce a record, and output without these markers yields none — an
+    infrastructure failure (``ENOSPC`` in the browser provider) therefore keeps
+    its ``unparsed_failure`` classification.
+
+    Args:
+        output: The command's combined stdout/stderr.
+
+    Returns:
+        One record per failing test with ``test_name`` (file, suite and test),
+        ``stdout_excerpt`` (≤1000 chars) and ``stack_trace`` — the shape triage
+        ``check_or_create.py`` and the audit consume.
+    """
+    text = _ANSI_ESCAPE_RE.sub("", output)
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(name: str, detail: str) -> None:
+        clean_name = " ".join(name.split())
+        key = clean_name.lower()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        body = detail.strip()
+        records.append(
+            {
+                "test_name": clean_name,
+                "stdout_excerpt": (body or clean_name)[:1000],
+                "stack_trace": body or clean_name,
+            }
+        )
+
+    # 1) Failed Tests blocks — the richest attribution (error + stack).
+    headers = list(_VITEST_FAIL_HEADER_RE.finditer(text))
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        add(header.group("name"), _vitest_block_body(text[header.end() : end]))
+
+    # 2) Per-file tree markers — the only attribution when a log is truncated
+    #    before the Failed Tests block.
+    lines = text.splitlines()
+    current_file = ""
+    for index, line in enumerate(lines):
+        file_match = _VITEST_FILE_HEADER_RE.match(line)
+        if file_match:
+            current_file = file_match.group("file")
+            continue
+        fail_match = _VITEST_TREE_FAIL_RE.match(line)
+        if not fail_match or not current_file:
+            continue
+        detail = _vitest_tree_detail(lines, index + 1)
+        add(f"{current_file} > {fail_match.group('name')}", detail)
+
+    return records
+
+
+def _vitest_block_body(block: str) -> str:
+    """Return the error/code-frame/stack lines that follow a FAIL header."""
+    body: list[str] = []
+    for line in block.splitlines():
+        if _VITEST_BLOCK_END_RE.match(line):
+            break
+        body.append(line)
+    return "\n".join(body).strip()
+
+
+def _vitest_tree_detail(lines: list[str], start: int) -> str:
+    """Return the ``→ <message>`` line(s) printed under a tree failure marker."""
+    detail: list[str] = []
+    for line in lines[start:]:
+        if not line.strip():
+            if detail:
+                break
+            continue
+        if _VITEST_BLOCK_END_RE.match(line) or _VITEST_TREE_ENTRY_RE.match(line):
+            break
+        detail.append(line.strip())
+    return "\n".join(detail).strip()
+
+
+def parse_failures(command: str, output: str) -> list[dict[str, str]]:
+    """Parse *output* with the failure parser matching *command*'s reporter.
+
+    Routing is shared by every consumer (``run_suite`` and the audit's suite
+    loop) so the two can never drift apart:
+
+    * ``pytest`` commands → :func:`parse_pytest_failures` (unchanged);
+    * Vitest commands → :func:`parse_vitest_failures`;
+    * anything else → :func:`parse_node_failures` (TAP, unchanged), falling
+      back to the Vitest parser when TAP yields nothing. The fallback covers
+      wrapper commands (``npm --silent test``) whose output shape cannot be
+      inferred from the command line; the Vitest markers are specific enough
+      that non-Vitest output still yields no records.
+    """
+    if "pytest" in command:
+        return parse_pytest_failures(output)
+    if is_vitest_command(command):
+        return parse_vitest_failures(output)
+    records = parse_node_failures(output)
+    return records or parse_vitest_failures(output)
+
+
 # ---------------------------------------------------------------------------
 # Suite execution
 # ---------------------------------------------------------------------------
@@ -2446,14 +2609,18 @@ def _cache_entry_metadata(
     """Reportable metadata of the cache entry a verdict was served from.
 
     ``run`` is a ``run_cached`` result (a cache hit). The returned mapping
-    carries the entry's ``command``, ``completed_at`` (epoch float), ``scope``
-    and ``fingerprint_kind`` so a consumer — the finish gate's report, a
-    completion comment, an auditor — can state *what* was reused rather than
-    only that something was (SA-0MVQHVJEX0071R7G).
+    carries the entry's ``command``, ``completed_at`` (epoch float),
+    ``cache_age_seconds`` (its age at reporting time), ``git_state`` (the
+    fingerprint it is keyed on), ``scope`` and ``fingerprint_kind`` so a
+    consumer — the finish gate's report, a completion comment, an auditor —
+    can state *what* was reused rather than only that something was
+    (SA-0MVQHVJEX0071R7G, SA-0MW7C6BMZ00931JG).
     """
     return {
         "command": run.get("command") or command,
         "completed_at": run.get("completed_at", 0),
+        "cache_age_seconds": run.get("cache_age_seconds"),
+        "git_state": run.get("git_state", ""),
         "scope": run.get("scope", "full"),
         "fingerprint_kind": run.get("fingerprint_kind", ""),
     }
@@ -2519,6 +2686,17 @@ def run_suite(
     resolution (``commands`` is set to the group's commands). The group name
     is recorded in ``type`` as ``"group:<name>"`` so cache keys remain distinct
     (SA-0MUJKF2HP001BR51).
+
+    *fingerprint* (default ``None``) is an explicit expected fingerprint —
+    normally a would-be-commit tree SHA from :func:`compute_tree_state` —
+    forwarded unchanged to :func:`run_cached`. When supplied it keys the
+    lookup and the stored entry (``fingerprint_kind="tree"``) instead of the
+    loose worktree state; a stored entry of a different kind or value is a
+    miss, so a tree request with no matching entry executes fresh. Callers
+    that pass nothing keep the historical loose-worktree keys byte for byte.
+    The CLI's ``--fingerprint`` is the fail-closed surface for this parameter
+    (an unusable value or a mode that cannot bind it is rejected with exit 2,
+    never degraded to a worktree key — SA-0MW7C6AYO0062GJB).
 
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
     ``cached``, ``scope``, ``type``; on a failure WITHOUT structured failures a
@@ -2793,10 +2971,7 @@ def run_suite(
             # commands would run against the same unstable checkout and
             # contribute nothing usable.
             break
-        if "pytest" in cmd:
-            failures = parse_pytest_failures(output)
-        else:
-            failures = parse_node_failures(output)
+        failures = parse_failures(cmd, output)
         all_failures.extend(failures)
         if proc.returncode != 0:
             overall_returncode = proc.returncode
@@ -3188,14 +3363,22 @@ def resolve_gate_subject(
     fresh checkout has no installed dependencies, so suite commands could fail
     for reasons unrelated to the pushed tree.
 
+    The pushed commit's **tree** SHA (``git rev-parse <commit>^{tree}``) is
+    derived as part of the evidence (SA-0MW7C6BMZ00931JG). It is the explicit
+    fingerprint the gate binds its verdict to, so the entry lands in the
+    ``fingerprint_kind="tree"`` namespace shared with the finish gate and is
+    reusable by any tree-keyed consumer. A tree that cannot be computed is a
+    refusal, never a fallback to the loose worktree key.
+
     Returns:
         ``(root, evidence)`` where *root* is the checkout to run/cache against
-        and *evidence* carries ``pushed`` (full sha), ``root`` and ``checkout``
-        (``"in-place"`` or ``"worktree"``).
+        and *evidence* carries ``pushed`` (full sha), ``tree`` (the pushed
+        commit's tree sha), ``root`` and ``checkout`` (``"in-place"`` or
+        ``"worktree"``).
 
     Raises:
-        GateSubjectError: when the commit is not present locally, or no clean
-            checkout holds it.
+        GateSubjectError: when the commit is not present locally, its tree
+            cannot be computed, or no clean checkout holds it.
     """
     root = Path(project_root).resolve()
     commit = (gate_commit or "").strip()
@@ -3219,11 +3402,29 @@ def resolve_gate_subject(
             f"holds it). {escape}"
         )
 
+    # The pushed commit's tree is the fingerprint the verdict is bound to
+    # (SA-0MW7C6BMZ00931JG). It must be computable: an unavailable tree means
+    # the gate cannot prove which tree it measured, so it refuses rather than
+    # falling back to a loose worktree key (the cache's provenance contract).
+    tree = (_git_output(root, "rev-parse", f"{full}^{{tree}}") or "").strip()
+    if not tree:
+        raise GateSubjectError(
+            f"pushed commit {full[:12]} is present in {root} but its tree SHA "
+            f"cannot be computed (`git rev-parse {full[:12]}^{{tree}}` failed), so "
+            "the gate cannot bind its verdict to the pushed tree. "
+            f"{escape}"
+        )
+
     rejected: list[str] = []
     head = (_git_output(root, "rev-parse", "HEAD") or "").strip()
     if head == full:
         if is_worktree_clean(root):
-            return root, {"pushed": full, "root": str(root), "checkout": "in-place"}
+            return root, {
+                "pushed": full,
+                "tree": tree,
+                "root": str(root),
+                "checkout": "in-place",
+            }
         rejected.append(f"{root} (HEAD matches, but the checkout has uncommitted changes)")
     else:
         rejected.append(f"{root} (HEAD is {head[:12] or 'unknown'})")
@@ -3238,6 +3439,7 @@ def resolve_gate_subject(
         if is_worktree_clean(candidate):
             return candidate.resolve(), {
                 "pushed": full,
+                "tree": tree,
                 "root": str(candidate.resolve()),
                 "checkout": "worktree",
             }
@@ -3258,33 +3460,166 @@ def _emit_gate_subject(evidence: dict[str, Any]) -> None:
 
     The root goes on its own line so a path containing spaces survives the
     hook's parse (`.githooks/pre-push` takes the rest of the line verbatim).
+
+    The gate is tree-keyed (SA-0MW7C6BMZ00931JG): it reports the pushed
+    commit's ``tree`` and ``fingerprint_kind=tree`` so the pusher can see the
+    verdict belongs to the pushed tree, not the loose checkout it resolved.
     """
     print(
         f"{GATE_SUBJECT_PREFIX}pushed={evidence['pushed']} "
-        f"checkout={evidence['checkout']} fingerprint_kind=worktree",
+        f"checkout={evidence['checkout']} fingerprint_kind=tree "
+        f"tree={evidence['tree']}",
         file=sys.stderr,
     )
     print(f"{GATE_ROOT_PREFIX}{evidence['root']}", file=sys.stderr)
 
 
-def _emit_gate_verdict(evidence: dict[str, Any], result: dict[str, Any]) -> None:
-    """Print executed-vs-cached plus the cache state the verdict belongs to."""
-    try:
-        state = compute_git_state(evidence["root"], strict=True)
-    except GitStateUnavailable:
-        state = "unavailable"
+def _gate_verdict_facts(
+    evidence: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
+    """The gate's verdict provenance as structured facts.
+
+    Shared by the ``run_tests: gate-verdict`` stderr line and the gate's JSON
+    ``gate`` object, so both report the same ``cache_hit``,
+    ``cache_age_seconds``, ``fingerprint_kind`` and ``tree``
+    (SA-0MW7C6BMZ00931JG AC3). ``cache_age_seconds`` is ``None`` on a miss
+    (nothing was reused) and the age of the **oldest** reused entry on a hit —
+    the weakest evidence in the aggregate.
+    """
     entries = result.get("cache_entries") or []
     kinds = sorted({entry.get("fingerprint_kind") or "" for entry in entries} - {""})
+    cache_hit = bool(result.get("cached"))
+    ages = [
+        float(entry["cache_age_seconds"])
+        for entry in entries
+        if isinstance(entry.get("cache_age_seconds"), (int, float))
+    ]
+    return {
+        "verdict": "cached" if cache_hit else "executed",
+        "cache_hit": cache_hit,
+        "cache_age_seconds": max(ages) if ages else None,
+        "fingerprint_kind": ",".join(kinds) or "tree",
+        "entries": len(entries),
+        "pushed": evidence["pushed"],
+        "tree": evidence["tree"],
+    }
+
+
+def _emit_gate_verdict(evidence: dict[str, Any], result: dict[str, Any]) -> None:
+    """Print executed-vs-cached plus the cache state the verdict belongs to.
+
+    Reports, in the ``run_tests: gate-verdict`` provenance line the hook
+    echoes, whether the verdict was served from the cache (``cache_hit``), the
+    age in seconds of the reused entry (``cache_age_seconds`` — ``n/a`` on a
+    miss) and that the verdict is bound to the pushed tree
+    (``fingerprint_kind=tree``, ``tree=<sha>``). This makes a reused verdict
+    visible and attributable to the pusher (SA-0MW7C6BMZ00931JG AC3).
+    """
+    facts = _gate_verdict_facts(evidence, result)
+    age = (
+        "n/a"
+        if facts["cache_age_seconds"] is None
+        else f"{facts['cache_age_seconds']:.1f}"
+    )
     print(
-        f"{GATE_VERDICT_PREFIX}verdict={'cached' if result.get('cached') else 'executed'} "
-        f"sha={evidence['pushed']} git_state={state} "
-        f"fingerprint_kind={','.join(kinds) or 'worktree'} "
-        f"entries={len(entries)} cached={len(entries)}",
+        f"{GATE_VERDICT_PREFIX}verdict={facts['verdict']} "
+        f"sha={evidence['pushed']} tree={evidence['tree']} "
+        f"fingerprint_kind={facts['fingerprint_kind']} "
+        f"cache_hit={'true' if facts['cache_hit'] else 'false'} "
+        f"cache_age_seconds={age} entries={facts['entries']}",
         file=sys.stderr,
     )
 
 
+#: A full hexadecimal object name as ``git write-tree`` emits: 40 characters
+#: for SHA-1 repositories, 64 for SHA-256. Anything else cannot name a tree,
+#: so an explicit ``--fingerprint`` value is rejected rather than silently
+#: keying the cache on an arbitrary string (SA-0MW7C6AYO0062GJB AC2).
+TREE_FINGERPRINT_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+
+
+class FingerprintRejected(ValueError):
+    """An explicit ``--fingerprint`` value cannot bind a tree-keyed run.
+
+    Raised by :func:`resolve_explicit_fingerprint` for a value that is not a
+    usable tree SHA in the project root; the CLI turns it into exit 2 with
+    the actionable message. Fail-closed by design (SA-0MW7C6AYO0062GJB
+    AC2): a rejected value stops the run instead of being dropped, because a
+    silent drop would fall back to a loose worktree key and hand a
+    tree-requesting consumer a verdict recorded for a different state.
+    """
+
+
+def resolve_explicit_fingerprint(value: str, project_root: Path) -> str:
+    """Validate and normalise an explicit ``--fingerprint`` tree SHA.
+
+    Returns the value lower-cased. Raises :class:`FingerprintRejected` with an
+    actionable message when *value* cannot name a tree in *project_root*:
+
+    * not a full 40-character (SHA-1) or 64-character (SHA-256) hexadecimal
+      object name — the shape ``git write-tree`` emits;
+    * an object the repository does not hold;
+    * an object that is a commit, blob or tag rather than a tree.
+
+    Fail-closed (AC2): a rejected value stops the run (exit 2 at the CLI)
+    instead of degrading to the loose :func:`compute_git_state` key, which
+    would record a tree-requesting caller's verdict against the wrong state.
+    Repository-override variables are scrubbed like every other git call in
+    the runner (SA-0MUIA3OE40001QJX) so a leaked ``GIT_DIR`` cannot have the
+    object resolved in a different repository.
+    """
+    candidate = value.strip()
+    if not TREE_FINGERPRINT_RE.fullmatch(candidate):
+        raise FingerprintRejected(
+            f"value {value!r} is not a usable tree SHA: a full 40-character "
+            "(SHA-1) or 64-character (SHA-256) hexadecimal object name is "
+            "required — the value `git write-tree` reports for the staged "
+            "change set. Supply that tree SHA, or omit --fingerprint to use "
+            "the loose worktree key."
+        )
+    env = subprocess_env_with_scrubbed_overrides()
+    try:
+        proc = subprocess.run(
+            ["git", "cat-file", "-t", candidate],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FingerprintRejected(
+            f"cannot verify tree SHA {candidate} in {project_root}: {exc}. "
+            "Supply a tree SHA from this repository, or omit --fingerprint "
+            "to use the loose worktree key."
+        ) from exc
+    obj_type = proc.stdout.strip()
+    if proc.returncode != 0 or not obj_type:
+        raise FingerprintRejected(
+            f"{project_root} does not hold an object named {candidate} "
+            "(`git cat-file -t` failed). Supply a tree SHA from this "
+            "repository, or omit --fingerprint to use the loose worktree key."
+        )
+    if obj_type != "tree":
+        raise FingerprintRejected(
+            f"{candidate} names a {obj_type}, not a tree — the explicit "
+            "fingerprint must be the tree a commit would produce "
+            "(`git write-tree`), not a commit/blob/tag SHA. Supply that tree "
+            "SHA, or omit --fingerprint to use the loose worktree key."
+        )
+    return candidate.lower()
+
+
 def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser.
+
+    ``--fingerprint`` is validated in :func:`main` by
+    :func:`resolve_explicit_fingerprint` and rejected (exit 2) when it cannot
+    bind a ``--scope full`` run to an explicit would-be-commit tree SHA —
+    fail-closed, never a silent fallback to a loose worktree key
+    (SA-0MW7C6AYO0062GJB).
+    """
     parser = argparse.ArgumentParser(
         description="Run the full project test suite in quiet mode and report failures."
     )
@@ -3397,8 +3732,27 @@ def build_parser() -> argparse.ArgumentParser:
         "being pushed. The gate resolves a checkout whose HEAD is SHA with no "
         "dirty paths (in place, else a clean `git worktree list` checkout) and "
         "runs/caches the suite there, so a cache entry computed from any other "
-        "state can never satisfy it. Refuses (exit 2) when no clean checkout "
-        "holds SHA. Omitted: historical behaviour, unchanged.",
+        "state can never satisfy it. The verdict is bound to the pushed "
+        "commit's tree SHA (`git rev-parse SHA^{tree}`) and stored/looked up "
+        "with fingerprint_kind=\"tree\" (SA-0MW7C6BMZ00931JG), so a tree-keyed "
+        "verdict from another consumer (e.g. the finish gate) is reused for the "
+        "same tree. Refuses (exit 2) when no clean checkout holds SHA or its "
+        "tree cannot be computed. Omitted: historical behaviour, unchanged.",
+    )
+    parser.add_argument(
+        "--fingerprint",
+        default=None,
+        metavar="SHA",
+        help="Bind a --scope full run to an explicit would-be-commit tree SHA "
+        "(the value `git write-tree` reports for a staged change set): the "
+        "run is stored and looked up with fingerprint_kind=\"tree\", keyed on "
+        "that SHA and never on the loose worktree state. Fail-closed: a value "
+        "that is not a usable tree SHA, or a combination that cannot bind it "
+        "(--scope changed, --summary, --no-cache), is rejected with exit 2 "
+        "and an actionable message — never a silent fallback to a loose "
+        "worktree key. A tree entry never satisfies a worktree request (and "
+        "vice versa); a tree request with no stored entry executes fresh. "
+        "Omitted: historical loose-worktree keys, byte for byte.",
     )
     return parser
 
@@ -3727,6 +4081,67 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         _emit_gate_subject(gate_evidence)
 
+    # --fingerprint: bind a --scope full run to an explicit would-be-commit
+    # tree SHA (SA-0MW7C6AYO0062GJB). Fail-closed (AC2): an unusable value, or
+    # a mode that cannot bind a tree-keyed cache entry, is rejected with exit 2
+    # and an actionable message — never silently dropped, because dropping it
+    # would fall back to the loose worktree key and misattribute the verdict.
+    fingerprint: str | None = None
+    if args.fingerprint is not None:
+        if args.scope != "full":
+            print(
+                "run_tests: --fingerprint binds a --scope full run to an "
+                f"explicit tree SHA and cannot bind --scope {args.scope}: a "
+                "partial run is not full-suite evidence for that tree. Drop "
+                "--scope or omit --fingerprint.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.summary:
+            print(
+                "run_tests: --fingerprint stores and queries a cache entry and "
+                "cannot be combined with --summary, which reads only loose "
+                "worktree entries (tree-bound entries are deliberately "
+                "invisible to it). Omit --fingerprint for a summary, or run "
+                "the suite to produce the tree-keyed verdict.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.no_cache:
+            print(
+                "run_tests: --fingerprint binds a stored cache entry and "
+                "cannot be combined with --no-cache, which neither looks up "
+                "nor stores one. Omit --fingerprint or drop --no-cache.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            fingerprint = resolve_explicit_fingerprint(
+                args.fingerprint, project_root
+            )
+        except FingerprintRejected as exc:
+            print(f"run_tests: --fingerprint: {exc}", file=sys.stderr)
+            return 2
+
+    # A gate run is tree-keyed (SA-0MW7C6BMZ00931JG): the pushed commit's tree
+    # SHA is the explicit fingerprint, so the verdict is stored and looked up
+    # in the same ``fingerprint_kind="tree"`` namespace as the finish gate's
+    # tree verdicts — a verdict recorded for the same tree by either consumer
+    # serves the other. The derived tree is authoritative; a conflicting
+    # explicit --fingerprint is refused rather than silently overridden.
+    if gate_evidence is not None:
+        gate_tree = str(gate_evidence["tree"])
+        if fingerprint is not None and fingerprint != gate_tree:
+            print(
+                f"run_tests: --gate-commit binds the run to pushed tree "
+                f"{gate_tree}, but --fingerprint names {fingerprint}. They must "
+                "match; omit --fingerprint (the pushed commit's tree is the "
+                "gate's fingerprint).",
+                file=sys.stderr,
+            )
+            return 2
+        fingerprint = gate_tree
+
     # --group: validate group name and route to group-based execution
     group_name = args.group
     if group_name is not None:
@@ -3857,10 +4272,16 @@ def main(argv: list[str] | None = None) -> int:
             commands=override_commands,
             test_type=test_type,
             group=group_name,
+            fingerprint=fingerprint,
         )
 
         if gate_evidence is not None:
             _emit_gate_verdict(gate_evidence, result)
+            # The same provenance is carried in the JSON report under
+            # ``gate`` so a served verdict (hit/miss plus the reused entry's
+            # age) is machine-readable, not only echoed on stderr
+            # (SA-0MW7C6BMZ00931JG AC3).
+            result["gate"] = _gate_verdict_facts(gate_evidence, result)
 
         if args.rerun_failures and result["failures"]:
             with Timer("rerun_failures"):

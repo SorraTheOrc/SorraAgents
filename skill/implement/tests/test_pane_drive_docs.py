@@ -138,7 +138,7 @@ def test_headless_fallback_is_documented_for_automated_callers(doc: Path) -> Non
         )
 
 
-@pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.name)
+@pytest.mark.parametrize("doc", [DRIVE_DOC], ids=lambda p: p.name)
 def test_blocked_pane_guidance_names_the_inspection_remedy(doc: Path) -> None:
     """A blocked child's pane is left open and the docs say how to read it."""
     text = _read(doc)
@@ -154,7 +154,7 @@ def test_blocked_pane_guidance_names_the_inspection_remedy(doc: Path) -> None:
     assert implement._pane_inspect_remedy("w1:p1") == "herdr pane read w1:p1"
 
 
-@pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.name)
+@pytest.mark.parametrize("doc", [DRIVE_DOC], ids=lambda p: p.name)
 def test_core_report_keys_are_documented(doc: Path) -> None:
     """The report vocabulary an agent needs mid-drive is documented."""
     text = _read(doc)
@@ -182,7 +182,7 @@ def test_documented_report_keys_are_emitted_by_the_source(key: str) -> None:
     )
 
 
-@pytest.mark.parametrize("doc", DOCS, ids=lambda p: p.name)
+@pytest.mark.parametrize("doc", [DRIVE_DOC], ids=lambda p: p.name)
 def test_worked_example_is_present(doc: Path) -> None:
     """The worked example (AC3) covers driving, inspection and resuming."""
     text = _read(doc)

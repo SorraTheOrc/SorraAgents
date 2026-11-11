@@ -348,26 +348,26 @@ class TestRecoveryContractDocumentation:
     manual, and the reinstall step with the never-edit rule)."""
 
     def test_skill_md_drive_recovery_section_covers_the_classifier(self) -> None:
-        skill = _read(_SKILL_MD)
+        skill = _read(_REFERENCE_MD)
         section_start = skill.find("**A failing `finish` is bounded")
-        assert section_start != -1, "SKILL.md must carry the drive-recovery section"
+        assert section_start != -1, "reference doc must carry the drive-recovery section"
         section = skill[section_start : section_start + 6000]
         # The three classifier kinds an operator can be told about.
         for kind in implement_mod.FINISH_FAILURE_KINDS:
             assert f"`{kind}`" in section, (
-                f"SKILL.md drive-recovery section must document the "
+                f"reference drive-recovery section must document the "
                 f"{kind!r} classifier kind"
             )
         # ``unknown`` fails safe — never retried as infrastructure.
         assert re.search(r"unknown[\s\S]{0,120}never[\s\S]{0,40}infrastructure", section), (
-            "SKILL.md must state that an unknown pair is never treated as an "
-            "infrastructure refusal (fails safe)"
+            "the reference must state that an unknown pair is never treated as "
+            "an infrastructure refusal (fails safe)"
         )
 
     def test_skill_md_documents_the_infra_retry_flag_and_backoff(self) -> None:
-        skill = _read(_SKILL_MD)
+        skill = _read(_REFERENCE_MD)
         assert "`--infra-retry-limit" in skill, (
-            "SKILL.md drive options must document `--infra-retry-limit`"
+            "the reference must document `--infra-retry-limit`"
         )
         # The full document (not just the options paragraph) carries the
         # default and the backoff schedule, so a rewrap or reflow cannot
@@ -376,21 +376,21 @@ class TestRecoveryContractDocumentation:
             "default `5`" in skill
             and "2 s doubling to a 30 s cap" in skill
         ), (
-            "SKILL.md must document the default infra-retry limit of 5 and "
-            "the 2s-doubling-to-30s backoff schedule"
+            "the reference must document the default infra-retry limit of 5 "
+            "and the 2s-doubling-to-30s backoff schedule"
         )
         assert "exponential backoff" in skill or "backoff" in skill
 
     def test_skill_md_documents_wip_preservation_and_report_fields(self) -> None:
-        skill = _read(_SKILL_MD)
+        skill = _read(_REFERENCE_MD)
         section = skill[skill.find("**A failing `finish` is bounded") : skill.find("**A failing `finish` is bounded") + 6000]
         assert "`refs/wip/<id>`" in section, (
-            "SKILL.md drive-recovery section must document the refs/wip/<id> "
-            "preservation ref"
+            "the reference drive-recovery section must document the "
+            "refs/wip/<id> preservation ref"
         )
         for field in ("finish_failure", "infra_retries", "infra_retry_limit", "preserved_refs"):
             assert f"`{field}`" in skill, (
-                f"SKILL.md must mention the {field!r} report field"
+                f"the reference must mention the {field!r} report field"
             )
 
     def test_skill_md_reference_anchor_still_resolves(self) -> None:

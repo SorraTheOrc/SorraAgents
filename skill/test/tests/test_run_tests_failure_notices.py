@@ -47,12 +47,12 @@ _CMD = "pytest -q -r a --disable-warnings"
 _NOISE = "\n".join(f"stderr-line-{i}" for i in range(2000))
 
 
-def _repo(tmp_path: Path) -> Path:
+def _repo(tmp_path: Path, command: str = _CMD) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".pi").mkdir()
     (repo / ".pi" / "test-config.json").write_text(
-        f'{{"suiteCommands": ["{_CMD}"]}}', encoding="utf-8"
+        json.dumps({"suiteCommands": [command]}), encoding="utf-8"
     )
     return repo
 
@@ -405,6 +405,50 @@ def test_structured_failures_are_never_classified_as_infrastructure(
     assert result["notice_code"] == ""
     assert result["failures"], "the parsable failure must be reported"
     assert result["returncode"] != 0
+
+
+def _run_suite_with_fixture(tmp_path: Path, command: str, proc) -> dict:
+    """Run *command*'s suite against a fixture process (slot stubbed)."""
+    with mock.patch.object(run_tests, "_run_cmd", side_effect=_slow_then(proc)), \
+         mock.patch.object(
+             run_tests, "_test_concurrency_slot", lambda: fx.slot_acquisition(wait=0)
+         ):
+        return run_suite("all", cwd=_repo(tmp_path, command=command), use_cache=False)
+
+
+def test_vitest_browser_failure_is_a_code_failure_not_a_notice(tmp_path) -> None:
+    """A real Vitest browser failure carries records and no notice code.
+
+    Regression pin (MS-0MW3UR8SX009YZWS): the runner parsed only TAP, so the
+    captured browser-mode failure produced ``failures: []`` and
+    ``notice_code: unparsed_failure`` — the operator was told the command or
+    configuration was wrong when the *code* was at fault.
+    """
+    result = _run_suite_with_fixture(
+        tmp_path, fx.VITEST_BROWSER_FAILURE_COMMAND, fx.vitest_browser_failure()
+    )
+
+    assert len(result["failures"]) == 2, (
+        "the failing file, suite and test must be named"
+    )
+    assert result["notice_code"] == ""
+    assert "no parsable failures" not in result["notice"]
+    assert result["success"] is False
+
+
+def test_vitest_command_does_not_mask_infrastructure_failure(tmp_path) -> None:
+    """Control: the same command with ENOSPC output stays ``unparsed``.
+
+    The Vitest parser must never turn a genuine infrastructure failure into a
+    ``test_failure``: without failure markers it produces no records, so the
+    ENOSPC classification is unchanged.
+    """
+    result = _run_suite_with_fixture(
+        tmp_path, fx.VITEST_BROWSER_FAILURE_COMMAND, fx.enospc_in_playwright()
+    )
+
+    assert result["failures"] == []
+    assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
 
 
 def test_published_notice_codes_match_the_runner_constants() -> None:

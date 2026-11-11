@@ -8,7 +8,12 @@ component of a pi session:
 - ``project_agents`` — project ``AGENTS.md`` at the repo root
 - ``skills_prose``   — sum of the frontmatter ``description`` prose across
   ``skill/*/SKILL.md`` files (the skills-discovery section of the prompt)
-- ``total``          — sum of the above
+- ``skill_implement_md`` — ``skill/implement/SKILL.md`` body size: the
+  operational brief inlined verbatim into every implement invocation. A
+  **separate** regression gate (SA-0MVYDCUWA001Z8K0, AC4), not part of the
+  startup ``total``.
+- ``total``          — sum of the startup components above (not
+  ``skill_implement_md``)
 
 Exits with a machine-readable summary (JSON or key=value). When thresholds are
 provided, exits non-zero when any measured byte count exceeds its threshold
@@ -45,6 +50,10 @@ CHARS_PER_TOKEN = 4
 GLOBAL_AGENTS_FILENAME = "AGENTS_GLOBAL.md"
 PROJECT_AGENTS_FILENAME = "AGENTS.md"
 SKILL_MD_GLOB = "skill/*/SKILL.md"
+#: The implement skill's operational brief, inlined on every invocation. It is
+#: measured separately from the startup ``total`` so its own byte threshold can
+#: gate silent regrowth (SA-0MVYDCUWA001Z8K0, AC4).
+IMPLEMENT_SKILL_MD = "skill/implement/SKILL.md"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -224,6 +233,7 @@ def measure(repo_root: Path, include_hidden: bool = False) -> dict:
     project_chars = file_bytes(repo_root / PROJECT_AGENTS_FILENAME)
     prose = skill_description_prose(repo_root, include_hidden=include_hidden)
     prose_chars = sum(len(desc) for desc in prose.values())
+    implement_md_chars = file_bytes(repo_root / IMPLEMENT_SKILL_MD)
 
     components: dict[str, dict] = {
         "global_agents": _component(global_chars),
@@ -233,7 +243,9 @@ def measure(repo_root: Path, include_hidden: bool = False) -> dict:
             "skill_count": len(prose),
             "hidden_skill_count": len(hidden_skill_names(repo_root)),
         },
+        "skill_implement_md": _component(implement_md_chars),
     }
+    # ``skill_implement_md`` is a separate gate, not part of the startup total.
     total_chars = global_chars + project_chars + prose_chars
     components["total"] = _component(total_chars)
     return components
@@ -302,8 +314,8 @@ def thresholds_from_components(components: dict) -> dict[str, int]:
     """Build a thresholds dict from a measurement's per-component byte counts.
 
     Mirrors the committed thresholds-file format used by the regression gate:
-    ``{component: max_bytes, ...}`` for the four components global_agents,
-    project_agents, skills_prose, total.
+    ``{component: max_bytes, ...}`` for global_agents, project_agents,
+    skills_prose, skill_implement_md and total.
     """
     return {
         name: comp["bytes"]

@@ -559,6 +559,14 @@ def test_phase_parent_releases_a_child_claim_after_a_finish_timeout() -> None:
         mock.patch.object(implement, "_probe_child_lock", return_value=None),
         mock.patch.object(implement, "_discover_worktree", return_value="/tmp/wt"),
         mock.patch.object(implement, "_has_worktree_changes", return_value=True),
+        # The work-state classifier inspects a real worktree on disk; the
+        # simulated child carries attributable work
+        # (SA-0MW74IKJE008JXDQ).
+        mock.patch.object(
+            implement,
+            "_classify_child_worktree",
+            return_value=implement.CHILD_WORK,
+        ),
         mock.patch.object(implement, "_invoke_implement", return_value=None),
         mock.patch.object(
             implement.StatusLifecycle,

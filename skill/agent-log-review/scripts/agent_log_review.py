@@ -1515,11 +1515,12 @@ def file_recommendations(
             continue
 
         create_cmd = _wl_command(
-            # Intentional producer hold on creation: these recommendation items
-            # are created directly on the producer's ``Map`` assignee, so they
-            # are never an agent claim and no terminal path ever releases them
-            # (assignee-hold convention; pinned by
-            # tests/test_assignee_release_all_skills.py).
+            # Creation-time producer-identity assignment: these recommendation
+            # items are created directly on the producer's ``Map`` assignee.
+            # ``Map`` is not a persistent hold (SA-0MW7QTAHW0030FGV), so the
+            # reaper may later release this claim; persistence, when required,
+            # belongs to ``needsProducerReview``. Pinned as a creation-time
+            # assignment by tests/test_assignee_release_all_skills.py.
             ["create", "--title", title, "--description", description,
              "--parent", parent_id, "--issue-type", issue_type,
              "--priority", priority, "--assignee", assignee, "--json"],

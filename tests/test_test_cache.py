@@ -7,6 +7,7 @@ pipeline normalization sharing, and read-only query mode.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -21,6 +22,8 @@ from shared.git_sandbox import fixture_git_env
 from test_cache import (
     DEFAULT_TTL_SECONDS,
     FAILED_RUN_TTL_SECONDS,
+    FINGERPRINT_KIND_TREE,
+    FINGERPRINT_KIND_WORKTREE,
     _default_runner,
     cache_dir,
     cache_key,
@@ -1035,6 +1038,44 @@ def test_default_request_keeps_loose_worktree_fingerprint_semantics(
     assert len(calls) == 1, "a legacy entry must still be served by default"
 
 
+def test_unfingerprinted_caller_keeps_the_byte_identical_worktree_key(
+    git_repo: Path,
+) -> None:
+    """AC4: unfingerprinted callers' cache keys are byte for byte unchanged.
+
+    Asserted explicitly, not merely implied: the historical key is the
+    SHA-256 prefix (32 hex chars) of ``normalized-command NUL git-state``,
+    and an unfingerprinted ``run_cached`` must deposit its entry exactly
+    there — the tree namespace at the *same string* is a different entry, and
+    a tree request at it still misses (SA-0MW7C6AYO0062GJB AC4).
+    """
+    calls: list[str] = []
+    runner = make_runner(calls)
+    loose_state = compute_git_state(str(git_repo))
+    normalized = normalize_test_command("pytest")
+    expected_key = hashlib.sha256(
+        f"{normalized}\x00{loose_state}".encode()
+    ).hexdigest()[:32]
+
+    result = run_cached("pytest", cwd=str(git_repo), runner=runner)
+
+    assert result["git_state"] == loose_state
+    assert result["fingerprint_kind"] == FINGERPRINT_KIND_WORKTREE
+    expected_dir = cache_dir(git_repo) / expected_key
+    assert expected_dir.is_dir(), (
+        "the unfingerprinted run must deposit its entry at the historical "
+        "byte-identical key location"
+    )
+    assert (expected_dir / "metadata.json").exists()
+    # The tree namespace at the same string is a miss: provenance is part of
+    # the request, so the loose entry is never tree evidence (and vice versa).
+    assert lookup(
+        "pytest", loose_state, cwd=str(git_repo), fingerprint_kind=FINGERPRINT_KIND_TREE
+    ) is None
+    # And the fingerprint-kind-agnostic historical lookup still reads it.
+    assert lookup("pytest", loose_state, cwd=str(git_repo)) is not None
+
+
 # ---------------------------------------------------------------------------
 # Tree-state fingerprint: ``git write-tree`` on an explicit index (F8)
 #
@@ -1188,6 +1229,53 @@ def test_tree_bound_entry_never_satisfies_a_loose_request(git_repo: Path) -> Non
         "pytest", loose_state, cwd=str(git_repo), fingerprint_kind="tree"
     )
     assert tree_hit is not None and tree_hit["cached"] is True
+
+
+def test_query_cached_with_explicit_tree_fingerprint_reads_a_tree_entry(
+    git_repo: Path,
+) -> None:
+    """A read-only consumer can look up a tree-keyed verdict (SA-0MWAXC5TD00461FN).
+
+    The dev-push gate records its verdict under the pushed commit's tree SHA
+    with ``fingerprint_kind="tree"``. ``query_cached`` historically only
+    computed the loose worktree fingerprint, so that verdict was invisible to
+    every read-only consumer (post-push verification and the audit path), and
+    post-push verification reported a false ``missing`` verdict on every
+    successful push. Passing the explicit fingerprint + kind makes the tree
+    entry reachable without changing the default (loose) behaviour.
+    """
+    calls: list[str] = []
+    runner = make_runner(calls)
+    tree = gs.run_git(
+        git_repo, ["rev-parse", "HEAD^{tree}"], check=True
+    ).stdout.strip()
+    primed = run_cached(
+        "pytest", cwd=str(git_repo), fingerprint=tree, runner=runner
+    )
+    assert primed["fingerprint_kind"] == "tree"
+    assert calls == [primed["command"]]
+
+    # The default (loose) query stays a miss: a tree entry is never loose
+    # evidence, so the historical semantics are preserved byte for byte.
+    assert query_cached("pytest", cwd=str(git_repo)) is None
+
+    # The explicit tree query finds it, and executes nothing.
+    hit = query_cached(
+        "pytest",
+        cwd=str(git_repo),
+        fingerprint=tree,
+        fingerprint_kind=FINGERPRINT_KIND_TREE,
+    )
+    assert hit is not None and hit["cached"] is True
+    assert hit["fingerprint_kind"] == "tree"
+    assert calls == [primed["command"]], (
+        "a read-only query must never execute the suite"
+    )
+
+    # A fingerprint recorded under the wrong kind is a miss, never a hit.
+    assert query_cached(
+        "pytest", cwd=str(git_repo), fingerprint=tree
+    ) is None
 
 
 # ---------------------------------------------------------------------------

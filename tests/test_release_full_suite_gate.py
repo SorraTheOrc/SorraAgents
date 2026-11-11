@@ -261,3 +261,111 @@ class TestMissingRunnerFailClosed:
         assert result.returncode != 0, result.stdout
         assert "run_tests.py not found" in result.stderr, result.stderr
         assert not _has_marker(gh_marker), "no PR may be opened without a gate"
+
+
+# ── Hook-like environment regression (AC2: GIT_DIR / GIT_INDEX_FILE) ──────────
+
+
+class TestHookLikeEnvironment:
+    def test_passes_under_leaked_git_dir_and_index_file(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression: the module must survive a hook-like environment.
+
+        Git hooks export ``GIT_DIR`` (and often ``GIT_INDEX_FILE``) into the
+        hook process environment.  When a test module builds fixtures using
+        ambient ``git`` commands, those leaks make the fixture operations
+        target the live checkout instead of the fixture repo — the root
+        cause of the pre-push gate failures described in SA-0MVZQVDUY0011DQD.
+
+        This test exercises the full fixture pipeline under leaked
+        ``GIT_DIR`` / ``GIT_INDEX_FILE`` so that any future regression in
+        the fixture's hermeticity is caught immediately.
+        """
+        live_repo = REPO_ROOT
+        # Capture the *current* working tree so pytest can clean up.
+        live_git_dir = str(live_repo / ".git")
+        live_index = str(live_repo / ".git" / "index")
+
+        # Leak the live repository's git variables into the environment that
+        # the fixture pipeline will inherit.
+        leaked_env = dict(os.environ)
+        leaked_env["GIT_DIR"] = live_git_dir
+        leaked_env["GIT_INDEX_FILE"] = live_index
+
+        # _build_release_fixture calls ``run_git()`` which invokes
+        # ``fixture_git_env()``; ``fixture_git_env()`` must strip the leaked
+        # vars before any subprocess call.  If the scrubbing works the
+        # fixture builds cleanly even though the process environment is
+        # polluted.
+        leaked_env["REPO_ROOT_FOR_REGRESSION"] = str(live_repo)
+        with subprocess.Popen(
+            ["python3", "-c", _REGRESSION_HELPER],
+            env=leaked_env,
+            cwd=str(live_repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as proc:
+            _, stderr = proc.communicate()
+            assert proc.returncode == 0, (
+                f"fixture pipeline failed under leaked GIT_DIR/GIT_INDEX_FILE:\n"
+                f"stderr: {stderr}"
+            )
+
+
+# Inline helper to keep the test file self-contained (no external dependency
+# on conftest fixtures).  It re-uses the exact same pipeline as the gate
+# tests so a regression in either path is caught.
+_REGRESSION_HELPER = r"""\
+import os, sys, subprocess
+from pathlib import Path
+
+# Mirror the sys.path setup in tests/conftest.py so shared is importable.
+repo_root = Path(os.environ.get("REPO_ROOT_FOR_REGRESSION", ".")).resolve()
+skills_root = repo_root / "skill"
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+if str(skills_root) not in sys.path:
+    sys.path.insert(1, str(skills_root))
+
+# Re-import the production helpers that the gate tests use.
+from shared.git_sandbox import fixture_git_env, run_git
+
+origin = Path("/tmp/fixture-regression-origin.git")
+seed = Path("/tmp/fixture-regression-seed")
+repo = Path("/tmp/fixture-regression-repo")
+
+# Clean slate.
+import shutil
+for p in (origin, seed, repo):
+    if p.exists():
+        shutil.rmtree(p)
+
+origin.mkdir(parents=True)
+seed.mkdir(parents=True)
+
+# Build a minimal fixture repo the same way the gate tests do.
+# run_git(cwd, args) — not the legacy _git() signature.
+run_git(origin, ["init", "-q", "--bare"])
+run_git(origin, ["--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"])
+
+run_git(seed, ["init", "-q"])
+run_git(seed, ["config", "user.email", "r@r"])
+run_git(seed, ["config", "user.name", "r"])
+(seed / "f.txt").write_text("f\n", encoding="utf-8")
+run_git(seed, ["add", "f.txt"])
+run_git(seed, ["commit", "-m", "base"])
+run_git(seed, ["branch", "-M", "main"])
+run_git(seed, ["checkout", "-q", "-b", "dev"])
+(seed / "d.txt").write_text("d\n", encoding="utf-8")
+run_git(seed, ["add", "d.txt"])
+run_git(seed, ["commit", "-m", "dev work"])
+run_git(seed, ["remote", "add", "origin", str(origin)])
+run_git(seed, ["push", "-q", "origin", "main", "dev"])
+run_git(seed, ["clone", "-q", str(origin), str(repo)])
+run_git(repo, ["config", "user.email", "r@r"])
+run_git(repo, ["config", "user.name", "r"])
+
+print("fixture-regression: OK", file=sys.stdout)
+"""

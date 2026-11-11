@@ -66,10 +66,10 @@ def _make_wl_show_proc(
     ``deleted_by`` (SA-0MUJBLZC60085DI9) populates the soft-delete
     attribution field ``deletedBy``; an empty value means the item is live.
 
-    ``assignee`` reports the scheduling hold already on the item (a
-    pre-existing producer hold when the context manager never set one).
-    ``needs_producer_review`` marks the item as the sanctioned persistent
-    hold that must survive every release path.
+    ``assignee`` reports the claim already on the item (including the
+    producer identity ``Map``, which is a normal claim since
+    SA-0MW7QTAHW0030FGV). ``needs_producer_review`` marks the item as the
+    persistent hold; releasing the assignee never clears the flag.
     """
     data = {
         "success": True,
@@ -297,8 +297,12 @@ class TestStatusLifecycleUnit:
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert self._release_value(calls[-1]) is None
 
-    def test_update_status_preserves_producer_hold(self, mock_run):
-        """The producer ``Map`` hold survives every direct terminal write."""
+    def test_update_status_releases_producer_identity(self, mock_run):
+        """The producer identity ``Map`` is released like any other claim.
+
+        ``Map`` is not a persistent hold; leaving it on a planned item strands
+        it as a scheduling hold (SA-0MW7QTAHW0030FGV).
+        """
         mock_run.side_effect = [
             _make_wl_show_proc(status="in-progress", assignee="Map"),
             _make_wl_update_proc(),
@@ -307,10 +311,14 @@ class TestStatusLifecycleUnit:
         StatusLifecycle.update_status("TEST-123", "open", stage="plan_complete")
 
         calls = [c.args[0] for c in mock_run.call_args_list]
-        assert self._release_value(calls[-1]) is None
+        assert self._release_value(calls[-1]) == ""
 
-    def test_update_status_preserves_needs_producer_review_hold(self, mock_run):
-        """A ``needsProducerReview`` item keeps its assignee."""
+    def test_update_status_releases_assignee_on_needs_producer_review_item(self, mock_run):
+        """A ``needsProducerReview`` item keeps the flag but releases the assignee.
+
+        The flag is the persistent hold, never the assignee; the release must
+        not clear it (SA-0MW7QTAHW0030FGV AC4).
+        """
         mock_run.side_effect = [
             _make_wl_show_proc(
                 status="in-progress",
@@ -323,12 +331,18 @@ class TestStatusLifecycleUnit:
         StatusLifecycle.update_status("TEST-123", "blocked")
 
         calls = [c.args[0] for c in mock_run.call_args_list]
-        assert self._release_value(calls[-1]) is None
+        assert self._release_value(calls[-1]) == ""
+        # The flag is never written by this transition, so the store keeps it.
+        assert "--needs-producer-review" not in calls[-1]
 
-    def test_update_status_handoff_keeps_hold_when_flagging_review(self, mock_run):
-        """Flagging producer review in the same write makes it a persistent hold."""
+    def test_update_status_handoff_releases_assignee_and_flags_review(self, mock_run):
+        """Flagging producer review in the same write still releases the claim.
+
+        The flag is the hold; a lingering assignee beside it would make the
+        item indistinguishable from a stranded claim (SA-0MW7QTAHW0030FGV).
+        """
         mock_run.side_effect = [
-            _make_wl_show_proc(status="in-progress", assignee="plan-agent"),
+            _make_wl_show_proc(status="in-progress", assignee="Map"),
             _make_wl_update_proc(),
         ]
 
@@ -337,9 +351,10 @@ class TestStatusLifecycleUnit:
         )
 
         calls = [c.args[0] for c in mock_run.call_args_list]
-        assert self._release_value(calls[-1]) is None
+        assert self._release_value(calls[-1]) == ""
         # The review flag itself is still written, so the hold is sanctioned.
         assert "--needs-producer-review" in calls[-1]
+        assert "yes" in calls[-1]
 
     def test_update_status_explicit_assignee_is_written_verbatim(self, mock_run):
         """An explicit assignee disables the automatic release (no claim read)."""
@@ -403,12 +418,12 @@ class TestStatusLifecycleUnit:
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
         assert self._release_value(calls[2]) == ""
 
-    def test_success_exit_keeps_preexisting_hold_it_never_held(self, mock_run):
-        """A pre-existing producer hold is never wiped on the success exit.
+    def test_success_exit_releases_preexisting_producer_identity(self, mock_run):
+        """A pre-existing ``Map`` claim is released on the success exit.
 
-        The context manager was constructed without ``assignee=``, so it never
-        held the claim's assignee: a hold already on the item (e.g. the
-        producer's ``Map``) must survive (no silent widening of the release).
+        The context manager was constructed without ``assignee=``, but the
+        producer identity is a normal claim: leaving it behind after a run
+        strands the item (SA-0MW7QTAHW0030FGV).
         """
         mock_run.side_effect = [
             _make_wl_show_proc(status="open", assignee="Map"),
@@ -421,15 +436,14 @@ class TestStatusLifecycleUnit:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
-        assert self._release_value(calls[2]) is None
+        assert self._release_value(calls[2]) == ""
 
     def test_success_exit_releases_externally_set_agent_claim(self, mock_run):
-        """A pre-existing **agent** claim the run never held is released.
+        """A pre-existing claim the run never held is released.
 
         The workflow claims (``AGENTS_GLOBAL.md`` step 1) *before* a skill
-        runs, so a pre-set agent claim must not survive the skill's own
-        terminal transition (SA-0MW0F91KN004J06U). Only the producer hold is
-        exempt.
+        runs, so a pre-set claim must not survive the skill's own terminal
+        transition (SA-0MW0F91KN004J06U). No assignee is exempt.
         """
         mock_run.side_effect = [
             _make_wl_show_proc(status="in-progress", assignee="refactor-agent"),
@@ -445,7 +459,7 @@ class TestStatusLifecycleUnit:
         assert self._release_value(calls[2]) == ""
 
     def test_failure_exit_releases_externally_set_agent_claim(self, mock_run):
-        """A rollback also releases a pre-existing non-producer claim."""
+        """A rollback also releases a pre-existing claim."""
         mock_run.side_effect = [
             _make_wl_show_proc(status="in-progress", assignee="audit-agent"),
             _make_wl_update_proc(),
@@ -482,8 +496,12 @@ class TestStatusLifecycleUnit:
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
         assert self._release_value(calls[2]) == ""
 
-    def test_needs_producer_review_hold_is_never_released(self, mock_run):
-        """The sanctioned ``needsProducerReview`` hold is preserved."""
+    def test_needs_producer_review_flag_survives_assignee_release(self, mock_run):
+        """The ``needsProducerReview`` flag survives, but the assignee is released.
+
+        The flag — never the assignee — is the persistent hold
+        (SA-0MW7QTAHW0030FGV AC4).
+        """
         mock_run.side_effect = [
             _make_wl_show_proc(
                 status="in-progress",
@@ -498,7 +516,9 @@ class TestStatusLifecycleUnit:
             pass
 
         calls = [c.args[0] for c in mock_run.call_args_list]
-        assert self._release_value(calls[2]) is None
+        assert self._release_value(calls[2]) == ""
+        # The exit write never passes the flag, so the store keeps it set.
+        assert "--needs-producer-review" not in calls[2]
 
     def test_assignee_cleared_on_failure(self, mock_run):
         """Failure with assignee restores status AND clears assignee."""
@@ -517,8 +537,8 @@ class TestStatusLifecycleUnit:
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
         assert self._release_value(calls[2]) == ""
 
-    def test_failure_exit_keeps_preexisting_hold_it_never_held(self, mock_run):
-        """A rollback does not wipe a hold the context manager never held."""
+    def test_failure_exit_releases_preexisting_producer_identity(self, mock_run):
+        """A rollback releases a pre-existing ``Map`` claim too."""
         mock_run.side_effect = [
             _make_wl_show_proc(status="open", assignee="Map"),
             _make_wl_update_proc(),
@@ -531,7 +551,7 @@ class TestStatusLifecycleUnit:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
-        assert self._release_value(calls[2]) is None
+        assert self._release_value(calls[2]) == ""
 
     def test_restore_on_exit_releases_held_assignee(self, mock_run):
         """restore_on_exit restores the status AND releases a held assignee."""
@@ -548,8 +568,8 @@ class TestStatusLifecycleUnit:
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
         assert self._release_value(calls[2]) == ""
 
-    def test_restore_on_exit_keeps_preexisting_hold_it_never_held(self, mock_run):
-        """Read-only analysis must not release a producer hold it never held."""
+    def test_restore_on_exit_releases_preexisting_producer_identity(self, mock_run):
+        """Read-only analysis releases a pre-existing ``Map`` claim too."""
         mock_run.side_effect = [
             _make_wl_show_proc(status="open", assignee="Map"),
             _make_wl_update_proc(),
@@ -561,7 +581,7 @@ class TestStatusLifecycleUnit:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "open"]
-        assert self._release_value(calls[2]) is None
+        assert self._release_value(calls[2]) == ""
 
     def test_preserve_assignee_on_exit_keeps_hold_on_success(self, mock_run):
         """The documented opt-out preserves the hold on the success exit."""
@@ -637,11 +657,10 @@ class TestStatusLifecycleUnit:
         assert self._release_value(calls[2]) == ""
 
     def test_legacy_clear_flag_is_deprecated_and_has_no_effect(self, mock_run):
-        """``clear_assignee_on_exit`` warns and no longer decides the release.
+        """``clear_assignee_on_exit`` warns; release is already the default.
 
-        Release is already the default, so the legacy flag cannot change the
-        outcome: a context manager that holds no assignee still does not clear
-        a pre-existing hold, even when the flag is passed as ``True``.
+        The legacy flag cannot change the outcome. A pre-existing ``Map``
+        claim is released by the default rule even when the flag is passed.
         """
         mock_run.side_effect = [
             _make_wl_show_proc(status="open", assignee="Map"),
@@ -657,7 +676,7 @@ class TestStatusLifecycleUnit:
 
         calls = [c.args[0] for c in mock_run.call_args_list]
         assert calls[2][:5] == ["wl", "update", "TEST-123", "--status", "completed"]
-        assert self._release_value(calls[2]) is None
+        assert self._release_value(calls[2]) == ""
 
     def test_legacy_clear_flag_warns_when_false_too(self, mock_run):
         """Passing the deprecated flag at all (even ``False``) warns."""

@@ -12,7 +12,7 @@ deterministic acceptance gate for the report-contract change
 final-step report template may instruct or exemplify a *routine next-step*
 producer action ("Proceed to /skill:plan", "review the brief, then run
 /skill:plan", "Next step: implement"), because routine workflow progression
-belongs in the report's ``Ready for <next_action>`` conclusion line.
+belongs in the report's standalone ready/not-ready conclusion line.
 
 Coverage:
 

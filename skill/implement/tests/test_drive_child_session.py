@@ -18,11 +18,22 @@ module: the Herdr CLI boundary is faked with
 ``skill/shared/tests/fake_herdr_cli.py``, so the split → start → prompt argv,
 the env isolation and the opt-in selection matrix are all asserted without a
 live Herdr session.
+
+The final section pins the per-child lock's *lifetime* (parent epic
+SA-0MVXWMVTH007MNJR AC5): the driver must hold the child's lock for the whole
+spawned session, exposed to that session as ``IMPLEMENT_CHILD_LOCK_TOKEN``,
+and release it once the session exits. The assertions run synchronously
+inside an injectable fake spawner that ``phase_drive`` awaits — no sleep, no
+clock.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import json
+import os
+import signal
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -33,6 +44,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) in sys.path:
     sys.path.remove(str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT))
+_SKILLS_ROOT = REPO_ROOT / "skill"
+if str(_SKILLS_ROOT) not in sys.path:
+    sys.path.append(str(_SKILLS_ROOT))
+
+from shared.work_item_lock import ENV_LOCK_TOKEN, WorkItemLock, lock_file_path
 
 from skill.implement.scripts import implement as impl_mod
 from skill.implement.scripts.implement import _default_session_spawner
@@ -771,3 +787,527 @@ class TestPhaseDrivePaneTransport:
         retained = report["retained_panes"]
         assert [p["pane_id"] for p in retained] == ["w1:p9"]
         assert retained[0]["remedy"] == "herdr pane read w1:p9"
+
+
+# ---------------------------------------------------------------------------
+# 5. The per-child lock lives for the driven session's whole lifetime
+# ---------------------------------------------------------------------------
+#
+# Parent epic SA-0MVXWMVTH007MNJR AC5. While a driven child session is alive,
+# ``<worklog>/locks/child-<id>.lock`` must be held by a live kernel ``flock``
+# and name the **live driver's** pid, and the spawned session must receive the
+# matching ownership token. Only then does the herdr hydrator's
+# "busy = pane OR live claim holder" rule keep the child ``in-progress``
+# instead of demoting it mid-implementation.
+#
+# The assertions run *inside* the injectable fake spawner, which
+# ``phase_drive`` calls synchronously and waits on, so the check is made while
+# the lock is provably supposed to be held — no sleep, no clock, no race.
+#
+# TDD ordering: this slice landed first and the fixing change set is
+# SA-0MW7LMUUQ00701KJ (``phase_drive`` acquires the child lock before spawning
+# and releases it after the session exits). That change set removed the
+# ``xfail(strict=True)`` markers these tests originally carried; a strict
+# xpass was the reminder, and the tests are now unconditional.
+#
+# The harness precondition — that ``phase_drive`` really calls the injected
+# spawner and awaits it — is proven independently, before and after the fix,
+# by ``TestPhaseDrivePaneTransport.test_drive_without_opt_in_keeps_the_
+# headless_spawner`` above, so a failure here can only be about the lock.
+
+LOCK_PARENT = "SA-LOCKPARENT"
+LOCK_CHILD = "SA-LOCKCHILD"
+LOCK_CHILD_TWO = "SA-LOCKCHILD2"
+LOCK_WORKTREE = "/tmp/wt-lock-child"
+LOCK_WORKTREE_TWO = "/tmp/wt-lock-child-two"
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_child_lock_state(monkeypatch):
+    """Never observe an ambient driver token or a leaked held lock.
+
+    A driven child session exports ``IMPLEMENT_CHILD_LOCK_TOKEN``; inheriting
+    it would make an "independent contender" probe a token-based re-entrant
+    no-op instead of being refused. The module global is reset and any lock the
+    code under test leaves behind is released at teardown.
+    """
+    monkeypatch.delenv(ENV_LOCK_TOKEN, raising=False)
+    monkeypatch.setattr(impl_mod, "_child_lock_global", None)
+    yield
+    lock = impl_mod._child_lock_global
+    if lock is not None:
+        lock.release()
+    impl_mod._child_lock_global = None  # monkeypatch restores the original
+
+
+@contextlib.contextmanager
+def _without_ambient_lock_token():
+    """Unset the ambient ownership token so a probe is a *different* owner."""
+    token = os.environ.pop(ENV_LOCK_TOKEN, None)
+    try:
+        yield
+    finally:
+        if token is not None:
+            os.environ[ENV_LOCK_TOKEN] = token
+
+
+def _lock_store() -> Path:
+    """The per-test throwaway worklog store the child lock resolves to.
+
+    ``skill/implement/tests/conftest.py`` points ``_child_lock_dir`` at a
+    per-test directory via ``IMPLEMENT_CHILD_LOCK_DIR``, so the driver under
+    test and the assertions below read and write the same lock file.
+    """
+    store = os.environ.get("IMPLEMENT_CHILD_LOCK_DIR")
+    assert store, (
+        "the package conftest fixture must point IMPLEMENT_CHILD_LOCK_DIR at "
+        "a throwaway store"
+    )
+    return Path(store)
+
+
+def _child_lock_metadata(child_id: str, store: Path) -> dict:
+    """Read *child_id*'s lock metadata, failing when no lock file exists."""
+    path = lock_file_path(child_id, store)
+    assert path.is_file(), (
+        f"no per-child lock file at {path} while the driver was spawning "
+        f"{child_id}'s session: the driver must hold the child lock for the "
+        "session's whole lifetime (SA-0MVXWMVTH007MNJR AC1)"
+    )
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(metadata, dict), metadata
+    return metadata
+
+
+def _assert_pid_alive(pid, child_id: str) -> None:
+    """Assert *pid* names a live process (the hydrator trusts only these)."""
+    assert isinstance(pid, int) and pid > 0, (
+        f"the lock file for {child_id} records a non-pid {pid!r}"
+    )
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        raise AssertionError(
+            f"the lock file for {child_id} records pid {pid}, which is not a "
+            "live process: the recorded owner is stale, so the herdr hydrator "
+            "would demote the child mid-session (SA-0MVXWMVTH007MNJR AC1)"
+        ) from None
+    except PermissionError:  # pragma: no cover - pid owned by another user
+        return  # the process exists; only our permission is missing
+
+
+def _assert_lock_held_for_session(
+    child_id: str, store: Path, env: dict[str, str],
+) -> dict:
+    """Assert, synchronously inside the spawner, that the driver holds the lock.
+
+    Covers the three facts the hydrator and the driven session depend on:
+
+    1. the kernel ``flock`` is live — an independent contender is refused;
+    2. the lock file's recorded ``pid`` is the live driver process;
+    3. the spawned session's environment carries the lock's ownership token
+       (so its own ``start``/``finish`` re-enter the lock instead of blocking).
+
+    Returns:
+        The lock metadata observed while the session was running.
+    """
+    metadata = _child_lock_metadata(child_id, store)
+
+    with _without_ambient_lock_token():
+        probe = WorkItemLock(
+            child_id,
+            agent="intruder",
+            session_id="intruder-probe",
+            worklog_dir=store,
+        )
+        try:
+            result = probe.acquire()
+        finally:
+            probe.release()
+    assert result.acquired is False, (
+        f"the driver did not hold {child_id}'s child lock while the session "
+        "it spawned was running: an independent contender acquired it "
+        "(SA-0MVXWMVTH007MNJR AC1)"
+    )
+    assert (result.held_by or {}).get("pid") == metadata.get("pid"), (
+        "the contender was refused by a different owner than the one the lock "
+        f"file records: held_by={result.held_by!r}, file={metadata!r}"
+    )
+
+    recorded_pid = metadata.get("pid")
+    _assert_pid_alive(recorded_pid, child_id)
+    assert recorded_pid == os.getpid(), (
+        "the lock file must record the live driver process's pid "
+        f"(expected {os.getpid()}, recorded {recorded_pid!r}) so the hydrator "
+        "sees a live claim holder (SA-0MVXWMVTH007MNJR AC1)"
+    )
+
+    token = env.get(ENV_LOCK_TOKEN)
+    assert token, (
+        f"the spawned session for {child_id} did not receive "
+        f"{ENV_LOCK_TOKEN}: its own start/finish would be refused as "
+        "`skipped-held` instead of re-entering the lock "
+        "(SA-0MVXWMVTH007MNJR AC2)"
+    )
+    assert token == metadata.get("token"), (
+        "the token handed to the spawned session does not match the lock "
+        f"file's token (env={token!r}, file={metadata.get('token')!r}) "
+        "(SA-0MVXWMVTH007MNJR AC2)"
+    )
+    return metadata
+
+
+def _assert_lock_free(child_id: str, store: Path) -> None:
+    """Assert *child_id*'s lock is free (released when the session exited)."""
+    with _without_ambient_lock_token():
+        probe = WorkItemLock(
+            child_id, agent="next", session_id="next-session", worklog_dir=store,
+        )
+        try:
+            result = probe.acquire()
+            assert result.acquired is True, (
+                f"{child_id}'s child lock is still held after the driven "
+                "session returned; the driver must release it once the "
+                f"session exits (held by {result.held_by!r}) "
+                "(SA-0MVXWMVTH007MNJR AC3)"
+            )
+        finally:
+            probe.release()
+
+
+@contextlib.contextmanager
+def _driven_phase(children: list[dict]):
+    """Patch ``phase_drive``'s worklog and worktree boundaries (no store I/O)."""
+    with (
+        patch.object(impl_mod, "wl_show", return_value={"id": LOCK_PARENT}),
+        patch.object(impl_mod, "wl_show_children", return_value=children),
+        patch.object(impl_mod, "_discover_worktree", return_value=""),
+        patch.object(impl_mod, "wl_add_comment", return_value=True),
+    ):
+        yield
+
+
+def _child_record(child_id: str) -> dict:
+    """A startable child as ``wl_show_children`` reports it."""
+    return {"id": child_id, "status": "open", "stage": "intake_complete"}
+
+
+def _spawned() -> dict:
+    """A successful spawner result (headless transport shape)."""
+    return {"success": True, "returncode": 0, "reason": ""}
+
+
+class TestDriveHoldsChildLockForSessionLifetime:
+    """``phase_drive`` owns the child lock while the spawned session runs."""
+
+    def test_lock_is_held_inside_the_spawner_and_released_afterwards(self):
+        """Held for the session's lifetime (flock live, pid live, token passed)."""
+        store = _lock_store()
+        observed: list[str] = []
+
+        def _fake_spawner(
+            child_id, worktree_path, timeout, env, verbose=False,
+        ):
+            # All three facts are asserted here, synchronously: ``phase_drive``
+            # is waiting on this call, so the session is "alive".
+            _assert_lock_held_for_session(child_id, store, env)
+            observed.append(child_id)
+            return _spawned()
+
+        parent_reports = [
+            {
+                "success": True,
+                "next_child": LOCK_CHILD,
+                "worktree_path": LOCK_WORKTREE,
+            },
+            {
+                "success": True,
+                "parent_advanced": True,
+                "message": "advanced",
+                "children_processed": [],
+            },
+        ]
+
+        with _driven_phase([_child_record(LOCK_CHILD)]):
+            report = impl_mod.phase_drive(
+                LOCK_PARENT,
+                parent_runner=lambda *a, **k: parent_reports.pop(0),
+                spawn_session=_fake_spawner,
+            )
+
+        assert observed == [LOCK_CHILD], (
+            "the fake spawner never ran, so the lock lifetime was never "
+            f"observed: {observed}"
+        )
+        assert report["sessions_spawned"] == 1, report
+        assert report["success"] is True, report["message"]
+        assert report["parent_advanced"] is True, report
+
+        # AC3: released once the spawner (the session) returned.
+        _assert_lock_free(LOCK_CHILD, store)
+
+    def test_each_child_gets_a_fresh_lock_token(self):
+        """A second child never inherits the first child's token (no reuse)."""
+        store = _lock_store()
+        observed: dict[str, dict] = {}
+
+        def _fake_spawner(
+            child_id, worktree_path, timeout, env, verbose=False,
+        ):
+            observed[child_id] = _assert_lock_held_for_session(
+                child_id, store, env,
+            )
+            return _spawned()
+
+        parent_reports = [
+            {
+                "success": True,
+                "next_child": LOCK_CHILD,
+                "worktree_path": LOCK_WORKTREE,
+            },
+            {
+                "success": True,
+                "next_child": LOCK_CHILD_TWO,
+                "worktree_path": LOCK_WORKTREE_TWO,
+            },
+            {
+                "success": True,
+                "parent_advanced": True,
+                "message": "advanced",
+                "children_processed": [],
+            },
+        ]
+
+        with _driven_phase([_child_record(LOCK_CHILD), _child_record(LOCK_CHILD_TWO)]):
+            report = impl_mod.phase_drive(
+                LOCK_PARENT,
+                parent_runner=lambda *a, **k: parent_reports.pop(0),
+                spawn_session=_fake_spawner,
+            )
+
+        assert set(observed) == {LOCK_CHILD, LOCK_CHILD_TWO}, observed
+        assert report["sessions_spawned"] == 2, report
+
+        first = observed[LOCK_CHILD]
+        second = observed[LOCK_CHILD_TWO]
+        # Each lock file records its own ownership token, and the env token
+        # handed to each session matched that child's lock (asserted above), so
+        # the two tokens being distinct proves there is no stale-token reuse.
+        assert first["token"] != second["token"], (
+            "the second child inherited the first child's lock token; a stale "
+            "token would let `_probe_child_lock` misclassify a different "
+            "child's lock as self-owned (SA-0MVXWMVTH007MNJR risk: stale "
+            "token reuse across children)"
+        )
+        _assert_lock_free(LOCK_CHILD, store)
+        _assert_lock_free(LOCK_CHILD_TWO, store)
+
+    def test_release_is_bounded_to_the_session(self):
+        """AC3: success, non-zero exit and timeout all leave no stale flock.
+
+        The lock is held *inside* each spawner call (the session is alive) and
+        free immediately after ``phase_drive`` returns, whatever the session's
+        outcome — so the next ``parent``/``start`` acquires it cleanly.
+        """
+        store = _lock_store()
+        outcomes = [
+            {"success": True, "returncode": 0, "reason": ""},
+            {"success": False, "returncode": 1, "reason": "session failed"},
+            {"success": False, "returncode": -9, "reason": "session timed out"},
+        ]
+        for outcome in outcomes:
+            observed: list[str] = []
+
+            def _fake_spawner(
+                child_id, worktree_path, timeout, env, verbose=False,
+                _outcome=outcome, _observed=observed,
+            ):
+                _assert_lock_held_for_session(child_id, store, env)
+                _observed.append(child_id)
+                return dict(_outcome)
+
+            parent_reports = [
+                {
+                    "success": True,
+                    "next_child": LOCK_CHILD,
+                    "worktree_path": LOCK_WORKTREE,
+                },
+                # Only consumed when the session succeeded: a failure stops
+                # the chain, so its lock release is observed on return.
+                {
+                    "success": True,
+                    "parent_advanced": True,
+                    "message": "advanced",
+                    "children_processed": [],
+                },
+            ]
+            # The failure paths reconcile the child against the store and
+            # inspect its worktree; those boundaries are covered elsewhere, so
+            # they are stubbed to isolate the lock's lifetime (AC3).
+            with (
+                _driven_phase([_child_record(LOCK_CHILD)]),
+                patch.object(
+                    impl_mod,
+                    "_reconcile_spawn_failure",
+                    return_value={
+                        "timed_out": outcome["returncode"] == -9,
+                        "timeout_seconds": 1,
+                        "terminal": False,
+                        "status": "in_progress",
+                        "stage": "in_progress",
+                        "reason": outcome["reason"],
+                        "evidence": "",
+                    },
+                ),
+                patch.object(
+                    impl_mod,
+                    "_release_orphaned_child_claim",
+                    return_value={"released": False, "reason": "stubbed"},
+                ),
+                patch.object(
+                    impl_mod,
+                    "_detect_stranded_child",
+                    return_value={
+                        "stranded": False,
+                        "commit": None,
+                        "evidence": "",
+                        "reason": "",
+                    },
+                ),
+            ):
+                report = impl_mod.phase_drive(
+                    LOCK_PARENT,
+                    parent_runner=(
+                        lambda *a, _reports=parent_reports, **k:
+                        _reports.pop(0)
+                    ),
+                    spawn_session=_fake_spawner,
+                )
+
+            assert observed == [LOCK_CHILD], (outcome, observed)
+            assert report["sessions_spawned"] == 1, report
+            _assert_lock_free(LOCK_CHILD, store)
+
+    def test_lock_is_released_when_the_spawner_raises(self):
+        """AC3: the release is in a ``finally``, so a raise cannot leak it."""
+        store = _lock_store()
+
+        def _fake_spawner(child_id, worktree_path, timeout, env, verbose=False):
+            _assert_lock_held_for_session(child_id, store, env)
+            raise RuntimeError("spawner blew up")
+
+        parent_reports = [
+            {
+                "success": True,
+                "next_child": LOCK_CHILD,
+                "worktree_path": LOCK_WORKTREE,
+            },
+        ]
+
+        with (
+            _driven_phase([_child_record(LOCK_CHILD)]),
+            pytest.raises(RuntimeError, match="spawner blew up"),
+        ):
+            impl_mod.phase_drive(
+                LOCK_PARENT,
+                parent_runner=lambda *a, **k: parent_reports.pop(0),
+                spawn_session=_fake_spawner,
+            )
+
+        _assert_lock_free(LOCK_CHILD, store)
+
+    def test_a_different_live_owner_is_refused_with_skipped_held(self):
+        """AC4: a contended child is reported held and no session is spawned."""
+        store = _lock_store()
+        other = WorkItemLock(
+            LOCK_CHILD,
+            agent="other-session",
+            session_id="sess-other",
+            worklog_dir=store,
+        )
+        contended = other.acquire()
+        assert contended.acquired is True, contended
+
+        spawned: list[str] = []
+
+        def _fake_spawner(child_id, worktree_path, timeout, env, verbose=False):
+            spawned.append(child_id)
+            return _spawned()
+
+        parent_reports = [
+            {
+                "success": True,
+                "next_child": LOCK_CHILD,
+                "worktree_path": LOCK_WORKTREE,
+                "children_processed": [],
+            },
+        ]
+
+        try:
+            with _driven_phase([_child_record(LOCK_CHILD)]):
+                report = impl_mod.phase_drive(
+                    LOCK_PARENT,
+                    parent_runner=lambda *a, **k: parent_reports.pop(0),
+                    spawn_session=_fake_spawner,
+                )
+        finally:
+            other.release()
+
+        assert spawned == [], (
+            "a session was spawned for a child whose lock a different live "
+            "owner holds (SA-0MW7LMUUQ00701KJ AC4)"
+        )
+        assert report["sessions_spawned"] == 0, report
+        assert report["action"] == "skipped-held", report
+        assert report["skipped_held"] is True, report
+        assert report["success"] is False, report
+        assert report["held_by"]["agent"] == "other-session", report
+        assert report["held_children"] == [LOCK_CHILD], report
+        assert str(store) in report["lock_path"], report
+
+    def test_signal_cleanup_does_not_misreport_the_parent_as_start(self):
+        """A held *child* lock during drive is not a parent ``start`` marker.
+
+        ``drive`` sets the process-wide work item to the parent while it holds
+        the child's lock across the spawned session. A signal in that window
+        must release the lock but must not post the "start phase interrupted
+        before the worktree was created" comment on the **parent** item — the
+        child's worktree exists and the parent was never being started
+        (SA-0MW7LMUUQ00701KJ).
+        """
+        store = _lock_store()
+        lock = WorkItemLock(
+            LOCK_CHILD,
+            agent="implement",
+            session_id="sess-drive",
+            worklog_dir=store,
+        )
+        acquired = lock.acquire()
+        assert acquired.acquired is True, acquired
+        impl_mod._child_lock_global = lock
+        impl_mod._work_item_id_global = LOCK_PARENT
+        impl_mod._worktree_path_global = ""
+        impl_mod._repo_root_global = ""
+
+        comments: list[tuple[str, str]] = []
+        with (
+            patch.object(
+                impl_mod.StatusLifecycle,
+                "show",
+                return_value={"workItem": {"status": "in-progress"}},
+            ),
+            patch.object(impl_mod.StatusLifecycle, "update_status"),
+            patch.object(
+                impl_mod,
+                "wl_add_comment",
+                side_effect=lambda wid, c: comments.append((wid, c)),
+            ),
+        ):
+            impl_mod._handle_signal_cleanup(signal.SIGTERM)
+
+        assert comments == [], (
+            "a signal while the driver held the child's lock was reported as "
+            f"an interrupted `start` on the parent: {comments}"
+        )
+        assert impl_mod._child_lock_global is None
+        _assert_lock_free(LOCK_CHILD, store)

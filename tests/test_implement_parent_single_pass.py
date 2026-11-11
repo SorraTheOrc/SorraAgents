@@ -136,6 +136,21 @@ class Simulation:
         cid = worktree_path.rsplit("/", 1)[-1]
         return bool(self.changes.get(cid, False))
 
+    def _classify_child_worktree(self, child_id, worktree_path, parent_branch=None):
+        """Model the work-state verdict for this simulation.
+
+        ``phase_parent`` refines ``_has_worktree_changes`` through
+        ``_classify_child_worktree``: a simulated child with changes carries
+        real (attributable) work, so it is finalisable; one without changes is
+        simply clean. The real classifier inspects the worktree on disk, which
+        this simulation does not materialise (SA-0MW74IKJE008JXDQ).
+        """
+        return (
+            self.mod.CHILD_WORK
+            if self.changes.get(child_id, False)
+            else self.mod.CHILD_CLEAN
+        )
+
     def _update_status(self, work_item_id, status, stage=None, assignee=None, **kwargs):
         if work_item_id == "SA-PARENT001":
             self.parent_status = status
@@ -173,6 +188,10 @@ class Simulation:
             mock.patch.object(
                 self.mod, "_has_worktree_changes",
                 side_effect=self._has_worktree_changes,
+            ),
+            mock.patch.object(
+                self.mod, "_classify_child_worktree",
+                side_effect=self._classify_child_worktree,
             ),
             mock.patch.object(
                 self.mod.StatusLifecycle, "update_status",
