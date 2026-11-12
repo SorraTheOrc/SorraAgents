@@ -194,13 +194,20 @@ class IndexWatch:
         On a violation the watch **re-baselines** on the current state, so the
         next poll reports ``None``: only the test that wrote the index is
         named, not every later test in the session.
+
+        An index that can no longer be read is a violation, never silent: the
+        stat-churn short-circuit applies only when **both** digests are
+        readable (``None == None`` would otherwise treat an unreadable-"unchanged"
+        index as benign stat churn and the offender would stay anonymous,
+        reproducing the gate failure this guard exists to attribute
+        (SA-0MW0V9PEP004EJYV AC2).
         """
         signature = _stat_signature(self.index_path)
         if signature == self.snapshot.signature:
             return None
 
         digest = _content_digest(self.index_path)
-        if digest == self.snapshot.digest:
+        if digest is not None and digest == self.snapshot.digest:
             # Stat churn only (e.g. a re-stat of an identical index).
             self.snapshot = IndexSnapshot(signature, digest, self.snapshot.tree)
             return None

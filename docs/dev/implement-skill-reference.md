@@ -1152,6 +1152,38 @@ dev-push integration gate — the pre-push hook's `run_tests.py --scope full`
 and the ship release gate (SA-0MVECQUGF0064U81). The tree-binding contract
 applies to whichever scope the gate runs.
 
+**Repeat finish (no diff, already pushed) and the full-scope fallback
+(SA-0MW0V9PEP004EJYV).** Re-running `finish` on a clean, fully-committed
+worktree (the documented recovery path after a failed push) leaves the
+changed-scope selector with nothing to select: with no changed files, group
+selection and the changed-file → test-file selector both come back empty and
+`run_tests()` falls back to the **full** suite — still tree-bound, still run
+inside `would_be_commit_index()`. Three properties make that repeat finish
+converge instead of failing the gate:
+
+- **The full-scope fallback is served from the dev-push tree entry.** The
+  pre-push hook's `run_tests.py --scope full --gate-commit <sha>` records its
+  green verdict under `fingerprint_kind="tree"` keyed on the pushed commit's
+  tree (SA-0MW7C6AYO0062GJB). A repeat finish fingerprints the same tree — on
+  a clean worktree the would-be-commit tree *is* the pushed commit's tree — so
+  the full-scope fallback's cache lookup hits that entry (same command, same
+  tree namespace, within TTL) and the suite is **not** re-executed. No entry
+  (or an expired one) genuinely re-runs the full suite and still converges;
+  the reuse is an optimisation, never a prerequisite.
+- **No test may stage into the inherited index.** The suite runs under the
+  gate's exported `GIT_INDEX_FILE`, and a fixture that honours it would trip
+  `verify_unchanged()` → `gate evidence invalid` (the observed failure on a
+  fresh repeat run). The repo-root `conftest.py`'s autouse `IndexWatch` names
+  the offending test; the fixture rule is `shared.git_sandbox.run_git` /
+  `fixture_git_env` (see `docs/dev/test-isolation.md` §9.7).
+- **The terminal read-back proves convergence.** The no-op push (branch
+  already on `dev`) still runs the post-push verification and `finish`
+  persists `completed`/`in_review` exactly like the push-with-diff path — see
+  [Terminal-status read-back](#terminal-status-read-back-no-op-push-guarantee-osl-0mvme1pi5005wu58)
+  below. Regression coverage:
+  `skill/implement/tests/test_finish_repeat_no_diff_cache.py` (cache-hit
+  repeat finish, fresh-run repeat finish, index unchanged).
+
 #### Verdict provenance (SA-0MVQHVJEX0071R7G)
 
 Every finish-gate verdict is self-describing. Each entry of
@@ -1665,7 +1697,10 @@ paths — the push-with-diff path and the no-op-push path (a worktree branch
 with no diff from `origin/dev`, e.g. a verification-only item whose evidence
 is a worklog comment). The reproduction on OSL-0MVME1PI5005WU58 confirmed
 that no step discards or overwrites that write, so the guarantee is enforced
-rather than assumed.
+rather than assumed. A **repeat finish** (re-running `finish` on an
+already-pushed, clean worktree — the failed-push recovery path) converges
+through this same no-op-push read-back; see the full-scope-fallback note
+above]
 
 After the `with` block (Step 8b), `phase_finish` calls
 `_assert_terminal_status(work_item_id)`, which:

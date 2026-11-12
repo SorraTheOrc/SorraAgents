@@ -288,6 +288,57 @@ class TestPoisonedIndexIsReported:
         assert guard.VIOLATION_HEADLINE in report
         assert "unreadable" in report
 
+    def test_deleted_inherited_index_is_reported(self, tmp_path):
+        """A deleted inherited index is a violation, never silent (AC2).
+
+        ``git write-tree`` on a missing index yields the empty tree (it does
+        not fail), so ``poll()`` must not treat the deletion as benign stat
+        churn — the empty tree differs from the captured HEAD tree, so the
+        violation falls through to the report (naming the offender).
+        """
+        repo, index = _project_with_inherited_index(tmp_path)
+        watch = guard.IndexWatch.capture(repo, env={"GIT_INDEX_FILE": str(index)})
+        assert watch is not None
+        assert watch.snapshot.digest is not None
+
+        index.unlink()
+
+        report = watch.poll()
+        assert report is not None
+        assert guard.VIOLATION_HEADLINE in report
+        # ``git write-tree`` on a missing index yields the empty tree, which
+        # differs from the captured HEAD tree — the violation is still named.
+        assert str(index) in report
+
+    def test_index_unreadable_at_capture_then_deleted_is_reported(self, tmp_path):
+        """An index unreadable at session start is not excused by ``None`` digests.
+
+        The narrow silent path (AC2): when capture recorded ``digest=None``
+        (the index already could not be read) and a test then deletes the
+        file, ``poll()`` must not treat ``None == None`` as stat churn — it
+        must report. Before this guard was hardened the offender stayed
+        anonymous and the finish gate failed with unattributable evidence.
+        """
+        repo, index = _project_with_inherited_index(tmp_path)
+        index.chmod(0)
+        try:
+            watch = guard.IndexWatch.capture(
+                repo, env={"GIT_INDEX_FILE": str(index)}
+            )
+        finally:
+            index.chmod(0o644)
+        assert watch is not None
+        # Capture could not read the index: the digest baseline is None — the
+        # exact state that used to short-circuit the stat-churn check.
+        assert watch.snapshot.digest is None
+
+        index.unlink()
+
+        report = watch.poll()
+        assert report is not None
+        assert guard.VIOLATION_HEADLINE in report
+        assert "unreadable" in report
+
 
 # ---------------------------------------------------------------------------
 # End to end — the real conftest wiring in a simulated gate run
