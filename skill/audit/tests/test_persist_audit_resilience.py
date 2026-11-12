@@ -19,6 +19,13 @@ Covers:
   within that bound.
 - AC3: Existing persistence behaviour (original report persisted verbatim,
   identity guard, stage preservation) is unchanged.
+- SA-0MW0LR5GC007WIU9 (Defect 2): a report wrapped by
+  ``FailureNotice.wrap()`` (failure banner on line 1) must still persist its
+  verdict into the audit-text field — wl only accepts a first non-empty line
+  of ``Ready to close: Yes|No`` (``inspectAuditFirstLine``), so the report
+  must be submitted header-first; genuine malformed-JSON content still goes
+  through the salvage pass; and a non-JSON persistence rejection must store
+  a notice naming the real wl error (never a false "malformed JSON" claim).
 
 All tests use a mocked runner — no real pi/wl calls.
 """
@@ -28,6 +35,8 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 # Ensure repo root is on sys.path so the audit scripts are importable.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -39,6 +48,7 @@ from audit.scripts.persist_audit import (
     persist_audit,
 )
 from audit.tests.wl_helpers import make_stateful_runner
+from scripts.failure_notice import FailureNotice
 
 # The 43-char stub observed in the Phase 2 failure: the summary string passed
 # to ``wl audit-set`` when the ``wl update --audit-text`` replacement failed.
@@ -244,6 +254,270 @@ class TestTotalPersistenceFailure:
         err = capsys.readouterr().err
         assert "audit-text" in err.lower() or "failed" in err.lower()
         assert len([c for c in runner.calls if "--audit-text" in c]) == 3  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# SA-0MW0LR5GC007WIU9 — failure-notice reports must persist with the verdict
+# header first (Defect 2 regression; parent SA-0MW0LR0D70034DGE).
+#
+# ``FailureNotice.wrap()`` (skill/scripts/failure_notice.py) leads with the
+# ``====`` / ``⚠ Script Execution Failure`` banner, but ``wl update
+# --audit-text`` only accepts a first non-empty line of exactly ``Ready to
+# close: Yes`` or ``Ready to close: No`` (``inspectAuditFirstLine`` in the
+# worklog package, src/audit.ts → ``audit-invalid-first-line``).  The fix
+# (SA-0MW0LRBJM008Q2MC) submits the report header-first and makes a residual
+# rejection truthful; until it lands, the assertions below are marked with an
+# imperative ``pytest.xfail`` naming that child (red-first convention — the
+# marker fires only while the defect is observed and disappears on its own
+# once the fix lands).
+# ---------------------------------------------------------------------------
+
+_VERDICT_HEADERS = ("Ready to close: Yes", "Ready to close: No")
+
+
+_AC_REPORT = (
+    "Audit report for SA-TEST\n"
+    "Ready to close: Yes\n"
+    "\n"
+    "| 1 | AC1 | met | evidence: verified in tests |\n"
+    "| 2 | AC2 | met | evidence: verified in tests |\n"
+)
+
+
+def _first_non_empty(text: str) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _wrap_with_failure_notice(report: str) -> str:
+    """Mirror audit_runner._assemble_report's script-failure wrapping."""
+    return FailureNotice(
+        script_name="audit_runner.py",
+        reason="Non-zero exit code: 1",
+        stderr_context="Pi provider error: Connection error",
+    ).wrap(report)
+
+
+def _make_wl_validating_runner(*, reject_when=None, reject_stderr=None):
+    """Runner emulating ``wl update --audit-text`` validation.
+
+    ``wl`` accepts only a first non-empty line of exactly ``Ready to close:
+    Yes`` / ``Ready to close: No`` (``inspectAuditFirstLine``); anything else
+    is rejected with rc != 0 and stderr ``audit-invalid-first-line`` — the
+    failure mode a ``FailureNotice``-wrapped report triggers. The optional
+    *reject_when* predicate additionally rejects payloads with a
+    non-successful stderr (default: a genuine malformed-JSON parse error —
+    the failure the resilience salvage pass repairs; tests may supply the
+    E2BIG ``Argument list too long`` error for the non-JSON diagnostic path).
+    All other wl calls succeed; no live ``wl``, no network, no ``pi`` calls.
+    """
+    calls: list[list[str]] = []
+
+    def fake_runner(cmd, **kwargs):
+        calls.append(list(cmd))
+        cmd_str = " ".join(cmd)
+        if "audit-set" in cmd_str:
+            return _proc(stdout='{"success": true}')
+        if "--audit-text" in cmd_str:
+            text = _audit_text_of(cmd)
+            if _first_non_empty(text) not in _VERDICT_HEADERS:
+                return _proc(returncode=1, stderr="audit-invalid-first-line")
+            if reject_when is not None and reject_when(text):
+                stderr = (
+                    reject_stderr
+                    if reject_stderr is not None
+                    else (
+                        "Expected ',' or '}' after property value in JSON "
+                        "at position 28"
+                    )
+                )
+                return _proc(returncode=1, stderr=stderr)
+            return _proc(stdout='{"success": true}')
+        if "show" in cmd_str:
+            return _show_proc()
+        return _proc(stdout='{"success": true}')
+
+    fake_runner.calls = calls  # type: ignore[attr-defined]
+    return fake_runner
+
+
+class TestFailureNoticeReportPersistence:
+    """AC1: a FailureNotice-wrapped report is persisted into the audit-text
+    field with the verdict header first — the report, not the notice."""
+
+    def test_failure_notice_wrapped_report_persists_header_first(self):
+        report = _wrap_with_failure_notice(_AC_REPORT)
+        # The banner leads today — exactly the shape wl rejects.
+        assert _first_non_empty(report).startswith("=")
+
+        runner = _make_wl_validating_runner()
+        rc = persist_audit("SA-TEST", report, runner=runner)
+
+        audit_text_calls = [c for c in runner.calls if "--audit-text" in c]  # type: ignore[attr-defined]
+        persisted = _audit_text_of(audit_text_calls[-1])
+
+        if "| 1 | AC1 | met |" not in persisted:
+            pytest.xfail(
+                "failure-notice report not persisted header-first "
+                "(SA-0MW0LRBJM008Q2MC): the banner-first report was rejected "
+                "by wl's audit-invalid-first-line rule and only the fallback "
+                "notice was stored"
+            )
+
+        # The report — not the notice — is submitted first, header-first…
+        assert rc == 0
+        submitted_first = _audit_text_of(audit_text_calls[0])
+        assert _first_non_empty(submitted_first) == "Ready to close: Yes"
+        assert "| 1 | AC1 | met |" in submitted_first
+        assert "Script Execution Failure" in submitted_first
+        # …the verdict rows and the ready-to-close verdict are intact…
+        assert "| 1 | AC1 | met |" in persisted
+        assert "| 2 | AC2 | met |" in persisted
+        assert _first_non_empty(persisted) == "Ready to close: Yes"
+        # …and no persistence notice replaced the report.
+        assert "Audit persistence notice" not in persisted
+        assert _STUB not in persisted
+
+    def test_failure_notice_wrapped_no_report_keeps_its_verdict(self):
+        report = _wrap_with_failure_notice(
+            "Audit report for SA-TEST\n"
+            "Ready to close: No\n"
+            "\n"
+            "| 1 | AC1 | unmet | evidence: check failed |\n"
+        )
+        runner = _make_wl_validating_runner()
+        rc = persist_audit("SA-TEST", report, runner=runner)
+
+        audit_text_calls = [c for c in runner.calls if "--audit-text" in c]  # type: ignore[attr-defined]
+        persisted = _audit_text_of(audit_text_calls[-1])
+
+        if "| 1 | AC1 | unmet |" not in persisted:
+            pytest.xfail(
+                "failure-notice 'No' report not persisted header-first "
+                "(SA-0MW0LRBJM008Q2MC): only the fallback notice was stored"
+            )
+
+        assert rc == 0
+        submitted_first = _audit_text_of(audit_text_calls[0])
+        # The verdict is preserved — never flipped to Yes by the header fix.
+        assert _first_non_empty(submitted_first) == "Ready to close: No"
+        assert _first_non_empty(persisted) == "Ready to close: No"
+        assert "| 1 | AC1 | unmet |" in persisted
+        assert "Script Execution Failure" in persisted
+        assert "Audit persistence notice" not in persisted
+
+
+class TestGenuineMalformedContentSalvage:
+    """AC2: genuine malformed-JSON content still salvages valid JSON
+    prefixes and never fabricates verdicts — the existing salvage contract
+    is preserved (these run green both before and after the fix)."""
+
+    def test_malformed_json_salvaged_and_valid_verdict_rows_preserved(self):
+        report = (
+            "Ready to close: No\n"
+            "\n"
+            "Audit report for SA-TEST\n"
+            "\n"
+            "| 1 | AC1 | met | evidence: verified |\n"
+            "| 2 | AC2 | unmet | " + _BROKEN_FRAGMENT + " |\n"
+            "| 3 | AC3 | met | evidence: verified |\n"
+        )
+        runner = _make_wl_validating_runner(
+            reject_when=lambda text: _BROKEN_FRAGMENT in text
+        )
+        rc = persist_audit("SA-TEST", report, runner=runner)
+
+        audit_text_calls = [c for c in runner.calls if "--audit-text" in c]  # type: ignore[attr-defined]
+        persisted = _audit_text_of(audit_text_calls[-1])
+
+        # Repaired retry accepted (rc 0) with the verdict header intact.
+        assert rc == 0
+        assert _first_non_empty(persisted) == "Ready to close: No"
+        assert len(audit_text_calls) == 2  # original + one repaired retry
+        # Valid JSON prefix is salvaged; the broken tail is replaced.
+        assert '{"verdict": "met"}' in persisted
+        assert _BROKEN_FRAGMENT not in persisted
+        assert "truncated malformed JSON" in persisted
+        # Verdict rows are preserved verbatim — nothing rewritten/invented.
+        assert "| 1 | AC1 | met | evidence: verified |" in persisted
+        assert "| 2 | AC2 | unmet |" in persisted
+        assert "| 3 | AC3 | met | evidence: verified |" in persisted
+        assert "Audit persistence notice" in persisted
+        assert _STUB not in persisted
+
+    def test_unsalvageable_fragment_is_marked_not_fabricated(self):
+        report = (
+            "Ready to close: No\n"
+            "\n"
+            "Audit report for SA-TEST\n"
+            "\n"
+            '| 2 | AC2 | unmet | {"evidence": "unterminated |\n'
+            "| 3 | AC3 | met | evidence: verified |\n"
+        )
+        runner = _make_wl_validating_runner(
+            reject_when=lambda text: '"unterminated' in text
+        )
+        rc = persist_audit("SA-TEST", report, runner=runner)
+
+        audit_text_calls = [c for c in runner.calls if "--audit-text" in c]  # type: ignore[attr-defined]
+        persisted = _audit_text_of(audit_text_calls[-1])
+
+        assert rc == 0
+        assert _first_non_empty(persisted) == "Ready to close: No"
+        # The unsalvageable fragment is rendered as an explicit marker — the
+        # report never fabricates a verdict for content it cannot parse.
+        assert "`(unparseable verdict data)`" in persisted
+        assert '"verdict"' not in persisted
+        assert "| 2 | AC2 | unmet |" in persisted
+        assert "| 3 | AC3 | met | evidence: verified |" in persisted
+
+
+class TestNonJsonRejectionDiagnostics:
+    """AC3: when persistence is rejected for a non-JSON reason, the stored
+    notice names the real wl error — it must not claim "malformed JSON"."""
+
+    def test_notice_does_not_claim_malformed_json_for_non_json_rejection(self):
+        # A large inline report trips the OS per-argument limit (E2BIG) long
+        # before any content validation — a genuine non-JSON failure that
+        # survives the header-first fix, so the stored notice must be
+        # truthful about it.
+        report = (
+            "Ready to close: No\n"
+            "\n"
+            "Audit report for SA-TEST\n"
+            "\n"
+            "| 1 | AC1 | unmet | evidence: " + ("x" * 600) + " |\n"
+        )
+        runner = _make_wl_validating_runner(
+            reject_when=lambda text: "| 1 | AC1 |" in text,
+            reject_stderr="OSError [Errno 7] Argument list too long",
+        )
+        rc = persist_audit("SA-TEST", report, runner=runner)
+
+        audit_text_calls = [c for c in runner.calls if "--audit-text" in c]  # type: ignore[attr-defined]
+        persisted = _audit_text_of(audit_text_calls[-1])
+
+        if "malformed JSON" in persisted:
+            pytest.xfail(
+                "non-JSON rejection still claims 'malformed JSON' "
+                "(SA-0MW0LRBJM008Q2MC): the stored notice must name the "
+                "actual wl error and its remediation"
+            )
+
+        # The truthful notice names the real failure (E2BIG), never a false
+        # "malformed JSON" claim…
+        assert "malformed JSON" not in persisted
+        assert (
+            "argument list too long" in persisted.lower()
+            or "errno 7" in persisted.lower()
+        )
+        # …while remaining a usable, verdict-leading fallback payload that
+        # still names the target work item (identity/readback guards).
+        assert _first_non_empty(persisted) == "Ready to close: No"
+        assert "SA-TEST" in persisted
+        assert rc != 0
 
 
 # ---------------------------------------------------------------------------
