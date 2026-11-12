@@ -125,11 +125,11 @@ SA-0MT4DFE8Y004J8SP):
 
 ```json
 {
-  "global_agents": 15922,
+  "global_agents": 16268,
   "project_agents": 3875,
   "skills_prose": 2339,
   "skill_implement_md": 22000,
-  "total": 22136
+  "total": 22482
 }
 ```
 
@@ -296,6 +296,20 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > `22136`; `project_agents` and `skills_prose` unchanged). The growth is the
 > canonical-wording clarification (the retired producer-hold exception is
 > removed), so the thresholds were regenerated to the new measured surface.
+>
+> **Driven-child placement-guard bump (2026-11-12, SA-0MW5FIJNQ002Z24I):**
+> confining the "discover a blocker → start working on it" rule for driven
+> sessions (a red first `finish` gate the child did not cause → triage →
+> STOP, never `implement.py start` the new item) and naming another item's
+> linked worktree as a forbidden write surface added ~346 B to
+> `AGENTS_GLOBAL.md` (`global_agents 15922` → `16268`; `total 22136` →
+> `22482`; `project_agents` and `skills_prose` unchanged). The growth is
+> deliberate driven-session safety guidance (the incident child followed the
+> blocker rule verbatim and wrote into a sibling worktree), so the thresholds
+> were regenerated to the new measured surface rather than compacting the
+> guidance. `skill_implement_md` stayed at its 22,000 B cap: the SKILL.md
+> red-gate note was accommodated by trimming duplicated prose, not by raising
+> the threshold.
 >
 > ### Enforcement (committed gate)
 >

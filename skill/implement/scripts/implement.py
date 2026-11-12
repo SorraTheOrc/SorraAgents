@@ -2784,10 +2784,14 @@ def _main_checkout_offending_paths(
     """Return the non-``.worklog/`` dirty paths in a checkout.
 
     Used by the implementation-placement gates to name the offending files
-    when work landed in the main checkout instead of a worktree.
+    when work landed outside the worktree — in the main checkout or in a
+    registered sibling worktree (SA-0MW5FIJNQ002Z24I). The scanner is
+    generic over any checkout root of the repository: the main checkout for
+    the classic case, or each sibling root for the sibling case.
 
     Args:
-        repo_root: Absolute path to the main checkout root.
+        repo_root: Absolute path to a checkout root of the repository (the
+            main checkout, or one of its linked worktrees).
         expected_dirty: Project-declared path prefixes to exclude.
 
     Returns:
@@ -14457,12 +14461,13 @@ def phase_parent(
         return report
 
     def _fail_placement(cid: str, violation: str) -> dict[str, Any]:
-        """Fail closed when a child's work landed in the main checkout.
+        """Fail closed when a child's work landed outside its worktree.
 
         A non-terminal child whose worktree is clean at the parent HEAD while
-        the main checkout is dirty means the child wrote outside its worktree
-        (``cwd`` is not sufficient). Report the offending paths and stop
-        instead of silently proceeding or advancing the parent.
+        the main checkout — or another item's linked worktree — holds changes
+        means the child wrote outside its worktree (``cwd`` is not
+        sufficient). Report the offending surface(s) and stop instead of
+        silently proceeding or advancing the parent.
         """
         LOG.error(violation)
         report["success"] = False
@@ -14472,8 +14477,9 @@ def phase_parent(
         report["children_processed"] = child_results
         wl_add_comment(
             work_item_id,
-            "Parent phase refused: a child session wrote to the main "
-            f"checkout instead of its worktree.\n```\n{violation}\n```",
+            "Parent phase refused: a child session wrote outside its "
+            "worktree (the main checkout or another item's linked "
+            f"worktree).\n```\n{violation}\n```",
         )
         if json_output:
             print(format_json_output(report))
@@ -18493,6 +18499,96 @@ def _is_worktree(path: Path) -> bool:
     return git_path.is_file()
 
 
+def _printable_path_listing(paths: list[str], limit: int = 20) -> str:
+    """Render offending paths as a bulleted list with an overflow marker."""
+    listing = "\n".join(f"  - {p}" for p in paths[:limit])
+    if len(paths) > limit:
+        listing += f"\n  … and {len(paths) - limit} more"
+    return listing
+
+
+def _placement_path_listing(paths: list[str], parent_branch: str) -> str:
+    """Render the evidence for one placement-violation change surface.
+
+    Dirty paths are listed; a surface flagged only because it holds commits
+    ahead of *parent_branch* (no dirty working-tree files) is described as
+    such, so a sibling that was strayed into and committed to is still named
+    even though it has no dirty paths to list.
+    """
+    if paths:
+        return f"Offending paths:\n{_printable_path_listing(paths)}"
+    return (
+        f"The surface holds commits ahead of {parent_branch} (no dirty "
+        f"working-tree files were observed)."
+    )
+
+
+def _registered_sibling_worktree_paths(
+    worktree_path: str | Path,
+    repo_root: str | Path,
+) -> list[Path]:
+    """Return the registered linked worktrees of *repo_root* other than the child's own.
+
+    A sibling worktree is any path git registers as a worktree of the same
+    repository, excluding the main checkout root and the child's own
+    worktree. It is the foreign write surface a driven child must never
+    touch — it belongs to another work item's session, so writing there
+    races that session and silently widens the epic (SA-0MW5FIJNQ002Z24I).
+    A foreign repository checkout — even one reachable by path — is never
+    listed, because the registry is scoped to *repo_root* itself
+    (cross-checkout attribution, SA-0MVXVBZF2009HRRN).
+
+    Args:
+        worktree_path: The child's own worktree root.
+        repo_root: The main checkout root.
+
+    Returns:
+        Existing, resolved sibling worktree paths (sorted for deterministic
+        ordering). Empty when the registry cannot be read or no siblings
+        exist — callers treat that as "no sibling write surface", never as
+        a violation.
+    """
+    root = Path(repo_root).resolve()
+    wt = Path(worktree_path).resolve()
+    registered = _registered_worktree_paths(str(root))
+    if not registered:
+        return []
+    siblings: list[Path] = []
+    for candidate in sorted(registered):
+        path = Path(candidate)
+        if path == root or path == wt:
+            continue
+        if not path.exists():
+            continue
+        siblings.append(path)
+    return siblings
+
+
+def _sibling_worktree_containing(
+    cur: Path, repo_root: str | Path, worktree_path: str | Path
+) -> Path | None:
+    """Return the registered sibling worktree that contains *cur*, if any.
+
+    The finish-phase placement gate is cwd-sensitive: a driven child that
+    ``cd``'s into another item's linked worktree and runs ``finish`` from
+    there is invisible to the main-checkout scan, so a cwd that resolves
+    into a registered sibling is checked as its own write surface
+    (SA-0MW5FIJNQ002Z24I).
+
+    Args:
+        cur: The resolved current directory.
+        repo_root: The main checkout root.
+        worktree_path: The child's own worktree root.
+
+    Returns:
+        The resolved sibling worktree root containing *cur*, else ``None``.
+    """
+    for sibling in _registered_sibling_worktree_paths(worktree_path, repo_root):
+        if cur == sibling or sibling in cur.parents:
+            return sibling
+    return None
+
+
 def _worktree_placement_violation(
     worktree_path: str,
     cwd: str | None = None,
@@ -18505,14 +18601,17 @@ def _worktree_placement_violation(
     ``implement.py start``. A violation exists only when ALL of:
 
     1. the current directory is not the worktree (or a subdirectory of it),
-    2. the main checkout holds uncommitted changes outside ``.worklog/``, and
+    2. another change surface holds the work — the main checkout holds
+       uncommitted changes outside ``.worklog/``, or the cwd resolves into a
+       **registered sibling worktree** of the same repository that holds
+       changes (SA-0MW5FIJNQ002Z24I), and
     3. the worktree itself holds NO changes (no dirty files and no commits
        ahead of the parent branch) — i.e. the work was done in the main
-       checkout, not the worktree.
+       checkout or a sibling worktree, not the worktree.
 
     Condition 3 keeps the gate precise: pre-existing/unrelated dirt in the
-    main checkout does not block a legitimate finish when the work actually
-    lives in the worktree.
+    main checkout (or in a sibling item's tree) does not block a legitimate
+    finish when the work actually lives in the worktree.
 
     Args:
         worktree_path: Absolute path to the worktree.
@@ -18522,8 +18621,9 @@ def _worktree_placement_violation(
         parent_branch: Branch the worktree forked from (default: ``dev``).
 
     Returns:
-        An actionable error message string if placement is violated,
-        otherwise ``None``.
+        An actionable error message string (naming both roots when the work
+        landed in a sibling worktree) if placement is violated, otherwise
+        ``None``.
     """
     wt = Path(worktree_path).resolve()
     cur = Path(cwd or os.getcwd()).resolve()
@@ -18532,6 +18632,38 @@ def _worktree_placement_violation(
 
     root = Path(repo_root or _get_repo_root(cur) or cur).resolve()
     root_expected = expected_dirty_paths(str(root))
+
+    # A cwd inside a *sibling* worktree is a foreign write surface: the main
+    # checkout scan below would miss changes written into another item's
+    # linked worktree entirely, so a registered sibling that contains cwd is
+    # checked explicitly as its own surface (SA-0MW5FIJNQ002Z24I).
+    sibling = _sibling_worktree_containing(cur, root, wt)
+    if sibling is not None:
+        if _git_path_has_changes(
+            wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
+        ):
+            return None  # work lives in the worktree; sibling dirt is unrelated
+        if _git_path_has_changes(
+            sibling, parent_branch, expected_dirty=root_expected
+        ):
+            offending = _main_checkout_offending_paths(
+                str(sibling), expected_dirty=root_expected
+            )
+            evidence = _placement_path_listing(offending, parent_branch)
+            return (
+                f"Work done outside the worktree: uncommitted changes were "
+                f"found in the sibling worktree {sibling} while this "
+                f"worktree {wt} contains no changes. A driven child MUST "
+                f"write only inside its own worktree ({wt} — the "
+                f"IMPLEMENT_WORKTREE_PATH); a sibling worktree belongs to "
+                f"another work item and racing its session is forbidden. "
+                f"{evidence}\n"
+                f"Move these changes into {wt} (or discard them), then "
+                f"re-run `implement.py finish`."
+            )
+        # A clean sibling is not evidence; fall through to the main-checkout
+        # scan, which still applies when the work landed there instead.
+
     if not git_has_dirty_files(
         git_status(cwd=str(root)), expected_dirty=root_expected
     ):
@@ -18598,24 +18730,28 @@ def _child_main_checkout_violation(
     parent_branch: str = DEFAULT_PARENT_BRANCH,
     repo_root: str | None = None,
 ) -> str | None:
-    """Detect a child session that wrote to the main checkout, not its worktree.
+    """Detect a child session that wrote outside its worktree.
 
     A driven child session receives ``cwd=<worktree>`` (and
     ``IMPLEMENT_WORKTREE_PATH``), but ``cwd`` is only a hint: an agent can
-    prefix commands with ``cd <main-checkout> && ...`` and write there. This
-    guard detects that failure after the fact so ``phase_parent``/``phase_drive``
-    fail closed instead of silently proceeding. A violation exists only when
-    ALL of:
+    prefix commands with ``cd <main-checkout> && ...`` and write there, or
+    even ``cd`` into **another item's linked worktree** and write there
+    (SA-0MW5FIJNQ002Z24I). This guard detects that failure after the fact so
+    ``phase_parent``/``phase_drive`` fail closed instead of silently
+    proceeding. A violation exists only when ALL of:
 
     1. the child is non-terminal (the caller enforces this),
-    2. the main checkout holds uncommitted changes outside ``.worklog/``, and
+    2. another change surface holds the work — the main checkout holds
+       uncommitted changes outside ``.worklog/``, or a **registered sibling
+       worktree** of the same repository holds changes, and
     3. the child's worktree holds NO changes (no dirty files and no commits
        ahead of the parent branch) — so the work did not land in the worktree.
 
     Condition 3 keeps the guard precise: pre-existing/unrelated dirt in the
-    main checkout does not block a child whose work legitimately lives in its
-    worktree. This mirrors :func:`_worktree_placement_violation`, minus the
-    cwd-sensitive check that only applies to ``phase_finish``.
+    main checkout (or in a sibling item's tree) does not block a child whose
+    work legitimately lives in its worktree. This mirrors
+    :func:`_worktree_placement_violation`, minus the cwd-sensitive check that
+    only applies to ``phase_finish``.
 
     Args:
         child_id: The child work item ID (named in the message).
@@ -18625,7 +18761,8 @@ def _child_main_checkout_violation(
             worktree).
 
     Returns:
-        An actionable error message naming the offending main-checkout paths,
+        An actionable error message naming every offending surface (the
+        main-checkout paths and/or the sibling worktrees with their paths),
         or ``None`` when there is no violation.
     """
     wt = Path(worktree_path)
@@ -18636,31 +18773,55 @@ def _child_main_checkout_violation(
     if not repo_root_str:
         return None
     root = Path(repo_root_str).resolve()
+    root_expected = expected_dirty_paths(str(root))
 
-    offending = _main_checkout_offending_paths(
-        str(root), expected_dirty=expected_dirty_paths(str(root))
-    )
-    if not offending:
-        return None  # main checkout clean (or only expected-dirty paths)
-
+    # The worktree holding the child's own work makes every other change
+    # surface unrelated (precise-guard rule) — check it first so a
+    # legitimate child never pays for the foreign-surface scans below.
     if _git_path_has_changes(
         wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
     ):
-        return None  # work lives in the worktree; main-checkout dirt is unrelated
+        return None
 
-    listing = "\n".join(f"  - {p}" for p in offending[:20])
-    if len(offending) > 20:
-        listing += f"\n  … and {len(offending) - 20} more"
+    offending = _main_checkout_offending_paths(str(root), expected_dirty=root_expected)
+    sibling_offending = [
+        (
+            sibling,
+            _main_checkout_offending_paths(
+                str(sibling), expected_dirty=root_expected
+            ),
+        )
+        for sibling in _registered_sibling_worktree_paths(wt, root)
+        if _git_path_has_changes(sibling, parent_branch, expected_dirty=root_expected)
+    ]
+    if not offending and not sibling_offending:
+        return None  # no foreign change surface
+
+    parts: list[str] = []
+    if offending:
+        parts.append(
+            f"Child {child_id} produced changes in the main checkout at "
+            f"{root} instead of its worktree {wt}. The worktree has no "
+            f"changes (no dirty files and no commits ahead of "
+            f"{parent_branch}), so the child's work did not land in its own "
+            f"worktree — `cwd` is not sufficient. Offending main-checkout "
+            f"paths:\n{_printable_path_listing(offending)}"
+        )
+    for sibling, sibling_paths in sibling_offending:
+        parts.append(
+            f"Child {child_id} produced changes in the sibling worktree "
+            f"{sibling} instead of its worktree {wt}. The worktree has no "
+            f"changes (no dirty files and no commits ahead of "
+            f"{parent_branch}), so the child's work did not land in its own "
+            f"worktree — `cwd` is not sufficient and a sibling worktree "
+            f"belongs to another work item. "
+            f"{_placement_path_listing(sibling_paths, parent_branch)}"
+        )
     return (
-        f"Child {child_id} produced changes in the main checkout at {root} "
-        f"instead of its worktree {wt}. The worktree has no changes (no "
-        f"dirty files and no commits ahead of {parent_branch}), so the "
-        f"child's work did not land in its own "
-        f"worktree — `cwd` is not sufficient. Offending main-checkout paths:\n"
-        f"{listing}\n"
-        f"Move these changes into {wt} (or discard them), then re-run. A "
-        f"driven child MUST run every write/edit with a path that resolves "
-        f"inside its worktree."
+        "\n\n".join(parts)
+        + "\nMove these changes into "
+        + f"{wt} (or discard them), then re-run. A driven child MUST run "
+        f"every write/edit with a path that resolves inside its worktree."
     )
 
 

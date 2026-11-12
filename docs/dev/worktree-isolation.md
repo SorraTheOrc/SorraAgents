@@ -51,8 +51,9 @@ The worktree keeps each work item's edits off the shared checkout so that:
 - a failed or abandoned run can be discarded without touching `dev`.
 
 `implement.py finish` refuses (fails closed) when it detects changes outside
-the worktree, and `phase_parent`/`drive` detect a driven child whose work
-landed in the main checkout — see **The placement guard** below.
+its worktree, and `phase_parent`/`drive` detect a driven child whose work
+landed outside its worktree — in the main checkout **or another item's linked
+worktree** — see **The placement guard** below.
 
 ## The split: `wl` reads the main checkout, edits live in the worktree
 
@@ -120,6 +121,10 @@ Rules:
 - Never edit through an absolute path under the main checkout (for example
   `/abs/path/to/main-checkout/src/...`) — that writes outside the worktree
   even when the shell `cwd` looks correct.
+- Never `cd` into (or write through) **another item's linked worktree** —
+  `.worklog/worktrees/wl-<other-id>-*` — a sibling worktree belongs to that
+  item's session; `phase_parent`/`drive`/`finish` detect a child that writes
+  there and fail closed naming both roots (SA-0MW5FIJNQ002Z24I).
 - Resolve every `write`/`edit` target inside the worktree root.
 - If you `cd` anywhere, `cd` back before editing; prefer a single explicit
   `--worklog-dir` invocation over changing directory at all.
@@ -340,17 +345,47 @@ never record a self-upstream.
 
 `phase_parent`/`phase_drive` fail closed when a **non-terminal** child's
 worktree holds no work — no dirty files and **no commits ahead of** the parent
-HEAD (`dev`), however far *behind* it is — while the main checkout holds
-uncommitted changes outside `.worklog/`: evidence the child wrote to the main
-checkout instead of its worktree. The failure names the offending
-main-checkout paths and does **not** advance the parent.
+HEAD (`dev`), however far *behind* it is — while another change surface holds
+changes: the main checkout (uncommitted changes outside `.worklog/`) **or a
+registered sibling worktree** of the same repository (another item's linked
+tree, which the stray child wrote into instead of its own). Both are evidence
+the child wrote outside its worktree. The failure names the offending
+surface(s) — the main-checkout paths, or the sibling root with both roots and
+the offending sibling paths — and does **not** advance the parent
+(SA-0MW5FIJNQ002Z24I). A fail-closed refusal mutates neither item's status: it
+reports (comment + structured `placement_violation` fields) and stops the
+chain.
 
 The guard is deliberately precise: a legitimate child whose work is already in
-its worktree, a clean main checkout, or `.worklog/`-only dirt never trigger
-it. The ahead-count (rather than a HEAD comparison) is what keeps a
-behind-only worktree — a long-running drive whose branch fell behind after
-unrelated commits landed on `dev` — on the "no work" side of the guard and on
-the "implement next" side of `phase_parent` (SA-0MVRN5Q67005H3M5).
+its worktree, a clean main checkout, `.worklog/`-only dirt, or a clean sibling
+tree never trigger it — the child's own worktree holding the work makes every
+other change surface unrelated (unrelated dirt never blocks). A **foreign
+repository checkout** — even one reachable by path — is never a sibling: only
+paths `git worktree list` registers for the child's own repository count
+(cross-checkout attribution). The ahead-count (rather than a HEAD comparison)
+is what keeps a behind-only worktree — a long-running drive whose branch fell
+behind after unrelated commits landed on `dev` — on the "no work" side of the
+guard and on the "implement next" side of `phase_parent`
+(SA-0MVRN5Q67005H3M5).
+
+The finish-phase gate (`_worktree_placement_violation`) is cwd-sensitive and
+symmetric: when `finish` runs from a cwd that resolves into a registered
+sibling worktree, that sibling's changes are checked as its own write surface
+(own worktree with no work + dirty sibling ⇒ refusal naming both roots), with
+the main-checkout scan unchanged for every other cwd.
+
+### Driven-child red-gate stop rule
+
+A driven child whose **first** `finish` gate is red because of a failure it
+did **not** introduce (e.g. a pre-existing environment-only failure) must stop
+after triage: create the work item for the failure, record the blocking
+relationship, report — and **stop**. It never runs `implement.py start` for
+that item and never edits that item's worktree (or any other item's). The
+drive loop already bounds finish retries; this rule is the behavioural
+instruction (`AGENTS_GLOBAL.md`, `skill/implement/SKILL.md`), and the extended
+placement guard above is its mechanical backstop — even a child that ignores
+the rule and starts the triaged item's implementation fails closed the moment
+it writes into the sibling worktree.
 
 ## The main checkout is a guarded surface
 
