@@ -148,18 +148,34 @@ PRIORITY_MAP = {
 
 @dataclass
 class QueueEntry:
-    """A single item in the priority queue."""
+    """A single item in the priority queue.
+
+    The optional ``project_root`` field (AC1 of LP-0MW96A9GW009KVF7, parent
+    LP-0MW0KZUJP0019SLS) carries the **project checkout root** that owns the
+    item (e.g. ``/home/rgardler/projects/SorraAgents``). The batch queue is
+    physically host-wide (``XDG_RUNTIME_DIR/pi-semaphores/``) but entries
+    carry no project identity, so a drain from repo A could dequeue an item
+    meant for repo B and route it to the wrong worklog (LP-0MW0KZUJP0019SLS
+    AC2). With the field, each drained item routes against its own worklog
+    root (AC3) and the drain reports which projects contributed
+    (``projects_included``, AC4). Absent (``None``) for legacy entries or
+    non-cross-project producers — behaviour is unchanged (AC5).
+    """
 
     item_id: str
     priority: int  # numeric priority value
     timestamp: float = field(default_factory=time.monotonic)
+    project_root: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "item_id": self.item_id,
             "priority": self.priority,
             "timestamp": self.timestamp,
         }
+        if self.project_root:
+            data["project_root"] = self.project_root
+        return data
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> QueueEntry:
@@ -167,6 +183,7 @@ class QueueEntry:
             item_id=data["item_id"],
             priority=data["priority"],
             timestamp=data["timestamp"],
+            project_root=data.get("project_root"),
         )
 
 
@@ -385,6 +402,7 @@ class PriorityQueue:
         priority: int,
         timeout: float | None = None,
         timestamp: float | None = None,
+        project_root: str | None = None,
     ) -> QueueEntry:
         """Add an item to the queue, waiting if at capacity.
 
@@ -396,6 +414,9 @@ class PriorityQueue:
             timeout: Override the instance timeout.  ``None`` = use
                 instance default, ``0`` = fail fast.
             timestamp: Override the entry timestamp (for testing).
+            project_root: Project checkout root owning this item
+                (LP-0MW96A9GW009KVF7 AC1: cross-project queue routing).
+                ``None`` preserves the legacy host-wide behaviour.
 
         Returns:
             The ``QueueEntry`` that was enqueued.
@@ -435,6 +456,7 @@ class PriorityQueue:
                         item_id=item_id,
                         priority=priority,
                         timestamp=ts,
+                        project_root=project_root,
                     )
                     entry_file = self._queue_dir / _queue_file(item_id)
                     with open(entry_file, "w") as f:

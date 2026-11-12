@@ -426,6 +426,55 @@ def test_queue_entry_has_expected_fields():
     assert entry.timestamp == 1234.0
 
 
+def test_queue_entry_project_root_default_is_none():
+    """AC5 (LP-0MW96A9GW009KVF7): a legacy entry carries no project root."""
+    entry = QueueEntry(item_id="test", priority=Priority.HIGH, timestamp=1234.0)
+    assert entry.project_root is None
+
+
+def test_queue_entry_project_root_round_trips():
+    """AC1: the project root survives to_dict/from_dict (the JSON file)."""
+    entry = QueueEntry(
+        item_id="SA-ROOT", priority=Priority.HIGH, timestamp=1234.0,
+        project_root="/home/rgardler/projects/OtherRepo",
+    )
+    data = entry.to_dict()
+    assert data["project_root"] == "/home/rgardler/projects/OtherRepo"
+    restored = QueueEntry.from_dict(data)
+    assert restored.project_root == "/home/rgardler/projects/OtherRepo"
+    assert restored.item_id == "SA-ROOT"
+
+
+def test_queue_entry_from_dict_tolerates_missing_project_root():
+    """AC5: entries written before the field existed deserialise cleanly."""
+    legacy = {"item_id": "SA-OLD", "priority": 2, "timestamp": 100.0}
+    restored = QueueEntry.from_dict(legacy)
+    assert restored.project_root is None
+    assert restored.item_id == "SA-OLD"
+
+
+def test_enqueue_stores_project_root_and_dequeue_returns_it():
+    """AC1/AC3: enqueue(project_root=...) is storable and survives dequeue."""
+    pq = PriorityQueue("unit-root", max_depth=5, timeout=5.0)
+    pq.enqueue(
+        "SA-X", Priority.MEDIUM,
+        project_root="/home/rgardler/projects/SomeProject",
+    )
+    entry = pq.dequeue(timeout=1.0)
+    assert entry is not None
+    assert entry.item_id == "SA-X"
+    assert entry.project_root == "/home/rgardler/projects/SomeProject"
+
+
+def test_enqueue_without_project_root_dequeues_with_none():
+    """AC5: legacy enqueue (no project_root) keeps today's shape."""
+    pq = PriorityQueue("unit-noroot", max_depth=5, timeout=5.0)
+    pq.enqueue("SA-Y", Priority.MEDIUM)
+    entry = pq.dequeue(timeout=1.0)
+    assert entry is not None
+    assert entry.project_root is None
+
+
 # ---------------------------------------------------------------------------
 # Cross-process safety
 # ---------------------------------------------------------------------------

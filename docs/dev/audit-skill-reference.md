@@ -631,6 +631,14 @@ flag (`--batch-drain` forces it on); drained items always run with
   is separate from the per-launch admission queue (`audit`), so draining
   never steals a live launch's admission ticket and never perturbs queue
   positions of contending audits (SA-0MTG5RYH8005RQNM).
+- **Cross-project entries** (LP-0MW96A9GW009KVF7, parent
+  LP-0MW0KZUJP0019SLS AC2): every entry carries an owning **project root**
+  (the checkout root whose `.worklog` holds the item). The queue is
+  physically host-wide, so a repo-A drain can dequeue an item enqueued by
+  repo B; the per-entry root makes that safe — each item drains against its
+  own worklog. Legacy entries (written before the field, or by a producer
+  that cannot resolve ownership) carry no root and keep today's
+  single-root routing (AC5).
 - A producer (operator/herdr dispatch) enqueues items, or the `batch`
   subcommand **primes** the queue from `wl list --stage in_review --json`
   when it is below the depth threshold: candidates are ordered by queue
@@ -646,10 +654,16 @@ duplicates; audits via the FULL single-item pipeline (`cmd_issue`:
 claim, freshness gate, phase gates, persist, verified lifecycle); every
 item's pi calls acquire/release host-wide slots, so the **concurrency
 slot is released between items** — another process can use the slot
-before the next item is dequeued. The loop stops when the queue is
-empty, `--max-items N` is reached, or the wall-clock budget elapses —
-whichever comes first; remaining items stay queued for the next window.
-A single item's audit failure is logged and does not abort the window.
+before the next item is dequeued. **Cross-project routing** (AC3): the
+item's stored project root is passed through to the audit, so each item
+is audited against ITS OWN `.worklog` (`<root>/.worklog`) rather than the
+drainer's default; a `None` root (legacy entry / undeterminable
+ownership) falls back to the drainer's own worklog dir — the documented
+fail-open, preserving single-host behaviour (AC5). The loop stops when
+the queue is empty, `--max-items N` is reached, or the wall-clock budget
+elapses — whichever comes first; remaining items stay queued for the next
+window. A single item's audit failure is logged and does not abort the
+window.
 
 ### Configuration
 
@@ -668,7 +682,44 @@ window; `--json` emits a machine-readable summary), and
 
 Every window emits exactly one stderr line with
 `batch_start`, `batch_end`, `items_processed`, `queue_remaining`,
-`items_included` (ISO timestamps; including zero-item windows).
+`items_included` (ISO timestamps; including zero-item windows). For
+cross-project windows the additive per-project map
+`projects_included={project_root: [item_ids...]}` is appended, so the
+report shows which repositories contributed to the window (AC4); a
+single-project window emits an empty map (backward compatible).
+
+## Cross-host audit lease (LP-0MW96A9GW009KVF7)
+
+The audit skill holds a **cross-host audit-tier lease** on the proxy for
+the lifetime of each run (parent epic LP-0MW0KZUJP0019SLS AC1): at most
+`audit_admission.max_audits` (default 1) audits hold a lease across ALL
+client hosts, so a second host's audit WAITS instead of competing for the
+one local `llama-server` GPU. The proxy owns the cap and the lease
+registry (`llm` repo, LP-0MW95FYMH006XYNK); this repo ships the client:
+
+- **Acquire** at run start (`audit_lease_begin`): `POST
+  /llama/local/audit/lease {session_id}` where the session id is
+  `audit-<issue>-lease-<uuid8>` (the proxy identifies audit-tier sessions
+  by the `audit-` prefix).
+- **Renew** between phases and **release** in the finally block, so every
+  exit path (success, scope error, abort, crash) frees the slot; a
+  crashed holder's lease expires via the proxy's TTL backstop regardless.
+- **Nested runs reuse** the outer lease (children, batch drains) — one
+  identity per process, never a double acquire.
+- **Fail-safe by construction**: a proxy error, timeout or a saturated
+  `audit-budget-saturated` refusal after bounded retries
+  (`AUDIT_LEASE_ACQUIRE_RETRIES`, default 3, honouring the hinted
+  `retry_after_s`) proceeds WITHOUT a lease under the legacy per-host
+  guards — a second audit never hangs indefinitely behind the running
+  holder (documented fallback).
+
+### Lease configuration
+
+| Setting | Env var | Default |
+|---|---|---|
+| Enable lease client | `AUDIT_LEASE_ENABLED=0` disables | enabled |
+| Per-request HTTP timeout | `AUDIT_LEASE_TIMEOUT` (seconds) | 5 |
+| Saturation retries | `AUDIT_LEASE_ACQUIRE_RETRIES` | 3 |
 
 ## Descendant cascade on a passing parent audit (SA-0MUR7Y3BJ004FGPP)
 

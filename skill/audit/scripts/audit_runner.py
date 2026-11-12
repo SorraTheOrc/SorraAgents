@@ -377,6 +377,53 @@ it processes only its own single item (AC1 trigger).
 AUDIT_BATCH_DISABLE_ENV = "AUDIT_BATCH_DRAIN"
 """Opt-out env var: set to ``0`` to disable automatic post-audit drain.
 """
+
+# ---------------------------------------------------------------------------
+# Proxy audit lease client (LP-0MW96A9GW009KVF7, parent AC1/AC2)
+# ---------------------------------------------------------------------------
+# The audit skill acquires a cross-host audit-tier lease from the proxy
+# (``POST /llama/local/audit/lease``, LP-0MW95FYMH006XYNK) for the lifetime
+# of a run, renews it periodically, and releases it at exit. At most
+# ``audit_admission.max_audits`` (default 1) audits hold a lease across ALL
+# client hosts, so a second host's audit WAITS (429 ``audit-budget-saturated``
+# + ``retry_after_s``) instead of competing for the one local GPU — the
+# parent epic serialises audits at the shared resource, not per host.
+#
+# The client is fail-safe by construction (parent constraint): a proxy error
+# or timeout never blocks an audit indefinitely — the acquire path waits a
+# bounded number of retries, then proceeds WITHOUT a lease (legacy per-host
+# behaviour preserved, documented fallback). A missing/unreachable proxy
+# therefore degrades to today's single-host guards, never to a hang.
+AUDIT_LEASE_ENABLED_ENV = "AUDIT_LEASE_ENABLED"
+"""Env var: set to ``0`` to disable the proxy audit-lease acquisition.
+
+The lease is best-effort and fail-safe, but a host that never wants to
+participate in cross-host serialisation (e.g. an isolated CI box) can
+opt out with this. Default: enabled (``1``).
+"""
+AUDIT_LEASE_ENABLED_DEFAULT = True
+AUDIT_LEASE_ENDPOINT_PATH = "/llama/local/audit/lease"
+AUDIT_LEASE_ENDPOINT_RENEW_PATH = "/llama/local/audit/lease/renew"
+AUDIT_LEASE_TIMEOUT_ENV = "AUDIT_LEASE_TIMEOUT"
+AUDIT_LEASE_TIMEOUT_DEFAULT = 5.0
+"""Per-lease HTTP request timeout (seconds; fail-open on expiry).
+"""
+AUDIT_LEASE_ACQUIRE_RETRIES_ENV = "AUDIT_LEASE_ACQUIRE_RETRIES"
+AUDIT_LEASE_ACQUIRE_RETRIES_DEFAULT = 3
+"""Bounded acquire retries on ``audit-budget-saturated`` (AC1 wait semantics):
+
+the second audit waits up to this many bounded retries for the running
+holder to finish, honouring the proxy's ``retry_after_s`` hint between
+attempts (never a tight spin).
+"""
+_AUDIT_LEASE_STATE: dict | None = None
+"""Module-level lease state ``{session_id, lease_id, ...}`` held by the
+current process's outermost ``cmd_issue`` run. ``None`` when no lease is
+held. Nested/recursive ``cmd_issue`` calls (children, batch drains) see
+``None`` only when the outer call failed to acquire — Python's
+module-level singleton keeps the lease across phase functions without a
+separate context object.
+"""
 _AUDIT_TS_FORMAT = "%Y-%m-%dT%H:%M:%S"
 _AUDIT_TICKET_COUNTER = itertools.count()
 """Per-process monotonically increasing launch ticket counter.
@@ -5363,17 +5410,23 @@ def _log_batch_metrics(metrics: dict) -> None:
     """Emit the batch-drain metrics line to stderr (AC5).
 
     Fields: ``batch_start``, ``batch_end``, ``items_processed``,
-    ``queue_remaining``, ``items_included``. Every batch run (even a
-    zero-item run) emits exactly one line so the dispatcher can observe
-    window utilization.
+    ``queue_remaining``, ``items_included``, and the additive per-project map
+    ``projects_included`` (AC4 of LP-0MW96A9GW009KVF7: which repositories
+    contributed to this window). Every batch run (even a zero-item run)
+    emits exactly one line so the dispatcher can observe window utilization.
     """
+    _projects = metrics.get("projects_included") or {}
+    projects_summary = " ".join(
+        f"project={k}:{len(v)}" for k, v in sorted(_projects.items())
+    )
     print(
         "Audit batch drain: "
         f"batch_start={metrics.get('batch_start')} "
         f"batch_end={metrics.get('batch_end')} "
         f"items_processed={metrics.get('items_processed', 0)} "
         f"queue_remaining={metrics.get('queue_remaining', 0)} "
-        f"items_included={metrics.get('items_included', [])}",
+        f"items_included={metrics.get('items_included', [])} "
+        f"projects_included={_projects}{' ' + projects_summary if projects_summary else ''}",
         file=sys.stderr,
     )
 
@@ -5389,6 +5442,13 @@ def _enqueue_pending_audit_items(max_items: int | None = None,
     FIFO within tier), and enqueues up to ``max_items`` work-item ids into
     the batch queue. Enqueue is idempotent (the shared queue returns the
     existing entry for a duplicate id), so re-priming never duplicates.
+
+    Each entry is stamped with the **owning project root** (AC1 of
+    LP-0MW96A9GW009KVF7): the worklog root the item was discovered from,
+    derived from *worklog_dir* when given, else the prefix-to-sibling scan.
+    A drain that later dequeues the entry routes it against that root (AC3),
+    so a repo-A drain can no longer audit a repo-B item against repo A's
+    worklog. Legacy entries (no root) keep today's single-root behaviour (AC5).
 
     Returns the list of enqueued work-item ids (already-queued items are
     included in the return value but not re-written).
@@ -5425,12 +5485,35 @@ def _enqueue_pending_audit_items(max_items: int | None = None,
             continue
         raw = ((item or {}).get("priority") or "").strip().lower()
         prio = _PRIORITY_VALUE.get(raw, Priority.MEDIUM)
-        queue.enqueue(item_id, prio, timeout=_resolve_batch_timeout())
+        # AC1: stamp the owning project root so a cross-project drain routes
+        # this item against ITS worklog (AC3), not the drainer's default. The
+        # root is the parent of the worklog dir the item was discovered from
+        # (explicit override, else the same prefix-to-sibling resolution a
+        # drain would use).
+        project_root = _discovered_project_root(item_id, worklog_dir=worklog_dir)
+        queue.enqueue(item_id, prio, timeout=_resolve_batch_timeout(),
+                      project_root=project_root)
         enqueued.append(item_id)
     return enqueued
 
 
-def _batch_drain_cycle(audit_one: Callable[[str, int], int],
+def _discovered_project_root(item_id: str,
+                             worklog_dir: str | None = None) -> str | None:
+    """Resolve the project root that owns *item_id* (AC1/AC3).
+
+    Returns the checkout root (parent of the ``.worklog`` dir) when
+    determinable — explicit *worklog_dir* first, else the prefix-to-sibling
+    scan — and ``None`` when ownership cannot be determined (legacy entry,
+    unknown prefix, no sibling match). Callers fail open: ``None`` keeps
+    today's single-root routing.
+    """
+    owning = _resolve_owning_project_root(item_id, worklog_dir=worklog_dir)
+    if owning is None:
+        return None
+    return str(owning)
+
+
+def _batch_drain_cycle(audit_one: Callable[[str, int, str | None], int],
                        max_items: int | None = None,
                        timeout: float | None = None,
                        worklog_dir: str | None = None,
@@ -5444,19 +5527,25 @@ def _batch_drain_cycle(audit_one: Callable[[str, int], int],
       2. Skip ``audit:`` admission tickets, the caller's own primary item
          (*skip_ids*), and duplicates (defensive; the queue holds work-item
          ids).
-      3. Audit the item via ``audit_one(item_id, priority)``. The caller's
-         callback owns the concurrency slot discipline (each item's pi
-         calls acquire/release slots host-wide), so the slot is released
-         between items — another process can use it before the next item
-         is dequeued (AC4).
+      3. Audit the item via ``audit_one(item_id, priority, project_root)``.
+         The caller's callback owns the concurrency slot discipline (each
+         item's pi calls acquire/release slots host-wide), so the slot is
+         released between items — another process can use it before the next
+         item is dequeued (AC4). Cross-project routing (LP-0MW96A9GW009KVF7
+         AC3): the entry's ``project_root`` is passed through, so a repo-A
+         drain audits a repo-B item against repo B's own worklog root, not a
+         shared default. Legacy entries (``project_root`` None) pass ``None``
+         — today's single-root behaviour (AC5).
       4. Continue until the queue is empty, ``max_items`` is reached, or
          the wall-clock *timeout* (AC3) elapses — whichever comes first.
          Remaining items stay queued for the next window.
 
     Returns a metrics dict ``{batch_start, batch_end, items_processed,
-    queue_remaining, items_included}`` and emits the AC5 metrics line.
-    Errors from a single item's audit are caught per-item (logged, item
-    still counted as processed) so one bad item never aborts the window.
+    queue_remaining, items_included}`` plus the additive per-project map
+    ``projects_included`` (AC4: which repositories contributed to this
+    window) and emits the AC5 metrics line. Errors from a single item's audit
+    are caught per-item (logged, item still counted as processed) so one bad
+    item never aborts the window.
     """
     max_items = _resolve_batch_max_items() if max_items is None else max_items
     timeout = _resolve_batch_timeout() if timeout is None else timeout
@@ -5465,6 +5554,7 @@ def _batch_drain_cycle(audit_one: Callable[[str, int], int],
     batch_start_ts = time.strftime(_AUDIT_TS_FORMAT, time.localtime(batch_start))
     items_processed = 0
     items_included: list[str] = []
+    projects_included: dict[str, list[str]] = {}
     seen: set[str] = set()
 
     while items_processed < max_items:
@@ -5481,8 +5571,11 @@ def _batch_drain_cycle(audit_one: Callable[[str, int], int],
             continue
         seen.add(item_id)
         items_included.append(item_id)
+        project_root = getattr(entry, "project_root", None)
+        if project_root:
+            projects_included.setdefault(str(project_root), []).append(item_id)
         try:
-            audit_one(item_id, entry.priority)
+            audit_one(item_id, entry.priority, project_root)
         except Exception as exc:  # noqa: BLE001 — per-item isolation
             print(
                 f"Warning: batch item {item_id} audit failed: {exc}",
@@ -5498,6 +5591,7 @@ def _batch_drain_cycle(audit_one: Callable[[str, int], int],
         "items_processed": items_processed,
         "queue_remaining": queue_remaining,
         "items_included": items_included,
+        "projects_included": projects_included,
     }
     _log_batch_metrics(metrics)
     return metrics
@@ -5618,6 +5712,211 @@ def _query_proxy_mode(base_url: str | None = None,
         return mode if isinstance(mode, str) else None
     except Exception:  # noqa: BLE001 — best-effort, fail-open
         return None
+
+
+# ---------------------------------------------------------------------------
+# Proxy audit lease client (LP-0MW96A9GW009KVF7, parent AC1/AC2)
+# ---------------------------------------------------------------------------
+# Acquire/renew/release the cross-host audit-tier lease around a run. Fail-
+# safe (parent constraint): every call is best-effort — a proxy error or
+# timeout never blocks the audit; the acquire path waits a bounded number of
+# retries on ``audit-budget-saturated`` and then proceeds WITHOUT a lease
+# (legacy per-host behaviour preserved). See the constants block above for
+# the rationale.
+
+def _audit_lease_enabled() -> bool:
+    """True when the proxy audit-lease acquisition is enabled."""
+    raw = os.environ.get(AUDIT_LEASE_ENABLED_ENV)
+    if raw is None:
+        return AUDIT_LEASE_ENABLED_DEFAULT
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _audit_lease_timeout() -> float:
+    """Per-lease HTTP request timeout (seconds)."""
+    raw = os.environ.get(AUDIT_LEASE_TIMEOUT_ENV)
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    return AUDIT_LEASE_TIMEOUT_DEFAULT
+
+
+def _audit_lease_acquire_retries() -> int:
+    """Bounded acquire retries on ``audit-budget-saturated`` (>= 0)."""
+    raw = os.environ.get(AUDIT_LEASE_ACQUIRE_RETRIES_ENV)
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return AUDIT_LEASE_ACQUIRE_RETRIES_DEFAULT
+
+
+def _audit_lease_post(endpoint: str, payload: dict,
+                      timeout: float | None = None) -> dict | None:
+    """POST *payload* to *endpoint* on the proxy; return parsed JSON or None.
+
+    Never raises (fail-open): a network error, timeout, non-JSON body or
+    non-2xx status returns ``None`` — the lease is best-effort.
+    """
+    try:
+        url = _proxy_base_url().rstrip("/") + endpoint
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout or _audit_lease_timeout()) as resp:
+            if resp.status >= 400:
+                return None
+            text = resp.read().decode("utf-8")
+        return json.loads(text) if text.strip() else None
+    except Exception:  # noqa: BLE001 — best-effort, fail-open
+        return None
+
+
+def _audit_lease_delete(endpoint: str,
+                        timeout: float | None = None) -> dict | None:
+    """DELETE *endpoint* on the proxy; return parsed JSON or None.
+
+    Never raises (fail-open): release is best-effort — a crashed holder's
+    lease expires via the proxy's TTL backstop regardless.
+    """
+    try:
+        url = _proxy_base_url().rstrip("/") + endpoint
+        req = urllib.request.Request(url, method="DELETE")
+        with urllib.request.urlopen(req, timeout=timeout or _audit_lease_timeout()) as resp:
+            if resp.status >= 400:
+                return None
+            text = resp.read().decode("utf-8")
+        return json.loads(text) if text.strip() else None
+    except Exception:  # noqa: BLE001 — best-effort, fail-open
+        return None
+
+
+def _audit_lease_acquire(session_id: str) -> dict | None:
+    """Acquire (or idempotently renew) the audit lease for *session_id*.
+
+    Waits up to :func:`_audit_lease_acquire_retries` bounded retries when the
+    proxy reports ``audit-budget-saturated`` (honouring the hinted
+    ``retry_after_s`` between attempts), then fails OPEN: returns ``None`` so
+    the audit proceeds under legacy per-host guards — a second host's audit
+    never hangs indefinitely behind the running holder (parent AC1
+    "waits rather than competing" + fail-safe constraint). Returns the
+    lease payload dict on success.
+    """
+    payload = {"session_id": session_id}
+    for attempt in range(_audit_lease_acquire_retries() + 1):
+        result = _audit_lease_post(AUDIT_LEASE_ENDPOINT_PATH, payload)
+        if result is None:
+            return None  # proxy error/timeout — fail open
+        if result.get("admit"):
+            return result
+        # Saturated: wait the hinted bound (or a 1 s floor) then retry.
+        reason = result.get("reason")
+        if reason == "audit-budget-saturated":
+            retry_after = result.get("retry_after_s")
+            try:
+                wait = max(1.0, float(retry_after)) if retry_after else 1.0
+            except (TypeError, ValueError):
+                wait = 1.0
+            # Bounded: never more than the fail-safe ceiling per attempt.
+            wait = min(wait, 30.0)
+            if attempt < _audit_lease_acquire_retries():
+                time.sleep(wait)
+                continue
+            print(
+                "Audit lease: proxy reports audit-budget-saturated after "
+                f"{_audit_lease_acquire_retries()} retries — proceeding "
+                "without the cross-host lease (legacy per-host guards).",
+                file=sys.stderr,
+            )
+            return None
+        return None
+    return None
+
+
+def _audit_lease_renew(session_id: str) -> bool:
+    """Renew the audit lease for *session_id* (True on acknowledged renew)."""
+    result = _audit_lease_post(
+        AUDIT_LEASE_ENDPOINT_RENEW_PATH, {"session_id": session_id}
+    )
+    return bool(result and result.get("renewed"))
+
+
+def _audit_lease_release(session_id: str) -> bool:
+    """Release the audit lease for *session_id* (True on acknowledged release)."""
+    endpoint = AUDIT_LEASE_ENDPOINT_PATH + "/" + _url_quote(session_id)
+    result = _audit_lease_delete(endpoint)
+    return bool(result and result.get("released") is True)
+
+
+def _url_quote(value: str) -> str:
+    """Percent-encode a path segment (session ids are scheme/underscore safe)."""
+    from urllib.parse import quote
+
+    return quote(value, safe="")
+
+
+def _audit_run_session_id(issue_id: str) -> str:
+    """Stable per-run audit session id for the lease.
+
+    Matches the proxy's audit-tier identification (the ``audit-`` prefix):
+    ``audit-<issue>-lease-<uuid8>``, built ONCE per process so the
+    acquire/renew/release round-trip uses one identity for the whole run.
+    """
+    short = uuid.uuid4().hex[:8]
+    safe_issue = _sanitize_session_id_segment(issue_id or "project")
+    return f"audit-{safe_issue}-lease-{short}"
+
+
+def audit_lease_begin(issue_id: str) -> str | None:
+    """Acquire the audit lease for a run; return the session id, or None.
+
+    Called once at the start of the outermost ``cmd_issue`` run. Disabled via
+    ``AUDIT_LEASE_ENABLED=0``; fail-open on proxy errors and on saturation
+    (bounded waits, then legacy behaviour). The module-level
+    :data:`_AUDIT_LEASE_STATE` records the held session id so nested calls
+    (children, batch drains) reuse it instead of double-acquiring.
+    """
+    global _AUDIT_LEASE_STATE
+    if not _audit_lease_enabled():
+        return None
+    if _AUDIT_LEASE_STATE is not None:
+        return _AUDIT_LEASE_STATE["session_id"]  # nested run — already held
+    session_id = _audit_run_session_id(issue_id)
+    result = _audit_lease_acquire(session_id)
+    if result is None:
+        return None
+    _AUDIT_LEASE_STATE = {"session_id": session_id, "lease_id": result.get("lease_id")}
+    print(
+        "Audit lease acquired: session=" + session_id
+        + f" lease_id={result.get('lease_id')} "
+        + f"live={result.get('live')} available={result.get('available')}",
+        file=sys.stderr,
+    )
+    return session_id
+
+
+def audit_lease_renew_current() -> None:
+    """Renew the process's held audit lease (no-op when none held)."""
+    if _AUDIT_LEASE_STATE is None:
+        return
+    _audit_lease_renew(_AUDIT_LEASE_STATE["session_id"])
+
+
+def audit_lease_end() -> None:
+    """Release the process's held audit lease (idempotent, fail-open)."""
+    global _AUDIT_LEASE_STATE
+    if _AUDIT_LEASE_STATE is None:
+        return
+    session_id = _AUDIT_LEASE_STATE["session_id"]
+    released = _audit_lease_release(session_id)
+    if released:
+        print(f"Audit lease released: session={session_id}", file=sys.stderr)
+    _AUDIT_LEASE_STATE = None
 
 
 def _explicit_parallelism_request() -> int | None:
@@ -11803,8 +12102,16 @@ def _ensure_execution_worktree_submodules(worktree_path: Path) -> bool:
         })
     }
     try:
+        # ``-c protocol.file.allow=always`` mirrors the merge-gate/fixture
+        # convention (the fixture registers its local-path submodule with the
+        # same flag): git >= 2.38 blocks the ``file`` transport by default
+        # (``fatal: transport 'file' not allowed``), which would silently
+        # fail *every* local-path submodule initialisation. Tracked remote
+        # submodules are unaffected (https/file semantics are unchanged by
+        # the flag).
         proc = subprocess.run(
-            ["git", "submodule", "update", "--init", "--recursive"],
+            ["git", "-c", "protocol.file.allow=always",
+             "submodule", "update", "--init", "--recursive"],
             cwd=str(worktree_path), capture_output=True, text=True,
             check=False, timeout=600, env=env,
         )
@@ -17115,6 +17422,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
     if rc is not None:
         return rc
 
+    # Cross-host audit lease (LP-0MW96A9GW009KVF7, parent AC1/AC2): acquire
+    # the proxy's audit-tier lease for the lifetime of this run. Fail-open —
+    # a missing lease (proxy down / saturated after bounded retries) proceeds
+    # under legacy per-host guards, never blocks the audit.
+    audit_lease_begin(issue_id)
+
     ctx.checkpoint = _open_checkpoint_store(ctx, checkpoint_dir, no_checkpoint)
 
     try:
@@ -17204,10 +17517,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # them.
             _capture_exempt_children_snapshot(ctx)
             _phase1_parent_screening(ctx)
+            # Renew the cross-host audit lease between phases so a long run
+            # never loses its lease mid-audit (LP-0MW96A9GW009KVF7).
+            audit_lease_renew_current()
             rc = _phase_children(ctx)
             if rc is not None:
                 pass
             else:
+                audit_lease_renew_current()
                 rc = _phase_report(ctx)
     except AuditScopeError as exc:
         # Scope error (LP-0MSQ32HNR007AI6B): the Phase 2 FILE SCOPE
@@ -17257,6 +17574,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
                 Path(ctx.owning_root) if ctx.owning_root else None,
                 ctx.runner, ctx.execution_worktree,
             )
+            # Release the cross-host audit lease (LP-0MW96A9GW009KVF7,
+            # parent AC1/AC2) now that the run is complete — every exit path
+            # (success, scope error, abort, crashed-pi cleanup) frees the
+            # slot for the next audit on ANY host. The proxy's TTL backstop
+            # covers a crashed holder regardless.
+            audit_lease_end()
     if rc == 0 and ctx.checkpoint is not None:
         if ctx.checkpoint.budget_exceeded_children():
             # Budget-exceeded children remain unverified: KEEP the checkpoint
@@ -17313,18 +17636,28 @@ def _maybe_run_batch_drain(ctx: _AuditContext) -> None:
     )
 
 
-def _batch_audit_one(origin: _AuditContext) -> Callable[[str, int], int]:
+def _batch_audit_one(origin: _AuditContext) -> Callable[[str, int, str | None], int]:
     """Build the per-item audit callback for a batch drain.
 
     Returns a closure that audits a drained work item via the full
     ``cmd_issue`` pipeline (claim, freshness, phase gates, persist,
     verified lifecycle). Every drained item shares the origin run's
-    configuration (model, worklog dir, persistence, etc.) but runs with
+    configuration (model, persistence, etc.) but runs with
     ``batch_drain=False`` so the drain cannot recurse. The callback owns
     slot discipline: each item's pi calls acquire/release host-wide slots,
     so the concurrency slot is free between items (AC4).
+
+    Cross-project routing (LP-0MW96A9GW009KVF7 AC3): ``worklog_root`` is the
+    owning project checkout root stamped at enqueue; the item is audited
+    against ``<root>/.worklog`` instead of the origin run's default, so a
+    repo-A drain audits a repo-B item against repo B's own worklog. A
+    ``None`` root (legacy entry / undeterminable ownership) keeps the
+    origin's ``worklog_dir`` fallback (AC5).
     """
-    def _audit_one(item_id: str, priority: int) -> int:
+    def _audit_one(item_id: str, priority: int, worklog_root: str | None = None) -> int:
+        per_item_wl = worklog_root
+        if per_item_wl:
+            per_item_wl = str(Path(worklog_root) / ".worklog")
         return cmd_issue(
             item_id,
             persist=origin.persist,
@@ -17338,7 +17671,7 @@ def _batch_audit_one(origin: _AuditContext) -> Callable[[str, int], int]:
             json_mode=origin.json_mode,
             debug_log=origin.debug_log,
             force=origin.force,
-            worklog_dir=origin.worklog_dir,
+            worklog_dir=per_item_wl or origin.worklog_dir,
             batch_phase2=origin.batch_phase2,
             green_run=origin.green_run,
             audit_children=origin.audit_children,
@@ -17613,7 +17946,16 @@ def cmd_batch(max_items: int | None = None,
                 print("No pending in_review items to audit.")
             return 0
 
-    def _audit_one(item_id: str, priority: int) -> int:
+    def _audit_one(item_id: str, priority: int, worklog_root: str | None = None) -> int:
+        # AC3 (LP-0MW96A9GW009KVF7): route each drained item against ITS
+        # owning worklog root. ``worklog_root`` is the project checkout root
+        # stamped at enqueue time; the wl store is ``<root>/.worklog``. A
+        # legacy entry (or a nil root — ownership undeterminable) falls back
+        # to the drainer's own *worklog_dir* (today's single-root behaviour,
+        # AC5).
+        per_item_wl = worklog_root
+        if per_item_wl:
+            per_item_wl = str(Path(worklog_root) / ".worklog")
         return cmd_issue(
             item_id,
             persist=persist,
@@ -17625,7 +17967,7 @@ def cmd_batch(max_items: int | None = None,
             json_mode=json_mode,
             debug_log=debug_log,
             force=force,
-            worklog_dir=worklog_dir,
+            worklog_dir=per_item_wl or worklog_dir,
             max_citations_per_ac=max_citations_per_ac,
             green_run=green_run,
             strict=strict,
