@@ -99,6 +99,13 @@ def _fake_run_cmd(cmd: list[str], *args, **kwargs) -> subprocess.CompletedProces
     repository instead of tripping a fail-closed assertion.
     """
     stdout = f"{_FAKE_COMMIT}\n" if len(cmd) > 1 and cmd[1] == "rev-parse" else ""
+    if len(cmd) > 1 and cmd[1] == "merge-base":
+        # A freshly-committed feature branch is not yet on origin/dev:
+        # the pre-push already-landed check (SA-0MW22SEMV00230O5) must see
+        # an unpushed commit and proceed to the push.
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=1, stdout="", stderr=""
+        )
     return subprocess.CompletedProcess(
         args=cmd, returncode=0, stdout=stdout, stderr=""
     )

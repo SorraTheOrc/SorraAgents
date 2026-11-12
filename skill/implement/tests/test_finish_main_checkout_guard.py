@@ -216,6 +216,11 @@ _FAKE_COMMIT = "1" * 40
 
 def _fake_run_cmd(cmd: list[str], *args, **kwargs) -> subprocess.CompletedProcess:
     stdout = f"{_FAKE_COMMIT}\n" if len(cmd) > 1 and cmd[1] == "rev-parse" else ""
+    if len(cmd) > 1 and cmd[1] == "merge-base":
+        # A freshly-committed feature branch is not yet on origin/dev:
+        # the pre-push already-landed check (SA-0MW22SEMV00230O5) must see
+        # an unpushed commit and proceed to the push.
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
     return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
 
 
@@ -302,6 +307,23 @@ def _finish_harness(tmp_path):
         )
         stack.enter_context(
             patch.object(implement, "git_push_to_dev", return_value=True)
+        )
+        # The post-push ancestry assertion (Step 6a) resolves against the
+        # stubbed main checkout; model a published commit so the terminal
+        # path is exercised (the assertion's own fail-closed behaviour has
+        # dedicated coverage in test_implement_finish_local_dev_verified_sync.py,
+        # SA-0MVPZG7A0000N66U).
+        stack.enter_context(
+            patch.object(
+                implement,
+                "_assert_commit_on_origin_dev",
+                return_value={
+                    "verified": True,
+                    "resolved_commit": _FAKE_COMMIT,
+                    "target": "refs/remotes/origin/dev",
+                    "target_tip": _FAKE_COMMIT,
+                },
+            )
         )
         # The push subject is the synthetic hash ``abc1234`` in this harness, so
         # the worktree-holding guard (SA-0MVUTXJ4300301ZN) is stubbed like the

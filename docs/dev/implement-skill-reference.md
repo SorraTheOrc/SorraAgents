@@ -1467,7 +1467,7 @@ Recovery from the manual-push comment:
 git push origin <branch>:refs/heads/dev
 ```
 
-### Push transport retry (SA-0MVSJX5HS002DJHI AC4)
+### Push transport retry (SA-0MVSJX5HS002DJHI AC4, SA-0MW22SEMV00230O5 AC1)
 
 A transient transport close — `Connection to <host> closed by remote host`,
 `Connection reset by peer`, `remote end hung up unexpectedly` or
@@ -1477,14 +1477,29 @@ retry. `git_push_to_dev()` now retries those stderr patterns up to
 with jittered exponential backoff (`PUSH_RETRY_BASE_SECONDS = 2.0`, doubling,
 capped at `PUSH_RETRY_CAP_SECONDS = 30.0`, +/-25% jitter).
 
+**AC1 — auth/transport is infrastructure, never a bare push failure.** The
+classifier (`classify_push_failure`) extends the retryable set to the
+concurrent-run failures observed under multiple agent sessions:
+`Permission denied (publickey)`, `Could not read from remote repository`,
+`Connection reset` / `Connection timed out`, and a remote `Internal Server
+Error`. All are treated as transient transport — a fresh key handshake per
+connection (no `SSH_AUTH_SOCK`), a connect timeout/reset or a GitHub-side 5xx
+— retried on the bounded budget with backoff, and reported on exhaustion as
+`reason: transport` (infrastructure, on the drive classifier's infra
+allow-list). Branch-policy rejections (`GH006`), hook declines and
+non-fast-forward errors are deliberately **not** in the retryable set: those
+are content conditions that retrying cannot fix (`classify_push_failure`
+returns `content`, a hard stop).
+
 - **Same cwd, same argv:** the retry re-runs the identical
   `git push origin <branch>:refs/heads/dev` from the same checkout, so the
   pre-push gate runs again against the same tree and serves its cached
-  full-suite entry. Nothing bypasses the gate.
-- **Everything else fails as before:** auth failures (`Permission denied`),
-  branch-policy refusals and a non-fast-forward rejection are never retried.
-  A non-fast-forward keeps its dedicated rebase-and-retry recovery, and a
-  push timeout raises `PushTimeoutError` immediately.
+  full-suite entry — N transport retries never mean N full suites (AC6).
+  Nothing bypasses the gate.
+- **Everything else fails as before:** branch-policy refusals and a
+  non-fast-forward rejection are never retried. A non-fast-forward keeps its
+  dedicated rebase-and-retry recovery, and a push timeout raises
+  `PushTimeoutError` immediately.
 - **Observable:** every attempt logs `attempt N/3`, the delay and the same cwd;
   the attempt bound and backoff are module constants, and the sleep is the
   `_push_retry_sleep()` seam used by the hermetic tests. The trail is also
@@ -1492,7 +1507,60 @@ capped at `PUSH_RETRY_CAP_SECONDS = 30.0`, +/-25% jitter).
   entries of `{attempt, delay_seconds, reason}`), which `phase_finish` exposes
   on `report["steps"]["push"]` for both a successful and a gate-refused push —
   so a `--json` finish report shows the attempt trail, not just a log line
-  (SA-0MVXEQEI500641SJ AC3).
+  (SA-0MVXEQEI500641SJ AC3). Auth/connect/5xx retries record `reason:
+  "transport"` in the trail; a connection close records `"transport_close"`.
+
+### Bounded leaf push loop, already-landed short-circuit and push outcomes
+(SA-0MW22SEMV00230O5 AC2/AC3/AC4/AC5/AC6/AC7)
+
+A plain leaf `finish` now absorbs the failures that used to strand items
+under concurrent runs (a driven child was already retried on the infra budget
+by `phase_drive`; the leaf was not):
+
+- **Non-fast-forward is rebase-and-retried within the bounded budget.**
+  `phase_finish` runs the push in a loop capped at `DEFAULT_INFRA_RETRY_LIMIT`
+  rounds; each round fetches `origin/dev`, rebases the feature branch onto
+  it and re-pushes from the worktree. A *second* concurrent advance (the
+  observed repeated-race case) is recovered instead of failing the item. A
+  rebase conflict is a genuine stop: `_recover_non_fast_forward_push` raises
+  with an actionable message and never forces or silently mutates the worktree.
+  Exhaustion records `reason: non_fast_forward` with `retries`/`budget` on the
+  push step and posts a comment with the manual recovery commands.
+- **Already-landed short-circuit (AC3/AC5).** Before the push, `finish` asks
+  `_commit_is_on_origin_dev` — a **remote-verified** ancestry query that
+  fetches `origin` first, never trusting a stale remote-tracking ref. When
+  the commit is already an ancestor of `origin/dev` the push is treated as
+  satisfied and **skipped** (`outcome: already_pushed`): re-running `finish`
+  over a commit that an earlier run published converges straight to
+  `in_review`, and a transport flake can never regress a landed item. The
+  remote-verified result is also used as Step 6a's ancestry assertion (the
+  fetch is not repeated).
+- **No open regression by a transport failure (AC5).** A transport/connection
+  failure re-checks remote ancestry before failing: if the commit landed
+  concurrently it converges (`outcome: already_pushed`), and the outer
+  failure handler reclassifies an already-landed commit as
+  `push_landed_but_unverified` — never the misleading "push it manually".
+- **Push outcomes (AC4).** Every `finish` push step and its work-item comment
+  name the outcome: `pushed` (this run landed it), `already_pushed` (it was
+  already on `origin/dev`), `push_failed` (nothing landed — the specific
+  `reason` names why: `transport`, `timeout`, `non_fast_forward`, a
+  `gate_reason=…` code, …), or `push_landed_but_unverified` (landed, but the
+  post-push full-suite verdict could not be proven from the read-only cache,
+  or the ancestry assertion failed).
+- **At most one full-suite gate per finish (AC6).** Transport/fast-forward
+  retries only re-run the **push**; the tree-keyed gate verdict is served from
+  the cache, and the changed-scope gate (Step 3) is never re-entered by the
+  retry loop.
+- **Load-flake gate failures are labelled, not misread as code failures
+  (AC7).** When a gate refusal's stderr names suite *load* errors (`Cannot
+  find package …`, `Cannot find module …`, `MODULE_NOT_FOUND` — a missing
+  shared build, an import failure), `phase_finish` retries the identical tree
+  exactly once. When the retry passes, `report[steps][push][load_flake]`
+  records `{failed_on_attempt, reason: "load_flake"}` and the log says
+  *suite failed to load on attempt N, passed unmodified on attempt N+1* — so
+  an environment flake under concurrent load reads as infrastructure, never
+  as a regression. A reproducible load failure (both attempts fail) still
+  blocks the push: the gate is never weakened.
 
 ### SSH keepalives and the transport-lost failure (SA-0MVWNHLQQ002TFZR)
 
@@ -3009,13 +3077,18 @@ so an agent could not tell *fix the code* from *retry later*.
   (`report["steps"]["local_dev_fast_forward"]["retry"]`), so the main
   checkout's `dev` tracks the pushed commit. A second refusal is recorded and
   never fails the finish.
-- **Transient transport closes retry.** `Connection … closed by remote host`,
-  `Connection reset by peer`, `remote end hung up unexpectedly` and
-  `kex_exchange_identification` are retried up to 3 attempts with jittered
-  exponential backoff from the **same cwd**, so the gate re-runs and serves its
-  cached full-suite entry. Auth, branch-policy and non-fast-forward errors are
-  never retried (non-fast-forward keeps its dedicated rebase recovery), and a
-  timeout still raises `PushTimeoutError` immediately.
+- **Transient transport closes and auth/connect failures retry.**
+  `Connection … closed by remote host`, `Connection reset by peer`, `remote
+  end hung up unexpectedly` and `kex_exchange_identification` are retried up
+  to 3 attempts with jittered exponential backoff from the **same cwd**, so
+  the gate re-runs and serves its cached full-suite entry. AC1
+  (SA-0MW22SEMV00230O5) extends the retryable set to the concurrent-run
+  auth/transport signatures (`Permission denied (publickey)`, `Could not
+  read from remote repository`, connect timeouts/resets, a remote `Internal
+  Server Error`), reported on exhaustion as `reason: transport`
+  (infrastructure). Branch-policy and non-fast-forward errors are never
+  retried as transport (non-fast-forward keeps its dedicated rebase
+  recovery), and a timeout still raises `PushTimeoutError` immediately.
 - **SSH keepalives keep the idle gate connection alive** (SA-0MVWNHLQQ002TFZR).
   The pre-push full suite runs *after* git opens the SSH connection and
   produces no SSH traffic, so a remote that closes idle connections (GitHub)
@@ -4043,12 +4116,46 @@ message, `report["steps"]["main_checkout_lock"]`, or
 (`ps -p <pid>`). A dead holder's lock file does not block you: re-run `finish`
 (or `start`) — there is nothing to clean up.
 
-**Ancestry assertion or non-fast-forward recovery refused.** The worktree and
-the feature branch are **retained**, the work item stays `open` (never
-`in_review`), and a comment records the commit, the target ref, the reason,
-the branch and the worktree path. The commit is complete and already
-published on its feature branch — only its arrival on `origin/dev` failed.
-Publish it, then re-run `finish`:
+**A transient transport/auth failure (SA-0MW22SEMV00230O5 AC1).** `finish`
+retries it automatically on a bounded budget with backoff and only refuses
+when the budget is spent — and even then it says so plainly: the push step
+reports `reason: transport` (infrastructure), never a bare "push failed" and
+never the misleading "commit is local and can be pushed manually" hint (an
+auth refusal means the connection never completed; nothing was rejected).
+Re-running `finish` retries the same way — no manual work needed.
+
+**A non-fast-forward rejection (AC2).** `finish` rebases onto `origin/dev`
+and re-attempts within the bounded budget; only a dev that *keeps* advancing
+past the budget refuses (the push step records `retries`/`budget`), and a
+rebase conflict stops with an actionable message. The recovery is otherwise
+manual only in the exhausted/conflicted case:
+
+```bash
+cd <retained worktree>
+git fetch origin dev
+git rebase origin/dev          # resolve conflicts if dev advanced
+git push origin HEAD:refs/heads/dev
+python3 $(skill_path implement)/scripts/implement.py finish <work-item-id>
+```
+
+**The commit already landed (`already_pushed`, AC3/AC5).** If the commit is
+remote-verified (fetch first — never a stale remote-tracking ref) to already
+be an ancestor of `origin/dev`, `finish` treats the push as satisfied, skips
+the re-push and proceeds straight to the terminal transition — so an item
+whose commit landed in an earlier run is completed by a plain re-run, and a
+transport failure can never take a landed item back to `open`. If the
+read-only full-suite cache cannot prove a green verdict for that already-landed
+tree, the run proceeds with a recorded notice (the dev-push gate ran when the
+commit landed; the audit re-verifies, F3); a *red* cached verdict still
+refuses (`push_landed_but_unverified`).
+
+**Ancestry assertion refused.** The worktree and the feature branch are
+**retained**, the work item stays `open` (never `in_review`), and a comment
+records the commit, the target ref, the reason, the branch and the worktree
+path. The commit is complete and already published on its feature branch —
+only its arrival on `origin/dev` failed (recorded `push_landed_but_unverified`
+when the push claimed success but ancestry could not be proven). Publish it,
+then re-run `finish`.
 
 ```bash
 cd <retained worktree>

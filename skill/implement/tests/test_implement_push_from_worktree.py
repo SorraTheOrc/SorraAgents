@@ -191,6 +191,17 @@ def _fake_run_cmd(cmd: list[str], *args, **kwargs) -> subprocess.CompletedProces
             )
         except OSError:  # pragma: no cover - best effort delegation
             pass
+    if (
+        isinstance(cmd, (list, tuple))
+        and len(cmd) >= 2
+        and cmd[0] == "git"
+        and cmd[1] == "merge-base"
+    ):
+        # A freshly-committed feature branch is not yet on origin/dev: the
+        # pre-push already-landed check (SA-0MW22SEMV00230O5) must see an
+        # unpushed commit and proceed to the push. The real merge-base runs
+        # only in the direct ``git_push_to_dev`` tests that opt in.
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
     return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
 

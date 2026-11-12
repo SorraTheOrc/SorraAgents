@@ -3,8 +3,12 @@
 AC4: a transient transport close (``Connection ... closed by remote host``,
 ``Connection reset by peer``, ``remote end hung up unexpectedly``,
 ``kex_exchange_identification``) is retried up to a bounded number of attempts
-with jittered exponential backoff **from the same cwd**; auth, branch-policy
-and non-fast-forward failures fail as before (non-fast-forward keeps its
+with jittered exponential backoff **from the same cwd**; AC1
+(SA-0MW22SEMV00230O5) extends the retryable set to the observed
+concurrent-run auth/transport failures (``Permission denied (publickey)``,
+``Could not read from remote repository``, connect timeouts, a remote
+``Internal Server Error``). Branch-policy rejections and other content
+conditions fail fast — retrying cannot fix them (non-fast-forward keeps its
 dedicated rebase recovery), and a timeout is never retried.
 
 Hermetic: ``subprocess.Popen`` is replaced with a scripted fake process and the
@@ -135,6 +139,12 @@ class TestRetryablePatterns:
             "Connection reset by peer",
             "fatal: the remote end hung up unexpectedly",
             "kex_exchange_identification: read: Connection reset",
+            # AC1 (SA-0MW22SEMV00230O5): the concurrent-run auth/transport
+            # signatures are classified as transient and retried.
+            "git@github.com: Permission denied (publickey).",
+            "fatal: Could not read from remote repository.",
+            "ssh: connect to host github.com port 22: Connection timed out",
+            "! [remote rejected]   HEAD -> dev (Internal Server Error)",
         ],
     )
     def test_transport_messages_are_retryable(self, message: str) -> None:
@@ -143,7 +153,8 @@ class TestRetryablePatterns:
     @pytest.mark.parametrize(
         "message",
         [
-            "Permission denied (publickey).",
+            # Content rejections and gate refusals are never retried as
+            # transport (AC1: distinct from a real content rejection).
             "remote: error: GH006: Protected branch update failed",
             "! [rejected]  wl-x -> dev (non-fast-forward)",
             "gate_reason=slot_contention",
@@ -315,16 +326,67 @@ class TestGitPushToDevRetry:
             f"{final}"
         )
 
-    def test_non_retryable_failure_fails_fast(self, push_harness):
-        push_harness["install"]([(128, AUTH_FAILURE)])
+    def test_content_rejection_fails_fast(self, push_harness):
+        # A branch-policy rejection is a *content* condition — retrying it
+        # cannot fix it, so it must fail immediately (AC1: distinct from the
+        # transient transport set).
+        content = (
+            b"remote: error: GH006: Protected branch update failed for "
+            b"refs/heads/dev.\n"
+            b"remote: This branch is protected and requires a pull request.\n"
+        )
+        push_harness["install"]([(128, content)])
 
         result = implement.git_push_to_dev(
             push_harness["cwd"], "wl-test", "abc123"
         )
 
         assert result is False
-        assert len(push_harness["calls"]) == 1, "auth failures must not retry"
+        assert len(push_harness["calls"]) == 1, (
+            "content rejections must not retry"
+        )
         assert push_harness["sleeps"] == []
+
+    def test_transient_auth_is_retried_then_succeeds(self, push_harness):
+        """AC1: an auth refusal is transient infrastructure, not a fail-fast.
+
+        The observed concurrent-run signature ``Permission denied (publickey)``
+        is retried on the bounded budget with backoff, so a leaf `finish` no
+        longer dies on one flaky key handshake (SA-0MW22SEMV00230O5).
+        """
+        push_harness["install"](
+            [(128, AUTH_FAILURE), (128, AUTH_FAILURE), (0, b"")]
+        )
+
+        result = implement.git_push_to_dev(
+            push_harness["cwd"], "wl-test", "abc123"
+        )
+
+        assert result is True
+        assert len(push_harness["calls"]) == 3
+        assert len(push_harness["sleeps"]) == 2
+
+    def test_auth_exhaustion_raises_the_distinct_transport_error(
+        self, push_harness
+    ):
+        """AC1: exhausted auth is *transport* infrastructure, never a bare
+        "push failed" and never the misleading "push manually" hint."""
+        push_harness["install"]([(128, AUTH_FAILURE)] * implement.PUSH_RETRY_MAX_ATTEMPTS)
+        evidence: dict = {}
+
+        with pytest.raises(implement.PushTransportExhaustedError) as excinfo:
+            implement.git_push_to_dev(
+                push_harness["cwd"],
+                "wl-test",
+                "abc123",
+                evidence_out=evidence,
+            )
+
+        assert len(push_harness["calls"]) == implement.PUSH_RETRY_MAX_ATTEMPTS
+        assert evidence["success"] is False
+        assert evidence["reason"] == "transport"
+        assert "infrastructure" in str(excinfo.value).lower()
+        assert excinfo.value.attempts == implement.PUSH_RETRY_MAX_ATTEMPTS
 
     def test_non_fast_forward_still_raises_without_retry(self, push_harness):
         stderr = (
@@ -437,7 +499,14 @@ class TestRetryTrailEvidence:
             assert entry["delay_seconds"] == pytest.approx(slept, abs=0.001)
 
     def test_fail_fast_still_reports_a_single_attempt(self, push_harness):
-        push_harness["install"]([(128, AUTH_FAILURE)])
+        # A content rejection (branch policy) is the fail-fast case now: it
+        # returns False on the first attempt with a distinct ``content``
+        # reason, never retried (AC1).
+        content = (
+            b"remote: error: GH006: Protected branch update failed for "
+            b"refs/heads/dev.\n"
+        )
+        push_harness["install"]([(128, content)])
         evidence: dict = {}
 
         implement.git_push_to_dev(
@@ -446,6 +515,7 @@ class TestRetryTrailEvidence:
 
         assert evidence["attempts"] == 1
         assert evidence["retry_trail"] == []
+        assert evidence["reason"] == "content"
 
 
 class TestParseGateReason:

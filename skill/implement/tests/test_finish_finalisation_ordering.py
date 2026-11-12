@@ -165,8 +165,19 @@ def _is_audit_candidate(item: dict) -> bool:
 
 
 def _fake_run_cmd(cmd: list[str], *args, **kwargs) -> subprocess.CompletedProcess:
-    """Stand-in for ``run_cmd``: every git sub-command "succeeds"."""
+    """Stand-in for ``run_cmd``: every git sub-command "succeeds".
+
+    ``git merge-base --is-ancestor`` returns exit code 1 ("not an
+    ancestor"): a freshly-committed feature branch is not yet on
+    ``origin/dev``, so finish's pre-push already-landed check
+    (SA-0MW22SEMV00230O5) must see an unpushed commit and proceed to the
+    push.
+    """
     stdout = f"{_FAKE_COMMIT}\n" if len(cmd) > 1 and cmd[1] == "rev-parse" else ""
+    if len(cmd) > 1 and cmd[1] == "merge-base":
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=1, stdout="", stderr=""
+        )
     return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
 
 
@@ -382,6 +393,23 @@ def _run_finish(tmp_path, monkeypatch, *, cache_entry=_GREEN_ENTRY,
         )
         stack.enter_context(
             patch.object(implement, "git_push_to_dev", return_value=True)
+        )
+        # The post-push ancestry assertion (Step 6a) resolves against the
+        # stubbed main checkout; model a published commit so the terminal
+        # path is exercised (the assertion's own fail-closed behaviour has
+        # dedicated coverage in test_implement_finish_local_dev_verified_sync.py,
+        # SA-0MVPZG7A0000N66U).
+        stack.enter_context(
+            patch.object(
+                implement,
+                "_assert_commit_on_origin_dev",
+                return_value={
+                    "verified": True,
+                    "resolved_commit": _FAKE_COMMIT,
+                    "target": "refs/remotes/origin/dev",
+                    "target_tip": _FAKE_COMMIT,
+                },
+            )
         )
         # The push-subject guard reads the real git HEAD; this harness drives a
         # placeholder worktree, so it is stubbed with the push itself (it has

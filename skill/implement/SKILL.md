@@ -335,6 +335,8 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   `--keep-worktree` (or
   `IMPLEMENT_KEEP_WORKTREE=1`) defers worktree removal; driven children never
   pass it (`IMPLEMENT_DRIVE_ACTIVE=1` defers).
+
+  **Retry taxonomy (SA-0MW22SEMV00230O5):** § Bounded push loop.
 - Follow the mandatory **build → test → commit** order.
 - **Add the `## Impact` sentence before finishing.** A newly completed item's
   description must carry an `## Impact` section: one sentence describing the user-experience impact — not a technical summary.
