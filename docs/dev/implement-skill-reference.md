@@ -1064,6 +1064,20 @@ codes:
 | `infrastructure` | any other notice, or a live-repo mutation | Unattributable to a test, but explained by a notice. | Read the notices; the repo may have been mutated by a concurrent session. |
 | `unknown` | — | Last resort: no structured failure, no notice and no executed command. | Re-run the suite with the test skill to obtain diagnostics. It is unreachable for a timed-out, killed or non-zero run. |
 
+**Vitest frame fallback (SA-0MWDLPC3F005S9S2).** `test_failure` also wins when
+the runner built **no** structured record but the gate's bounded output tail
+(stderr first, then stdout — each already bounded by `_tail_text` at
+`GATE_OUTPUT_TAIL_CHARS` = 1200 chars) carries a Vitest stack frame
+(`❯ [<fn>] <file>:<line>:<col>`, matched by
+`gate_reason.vitest_frame_location`): the 1200-char window can strip the `FAIL`
+header and the `AssertionError:` line (for example a long README diff in the
+assertion message), leaving the frame as the failure's only surviving signal —
+such a non-zero run is classified `test_failure`, never `unparsed`
+(RISE-0MW5JFQCU001YYQK). The fallback replaces **only** the `unparsed`
+outcome: `timeout`, `killed`, `slot_contention` and `infrastructure` (including
+a live-repo mutation) are decided first, so a frame that merely survived in the
+tail can never reclassify them.
+
 The deciding **fact fields** travel with the verdict — on `test_phase` in the
 finish report and in the operator message under `Gate facts:` — so nothing has
 to be re-derived from prose:
@@ -3164,6 +3178,16 @@ act, and every reason never lands on `unknown` with an empty `failures` list.
 | `slot_contention` | No host test slot within the bounded wait (`slot_busy`). | Wait a staggered delay, or raise `TEST_LOCK_TIMEOUT`. The wait is reported separately from execution. |
 | `infrastructure` | Explained by a runner notice but not attributable to a test (includes a live-repo mutation). | Read the notices; the checkout may have been mutated by a concurrent session. |
 | `unknown` | Last resort: no structured failure, no notice and no executed command. | Re-run the suite with the test skill to obtain diagnostics. |
+
+A non-zero Vitest run whose failed-test output was trimmed by the gate's
+1200-character tail down to a bare `❯ <file>:<line>:<col>` frame (the `FAIL`
+header and `AssertionError:` line lost, e.g. to a long README diff in the
+assertion message) is still `test_failure`, never `unparsed`: the frame is the
+failure's surviving signal and is reported as the failing location
+(`gate_reason.vitest_frame_location`, SA-0MWDLPC3F005S9S2). The frame fallback
+replaces only the `unparsed` outcome — timeout, killed, slot-contention and
+infrastructure verdicts are decided first and are never reclassified by a
+surviving frame.
 
 The deciding **fact fields** accompany every classified failure:
 

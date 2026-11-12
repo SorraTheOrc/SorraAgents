@@ -495,6 +495,22 @@ pin replays the captured browser-mode output
 `skill/test/tests/test_run_tests_vitest_parser.py` and
 `skill/test/tests/test_run_tests_failure_notices.py`.
 
+**Tail-window rationale (SA-0MWDLPIA3003GKXV).** The frame-only pass is what
+makes the gate's 1200-character output tail (`implement.py::_tail_text` /
+`GATE_OUTPUT_TAIL_CHARS`) sufficient for Vitest failures: the gate keeps only
+the last 1200 characters of a suite's output, which can strip the `FAIL`
+header, the `AssertionError:` line and the project pipes — for example when an
+assertion message embeds a long README diff. The parser no longer *needs* the
+header: the surviving `❯ <file>:<line>:<col>` frame plus its source excerpt is
+a self-sufficient failure signal (SA-0MWDLP4SW0099MZM). The same frame is what
+the gate classifier falls back on
+(`skill/test/scripts/gate_reason.py::vitest_frame_location`) to classify such a
+run `test_failure` even when no structured record could be built — see the
+Vitest frame fallback in
+[implement-skill-reference.md](implement-skill-reference.md).
+Only a run whose tail carries *no* Vitest marker at all (ENOSPC, missing
+executable, wrapper error) keeps its `unparsed`/infrastructure classification.
+
 #### Notice codes (stable strings)
 
 | Code | Meaning |
