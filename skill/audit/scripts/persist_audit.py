@@ -113,18 +113,120 @@ def _inline_or_file_flags(report_text: str, inline_flag: str):
             pass
 
 
-def _build_fallback_text(issue_id: str, ready: str) -> str:
+#: Rejection kinds for the final ``wl update --audit-text`` step, used to
+#: keep the fallback notice truthful (SA-0MW0LRBJM008Q2MC). Only a genuine
+#: malformed-JSON rejection carries :data:`PERSIST_CONTENT_INVALID` semantics;
+#: other failures (E2BIG, first-line validation) return a plain non-zero code.
+_REJECTION_KIND_E2BIG = "e2big"
+_REJECTION_KIND_INVALID_FIRST_LINE = "invalid_first_line"
+_REJECTION_KIND_MALFORMED_JSON = "malformed_json"
+_REJECTION_KIND_OTHER = "other"
+
+
+def _classify_rejection(stderr: str) -> tuple[str, str, str]:
+    """Classify a ``wl update --audit-text`` rejection into (kind, cause, remediation).
+
+    *stderr* is the captured wl stderr for the rejected update. Returns:
+
+    - *kind* — machine-readable classification used for the return code
+      (only ``malformed_json`` maps to :data:`PERSIST_CONTENT_INVALID`).
+    - *cause* — a short human-readable phrase naming the real failure.
+    - *remediation* — a concrete operator next step.
+
+    The fallback notice embeds *cause*/*remediation* so a degraded
+    persistence tells the truth about why it failed instead of claiming a
+    generic "malformed JSON / validation error" for every rejection
+    (SA-0MW0LRBJM008Q2MC).
+    """
+    lowered = (stderr or "").lower()
+    if (
+        "argument list too long" in lowered
+        or "errno 7" in lowered
+        or "e2big" in lowered
+    ):
+        return (
+            _REJECTION_KIND_E2BIG,
+            "argument list too long (E2BIG)",
+            "The report exceeded the OS per-argument limit before wl could "
+            "store it; retry with the large-report --audit-file path "
+            "(lower AUDIT_PERSIST_INLINE_SIZE_LIMIT) or a smaller report.",
+        )
+    if "audit-invalid-first-line" in lowered:
+        return (
+            _REJECTION_KIND_INVALID_FIRST_LINE,
+            "invalid first line (audit-invalid-first-line)",
+            "The report's first non-empty line was not 'Ready to close: "
+            "Yes' or 'Ready to close: No'; resubmit header-first.",
+        )
+    if (
+        "json" in lowered
+        or "expected" in lowered
+        or "malformed" in lowered
+        or "parse" in lowered
+    ):
+        return (
+            _REJECTION_KIND_MALFORMED_JSON,
+            "malformed JSON / validation error",
+            "A re-audit may be required if the verdict data is needed in "
+            "this field.",
+        )
+    detail = (stderr or "").strip()
+    if not detail:
+        detail = "an unknown wl validation error"
+    return (
+        _REJECTION_KIND_OTHER,
+        detail,
+        "Inspect the wl error above and re-run the audit persistence.",
+    )
+
+
+def _update_rejection_detail(proc) -> str:
+    """Extract a human-readable rejection detail from a failed wl update.
+
+    ``wl update --audit-text --json`` reports validation failures as JSON on
+    stdout (``{success: false, error, message}``) with a non-zero exit code,
+    while pre-exec failures (e.g. E2BIG) and non-JSON wl output land on
+    stderr. Combine both so the fallback notice names the real cause
+    (SA-0MW0LRBJM008Q2MC).
+    """
+    parts: list[str] = []
+    stderr = getattr(proc, "stderr", "") or ""
+    if stderr.strip():
+        parts.append(stderr.strip())
+    stdout = getattr(proc, "stdout", "") or ""
+    if stdout.strip():
+        try:
+            data = json.loads(stdout)
+            if isinstance(data, dict) and data.get("success") is False:
+                error = data.get("error")
+                message = data.get("message")
+                if error:
+                    parts.append(str(error))
+                if message:
+                    parts.append(str(message))
+            elif not parts:
+                parts.append(stdout.strip())
+        except json.JSONDecodeError:
+            if not parts:
+                parts.append(stdout.strip())
+    return "\n".join(parts)
+
+
+def _build_fallback_text(issue_id: str, ready: str,
+                         rejection: str | None = None) -> str:
     """Compact markdown fallback persisted when the full report is rejected.
 
     Starts with the wl-required ``Ready to close:`` line, names *issue_id*
     (so the identity and readback guards still pass) and carries a clear
-    failure notice explaining that the assembled verdict content was rejected.
+    failure notice naming the real rejection cause and its remediation
+    (SA-0MW0LRBJM008Q2MC) instead of a generic "malformed JSON" claim.
 
     A machine-readable ``Audit classification: transient
     (verdict_persistence_failure)`` line follows the verdict line so a
     degraded persistence is distinguishable from a genuine ``Ready to
     close: No`` verdict (WL-0MW2F2T1I001ZNH7 AC1).
     """
+    _kind, cause, remediation = _classify_rejection(rejection)
     return (
         f"Ready to close: {ready}\n"
         "Audit classification: transient (verdict_persistence_failure)\n"
@@ -134,11 +236,10 @@ def _build_fallback_text(issue_id: str, ready: str) -> str:
         f"**Work item:** {issue_id}\n"
         "\n"
         "The audit pipeline completed, but the final persistence step "
-        "rejected the assembled verdict content (malformed JSON / validation "
-        "error). The full report could not be stored in the audit text field. "
-        "The complete report is preserved in the audit raw output "
-        "(`wl audit-show`). A re-audit may be required if the verdict data "
-        "is needed in this field."
+        f"rejected the assembled verdict content ({cause}). The full report "
+        "could not be stored in the audit text field. The complete report "
+        "is preserved in the audit raw output (`wl audit-show`). "
+        f"{remediation}"
     )
 
 
@@ -354,6 +455,63 @@ def _extract_transient_classification(report_text: str) -> str | None:
     return None
 
 
+def _first_non_empty_line(text: str) -> str:
+    """Return the first non-blank line of *text* (stripped), or ``""``."""
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _verdict_header_line(ready: str) -> str:
+    """Return the canonical ``Ready to close:`` verdict header for *ready*."""
+    return "Ready to close: Yes" if ready == "yes" else "Ready to close: No"
+
+
+def _is_failure_notice_wrapped(report_text: str) -> bool:
+    """Return True when *report_text* leads with a ``FailureNotice`` banner.
+
+    ``FailureNotice.wrap()`` (skill/scripts/failure_notice.py) places a run
+    of ``=`` separators and the ``⚠ Script Execution Failure:`` header before
+    the real report, so the wl-required ``Ready to close:`` first line is
+    buried below the banner. Detect that shape so the persistence boundary
+    can submit the verdict header first while keeping the banner visible in
+    the body (SA-0MW0LRBJM008Q2MC).
+    """
+    first = _first_non_empty_line(report_text)
+    if not first:
+        return False
+    if set(first) in ({"="}, {"\u2550"}):
+        return True
+    return first.startswith("⚠ Script Execution Failure:")
+
+
+def _header_first_report(report_text: str, ready: str) -> str:
+    """Return *report_text* with the wl-required verdict header first.
+
+    Only a ``FailureNotice``-wrapped report is relocated: its banner (and
+    any leading blank lines) currently precedes the ``Ready to close:``
+    line, which ``wl update --audit-text`` rejects with
+    ``audit-invalid-first-line``. Move the verdict header to the top and
+    keep the failure banner fully visible in the body. Reports that are not
+    failure-notice wrapped are returned unchanged (report assembly already
+    emits the verdict header first).
+    """
+    if not _is_failure_notice_wrapped(report_text):
+        return report_text
+    header = _verdict_header_line(ready)
+    lines = report_text.splitlines()
+    verdict_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().lower().startswith("ready to close:"):
+            verdict_idx = i
+            break
+    if verdict_idx is not None:
+        lines = lines[:verdict_idx] + lines[verdict_idx + 1:]
+    return header + "\n" + "\n".join(lines)
+
+
 # Work-item id pattern: 2-5 uppercase letters, dash, then base62-ish suffix
 # (e.g. ``SA-0MSAS108O009DYKT``, ``OSL-0MSABC7SB001NVUN``).
 _WORK_ITEM_ID_RE = r"\b[A-Z]{2,5}-[A-Z0-9]{12,20}\b"
@@ -495,13 +653,18 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
     - ``0`` — a usable audit was persisted (the original report, or a
       repaired report after the resilience pass salvaged malformed JSON).
     - ``PERSIST_CONTENT_INVALID`` (4) — the final ``wl update --audit-text``
-      step rejected the assembled verdict content (malformed JSON) and only
-      the compact fallback markdown notice (with a clear failure notice and
-      the target work-item ID) could be persisted. The audit is usable and
-      the identity/readback guards pass; the caller may trigger a bounded
-      model re-ask (SA-0MSF3RXUB000NLOI).
-    - non-zero — nothing could be persisted (e.g. ``wl audit-set`` failed,
-      or every ``--audit-text`` attempt including the fallback failed).
+      step rejected the assembled verdict content as genuine malformed JSON
+      and only the compact fallback markdown notice (with a clear failure
+      notice and the target work-item ID) could be persisted. The audit is
+      usable and the identity/readback guards pass; the caller may trigger a
+      bounded model re-ask (SA-0MSF3RXUB000NLOI).
+    - ``1`` — a non-content rejection (E2BIG, first-line validation, or any
+      other wl error) prevented the full report from being stored; the
+      truthful fallback notice was persisted, but the code is deliberately
+      not :data:`PERSIST_CONTENT_INVALID` (SA-0MW0LRBJM008Q2MC).
+    - other non-zero — nothing could be persisted (e.g. ``wl audit-set``
+      failed, or every ``--audit-text`` attempt including the fallback
+      failed).
 
     * _fail (internal/testing only): when True, skip the wl call, print the
       report to stdout as a fallback, and return 1 to simulate a persistence
@@ -612,12 +775,21 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
             cmd.append("--json")
             return runner(cmd, check=False, text=True, capture_output=True)
 
-    update_proc = _run_audit_text_update(report_text)
+    # ── Header-first submission (SA-0MW0LRBJM008Q2MC) ──
+    # ``wl update --audit-text`` only accepts a first non-empty line of
+    # exactly ``Ready to close: Yes`` / ``Ready to close: No``. A
+    # FailureNotice-wrapped report (script-failure banner on line 1) must be
+    # submitted with the verdict header relocated to the top while the banner
+    # stays fully visible in the body. ``wl audit-set --raw-output`` above
+    # keeps the original report, so rawOutput preservation is unchanged.
+    audit_text = _header_first_report(report_text, ready)
+
+    update_proc = _run_audit_text_update(audit_text)
     if getattr(update_proc, "returncode", 1) != 0:
-        stderr = getattr(update_proc, "stderr", "") or ""
+        rejection = _update_rejection_detail(update_proc)
         print(
             f"wl update --audit-text failed (rc={getattr(update_proc, 'returncode', 'unknown')}): "
-            f"{stderr.strip()}",
+            f"{rejection}",
             file=sys.stderr
         )
         # ── Resilience repair pass (SA-0MSF3RXUB000NLOI, P8) ──
@@ -627,7 +799,7 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
         # broken JSON fragments, zero model calls) and retry once, then fall
         # back to a compact markdown notice so the audit text field never
         # stays the 43-char stub.
-        repaired, changed = _salvage_report_text(report_text, issue_id)
+        repaired, changed = _salvage_report_text(audit_text, issue_id)
         if changed:
             repair_proc = _run_audit_text_update(repaired)
             if getattr(repair_proc, "returncode", 1) == 0:
@@ -637,19 +809,23 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
                     file=sys.stderr,
                 )
                 return 0
-            rerr = getattr(repair_proc, "stderr", "") or ""
+            repair_detail = _update_rejection_detail(repair_proc)
+            rejection = repair_detail or rejection
             print(
                 f"wl update --audit-text (repaired) failed (rc={getattr(repair_proc, 'returncode', 'unknown')}): "
-                f"{rerr.strip()}",
+                f"{repair_detail}",
                 file=sys.stderr,
             )
 
         # Fallback: persist a compact markdown notice so the audit text field
-        # carries usable content (with a clear failure notice and the target
-        # work-item ID so the identity/readback guards still pass) instead of
-        # the 43-char stub. The audit runner maps PERSIST_CONTENT_INVALID to
-        # a bounded model re-ask (≤1 additional call).
-        fallback = _build_fallback_text(issue_id, "Yes" if ready == "yes" else "No")
+        # carries usable content (with a clear failure notice naming the real
+        # wl error and the target work-item ID so the identity/readback guards
+        # still pass) instead of the 43-char stub. The audit runner maps
+        # PERSIST_CONTENT_INVALID to a bounded model re-ask (≤1 additional
+        # call); only a genuine malformed-JSON rejection earns that code.
+        fallback = _build_fallback_text(
+            issue_id, "Yes" if ready == "yes" else "No", rejection=rejection,
+        )
         fb_proc = _run_audit_text_update(fallback)
         if getattr(fb_proc, "returncode", 1) != 0:
             ferr = getattr(fb_proc, "stderr", "") or ""
@@ -664,7 +840,10 @@ def persist_audit(issue_id: str, report_text: str, wl_bin: str = "wl",
             "assembled verdict content was rejected.",
             file=sys.stderr,
         )
-        return PERSIST_CONTENT_INVALID
+        kind, _cause, _remediation = _classify_rejection(rejection)
+        if kind == _REJECTION_KIND_MALFORMED_JSON:
+            return PERSIST_CONTENT_INVALID
+        return 1
 
     return 0
 
