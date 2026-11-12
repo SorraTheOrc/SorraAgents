@@ -9446,6 +9446,39 @@ def _reported_exit_code(test_result: dict[str, Any]) -> int | None:
     return None
 
 
+#: `` ❯ [<fn>] <file>:<line>:<col>`` — a Vitest stack frame
+#: (RISE-0MW5JFQCU001YYQK, SA-0MWDLPF320060T0H). Mirrored from the shared
+#: classifier's ``gate_reason._VITEST_FRAME_RE`` (pinned by a consistency
+#: test) so the compatibility fallback body in ``_gate_failure_kind`` and the
+#: detail renderer agree with the single shared classifier without importing
+#: the runner.
+_VITEST_FRAME_RE = re.compile(
+    r"^\s*(?:❯|>)\s+(?:\S+\s+)?(?P<loc>\S+:\d+:\d+)\s*$",
+    re.MULTILINE,
+)
+
+
+def _gate_vitest_frame(test_result: dict[str, Any] | None) -> str | None:
+    """The first ``❯ <file>:<line>:<col>`` Vitest frame in the result tails.
+
+    Consults the already-carried bounded ``stdout``/``stderr`` tails that
+    ``_adapt_guarded_result`` set (``GATE_OUTPUT_TAIL_CHARS``), stderr first —
+    the stream ``_gate_failure_detail`` prefers. ``None`` when neither tail
+    carries a frame, so a genuinely unparsable run (ENOSPC, missing
+    executable) is never fabricated into a code failure.
+    """
+    if not isinstance(test_result, dict):
+        return None
+    for key in ("stderr", "stdout"):
+        tail = test_result.get(key)
+        if not isinstance(tail, str):
+            continue
+        match = _VITEST_FRAME_RE.search(tail)
+        if match:
+            return match.group("loc")
+    return None
+
+
 def _gate_failure_kind(test_result: dict[str, Any]) -> str:
     """Classify why the test gate failed.
 
@@ -9485,9 +9518,21 @@ def _gate_failure_kind(test_result: dict[str, Any]) -> str:
         return GATE_FAILURE_TIMEOUT
     if _NOTICE_KILLED in notice_codes:
         return GATE_FAILURE_KILLED
+    exit_code = _reported_exit_code(test_result)
+    # Vitest frame fallback (SA-0MWDLPC3F005S9S2) — mirror of the shared
+    # classifier: a non-zero run whose bounded output tail carries a
+    # ``❯ <file>:<line>:<col>`` frame is a genuine code failure even when no
+    # structured failure record could be built. Replaces ONLY the ``unparsed``
+    # outcome: timeout / signal-kill / slot-contention / infrastructure
+    # notices above still win.
+    if (
+        exit_code is not None
+        and exit_code > 0
+        and _gate_vitest_frame(test_result) is not None
+    ):
+        return GATE_FAILURE_TESTS
     if _NOTICE_UNPARSED_FAILURE in notice_codes:
         return GATE_FAILURE_UNPARSED
-    exit_code = _reported_exit_code(test_result)
     if exit_code is not None:
         if exit_code < 0:
             return GATE_FAILURE_KILLED
@@ -9509,6 +9554,15 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
     failures = [str(f) for f in (test_result.get("failures") or [])]
     if failures:
         return "Failures:\n" + "\n".join(failures[:20])
+
+    # Frame fallback (SA-0MWDLPC3F005S9S2): a classified test failure with no
+    # structured failure record still reports the frame as the failing
+    # location — it must never fall through to the "no structured failures
+    # were parsed" prose.
+    if _gate_failure_kind(test_result) == GATE_FAILURE_TESTS:
+        frame = _gate_vitest_frame(test_result)
+        if frame is not None:
+            return "Failing location:\n" + frame
 
     state_changed_flags = test_result.get("state_changed_during_run") or []
     if isinstance(state_changed_flags, dict):

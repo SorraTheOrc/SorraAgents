@@ -17,7 +17,11 @@ The input is the runner's machine-readable aggregate result (``run_tests.py
 (owned by ``skill/test/scripts/run_tests.py``) plus the result's shape; it
 never parses human-readable notice wording except for the documented legacy
 ``slot_busy`` prefix. Structured test failures always win: a genuine failure is
-never reclassified as infrastructure.
+never reclassified as infrastructure. When the runner built no structured
+failure record but the bounded output tail still carries a Vitest frame
+(``❯ <file>:<line>:<col>``) — the gate's output window can strip the ``FAIL``
+header and error line — the frame is reported as the failing location and the
+run classifies ``test_failure``, never ``unparsed`` (SA-0MWDLPC3F005S9S2).
 
 Reason vocabulary
 -----------------
@@ -35,6 +39,7 @@ Reason vocabulary
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 #: Machine-readable reason codes. These are the strings emitted as
@@ -138,6 +143,40 @@ def _suite_exit_code(result: dict[str, Any]) -> int | None:
     return None
 
 
+#: `` ❯ [<fn>] <file>:<line>:<col>`` — a Vitest stack frame
+#: (RISE-0MW5JFQCU001YYQK, SA-0MWDLPF320060T0H). Mirrored from the runner's
+#: ``run_tests._VITEST_FRAME_RE`` (pinned by a consistency test) so this
+#: module stays importable by the shell hook without importing the runner.
+_VITEST_FRAME_RE = re.compile(
+    r"^\s*(?:❯|>)\s+(?:\S+\s+)?(?P<loc>\S+:\d+:\d+)\s*$",
+    re.MULTILINE,
+)
+
+
+def vitest_frame_location(result: dict[str, Any] | None) -> str | None:
+    """The first ``❯ <file>:<line>:<col>`` Vitest frame in the output tails.
+
+    Consults the already-carried bounded ``stderr``/``stdout`` tails (the
+    runner bounds each at ``NOTICE_OUTPUT_TAIL_CHARS``; ``implement.py``
+    re-bounds at ``GATE_OUTPUT_TAIL_CHARS``), stderr first — the stream the
+    gate's diagnostic tail prefers. ``None`` when neither tail carries a
+    frame, so a genuinely unparsable run (ENOSPC, missing executable) is
+    never fabricated into a code failure by an over-broad arrow match (the
+    frame-less control `` ❯ the run ended with no test failure markers to
+    attribute.`` deliberately does not match).
+    """
+    if not isinstance(result, dict):
+        return None
+    for key in ("stderr", "stdout"):
+        tail = result.get(key)
+        if not isinstance(tail, str):
+            continue
+        match = _VITEST_FRAME_RE.search(tail)
+        if match:
+            return match.group("loc")
+    return None
+
+
 def classify_gate_result(result: dict[str, Any] | None) -> str:
     """Return the stable reason code for a failed gate result.
 
@@ -160,6 +199,8 @@ def classify_gate_result(result: dict[str, Any] | None) -> str:
     if result.get("failures"):
         return GATE_REASON_TEST_FAILURE
 
+    frame_location = vitest_frame_location(result)
+
     notice_codes = [str(c) for c in (result.get("notice_codes") or [])]
     if _NOTICE_SLOT_BUSY in notice_codes:
         return GATE_REASON_SLOT_CONTENTION
@@ -173,12 +214,23 @@ def classify_gate_result(result: dict[str, Any] | None) -> str:
         return GATE_REASON_TIMEOUT
     if _NOTICE_KILLED in notice_codes:
         return GATE_REASON_KILLED
-    if _NOTICE_UNPARSED_FAILURE in notice_codes:
-        return GATE_REASON_UNPARSED
     if _NOTICE_COMMAND_NOT_FOUND in notice_codes:
         return GATE_REASON_INFRASTRUCTURE
 
     exit_code = _suite_exit_code(result)
+    # Frame fallback (SA-0MWDLPC3F005S9S2): a non-zero run whose (bounded)
+    # output tail carries a Vitest ``❯ <file>:<line>:<col>`` frame is a
+    # genuine code failure even when no structured failure record could be
+    # built — the gate's output window may have stripped the ``FAIL`` header
+    # and error line, leaving the frame as the failure's surviving signal.
+    # The fallback replaces ONLY the ``unparsed`` outcome: the timeout,
+    # signal-kill, slot-contention and infrastructure notices above still
+    # win, so none of them can be reclassified by a frame that merely
+    # happened to survive in the tail.
+    if exit_code is not None and exit_code > 0 and frame_location is not None:
+        return GATE_REASON_TEST_FAILURE
+    if _NOTICE_UNPARSED_FAILURE in notice_codes:
+        return GATE_REASON_UNPARSED
     if exit_code is not None:
         return GATE_REASON_KILLED if exit_code < 0 else GATE_REASON_UNPARSED
     if notice_codes or result.get("notices"):
@@ -258,7 +310,9 @@ def render_gate_diagnostic(
     working; when it carries a moved-checkout flag the diagnostic additionally
     names the checkout, both commits and the required re-run
     (SA-0MW3FF18I003KGZE AC4) instead of only the generic infrastructure
-    remedy.
+    remedy. A ``test_failure`` whose output tail carries a Vitest frame (no
+    structured failure record) additionally names the frame as the failing
+    location (SA-0MWDLPC3F005S9S2).
     """
     diagnostic = f"gate_reason={reason}\n{gate_reason_message(reason)}"
     flag = (result or {}).get("state_changed_during_run")
@@ -276,4 +330,8 @@ def render_gate_diagnostic(
                 "\n  Re-run the suite from a stable checkout: "
                 "python3 skill/test/scripts/run_tests.py --scope full"
             )
+    elif reason == GATE_REASON_TEST_FAILURE:
+        frame = vitest_frame_location(result)
+        if frame:
+            diagnostic += "\n  Failing location: " + frame
     return diagnostic
