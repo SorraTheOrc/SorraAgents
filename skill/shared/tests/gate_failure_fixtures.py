@@ -167,6 +167,54 @@ VITEST_BROWSER_FAILURE_COMMAND = (
 )
 
 
+#: Captured Vitest **frame-only** tail (RISE-0MW5JFQCU001YYQK, fed to the
+#: gate by RISE-0MW4XICXH006AEVS / SA-0MW0NL3EW0009R4G). This is the *exact*
+#: last-1200-character gate tail of the ``tce-the-rising`` unit run that
+#: ``implement.py::_tail_text`` kept (``GATE_OUTPUT_TAIL_CHARS``): the suite
+#: output's ``FAIL |unit| …`` header, ``AssertionError:`` line and ``|project|``
+#: pipes all fell outside the window, leaving only the tail of the
+#: ``+ Received:`` README string, the ``❯ <file>:<line>:<col>`` frame, its
+#: source-excerpt lines and the ``⎯⎯[1/1]⎯`` separator. The pre-parse vitest
+#: parser (MS-0MW3UR8SX009YZWS) needs a ``|project|`` pipe or a ``×`` tree
+#: marker, so this tail parsed to ``failures: []`` → gate ``reason: unparsed``
+#: — wrong for a genuine assertion failure in the docs test. Recorded from the
+#: runner's cached stderr
+#: (``tce-the-rising/.worklog/cache/b4dcb0f7cff13a55d1a059e47351e445/stderr.txt``)
+#: with the 1200-char ``_tail_text`` rule applied — every line is evidence.
+VITEST_FRAME_ONLY_OUTPUT = r"""ed a tie a player win. the report also carries its machine-readable twin (`rising-sweep-1000-progressivefaceoff-tie-neutral.json`). the candidate table (`w = 0…6`) is flat: player win rate 36.8–37.3% and the vp spread −3.44…−3.37, both inside the batch's ±1.5-point win-rate standard error, so no candidate is distinguishable and **`w = 3` is retained** rather than moved to chase noise. the material shift in this report is the rule change itself (a drawn duel now removes the player's card too, and 16.1% of resolved face-offs tie), which belongs to the balance pass (rise-0mvp9zbrv0054kc4), not to a weight tune in this item. reproduce it with: ```bash npx tsx scripts/rising-cadence-report.ts --seeds 1000 \\ --slot-zero-weights 0,1,2,3,4,5,6 \\ --write docs/balance/rising-sweep-1000-progressivefaceoff-tie-neutral.md ``` "
+
+ ❯ tests/the-rising/the-rising-docs.test.ts:2129:20
+    2127|     // explicitly labelled history rather than a description of today'…
+    2128|     expect(readme).toMatch(/rising-sweep-1000-progressivefaceoff-tie-n…
+    2129|     expect(readme).toMatch(/not the parity target/);
+       |                    ^
+    2130|   });
+    2131| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯"""
+
+#: The command of the captured ``tce-the-rising`` unit run. ``npm --silent
+#: test`` is the project's unit ``suiteCommands`` entry (``.pi/test-config.json``
+#: → ``vitest run --project unit``), so the fixture also exercises the
+#: TAP-fallback routing path in ``parse_failures`` ("npm --silent test" is not
+#: itself a vitest command line).
+VITEST_FRAME_ONLY_COMMAND = "npm --silent test"
+
+#: Control for the frame-only contract: a **frame-less, marker-less** non-zero
+#: vitest-adjacent output. It carries no ``FAIL |project|`` header, no
+#: ``|project|`` pipes, no ``×``/``✓`` tree markers and no
+#: ``❯ <path>:<line>:<col>`` frame — so it must keep today's
+#: ``unparsed_failure`` → gate ``unparsed`` classification after the frame
+#: parser lands (the frame regex must not over-match an arrow + prose).
+VITEST_FRAME_LESS_OUTPUT = (
+    "node:internal/modules/run_main:142\n"
+    "  (node:12345) UnhandledPromiseRejectionWarning: boom\n"
+    "Vitest caught 1 unhandled error during the test run.\n"
+    " ❯ the run ended with no test failure markers to attribute.\n"
+    "Tests failed with exit code 1.\n"
+)
+
+
 def completed(
     *, stdout: str = "", stderr: str = "", returncode: int = 0
 ) -> subprocess.CompletedProcess:
@@ -265,6 +313,35 @@ def vitest_browser_failure(
     hand-written approximation of the reporter.
     """
     return completed(stdout=output, returncode=exit_code)
+
+
+def vitest_frame_only_failure(
+    *, exit_code: int = 1, output: str = VITEST_FRAME_ONLY_OUTPUT
+) -> subprocess.CompletedProcess:
+    """The captured frame-only Vitest tail (RISE-0MW5JFQCU001YYQK).
+
+    A genuine *code* failure whose ``FAIL`` header was trimmed away by the
+    gate's 1200-character tail window: only the ``❯ <file>:<line>:<col>``
+    frame and its source excerpt survive. The runner must still parse one
+    structured record so the gate reports ``test_failure`` — never
+    ``unparsed`` — for a tail the operator actually sees.
+    """
+    return completed(stdout=output, returncode=exit_code)
+
+
+def vitest_frame_less_failure(
+    *, exit_code: int = 1, output: str = VITEST_FRAME_LESS_OUTPUT
+) -> subprocess.CompletedProcess:
+    """A non-zero Vitest run with no failure markers at all.
+
+    The frame parser's control: output with an arrow + prose but no
+    ``❯ <path>:<line>:<col>`` frame, no ``|project|`` pipes and no tree
+    markers must keep today's ``unparsed_failure`` → ``unparsed``
+    classification (SA-0MW0NL3EW0009R4G AC: no regression to the
+    infrastructure vocabulary).
+    """
+    return completed(stdout=output, returncode=exit_code)
+
 
 
 def timeout_expired(timeout: int = FIXTURE_TIMEOUT) -> subprocess.TimeoutExpired:

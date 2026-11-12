@@ -451,6 +451,60 @@ def test_vitest_command_does_not_mask_infrastructure_failure(tmp_path) -> None:
     assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
 
 
+#: Runner-level twin of the parser contract pin (SA-0MWDLP4SW0099MZM): a
+#: run whose captured output is only a ``❯ <file>:<line>:<col>`` frame tail
+#: must produce one structured failure and no infrastructure notice. Strict
+#: xfail fails on XPASS once the parser slice SA-0MWDLPF320060T0H lands,
+#: forcing marker removal there.
+_FRAME_NOTICE_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Contract pinned test-first by SA-0MWDLP4SW0099MZM; the parser slice "
+        "SA-0MWDLPF320060T0H parses the bare `❯ <file>:<line>:<col>` frame "
+        "tail into a structured failure. Remove this marker in that slice "
+        "(strict xfail fails on XPASS)."
+    ),
+)
+
+
+@_FRAME_NOTICE_XFAIL
+def test_frame_only_vitest_failure_is_a_code_failure_not_a_notice(tmp_path) -> None:
+    """A 1200-char frame-only vitest tail carries a record and no notice.
+
+    Regression pin (RISE-0MW5JFQCU001YYQK / RISE-0MW4XICXH006AEVS): the gate's
+    tail window trimmed the ``FAIL`` header, ``AssertionError:`` line and
+    ``|project|`` pipes from a genuine docs-assertion failure, so the runner
+    parsed no record and reported ``unparsed_failure`` — the operator was told
+    the command or configuration was wrong when the *code* was at fault.
+    """
+    result = _run_suite_with_fixture(
+        tmp_path, fx.VITEST_FRAME_ONLY_COMMAND, fx.vitest_frame_only_failure()
+    )
+
+    assert len(result["failures"]) == 1, (
+        "the failing file and frame must be named, never 'unparsed'"
+    )
+    assert result["notice_code"] == ""
+    assert "no parsable failures" not in result["notice"]
+    assert result["success"] is False
+
+
+def test_frame_less_vitest_output_stays_unparsed_failure(tmp_path) -> None:
+    """Control: marker-less non-zero vitest output keeps the unparsed notice.
+
+    The frame parser must never turn a genuinely unparsable non-zero run into
+    a ``test_failure`` (AC5, SA-0MWDLP4SW0099MZM): output with an arrow plus
+    prose but no ``❯ <path>:<line>:<col>`` frame stays ``unparsed_failure``.
+    """
+    result = _run_suite_with_fixture(
+        tmp_path, fx.VITEST_FRAME_ONLY_COMMAND, fx.vitest_frame_less_failure()
+    )
+
+    assert result["failures"] == []
+    assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
+    assert result["success"] is False
+
+
 def test_published_notice_codes_match_the_runner_constants() -> None:
     """The fixture vocabulary *is* the runner's contract, not a copy of it."""
     assert fx.NOTICE_SUITE_TIMEOUT == run_tests.NOTICE_SUITE_TIMEOUT
