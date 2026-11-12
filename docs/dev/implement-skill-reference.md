@@ -404,6 +404,11 @@ is preserved: a finished item is never left on a hold.
 until the terminal write):
 
 1. build → changed-scope test gate → commit → dev push (pre-existing)
+
+   The changed-scope gate's node/vitest selection order (group → convention
+   mapping → full fallback) and its real-gate proof are documented in
+   [node-vitest-selection-order.md](node-vitest-selection-order.md)
+   (SA-0MW0LNT970057DM9).
 2. local `dev` fast-forward and post-push ancestry assertion (pre-existing)
 3. **read-only post-push verification** — resolve the full-suite verdict for
    the pushed tree from the test cache; never executes a suite. `green` /

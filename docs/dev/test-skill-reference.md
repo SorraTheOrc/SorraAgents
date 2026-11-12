@@ -1115,6 +1115,11 @@ evidence.
 
 **Changed-file → test selection** combines:
 
+> The node/vitest view of this order (group → convention mapping → full
+> fallback) and its real-gate proof are summarised in
+> [node-vitest-selection-order.md](node-vitest-selection-order.md)
+> (SA-0MW0LNT970057DM9).
+
 1. **Named test groups** — the smallest group in `.pi/test-config.json`
    whose `paths` match a changed file wins and its `commands` run
    (SA-0MUJKF2HP001BR51). `suiteCommands` no longer disables selection: it
