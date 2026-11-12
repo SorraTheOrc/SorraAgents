@@ -116,3 +116,88 @@ class TestReliabilitySummaryEarlyExit:
         ), pytest.raises(RuntimeError):
             audit_runner._run_issue_command(args)
         assert audit_runner.RELIABILITY_SUMMARY_PREFIX in capsys.readouterr().err
+
+
+class TestPerRunIsolation:
+    """AC1: two sequential runs must not bleed counters or summary values."""
+
+    def setup_method(self):
+        audit_runner._rel_reset()
+
+    def test_two_sequential_runs_have_isolated_counters_and_summaries(
+            self, capsys):
+        # Run A: two parseable calls, no provider errors.
+        audit_runner._rel_reset()
+        _logged(raw_stdout="x",
+                extracted_text='[{"index": 0, "verdict": "met"}]')
+        _logged(raw_stdout="x",
+                extracted_text='[{"index": 0, "verdict": "met"}]')
+        snap_a = audit_runner._rel_snapshot()
+        line_a = audit_runner.emit_reliability_summary(elapsed_seconds=1.0)
+
+        # Run B: one provider error and no parseable call.
+        audit_runner._rel_reset()
+        _logged(raw_stdout="x", _provider_error=True,
+                _provider_error_message="boom")
+        snap_b = audit_runner._rel_snapshot()
+        line_b = audit_runner.emit_reliability_summary(elapsed_seconds=2.0)
+
+        # Each run's counters describe only that run (no bleed-through).
+        assert snap_a["calls"] == 2
+        assert snap_a["parse_ok"] == 2
+        assert snap_a["provider_errors"] == 0
+        assert snap_b["calls"] == 1
+        assert snap_b["parse_ok"] == 0
+        assert snap_b["provider_errors"] == 1
+
+        # The emitted summaries differ and carry only their own run's values.
+        assert line_a is not None and line_b is not None
+        assert line_a != line_b
+        assert "calls=2" in line_a and "parse_ok=2" in line_a
+        assert "provider_errors=0" in line_a
+        assert "calls=1" in line_b and "provider_errors=1" in line_b
+        assert "parse_ok=0" in line_b
+
+
+class TestSummaryReflectsOnlyCurrentAttempt:
+    """The summary lists only counters incremented in the current attempt."""
+
+    def setup_method(self):
+        audit_runner._rel_reset()
+
+    def test_summary_reflects_only_this_attempts_calls(self):
+        # A parseable call (calls + parse_ok), a timeout (calls + timeouts +
+        # parse_failed because nothing was parsed), a provider error
+        # (calls + provider_errors) and a JSON-contract re-ask.
+        _logged(raw_stdout="x",
+                extracted_text='[{"index": 0, "verdict": "met"}]')
+        _logged(raw_stdout="", _timeout=True)
+        _logged(raw_stdout="x", _provider_error=True,
+                _provider_error_message="boom")
+        audit_runner._rel_incr("verdict_reasks")
+
+        snap = audit_runner._rel_snapshot()
+        assert snap == {
+            "calls": 3,
+            "parse_ok": 1,
+            "parse_failed": 1,
+            "timeouts": 1,
+            "child_skips": 0,
+            "provider_errors": 1,
+            "concurrency_waits": 0,
+            "verdict_reasks": 1,
+            "child_screen_timeouts": 0,
+            "parent_screen_timeouts": 0,
+        }
+
+        line = audit_runner.render_reliability_summary(elapsed_seconds=0.5)
+        assert "calls=3" in line
+        assert "parse_ok=1" in line
+        assert "parse_failed=1" in line
+        assert "timeouts=1" in line
+        assert "child_skips=0" in line
+        assert "provider_errors=1" in line
+        assert "concurrency_waits=0" in line
+        assert "verdict_reasks=1" in line
+        assert "child_screen_timeouts=0" in line
+        assert "parent_screen_timeouts=0" in line
