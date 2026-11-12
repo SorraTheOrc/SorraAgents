@@ -89,6 +89,36 @@ human checkpoint is never silently skipped. The returned `reason` names both
 the effort scale and the risk level that triggered the gate
 (SA-0MUYG0HE6001YTEM, SA-0MUIUTJJS008W06Y).
 
+## Autoplan effort/risk derivation and unknown fallback
+
+The autoplan pre-check (`run_effort_and_risk` / `make_autoplan_decision`)
+never posts the historical hard-coded placeholder payload
+(`o=m=p=0`, certainty 100). That payload aggregated into
+`Extra Small`/`Low` (0.00h) and made `plan-if-needed` return `skip` for
+**every** item — silently skipping planning for epics (SA-0MW0LPXXY0002CQ0).
+
+Instead:
+
+- **Derive from children.** `run_effort_and_risk` fetches the item and its
+  children (`wl show <id> --children --json`). Each child with a stored
+  `effort` t-shirt label contributes a non-zero WBS row, with hours taken
+  from the effort-and-risk thresholds (`Extra Small` 2h, `Small` 14h,
+  `Medium` 52h, `Large` 160h, `Extra Large` 240h). Child and item `risk`
+  labels are mapped to conservative probability/impact pairs for the risk
+  aggregation. When no risk label exists, risk defaults to `Medium` — never a
+  confident `Low` — and the assumption is recorded in the estimate output.
+- **Unknown when there are no real inputs.** If no child carries an effort
+  label (or the item cannot be read), `run_effort_and_risk` returns `None`
+  **without invoking the orchestrator**. `make_autoplan_decision` then returns
+  `do_plan=True` / stage `plan_complete`, leaves the item's `effort`/`risk`
+  untouched, and posts **no** autoplan-decision comment. No
+  `autoplan-decision-hash` marker is written, so a later run can still compute
+  a genuine estimate. The observable decision vocabulary stays
+  `skip` / `plan` / `error`; `unknown` is expressed as `plan`.
+- **Defence in depth.** `orchestrate_estimate.py` refuses an all-zero
+  `o=m=p` payload (exit code 6, explicit `error`) before any `wl update`, so a
+  zero-derived `Extra Small`/`Low` can never be persisted by any caller.
+
 ## AC coverage review: triage-generated children are excluded
 
 The AC coverage review (`run_coverage_review` / `apply_coverage_review` in

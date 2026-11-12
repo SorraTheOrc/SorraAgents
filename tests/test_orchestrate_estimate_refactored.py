@@ -573,6 +573,24 @@ class TestMainRefactoredBehavior(unittest.TestCase):
         "thresholds": DEFAULT_THRESHOLDS
     }))
     @patch("subprocess.run")
+    def test_main_rejects_all_zero_effort_inputs(self, mock_run, mock_file):
+        """An all-zero O/M/P payload is unknown: exit 6, no wl write/comment.
+
+        SA-0MW0LPXXY0002CQ0 — the orchestrator must never aggregate a zero
+        payload into a confident XS/Low estimate.
+        """
+        input_data = {"issue_id": "TEST-123", "o": 0, "m": 0, "p": 0}
+
+        with patch("json.load", return_value=input_data):  # noqa: SIM117
+            with self.assertRaises(ExitCaptured) as ctx:
+                oe.main()
+        self.assertEqual(ctx.exception.code, 6)
+        mock_run.assert_not_called()
+
+    @patch("builtins.open", new_callable=mock_open, read_data=json.dumps({
+        "thresholds": DEFAULT_THRESHOLDS
+    }))
+    @patch("subprocess.run")
     def test_main_shows_intake_stage_scales_certainty(self, mock_run, mock_file):
         """main() scales certainty down when stage is intake_complete."""
         def subprocess_side_effect(cmd, *args, **kwargs):

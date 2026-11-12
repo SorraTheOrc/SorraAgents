@@ -32,11 +32,13 @@ from unittest.mock import patch
 import pytest
 
 from skill.plan.plan_helpers import (
+    derive_effort_risk_payload,
     make_autoplan_decision,
     normalise_effort_label,
     plan_approval_gate,
     plan_if_needed,
     resolve_complexity_tier,
+    run_effort_and_risk,
     should_request_plan_approval,
 )
 
@@ -788,3 +790,292 @@ class TestMakeAutoplanDecisionFreshPathEffortSpellingParity:
         do_plan, stage, _ = self._fresh_decision("M", "Low")
         assert do_plan is True
         assert stage == "plan_complete"
+
+
+# =========================================================================
+# 6. Zeroed autoplan estimate regression (SA-0MW0LPXXY0002CQ0)
+#
+# The autoplan pre-check used to post a hard-coded placeholder payload
+# (o=m=p=0, certainty 100) to the effort-and-risk orchestrator. The
+# orchestrator faithfully aggregated it into "Extra Small"/"Low" (0.00h),
+# so the pre-check returned `skip` for EVERY item — including epics with
+# many children. The fix derives real inputs from a work item's children and,
+# when none exist, treats the estimate as UNKNOWN: no zero payload, no write
+# to effort/risk, no autoplan decision comment, and full planning.
+# =========================================================================
+
+
+class _ScriptedEffortRunner:
+    """Runner that answers ``wl show`` and the effort-and-risk orchestrator.
+
+    ``wl show`` (including ``--children``) returns ``show_payload``; the
+    orchestrator returns ``orchestrator_result`` and records the payload it
+    was invoked with. Any other ``wl`` command returns empty comments.
+    """
+
+    def __init__(self, show_payload: dict, orchestrator_result: dict | None = None):
+        self.show_payload = show_payload
+        self.orchestrator_result = orchestrator_result
+        self.orchestrator_calls = 0
+        self.orchestrator_payload: str | None = None
+        self.calls: list[list[str]] = []
+
+    def __call__(self, cmd):
+        self.calls.append(list(cmd))
+        if "show" in cmd:
+            return _FakeResult(json.dumps(self.show_payload))
+        if any("orchestrate_estimate.py" in part for part in cmd):
+            self.orchestrator_calls += 1
+            # FakeRunner convention: the payload is appended as the last arg.
+            self.orchestrator_payload = cmd[-1]
+            return _FakeResult(json.dumps(self.orchestrator_result or {}))
+        if "comment" in cmd and "list" in cmd:
+            return _FakeResult(json.dumps({"comments": []}))
+        return _FakeResult("{}")
+
+
+def _show_epic(
+    *,
+    item_effort: str = "",
+    item_risk: str = "",
+    children: list[dict] | None = None,
+) -> dict:
+    """Build a ``wl show --children --json`` payload for a test epic."""
+    return {
+        "success": True,
+        "workItem": {
+            "id": "SA-EPIC",
+            "stage": "plan_complete",
+            "effort": item_effort,
+            "risk": item_risk,
+        },
+        "children": children or [],
+        "comments": [],
+    }
+
+
+class TestDeriveEffortRiskPayload:
+    """The derivation helper feeds real child inputs and never a zero payload."""
+
+    def test_returns_none_when_no_child_has_an_effort_estimate(self):
+        """An epic whose children carry no effort labels has no real inputs."""
+        payload = derive_effort_risk_payload(
+            {"id": "SA-EPIC", "effort": "", "risk": ""},
+            [
+                {"id": "C1", "title": "Child 1", "effort": "", "risk": "Low"},
+                {"id": "C2", "title": "Child 2", "effort": None, "risk": ""},
+            ],
+            target_id="SA-EPIC",
+        )
+        assert payload is None
+
+    def test_derives_nonzero_items_from_child_effort_labels(self):
+        """Children with stored effort labels produce strictly positive O/M/P."""
+        payload = derive_effort_risk_payload(
+            {"id": "SA-EPIC", "effort": "", "risk": ""},
+            [
+                {"id": "C1", "title": "Child 1", "effort": "Medium", "risk": "High"},
+                {"id": "C2", "title": "Child 2", "effort": "S", "risk": "Low"},
+            ],
+            target_id="SA-EPIC",
+        )
+        assert payload is not None
+        assert payload["issue_id"] == "SA-EPIC"
+        assert len(payload["items"]) == 2
+        assert all(row["o"] > 0 and row["m"] > 0 and row["p"] > 0 for row in payload["items"])
+        # Abbreviated "S" is normalised before mapping (14h = Small).
+        assert payload["items"][1]["m"] == 14.0
+        # Child risk labels feed the orchestrator's risk aggregation.
+        risk_ids = {row["id"] for row in payload["children"]}
+        assert risk_ids == {"C1", "C2"}
+
+    def test_ignores_children_without_effort_but_keeps_their_risk(self):
+        """A child with only a risk label contributes risk, not an effort row."""
+        payload = derive_effort_risk_payload(
+            {"id": "SA-EPIC", "effort": "", "risk": ""},
+            [
+                {"id": "C1", "title": "Child 1", "effort": "Small", "risk": ""},
+                {"id": "C2", "title": "Child 2", "effort": "", "risk": "Severe"},
+            ],
+            target_id="SA-EPIC",
+        )
+        assert payload is not None
+        assert [row["id"] for row in payload["items"]] == ["C1"]
+        assert {row["id"] for row in payload["children"]} == {"C2"}
+
+    def test_flattens_nested_children(self):
+        """Nested grandchildren are considered when deriving the estimate."""
+        payload = derive_effort_risk_payload(
+            {"id": "SA-EPIC", "effort": "", "risk": ""},
+            [
+                {
+                    "id": "C1",
+                    "title": "Child 1",
+                    "effort": "",
+                    "risk": "",
+                    "children": [
+                        {"id": "G1", "title": "Grandchild", "effort": "Large", "risk": "High"},
+                    ],
+                },
+            ],
+            target_id="SA-EPIC",
+        )
+        assert payload is not None
+        assert [row["id"] for row in payload["items"]] == ["G1"]
+
+
+class TestRunEffortAndRiskNoZeroPayload:
+    """``run_effort_and_risk`` derives real inputs or returns unknown (None)."""
+
+    def test_epic_with_children_derives_nonzero_payload(self):
+        """Regression: an epic with non-trivial children never gets the zero payload."""
+        runner = _ScriptedEffortRunner(
+            _show_epic(
+                children=[
+                    {"id": "C1", "title": "Child 1", "effort": "Large", "risk": "High"},
+                    {"id": "C2", "title": "Child 2", "effort": "Medium", "risk": "Medium"},
+                ]
+            ),
+            orchestrator_result={
+                "effort": {"tshirt": "Extra Large"},
+                "risk": {"level": "High", "score": 16},
+            },
+        )
+
+        result = run_effort_and_risk("SA-EPIC", runner=runner)
+
+        assert result is not None
+        assert runner.orchestrator_calls == 1
+        payload = json.loads(runner.orchestrator_payload)
+        assert payload["issue_id"] == "SA-EPIC"
+        assert payload["items"], "expected child-derived WBS rows"
+        total_m = sum(row["m"] for row in payload["items"])
+        assert total_m > 0, "the zeroed placeholder payload must never be sent"
+        assert result["effort"]["tshirt"] == "Extra Large"
+
+    def test_no_real_inputs_returns_none_without_invoking_orchestrator(self):
+        """No child effort labels -> unknown: the orchestrator is never called."""
+        runner = _ScriptedEffortRunner(
+            _show_epic(
+                children=[
+                    {"id": "C1", "title": "Child 1", "effort": "", "risk": ""},
+                    {"id": "C2", "title": "Child 2", "effort": "", "risk": ""},
+                ]
+            )
+        )
+
+        assert run_effort_and_risk("SA-EPIC", runner=runner) is None
+        assert runner.orchestrator_calls == 0
+
+    def test_show_failure_returns_none_without_invoking_orchestrator(self):
+        """An unreadable item is unknown, not a zero estimate."""
+
+        class _FailingShowRunner:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, cmd):
+                self.calls.append(list(cmd))
+                return _FakeResult("{}", returncode=1, stderr="wl show failed")
+
+        runner = _FailingShowRunner()
+        assert run_effort_and_risk("SA-EPIC", runner=runner) is None
+        assert all(
+            not any("orchestrate_estimate.py" in part for part in cmd)
+            for cmd in runner.calls
+        )
+
+
+class TestMakeAutoplanDecisionUnknownFallback:
+    """Unknown estimates fall back to full planning without writing anything."""
+
+    def test_unknown_plans_without_comment_or_field_write(self):
+        """A None estimator result returns plan, leaves fields unchanged, posts no
+        zeroed decision comment (so a later run may compute a real estimate)."""
+        with (
+            patch("skill.plan.plan_helpers.run_effort_and_risk", return_value=None),
+            patch("skill.plan.plan_helpers.append_autoplan_decision_comment") as mock_append,
+        ):
+            do_plan, stage, effort_risk = make_autoplan_decision(
+                "SA-EPIC",
+                config={},
+                precomputed_item={"effort": "", "risk": ""},
+                precomputed_comments=[],
+            )
+            mock_append.assert_not_called()
+
+        assert do_plan is True
+        assert stage == "plan_complete"
+        assert effort_risk == {"effort": "", "risk": ""}
+
+    def test_unknown_preserves_existing_partial_fields(self):
+        """Existing effort/risk values are reported unchanged on the unknown path."""
+        with (
+            patch("skill.plan.plan_helpers.run_effort_and_risk", return_value=None),
+            patch("skill.plan.plan_helpers.append_autoplan_decision_comment") as mock_append,
+        ):
+            do_plan, stage, effort_risk = make_autoplan_decision(
+                "SA-EPIC",
+                config={},
+                precomputed_item={"effort": "", "risk": "Medium"},
+                precomputed_comments=[],
+            )
+            mock_append.assert_not_called()
+
+        assert do_plan is True
+        assert stage == "plan_complete"
+        assert effort_risk == {"effort": "", "risk": "Medium"}
+
+    def test_unknown_does_not_mark_effort_risk_computed(self):
+        """The unknown path writes no hash marker, so a later run can still estimate."""
+        with (
+            patch("skill.plan.plan_helpers.run_effort_and_risk", return_value=None),
+            patch("skill.plan.plan_helpers.append_autoplan_decision_comment") as mock_append,
+        ):
+            make_autoplan_decision(
+                "SA-EPIC",
+                config={},
+                precomputed_item={"effort": "", "risk": ""},
+                precomputed_comments=[],
+            )
+            mock_append.assert_not_called()
+
+    def test_plan_if_needed_returns_plan_for_epic_without_estimates(self):
+        """AC3: an epic whose children exist but produce no numbers returns plan."""
+        runner = _ScriptedEffortRunner(
+            _show_epic(
+                children=[
+                    {"id": "C1", "title": "Child 1", "effort": "", "risk": ""},
+                    {"id": "C2", "title": "Child 2", "effort": "", "risk": ""},
+                ]
+            )
+        )
+
+        result = plan_if_needed("SA-EPIC", runner=runner)
+
+        assert result["decision"] == "plan"
+        assert result["effort"] == ""
+        assert result["risk"] == ""
+        # The orchestrator (which writes effort/risk) was never invoked.
+        assert runner.orchestrator_calls == 0
+
+    def test_plan_if_needed_returns_plan_for_epic_with_estimates(self):
+        """A child-derived estimate above the skip threshold returns plan."""
+        runner = _ScriptedEffortRunner(
+            _show_epic(
+                children=[
+                    {"id": "C1", "title": "Child 1", "effort": "Large", "risk": "High"},
+                    {"id": "C2", "title": "Child 2", "effort": "Large", "risk": "Medium"},
+                ]
+            ),
+            orchestrator_result={
+                "effort": {"tshirt": "Extra Large"},
+                "risk": {"level": "High", "score": 16},
+            },
+        )
+
+        result = plan_if_needed("SA-EPIC", runner=runner)
+
+        assert result["decision"] == "plan"
+        assert result["effort"] == "Extra Large"
+        assert result["risk"] == "High"

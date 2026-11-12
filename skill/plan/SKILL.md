@@ -111,6 +111,15 @@ the autoplan decision logic).
    in this case), `effort` (t-shirt size when determinable), `risk` (level
    when determinable), `error` (only when `decision == "error"`).
 
+   **Unknown estimates fall back to full planning.** When the estimator has
+   no real inputs (no child carries an effort estimate, or the item cannot be
+   read), the pre-check returns `decision: "plan"` and leaves the item's
+   `effort`/`risk` **unchanged** — it never writes a zeroed
+   `Extra Small`/`Low` estimate. A zeroed estimate previously made the
+   pre-check return `skip` for every item, silently skipping planning for
+   epics (SA-0MW0LPXXY0002CQ0). When an epic's children carry stored
+   effort/risk labels, those are aggregated into the estimate instead.
+
 3. Act on the decision:
 
    - **If `decision == "skip"`**: the item is small enough to implement
