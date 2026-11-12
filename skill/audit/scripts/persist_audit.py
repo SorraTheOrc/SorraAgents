@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# <!-- REFACTOR-SA-0MWDKRD8G008Z164
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 """Persist an audit report to a Worklog work item using the `wl audit-set` CLI.
 
 Usage:
