@@ -139,3 +139,39 @@ def _default_resolvable_ownership(tmp_path_factory):
         ),
     ):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _neutralise_execution_worktree_git():
+    """Keep flow tests hermetic against the AC1/AC2 git helpers.
+
+    SA-0MW4ZRLSI005PHL6 adds two git-heavy steps to ``_phase_gate``: it
+    resolves a fresh origin/dev **execution worktree** and runs an
+    **ahead/divergent** guard against the audited checkout. Flow tests that
+    audit a synthetic id resolve their owning root to the live framework
+    checkout (see ``_default_resolvable_ownership`` above) and use the
+    default real-git runner, so those steps would create/remove real
+    worktrees in the live repository — and, inside the ``implement.py
+    finish`` gate, inherit its exported ``GIT_INDEX_FILE`` (SA-0MVWQ4FZ4003S0GE).
+
+    Neutralise the three helpers here so every flow test stays hermetic and
+    deterministic. The dedicated ``test_audit_runner_contaminated_launch.py``
+    (and the two audit-base-freshness tests in
+    ``test_audit_runner_check_freshness.py``) re-enable the real functions via
+    their own module-scoped autouse fixture to exercise the real behaviour
+    against an offline ``git_sandbox`` fixture.
+    """
+    with (
+        mock.patch.object(
+            audit_runner, "_create_execution_worktree",
+            return_value=(None, "test: execution worktree disabled"),
+        ),
+        mock.patch.object(
+            audit_runner, "_remove_execution_worktree", return_value=None,
+        ),
+        mock.patch.object(
+            audit_runner, "_launch_checkout_divergence",
+            return_value=(False, [], ""),
+        ),
+    ):
+        yield

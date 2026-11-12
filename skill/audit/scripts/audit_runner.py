@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# <!-- REFACTOR-SA-0MWD28TXD000ZO2F
+# smell: security
+# severity: high
+# description: `try`-`except`-`pass` detected, consider logging the exception
+# -->
 # <!-- REFACTOR-SA-0MW2SWB2A005CS2B
 # smell: unknown
 # severity: low
@@ -11184,6 +11189,27 @@ class _AuditContext:
             if self.per_audit_project_root else TARGET_PROJECT_ROOT
         )
 
+    execution_worktree: str = ""
+    """Fresh detached origin/dev worktree used for execution-dependent work
+    (SA-0MW4ZRLSI005PHL6 AC1).
+
+    Created by ``_phase_gate`` before F3 suite execution and removed by
+    ``cmd_issue``'s finally block. Empty when the worktree could not be
+    created (fail-open: execution falls back to ``per_audit_project_root``).
+    The F3 full-suite gate and the Phase 1/2 file-scope manifest resolve
+    against it so an un-pushed in-flight commit parked on the launch checkout
+    can never contaminate an audit.
+    """
+
+    @property
+    def execution_root(self) -> Path:
+        """Execution base: the fresh origin/dev worktree when available,
+        else the per-audit target root (fail-open)."""
+        return (
+            Path(self.execution_worktree)
+            if self.execution_worktree else self.per_audit_root
+        )
+
     resolved_model: str = DEFAULT_MODEL
     resolved_phase1_model: str = DEFAULT_MODEL
     green_run_block: str | None = None
@@ -11727,6 +11753,207 @@ def _integrate_into_dev(ctx: _AuditContext,
             pass
 
 
+# ---------------------------------------------------------------------------
+# Fresh origin/dev execution worktree + ahead/divergent guard
+# (SA-0MW4ZRLSI005PHL6 AC1/AC2)
+# ---------------------------------------------------------------------------
+
+#: Prefix of the fresh origin/dev execution worktree directory name. Kept
+#: distinct from the merge gate's ``audit-merge-<id>`` worktree so the two
+#: never collide.
+_EXECUTION_WORKTREE_PREFIX = "audit-exec"
+
+#: A value that looks like a git object name (short or full sha). Used to
+#: reject a mocked/garbage runner output before treating it as a resolved
+#: commit — a fake runner that answers unknown commands with a JSON success
+#: blob must never be read as ``origin/dev`` or as ahead commits.
+_SHA_LIKE_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def _looks_like_sha(value: str) -> bool:
+    """True when *value* is a git object name (7–40 lowercase hex chars)."""
+    return bool(_SHA_LIKE_RE.match((value or "").strip()))
+
+
+def _ensure_execution_worktree_submodules(worktree_path: Path) -> bool:
+    """Initialise git submodules inside a fresh execution worktree.
+
+    Mirrors ``implement.py::_ensure_submodules`` (SA-0MSN52GGN002B0AZ): a
+    ``git worktree add`` leaves a tracked gitlink's submodule directory
+    empty, so a project whose suite imports a submodule (e.g.
+    tce-the-rising's ``core/``) fails every suite command at startup. Run
+    **before** the ``node_modules`` symlink (ordering hazard
+    SA-0MVTOR53E003IIEQ).
+
+    Best-effort: a failure never aborts the audit — the execution worktree
+    is then no worse than the launch checkout. Returns ``True`` when
+    submodules were initialised (or there are none).
+    """
+    if not (worktree_path / ".gitmodules").is_file():
+        return True
+    # Scrub repository-overriding env (the ``implement.py finish`` gate exports
+    # a temporary ``GIT_INDEX_FILE`` for the suite it runs — SA-0MVWQ4FZ4003S0GE;
+    # a leaked ``GIT_DIR``/``GIT_WORK_TREE``/``GIT_INDEX_FILE`` would redirect
+    # the submodule update off this worktree).
+    env = {
+        k: v for k, v in os.environ.items()
+        if not (k == "GIT_INDEX_FILE" or k in {
+            "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR",
+            "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+        })
+    }
+    try:
+        proc = subprocess.run(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=str(worktree_path), capture_output=True, text=True,
+            check=False, timeout=600, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _create_execution_worktree(owning_root: Path, runner: Runner,
+                               issue_id: str) -> tuple[Path | None, str]:
+    """Create a fresh detached worktree at the latest ``origin/dev``.
+
+    AC1 (SA-0MW4ZRLSI005PHL6): the F3 full-suite gate must execute against
+    the merged, checked-in dev state — never a stale/dirty launch checkout.
+    Fetches ``origin/dev`` first (so the worktree is at the latest delivered
+    tip), creates a detached worktree, initialises submodules *before*
+    symlinking the shared ``node_modules`` (ordering hazard
+    SA-0MVTOR53E003IIEQ; symlink convention SA-0MSGS763C006SM1B), and
+    returns the worktree path.
+
+    Returns ``(worktree_path, evidence)``. ``worktree_path`` is ``None``
+    when the worktree could not be created — callers fall back to the launch
+    checkout (fail-open; an execution worktree is an improvement, never a
+    new hard dependency).
+    """
+    evidence: list[str] = []
+    try:
+        proc = runner(["git", "fetch", "origin", "dev"])
+        if proc.returncode != 0:
+            return None, "git fetch origin dev failed; execution worktree unavailable"
+        proc = runner(["git", "rev-parse", "--verify", "origin/dev"])
+        if proc.returncode != 0 or not _looks_like_sha(proc.stdout):
+            return None, "origin/dev unresolvable; execution worktree unavailable"
+        dev_sha = proc.stdout.strip()
+        worktree_path = (
+            owning_root / ".worklog" / "worktrees"
+            / f"{_EXECUTION_WORKTREE_PREFIX}-{issue_id}"
+        )
+        if worktree_path.exists():
+            runner(["git", "worktree", "remove", "--force", str(worktree_path)])
+        proc = runner(["git", "worktree", "add", "--detach",
+                       str(worktree_path), dev_sha])
+        # A mocked/garbage runner can report rc=0 without creating the
+        # worktree; require the directory AND its git file to exist before
+        # treating the worktree as the execution base (fail-open otherwise).
+        if proc.returncode != 0 or not worktree_path.exists() \
+                or not (worktree_path / ".git").exists():
+            return None, (
+                "git worktree add at origin/dev failed "
+                f"(rc={proc.returncode}); execution worktree unavailable"
+            )
+        evidence.append(
+            f"execution worktree created at {worktree_path} "
+            f"(detached at origin/dev {dev_sha[:10]})"
+        )
+        # Submodules BEFORE the node_modules symlink (SA-0MVTOR53E003IIEQ).
+        if _ensure_execution_worktree_submodules(worktree_path):
+            evidence.append("submodules initialised in execution worktree")
+        else:
+            evidence.append("submodule initialisation skipped/failed (best-effort)")
+        # Reuse the merge-gate node_modules symlink convention
+        # (SA-0MSGS763C006SM1B): never npm-install inside a worktree.
+        if (owning_root / "node_modules").exists() \
+                and not (worktree_path / "node_modules").exists():
+            try:
+                (worktree_path / "node_modules").symlink_to(
+                    owning_root / "node_modules", target_is_directory=True
+                )
+                evidence.append("node_modules symlinked into execution worktree")
+            except OSError:
+                evidence.append("node_modules symlink failed (best-effort)")
+        return worktree_path, "\n".join(evidence)
+    except Exception as exc:  # noqa: BLE001 -- fail-open: fall back to launch
+        return None, f"execution worktree creation error: {exc}"
+
+
+def _remove_execution_worktree(owning_root: Path | None, runner: Runner,
+                               worktree_path: str | None) -> None:
+    """Remove the fresh origin/dev execution worktree (best-effort).
+
+    AC1 (SA-0MW4ZRLSI005PHL6): the execution worktree is removed after the
+    audit so it never accumulates under ``.worklog/worktrees``. Removing a
+    worktree never touches the main checkout's tracked content.
+    """
+    if not worktree_path:
+        return
+    try:
+        runner(["git", "worktree", "remove", "--force", str(worktree_path)])
+    except Exception:  # noqa: BLE001 -- cleanup best-effort
+        pass
+
+
+def _launch_checkout_divergence(owning_root: Path, runner: Runner,
+                                launch_root: Path,
+                                ) -> tuple[bool, list[str], str]:
+    """Detect a main checkout ahead of / divergent from ``origin/dev``.
+
+    AC2 (SA-0MW4ZRLSI005PHL6): an audit must never run against un-pushed
+    in-flight work parked on the owning repo's MAIN checkout. The
+    stale-audit-base guard (SA-0MT9EK1UU000DT1R) only flags *behind*
+    (delivered on origin/dev, absent from HEAD); this flags *ahead/divergent*
+    (local HEAD contains commits not in origin/dev), the 2026-11-06
+    RISE-0MW19AROF0035FRH incident shape (1 un-pushed commit, 6 behind).
+
+    **Scope (AC5).** Only applies when the launch checkout IS the owning
+    repo's main checkout. A feature-worktree launch
+    (``<owning>/.worklog/worktrees/wl-<id>-*``) legitimately has a HEAD
+    ahead of origin/dev (the item's own un-pushed work); the behind-only
+    guard suffices there, so this returns ``(False, [], "")``.
+
+    Returns ``(divergent, ahead_commits, evidence)``. Fail-open on any git
+    error (an unresolvable origin/dev or a git failure never blocks an
+    audit).
+    """
+    try:
+        launch = Path(launch_root).resolve()
+        owning = Path(owning_root).resolve()
+    except OSError:
+        return False, [], ""
+    if launch != owning:
+        # Not the main checkout (a worktree launch): legitimately ahead.
+        return False, [], ""
+    try:
+        # Ensure origin/dev is current so the comparison is meaningful.
+        runner(["git", "fetch", "origin", "dev"])
+        proc = runner(["git", "rev-parse", "--verify", "origin/dev"])
+        if proc.returncode != 0 or not _looks_like_sha(proc.stdout):
+            return False, [], ""
+        proc = runner(["git", "rev-list", "origin/dev..HEAD"])
+        if proc.returncode != 0:
+            return False, [], ""
+        ahead = [
+            ln.strip() for ln in proc.stdout.splitlines()
+            if _looks_like_sha(ln)
+        ]
+    except Exception:  # noqa: BLE001 -- fail-open
+        return False, [], ""
+    if not ahead:
+        return False, [], ""
+    shown = ahead[:10]
+    evidence = (
+        f"the launch checkout {launch} is ahead of origin/dev by "
+        f"{len(ahead)} un-pushed commit(s) not present on origin/dev: "
+        + ", ".join(shown)
+        + (" …" if len(ahead) > len(shown) else "")
+    )
+    return True, ahead, evidence
+
+
 def _audit_base_freshness(ctx: _AuditContext,
                           commits: list[str],
                           branch: str) -> tuple[bool, str, list[str], str | None]:
@@ -11755,8 +11982,11 @@ def _audit_base_freshness(ctx: _AuditContext,
     Fail-open semantics: a candidate that is NOT an ancestor of origin/dev
     (e.g. an unrelated/context citation, or an unresolvable sha) is skipped;
     candidates whose presence in HEAD cannot be verified due to a git error
-    are treated as present. The guard only flags the deterministic
-    stale-checkout case (delivered on origin/dev, absent from HEAD).
+    are treated as present. The guard flags the deterministic
+    stale-checkout case (delivered on origin/dev, absent from HEAD) AND —
+    AC2 of SA-0MW4ZRLSI005PHL6 — the ahead/divergent main-checkout case
+    (local HEAD contains commits not in ``origin/dev``: un-pushed in-flight
+    work parked on the checkout being audited).
     """
     evidence: list[str] = []
     missing: list[str] = []
@@ -11766,6 +11996,36 @@ def _audit_base_freshness(ctx: _AuditContext,
         evidence.append(f"local audit base HEAD resolved to {head_sha}")
     else:
         evidence.append("local audit base HEAD could not be resolved")
+
+    # AC2 (SA-0MW4ZRLSI005PHL6): belt-and-braces ahead/divergent check. The
+    # early guard in ``_phase_gate`` catches this BEFORE F3 execution; this
+    # records the same condition in the merge-gate evidence (which the
+    # report surfaces) so a caller that reaches the gate another way still
+    # refuses to audit un-pushed in-flight work. Only fires when the launch
+    # checkout is the owning repo's MAIN checkout (worktree launches
+    # legitimately sit ahead — AC5).
+    owning = Path(ctx.owning_root) if ctx.owning_root else None
+    ahead_commits: list[str] = []
+    if owning is not None:
+        # The checkout the audit resolves git against is the per-audit root
+        # (the launch checkout, or the owning root on a foreign-cwd launch).
+        # ``_launch_checkout_divergence`` only fires when that checkout IS
+        # the owning repo's main checkout (a worktree launch legitimately
+        # sits ahead — AC5).
+        divergent, ahead_commits, divergence_evidence = _launch_checkout_divergence(
+            owning, ctx.runner, ctx.per_audit_root,
+        )
+        if divergent:
+            evidence.append(
+                "Audit-base divergence check: " + divergence_evidence
+                + " — STALE (launch checkout ahead/divergent from origin/dev)"
+            )
+        else:
+            evidence.append(
+                "Audit-base divergence check: launch checkout is at "
+                "origin/dev (or a worktree launch) — OK"
+            )
+    divergent_missing = list(ahead_commits)
 
     candidates: list[str] = []
     seen: set[str] = set()
@@ -11826,6 +12086,10 @@ def _audit_base_freshness(ctx: _AuditContext,
             "no delivered-commit candidates — nothing to verify (fail-open)"
         )
 
+    if divergent_missing:
+        # Ahead/divergent is stale regardless of delivered-commit ancestry.
+        return False, "\n".join(evidence), missing + divergent_missing, head_sha
+
     return not missing, "\n".join(evidence), missing, head_sha
 
 
@@ -11854,10 +12118,11 @@ def _audit_base_freshness_guard_passes(ctx: _AuditContext,
         "The item's delivered work IS merged into the owning repo's "
         "origin/dev, but the local checkout the audit resolves its git "
         "scope against (HEAD "
-        f"{head_sha or '<unresolved>'}) does NOT contain the delivered "
-        "commit(s): "
+        f"{head_sha or '<unresolved>'}) is stale or divergent from "
+        "origin/dev: commit(s) "
         + ", ".join(missing)
-        + ". The audit would run against a stale tree and report "
+        + ". The audit would run against a stale/contaminated tree "
+        "(missing delivered work or un-pushed in-flight work) and report "
         "misleading verdicts."
     )
     print(
@@ -12150,6 +12415,75 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     per_audit_root = git_root
     runner = _cwd_aware_runner(git_root, runner)
     ctx.runner = runner
+    # Publish the per-audit root EARLY: the AC1/AC2 helpers below (execution
+    # worktree + divergence guard) read ``ctx.per_audit_root`` / ``ctx.
+    # execution_root``, whose ``per_audit_root`` property falls back to the
+    # cwd-derived ``TARGET_PROJECT_ROOT`` while ``per_audit_project_root`` is
+    # empty. Set it now (idempotently reassigned at the gate's end) so the F3
+    # execution base resolves to the owning/launch root, never the framework
+    # cwd (SA-0MW4ZRLSI005PHL6).
+    ctx.per_audit_project_root = str(per_audit_root)
+
+    # ------------------------------------------------------------------
+    # AC2 (SA-0MW4ZRLSI005PHL6): refuse to audit a main checkout that is
+    # ahead of / divergent from origin/dev. Evaluated HERE — right after
+    # owning-root resolution and BEFORE the F3 suite auto-execution below —
+    # so a contaminated run never executes (and never triages spurious
+    # critical ``test-failure`` children against the audited item).
+    #
+    # Belt-and-braces with the fresh origin/dev execution worktree (AC1):
+    # the worktree makes the launch checkout irrelevant for F3, and this
+    # early abort prevents the wasted execution entirely. Scope (AC5): only
+    # fires when the launch checkout IS the owning repo's main checkout — a
+    # feature worktree legitimately sits ahead of origin/dev.
+    # ------------------------------------------------------------------
+    divergent, ahead_commits, divergence_evidence = _launch_checkout_divergence(
+        owning_root, runner, TARGET_PROJECT_ROOT,
+    )
+    if divergent:
+        error = (
+            f"Refusing to audit {issue_id}: {divergence_evidence}. An audit "
+            f"must never run against un-pushed in-flight work parked on the "
+            f"main checkout. Push/merge the commits to origin/dev (or "
+            f"launch the audit from a clean worktree at origin/dev) and "
+            f"re-run."
+        )
+        if json_mode:
+            print(json.dumps({
+                "error": error,
+                "launch_checkout_divergence": {
+                    "ahead_commits": ahead_commits,
+                    "remediation": (
+                        "push/merge the un-pushed commits to origin/dev, or "
+                        "launch the audit from a clean worktree at "
+                        "origin/dev, then re-run"
+                    ),
+                },
+            }, indent=2))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    # ------------------------------------------------------------------
+    # AC1 (SA-0MW4ZRLSI005PHL6): resolve a fresh, detached worktree at the
+    # latest origin/dev as the execution base for execution-dependent work.
+    # Fail-open: when the worktree cannot be created the audit proceeds
+    # against ``per_audit_root`` (today's behaviour) rather than blocking.
+    # ------------------------------------------------------------------
+    execution_worktree_path, execution_worktree_evidence = _create_execution_worktree(
+        owning_root, runner, issue_id,
+    )
+    if execution_worktree_path is not None:
+        ctx.execution_worktree = str(execution_worktree_path)
+        ctx.merge_gate_evidence += (
+            "\nExecution worktree (fresh origin/dev):\n"
+            + execution_worktree_evidence
+        )
+    else:
+        ctx.merge_gate_evidence += (
+            "\nExecution worktree (fresh origin/dev): "
+            + execution_worktree_evidence
+        )
 
     # Resolve the operator-attested green test run (if any). The attestation
     # is external evidence: the runner NEVER executes the test suite itself
@@ -12227,8 +12561,10 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
                     f3_touched = None
                 if ctx.description:
                     f3_key = _extract_key_files(ctx.description)
+                # AC1 (SA-0MW4ZRLSI005PHL6): execute the F3 suite in the fresh
+                # origin/dev execution worktree — never the launch checkout.
                 test_run = _run_tests_via_test_skill(
-                    cwd=per_audit_root,
+                    cwd=ctx.execution_root,
                     parent_work_item_id=issue_id,
                     head_sha=head_sha,
                     strict=ctx.strict,
@@ -12292,8 +12628,10 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
                 # suite execution in tests); in those contexts cached-red keeps
                 # today's fail-open-partial behaviour.
                 head_sha = _resolve_audited_head(runner)
+                # AC1 (SA-0MW4ZRLSI005PHL6): execute in the fresh origin/dev
+                # execution worktree, never the launch checkout.
                 test_run = _run_tests_via_test_skill(
-                    cwd=per_audit_root,
+                    cwd=ctx.execution_root,
                     parent_work_item_id=issue_id,
                     head_sha=head_sha,
                     strict=ctx.strict,
@@ -14205,7 +14543,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     if acs and acs[0] != "No acceptance criteria defined.":
         ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
         file_scope = _build_file_scope_manifest(
-            work_item, [], runner=runner, project_root=ctx.per_audit_root,
+            work_item, [], runner=runner, project_root=ctx.execution_root,
         )
         # Validate the FILE SCOPE manifest covers the item repository
         # (LP-0MSQ32HNR007AI6B): a manifest built from the wrong scope
@@ -16911,6 +17249,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # lifecycle raises unexpectedly.
             if ctx.abort_state_path:
                 _cleanup_audit_state(ctx.abort_state_path)
+            # Remove the fresh origin/dev execution worktree (AC1,
+            # SA-0MW4ZRLSI005PHL6) so it never accumulates under
+            # ``.worklog/worktrees``. Best-effort and never touches the main
+            # checkout's tracked content.
+            _remove_execution_worktree(
+                Path(ctx.owning_root) if ctx.owning_root else None,
+                ctx.runner, ctx.execution_worktree,
+            )
     if rc == 0 and ctx.checkpoint is not None:
         if ctx.checkpoint.budget_exceeded_children():
             # Budget-exceeded children remain unverified: KEEP the checkpoint
