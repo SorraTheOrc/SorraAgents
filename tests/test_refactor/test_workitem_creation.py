@@ -1433,3 +1433,158 @@ class TestDocHygiene:
         assert "in_progress" in content, "SKILL.md must reference setting status to in_progress"
         assert "open --json" not in content, "SKILL.md must NOT contain ad-hoc wl update --status commands"
         assert "wl update <id> --status" not in content, "SKILL.md must NOT contain ad-hoc wl update --status commands"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Identity dedupe — cross-family twin suppression (AC5)
+# ---------------------------------------------------------------------------
+
+
+def _twin_capable_workitem_creation():
+    """Import the module; skip unless cross-family twin support has landed.
+
+    The refactor producer learns to consult the audit false-positive-chore
+    family in SA-0MWE1EAR30045VHO (F3), which introduces the
+    ``AUDIT_FP_TITLE_MARKER`` constant. Guarding on that constant keeps this
+    test dormant until its sibling item implements the contract.
+    """
+    from refactor import workitem_creation as wic
+
+    if not hasattr(wic, "AUDIT_FP_TITLE_MARKER"):
+        pytest.skip(
+            "cross-family twin suppression not yet implemented "
+            "(SA-0MWE1EAR30045VHO)"
+        )
+    return wic
+
+
+class TestIdentityDedupeScenarios:
+    """End-to-end identity dedupe scenarios that exercise the wl seam.
+
+    Related acceptance criteria (SA-0MWE1DXPW00846UV):
+    - AC5: the refactor producer suppresses creation when an audit-created
+      open item of the form ``ruff <RULE> in <path> — candidate false
+      positive`` already exists (twin suppression).
+    """
+
+    @staticmethod
+    def _fake_run(tmp_path, list_items, created, commands):
+        """Fake git + wl runner returning *list_items* for every ``wl list``."""
+
+        def fake_run(cmd, *args, **kwargs):
+            argv = (
+                list(cmd)
+                if isinstance(cmd, (list, tuple))
+                else str(cmd).split()
+            )
+            commands.append(argv)
+            prog = argv[0] if argv else ""
+            if prog == "git" and "rev-parse" in argv:
+                return _cp(stdout=str(tmp_path))
+            if prog == "wl" and len(argv) > 1:
+                sub = argv[1]
+                if sub == "list":
+                    return _cp(
+                        stdout=json.dumps(
+                            {"success": True, "workItems": list_items}
+                        )
+                    )
+                if sub == "create":
+                    created.append(argv)
+                    return _cp(
+                        stdout=json.dumps(
+                            {
+                                "success": True,
+                                "workItem": {"id": "SA-0NEWXX"},
+                            }
+                        )
+                    )
+                return _cp(stdout='{"success":true}')
+            return _cp(stdout='{"success":true,"workItems":[]}')
+
+        return fake_run
+
+    @staticmethod
+    def _audit_twin(status: str) -> dict[str, Any]:
+        return {
+            "id": "SA-0AUDITX",
+            "title": (
+                "ruff S112 in skill/x.py:99 — candidate false positive "
+                "— producer decision required"
+            ),
+            "description": "CFP-Chore-Key: ruff:S112:skill/x.py:99\n",
+            "status": status,
+            "issueType": "chore",
+            "tags": [],
+        }
+
+    @staticmethod
+    def _smell(file_path: Path) -> dict[str, Any]:
+        return {
+            "file": str(file_path),
+            "line": 42,
+            "severity": "medium",
+            "message": "S112 finding",
+            "source": "linter",
+            "smell_type": "lint",
+            "code": "S112",
+        }
+
+    def test_audit_twin_suppresses_refactor_creation(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """An open audit twin suppresses creation and is never auto-closed."""
+        wic = _twin_capable_workitem_creation()
+        file_path = tmp_path / "skill" / "x.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("a = 1\n")
+
+        created: list[list[str]] = []
+        commands: list[list[str]] = []
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            self._fake_run(
+                tmp_path, [self._audit_twin("open")], created, commands
+            ),
+        )
+        monkeypatch.setattr(wic.shutil, "which", lambda _name: "/usr/bin/wl")
+
+        result = wic.create_smell_work_item(self._smell(file_path))
+
+        assert result is None, f"an audit twin must suppress creation, got {result!r}"
+        assert not created, f"no item may be created for a twin: {created}"
+        # The audit chore carries needsProducerReview by design: the refactor
+        # producer must never close it.
+        assert not any(
+            cmd[:2] in (["wl", "close"], ["wl", "update"])
+            and "SA-0AUDITX" in cmd
+            for cmd in commands
+        ), f"audit chore was mutated: {commands}"
+
+    def test_terminal_audit_twin_does_not_suppress(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """A completed audit chore no longer tracks the finding."""
+        wic = _twin_capable_workitem_creation()
+        file_path = tmp_path / "skill" / "x.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("a = 1\n")
+
+        created: list[list[str]] = []
+        commands: list[list[str]] = []
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            self._fake_run(
+                tmp_path, [self._audit_twin("completed")], created, commands
+            ),
+        )
+        monkeypatch.setattr(wic.shutil, "which", lambda _name: "/usr/bin/wl")
+
+        result = wic.create_smell_work_item(self._smell(file_path))
+
+        assert result == "SA-0NEWXX", (
+            f"a terminal audit chore must not suppress, got {result!r}"
+        )
+        assert len(created) == 1
