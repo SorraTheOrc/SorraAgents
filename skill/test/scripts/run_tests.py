@@ -1991,16 +1991,35 @@ def _extract_yaml_block(block: str, key: str) -> str:
 # (``❯``→``>``, ``×``→``x``) are accepted so a captured or Windows-rendered log
 # still parses.
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-#: `` FAIL  |<project>| <file> > <suite> > <test>`` — the Failed Tests header.
+#: `` FAIL  [|<project>|] <file> > <suite> > <test>`` — the Failed Tests
+#: header. The ``|<project>|`` pipe is **optional**: project-mode runs print
+#: it, plain node-mode runs print ``FAIL  <file> > <suite> > <test>``
+#: (SA-0MWDLPF320060T0H).
 _VITEST_FAIL_HEADER_RE = re.compile(
-    r"^\s*FAIL\s+\|(?P<project>[^|\n]*)\|\s*(?P<name>\S[^\n]*?)\s*$",
+    r"^\s*FAIL\s+(?:\|(?P<project>[^|\n]*)\|\s*)?(?P<name>\S[^\n]*?)\s*$",
     re.MULTILINE,
 )
-#: `` ❯ |<project>| <file> (N tests | M failed) 1234ms`` — the per-file header.
+#: `` ❯ [|<project>|] <file> (N tests | M failed) 1234ms`` — the per-file
+#: tree header. The ``|<project>|`` pipe is optional (node-mode); the
+#: ``(N tests`` parenthetical is required so a ``❯ <file>:<line>:<col>``
+#: stack frame is never read as a file header.
 _VITEST_FILE_HEADER_RE = re.compile(
-    r"^\s*(?:❯|>)\s+\|(?P<project>[^|\n]*)\|\s*(?P<file>[^\s()]+)",
+    r"^\s*(?:❯|>)\s+(?:\|(?P<project>[^|\n]*)\|\s*)?"
+    r"(?P<file>[^\s()]+)\s*\(\s*\d+\s*test",
     re.MULTILINE,
 )
+#: `` ❯ [<fn>] <file>:<line>:<col>`` — a Vitest stack frame. When the gate's
+#: 1200-char output tail has stripped the FAIL header and error line (their
+#: message embeds a long diff), the surviving frame plus its source excerpt
+#: is the failure's remaining signal — the frame is reported as the failing
+#: location (RISE-0MW5JFQCU001YYQK, SA-0MWDLPF320060T0H).
+_VITEST_FRAME_RE = re.compile(
+    r"^\s*(?:❯|>)\s+(?:\S+\s+)?(?P<loc>\S+:\d+:\d+)\s*$",
+    re.MULTILINE,
+)
+#: The source-window lines printed under a Vitest frame: ``  104|   }``
+#: (line + code) and ``      |        ^`` (the caret marker).
+_VITEST_EXCERPT_LINE_RE = re.compile(r"^\s*(?:\d+\||\|\s*\^)")
 #: ``   × <suite> > <test> 29146ms`` — a failed test inside a file's tree.
 _VITEST_TREE_FAIL_RE = re.compile(
     r"^\s*(?P<marker>[×✗x])\s+(?P<name>\S[^\n]*?)"
@@ -2019,9 +2038,10 @@ _VITEST_BLOCK_END_RE = re.compile(
 def parse_vitest_failures(output: str) -> list[dict[str, str]]:
     """Parse Vitest's default-reporter output into structured failure records.
 
-    Vitest names a failing test after its file and suite — ``FAIL  |<project>|
-    <file> > <suite> > <test>`` in the ``Failed Tests`` block and ``× <suite> >
-    <test>`` under the ``❯ |<project>| <file>`` tree header. Before
+    Vitest names a failing test after its file and suite — ``FAIL  [|<project>|]
+    <file> > <suite> > <test>`` in the ``Failed Tests`` block (the ``|<project>|``
+    pipe is optional: node-mode runs omit it) and ``× <suite> > <test>`` under
+    the ``❯ [|<project>|] <file>`` tree header. Before
     MS-0MW3UR8SX009YZWS the runner understood only TAP, so every Vitest
     failure produced ``failures: []`` and was classified ``unparsed_failure``
     (gate ``reason: unparsed``): the operator was told the *command or
@@ -2030,10 +2050,14 @@ def parse_vitest_failures(output: str) -> list[dict[str, str]]:
 
     The ``Failed Tests`` block is parsed first (it carries the error, code
     frame and stack), then the per-file tree; a test reported in both places
-    yields **one** record. Summary lines (``Test Files …``/``Tests …``) never
-    produce a record, and output without these markers yields none — an
-    infrastructure failure (``ENOSPC`` in the browser provider) therefore keeps
-    its ``unparsed_failure`` classification.
+    yields **one** record. When neither pass finds anything — the gate's
+    1200-char output tail (``GATE_OUTPUT_TAIL_CHARS``) can strip the FAIL
+    header and tree markers, leaving only the ``❯ <file>:<line>:<col>``
+    frames plus their source excerpts — the frames themselves become the
+    failing locations. Summary lines (``Test Files …``/``Tests …``) never
+    produce a record, and output without any of these markers yields none —
+    an infrastructure failure (``ENOSPC`` in the browser provider) therefore
+    keeps its ``unparsed_failure`` classification.
 
     Args:
         output: The command's combined stdout/stderr.
@@ -2083,6 +2107,28 @@ def parse_vitest_failures(output: str) -> list[dict[str, str]]:
         detail = _vitest_tree_detail(lines, index + 1)
         add(f"{current_file} > {fail_match.group('name')}", detail)
 
+    # 3) Frame-only fallback (SA-0MWDLPF320060T0H): when the gate's 1200-char
+    #    output tail has stripped both the FAIL headers and the tree markers,
+    #    the ``❯ <file>:<line>:<col>`` frames (plus source excerpts) are the
+    #    surviving failure signal — e.g. an assertion whose message embeds a
+    #    long README diff. Each frame (or the excerpt under it) becomes a
+    #    structured record whose failing location is the frame. Only reached
+    #    when the richer passes found nothing, so a full output never
+    #    double-reports a failure's stack frames as extra records.
+    if not records:
+        for index, line in enumerate(lines):
+            frame = _VITEST_FRAME_RE.match(line)
+            if not frame:
+                continue
+            loc = frame.group("loc")
+            # The frame line itself heads the record's detail so the failing
+            # location is visible in both test_name and stack_trace, followed
+            # by the source excerpt when one is printed (SA-0MWDLP4SW0099MZM
+            # contract: the captured frame must appear in stack_trace).
+            excerpt = _vitest_frame_detail(lines, index + 1)
+            detail = line.strip() + ("\n" + excerpt if excerpt else "")
+            add(loc, detail)
+
     return records
 
 
@@ -2107,6 +2153,23 @@ def _vitest_tree_detail(lines: list[str], start: int) -> str:
         if _VITEST_BLOCK_END_RE.match(line) or _VITEST_TREE_ENTRY_RE.match(line):
             break
         detail.append(line.strip())
+    return "\n".join(detail).strip()
+
+
+def _vitest_frame_detail(lines: list[str], start: int) -> str:
+    """Return the source-excerpt lines printed under a Vitest frame line.
+
+    Vitest prints the failing source window as ``N| code`` lines followed by a
+    `` | ^`` caret marker; collection stops at the first non-excerpt line (the
+    next frame, a blank line or a block/summary marker). The frame location
+    itself is not repeated — it is already the record's ``test_name``.
+    """
+    detail: list[str] = []
+    for line in lines[start:]:
+        if _VITEST_EXCERPT_LINE_RE.match(line):
+            detail.append(line.strip())
+            continue
+        break
     return "\n".join(detail).strip()
 
 

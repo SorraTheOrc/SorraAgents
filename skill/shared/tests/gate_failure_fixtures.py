@@ -200,6 +200,27 @@ VITEST_FRAME_ONLY_OUTPUT = r"""ed a tie a player win. the report also carries it
 #: itself a vitest command line).
 VITEST_FRAME_ONLY_COMMAND = "npm --silent test"
 
+#: Supplementary hand-built frame-only tail (SA-0MWDLPF320060T0H): the same
+#: shape as :data:`VITEST_FRAME_ONLY_OUTPUT` — a README-diff tail, the
+#: ``❯ <file>:<line>:<col>`` frame and its source excerpt, no ``FAIL`` header
+#: and no ``|project|`` pipes — used by the parser slice's own unit tests so
+#: the frame fallback is exercised on a minimal, readable fixture as well as
+#: on the captured tail.
+VITEST_FRAME_ONLY_TAIL = (
+    "  diff --git a/README.md b/README.md\n"
+    "  index 0f4a2c1..b7e3d5a 100644\n"
+    "  --- a/README.md\n"
+    "  +++ b/README.md\n"
+    "  @@ -2125,6 +2125,7 @@ rising-sweep-1000-progressivefaceoff-tie-n…\n"
+    "  -the README states the parity target at progressive-faceoff\n"
+    "  +README parity target updated to progressive-faceoff-tie\n"
+    "  …\n"
+    " ❯ tests/the-rising/the-rising-docs.test.ts:2129:20\n"
+    "    2128|     expect(readme).toMatch(/rising-sweep-1000-progressivefaceoff-tie-n…/)\n"
+    "    2129|     expect(readme).toMatch(/not the parity target/);\n"
+    "       |                    ^\n"
+)
+
 #: Control for the frame-only contract: a **frame-less, marker-less** non-zero
 #: vitest-adjacent output. It carries no ``FAIL |project|`` header, no
 #: ``|project|`` pipes, no ``×``/``✓`` tree markers and no

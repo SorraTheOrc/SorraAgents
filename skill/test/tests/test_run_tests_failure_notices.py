@@ -453,21 +453,9 @@ def test_vitest_command_does_not_mask_infrastructure_failure(tmp_path) -> None:
 
 #: Runner-level twin of the parser contract pin (SA-0MWDLP4SW0099MZM): a
 #: run whose captured output is only a ``❯ <file>:<line>:<col>`` frame tail
-#: must produce one structured failure and no infrastructure notice. Strict
-#: xfail fails on XPASS once the parser slice SA-0MWDLPF320060T0H lands,
-#: forcing marker removal there.
-_FRAME_NOTICE_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Contract pinned test-first by SA-0MWDLP4SW0099MZM; the parser slice "
-        "SA-0MWDLPF320060T0H parses the bare `❯ <file>:<line>:<col>` frame "
-        "tail into a structured failure. Remove this marker in that slice "
-        "(strict xfail fails on XPASS)."
-    ),
-)
-
-
-@_FRAME_NOTICE_XFAIL
+#: must produce one structured failure and no infrastructure notice. The
+#: strict-xfail marker pinned test-first by SA-0MWDLP4SW0099MZM was removed
+#: here — the parser slice SA-0MWDLPF320060T0H lands the frame tail parsing.
 def test_frame_only_vitest_failure_is_a_code_failure_not_a_notice(tmp_path) -> None:
     """A 1200-char frame-only vitest tail carries a record and no notice.
 

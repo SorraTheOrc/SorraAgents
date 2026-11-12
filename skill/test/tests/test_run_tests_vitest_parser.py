@@ -21,8 +21,6 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-import pytest
-
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _RUNNER_DIR = _SCRIPT_DIR.parent / "scripts"
 if str(_RUNNER_DIR) not in sys.path:
@@ -57,6 +55,39 @@ _TREE_ONLY_OUTPUT = """\
    ✓ MainStreetScene browser tests > renders the street as a 2x5 grid  4142ms
    × MainStreetScene browser tests > allows pressing Enter to end the turn when legal 49575ms
      → Timed out waiting for Turn Summary dialog after end-of-turn presentation after 40000ms (cap 16000ms)
+"""
+
+#: Node-mode vitest (no ``--project``): the ``|<project>|`` pipe is absent from
+#: both the per-file tree header and the ``Failed Tests`` header
+#: (SA-0MWDLPF320060T0H AC3).
+_NODE_MODE_OUTPUT = """\
+ ❯ tests/unit/score.test.ts (3 tests | 1 failed) 412ms
+   ✓ score > adds points  3ms
+   × score > subtracts points  8ms
+     → expected 2 to be 3 // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  tests/unit/score.test.ts > score > subtracts points
+AssertionError: expected 2 to be 3 // Object.is equality
+ ❯ tests/unit/score.test.ts:14:20
+     12|   const total = score(4, 2);
+     13|
+     14|   expect(total).toBe(3);
+       |                 ^
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed (1)
+      Tests  1 failed | 2 passed (3)
+"""
+
+#: Node-mode tree section only (the Failed Tests block is lost to truncation).
+_NODE_MODE_TREE_ONLY = """\
+ ❯ tests/unit/score.test.ts (3 tests | 1 failed) 412ms
+   ✓ score > adds points  3ms
+   × score > subtracts points  8ms
+     → expected 2 to be 3 // Object.is equality
 """
 
 _UNIT_OUTPUT = """\
@@ -104,34 +135,6 @@ not ok 1 - failing test
 _PYTEST_OUTPUT = """\
 FAILED tests/test_demo.py::test_fail - AssertionError: boom
 """
-
-#: Contract pinned test-first by SA-0MWDLP4SW0099MZM (frame-only tail
-#: regression); the parser slice SA-0MWDLPF320060T0H parses the bare
-#: ``❯ <file>:<line>:<col>`` frame tail and makes the ``|project|`` pipe
-#: optional. Strict xfail fails on XPASS, forcing marker removal in that
-#: slice.
-_FRAME_PARSE_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Contract pinned test-first by SA-0MWDLP4SW0099MZM; the parser slice "
-        "SA-0MWDLPF320060T0H parses the bare `❯ <file>:<line>:<col>` frame "
-        "tail and makes the |project| pipe optional. Remove this marker in "
-        "that slice (strict xfail fails on XPASS)."
-    ),
-)
-
-#: Gate-side twin of :data:`_FRAME_PARSE_XFAIL` (SA-0MWDLPC3F005S9S2): the
-#: frame-only runner result must classify ``test_failure`` with a non-empty
-#: ``failures`` list — never ``unparsed``.
-_FRAME_GATE_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Contract pinned test-first by SA-0MWDLP4SW0099MZM; the gate slice "
-        "SA-0MWDLPC3F005S9S2 classifies a framed vitest run as test_failure "
-        "with a non-empty failures list. Remove this marker in that slice "
-        "(strict xfail fails on XPASS)."
-    ),
-)
 
 #: A full **node-mode** vitest FAIL block (no ``|project|`` pipes — the
 #: non-``--project`` default-reporter shape, i.e. the tce-the-rising unit
@@ -279,6 +282,120 @@ class TestUnitProjectFailureParsing:
         assert parse_vitest_failures(green) == []
 
 
+class TestNodeModeFailureParsing:
+    """Node-mode vitest (no ``--project``) drops the ``|<project>|`` pipe."""
+
+    def test_node_mode_failure_parses_once_with_full_attribution(self) -> None:
+        records = parse_vitest_failures(_NODE_MODE_OUTPUT)
+
+        assert len(records) == 1, "the tree marker and FAIL block must de-duplicate"
+        record = records[0]
+        assert record["test_name"] == (
+            "tests/unit/score.test.ts > score > subtracts points"
+        )
+        assert "expected 2 to be 3" in record["stdout_excerpt"]
+        assert "tests/unit/score.test.ts:14:20" in record["stack_trace"]
+
+    def test_node_mode_tree_only_attributes_file_and_test(self) -> None:
+        records = parse_vitest_failures(_NODE_MODE_TREE_ONLY)
+
+        assert len(records) == 1
+        assert records[0]["test_name"] == (
+            "tests/unit/score.test.ts > score > subtracts points"
+        )
+        assert "expected 2 to be 3" in records[0]["stdout_excerpt"]
+
+    def test_node_mode_routes_from_a_projectless_vitest_command(self) -> None:
+        records = parse_failures(
+            "npx vitest run tests/unit/score.test.ts", _NODE_MODE_OUTPUT
+        )
+
+        assert [r["test_name"] for r in records] == [
+            "tests/unit/score.test.ts > score > subtracts points"
+        ]
+
+
+class TestFrameOnlyFailureParsing:
+    """A tail shorn of FAIL headers still reports the frame as the failure.
+
+    The gate keeps only the last 1200 output characters
+    (``implement.py::GATE_OUTPUT_TAIL_CHARS``); an assertion whose message
+    embeds a long diff pushes the ``FAIL … > <test>`` header above the cut, so
+    the surviving failure signal is only the ``❯ <file>:<line>:<col>`` frame
+    plus its source excerpt (RISE-0MW5JFQCU001YYQK). A parser keyed on the
+    FAIL header alone would still report ``unparsed``.
+    """
+
+    def test_frame_only_tail_yields_a_structured_record(self) -> None:
+        records = parse_vitest_failures(fx.VITEST_FRAME_ONLY_TAIL)
+
+        assert len(records) == 1
+        record = records[0]
+        assert record["test_name"] == (
+            "tests/the-rising/the-rising-docs.test.ts:2129:20"
+        ), "the frame is the failing location when the headers are gone"
+        assert "expect(readme).toMatch(/not the parity target/);" in record[
+            "stdout_excerpt"
+        ], "the source excerpt under the frame is the operator's cause"
+        assert len(record["stdout_excerpt"]) <= 1000
+        assert set(record) == {"test_name", "stdout_excerpt", "stack_trace"}
+
+    def test_frame_only_tail_is_a_test_failure_end_to_end(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """AC1: ``reason`` is ``test_failure``, never ``unparsed``."""
+        monkeypatch.setenv("TEST_SCOPE_SKIP", "1")
+        proc = fx.vitest_browser_failure(output=fx.VITEST_FRAME_ONLY_TAIL)
+        with mock.patch.object(run_tests, "_run_cmd", return_value=proc), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            aggregate = run_all(
+                ("all",),
+                cwd=_repo(tmp_path, fx.VITEST_BROWSER_FAILURE_COMMAND),
+                use_cache=False,
+            )
+
+        assert [f["test_name"] for f in aggregate["failures"]] == [
+            "tests/the-rising/the-rising-docs.test.ts:2129:20"
+        ]
+        assert aggregate["notice_codes"] == []
+        assert classify_gate_result(aggregate) == GATE_REASON_TEST_FAILURE
+
+    def test_full_output_header_above_the_gate_tail_still_parses(self) -> None:
+        """AC5: the captured-tail cut keeps a structured record via the frame.
+
+        A failure block whose assertion message embeds a >1200-char diff puts
+        the ``FAIL`` header above the gate's 1200-char bound; the tail slice
+        (the text the gate keeps) must still parse into a frame record.
+        """
+        diff = "\n".join(f"  {i:>4}| some long diff line" for i in range(120))
+        full = (
+            " RUN  v3.2.7 /ws\n\n"
+            " ❯ tests/unit/docs.test.ts (2 tests | 1 failed) 412ms\n"
+            "   × docs > README parity 8ms\n"
+            "     → assertion failed\n\n"
+            "⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯\n\n"
+            " FAIL  tests/unit/docs.test.ts > docs > README parity\n"
+            "AssertionError: README does not match the parity target\n"
+            + diff
+            + "\n ❯ tests/unit/docs.test.ts:2129:20\n"
+            "    2128|     expect(readme).toMatch(/not the parity target/);\n"
+            "    2129|     expect(readme).toMatch(/progressive-faceoff/);\n"
+            "       |                    ^\n"
+            "\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯\n"
+        )
+        tail_start = len(full) - 1200
+        assert "FAIL  tests/unit/docs.test.ts" not in full[tail_start:], (
+            "fixture sanity: the FAIL header must sit above the 1200-char tail"
+        )
+        assert "❯ tests/unit/docs.test.ts:2129:20" in full[tail_start:]
+
+        assert parse_vitest_failures(full), "the full output still resolves"
+        tail_records = parse_vitest_failures(full[tail_start:])
+        assert tail_records, "the header-less tail must still parse via the frame"
+        assert tail_records[0]["test_name"] == "tests/unit/docs.test.ts:2129:20"
+        assert "not the parity target" in tail_records[0]["stdout_excerpt"]
+
+
 class TestSummaryLinesAreNeverFailures:
     """An over-broad regex would fabricate failures from the summary block."""
 
@@ -305,7 +422,6 @@ class TestFrameOnlyTailParsing:
     never ``failures: []`` → gate ``reason: unparsed``.
     """
 
-    @_FRAME_PARSE_XFAIL
     def test_captured_frame_only_tail_yields_exactly_one_record(self) -> None:
         records = parse_vitest_failures(fx.VITEST_FRAME_ONLY_OUTPUT)
 
@@ -322,7 +438,6 @@ class TestFrameOnlyTailParsing:
             in record["stack_trace"]
         ), "the failing location must be the captured frame, not an invented one"
 
-    @_FRAME_PARSE_XFAIL
     def test_frame_only_record_carries_the_assertion_cause(self) -> None:
         records = parse_vitest_failures(fx.VITEST_FRAME_ONLY_OUTPUT)
 
@@ -334,7 +449,6 @@ class TestFrameOnlyTailParsing:
             "the excerpt bound is a consumer contract (≤1000 chars)"
         )
 
-    @_FRAME_PARSE_XFAIL
     def test_frame_only_record_keeps_the_three_triage_keys(self) -> None:
         records = parse_vitest_failures(fx.VITEST_FRAME_ONLY_OUTPUT)
 
@@ -342,7 +456,6 @@ class TestFrameOnlyTailParsing:
         assert set(payload) == {"test_name", "stdout_excerpt", "stack_trace"}
         assert all(payload[key] for key in payload), "no empty record fields"
 
-    @_FRAME_PARSE_XFAIL
     def test_1200_char_tail_of_a_full_fail_block_still_parses(self) -> None:
         """AC6: emulate ``_tail_text`` — the frame survives the window.
 
@@ -482,6 +595,26 @@ class TestRunnerAndGateClassification:
             "the operator must be told to fix the code, not the command"
         )
 
+    def test_node_mode_failure_classifies_as_test_failure_end_to_end(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """Node-mode output (no ``--project`` pipe) is a code failure too."""
+        monkeypatch.setenv("TEST_SCOPE_SKIP", "1")
+        proc = fx.vitest_browser_failure(output=_NODE_MODE_OUTPUT)
+        with mock.patch.object(run_tests, "_run_cmd", return_value=proc), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            aggregate = run_all(
+                ("all",),
+                cwd=_repo(tmp_path, fx.VITEST_BROWSER_FAILURE_COMMAND),
+                use_cache=False,
+            )
+
+        assert [f["test_name"] for f in aggregate["failures"]] == [
+            "tests/unit/score.test.ts > score > subtracts points"
+        ]
+        assert aggregate["notice_codes"] == []
+        assert classify_gate_result(aggregate) == GATE_REASON_TEST_FAILURE
+
     def test_infrastructure_failure_still_classifies_as_unparsed(
         self, tmp_path: Path, monkeypatch
     ) -> None:
@@ -500,7 +633,6 @@ class TestRunnerAndGateClassification:
         assert NOTICE_UNPARSED_FAILURE in aggregate["notice_codes"]
         assert classify_gate_result(aggregate) == GATE_REASON_UNPARSED
 
-    @_FRAME_GATE_XFAIL
     def test_frame_only_run_classifies_as_test_failure(
         self, tmp_path: Path, monkeypatch
     ) -> None:
