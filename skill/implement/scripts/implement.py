@@ -423,6 +423,13 @@ PANE_SESSIONS_ENV = "IMPLEMENT_DRIVE_PANE_SESSIONS"
 #: Default focus behaviour for pane-driven children: never steal the caller's
 #: focus. ``--focus`` switches to each new child pane instead.
 DEFAULT_PANE_FOCUS = False
+#: Seconds of slack added to the default pane client's own subprocess timeout
+#: above the child budget (SA-0MW7PAKSF008H8OH). The herdr CLI owns the wait
+#: verdict — its ``--timeout`` value is the child budget — so the client's
+#: ``subprocess.run(timeout=...)`` must sit *above* that: a turn that runs its
+#: full budget is stopped by the CLI's own timeout error, never killed by the
+#: client's 60 s default.
+PANE_CLIENT_TIMEOUT_SLACK = 60.0
 #: Environment keys a pane child must receive explicitly (the recursion guard,
 #: the worktree marker and — when present — the per-child lock token).
 #: Deliberately an allow-list: the whole inherited environment is never
@@ -15268,7 +15275,11 @@ def _pane_session_spawner(
         verbose: Accepted for signature parity with the headless spawner.
         focus: Whether the new pane takes focus (default: do not steal focus).
         client: Injectable herdr session client (tests); defaults to a
-            :class:`shared.herdr_session.HerdrSessionClient` over *env*.
+            :class:`shared.herdr_session.HerdrSessionClient` over *env* whose
+            per-call subprocess timeout is scaled above the child budget
+            (budget + :data:`PANE_CLIENT_TIMEOUT_SLACK`), so a multi-minute
+            turn is stopped by the herdr CLI's own ``--timeout`` verdict,
+            never killed by the client's 60 s default (SA-0MW7PAKSF008H8OH).
 
     Returns:
         ``{"success", "returncode", "reason", "pane_id", "transport"}`` —
@@ -15286,7 +15297,10 @@ def _pane_session_spawner(
         "transport": "pane",
     }
 
-    herdr = client or HerdrSessionClient(env=env)
+    herdr = client or HerdrSessionClient(
+        env=env,
+        timeout=max(int(timeout), 1) + PANE_CLIENT_TIMEOUT_SLACK,
+    )
 
     split = herdr.split_pane(worktree_path, env=_pane_child_env(env), focus=focus)
     if not split.get("success"):
