@@ -250,7 +250,15 @@ export function getTopLevelCandidateItems() {
 // these markers, the gate treats the item as transient (warning, not blocking)
 // so a release is not spuriously blocked by a merely timed-out audit.
 const TIMEOUT_TRANSIENT_PATTERNS = [
-  /\btime(?:d)?\s*outs?\b/i, // "timed out", "time out", "timeout(s)"
+  // SA-0MWDPX9HM005V0WX: the zero-whitespace `\s*` used to match the literal
+  // `timeouts` inside the persisted reliability-summary counters
+  // (`AUDIT_RELIABILITY_SUMMARY … timeouts=0 child_screen_timeouts=0
+  // parent_screen_timeouts=0 …`), so a genuine `Ready to close: No` verdict
+  // carrying that line was misclassified as transient. The negative lookahead
+  // `(?!\s*=)` refuses a `timeout(s)` token that is a `key=value` counter —
+  // the counters are run metadata, never a transient marker — while the real
+  // prose markers ("timed out", "time out", "timeout(s)") still match.
+  /\btime(?:d)?\s*outs?\b(?!\s*=)/i, // "timed out", "time out", "timeout(s)"
   /provider\s+(?:error|stop\s+reason)/i, // "Pi provider error: ..."
   /script\s+execution\s+failure/i, // FailureNotice banner
   // WL-0MW2F2T1I001ZNH7 (C2): the machine-readable transient classification
