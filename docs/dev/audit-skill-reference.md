@@ -189,6 +189,23 @@ whole audit:
   audit verdict or the exit code. Checkpointing applies to `issue` audits
   only; `audit project` runs are out of scope.
 
+## Abort-recovery state file is write-only for the runner (SA-0MTRH8C5O005URGR)
+
+When an audit begins, the runner writes the captured pre-audit
+`{issue_id, original_status, original_stage}` to a state file
+(`.audit_state_<id>.json` in `$AUDIT_ABSTATE_FILE`, else the explicit
+`--worklog-dir`, else `/tmp`) immediately **before** the `in_progress`
+claim, and removes it on normal exit and in its SIGTERM/SIGINT handlers.
+The runner **never reads this file back** — it only writes
+(`_write_audit_state_file`) and removes (`_remove_audit_state_file`) it.
+The file exists solely for the **parent** process:
+`skill/ship/scripts/check-audit-gate.js` (and `refresh-audits.js` via
+`attemptAuditRemediation`) reads a leftover state file after the child exits
+and restores the pre-audit status itself. A stale state file therefore
+cannot short-circuit or distort a retry: the runner's verdict, counters and
+retry path are unaffected by whatever the file contains, and a leftover file
+only triggers a parent-side restore after an uncatchable kill (`SIGKILL`).
+
 ## Pre-flight affirmation guard
 
 Entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY) preventing two audits of the same work item from racing. The SKILL.md long documented a "pre-flight affirmation" with no code behind it; this guard makes docs and code agree.
@@ -1012,7 +1029,15 @@ python3 ./scripts/audit_runner.py issue SA-123 --run-tests
 
 **Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide. Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > live proxy slot status > 6 static default. When no explicit request is present the ceiling is **derived from the live proxy slot capacity** (`/llama/local/status` → `max(1, min(available_slots, total_slots))`) so a 2-slot proxy never queues six pi sessions behind two slots (SA-0MVF1NKZQ009P3ZG AC3): six concurrent pi sessions used to queue behind two slots and the queue wait was charged against each call's own timeout budget, inflating p90 and pushing calls onto their 600 s/1,800 s caps. The derivation is fail-open and logged once per run (`Audit ceiling: ceiling=<N> source=<cli|env|slots|static> available_slots=<N> total_slots=<N>`) so the decision is observable in the audit log. An explicit `--max-concurrency` or `AUDIT_MAX_CONCURRENCY` is authoritative and is never silently overridden by slot discovery; an invalid env value warns and falls back to the static ceiling. The host-wide `issue` ingress cap (`AUDIT_MAX_HOST_AUDITS`, default 6) separately bounds independently launched `audit_runner.py issue` processes. Both defaults were right-sized to the host's measured audit-slot capacity (SA-0MUSZJRB9006ZCHE): the F7 harness (`skill/shared/validate_fanout.py`) showed the old ingress cap of 3 was the binding constraint on concurrent audits, and 6 (= 2x the 3-slot local LLM proxy pool) drains bursts with a batch-attributable load delta <= 1.63 and no swap growth on the 16-core host. Each pi launch holds one audit slot; when the ceiling is saturated the launch **waits on a shared bounded priority queue** (SA-0MTG5RYH8005RQNM) instead of failing fast: it enqueues a ticket at its work item's priority (critical > high > medium > low; missing/unknown priority defaults to medium), and is admitted in priority order (FIFO within a tier) as slots free up. The total wait for admission + slot is bounded by `AUDIT_QUEUE_TIMEOUT` (default 90s); `AUDIT_LOCK_TIMEOUT` now bounds only each individual semaphore attempt inside the admission poll (default 0s = immediate retry). Log lines (`Audit slot acquired: queued_at=<ts> priority=<level> queue_position=<N> dequeued_at=<ts> wait_seconds=<N> ticket=<id>`) make queue behaviour observable from stderr (AC4). If the bound is exhausted the audit still completes gracefully with the `unmet` evidence "Audit concurrency limit reached" (bounded, never fail-fast). Queue/admission and downtime-gate metrics are collected read-only by [`skill/shared/audit_gate_metrics.py`](../../skill/shared/audit_gate_metrics.py) (a pure-Python metrics collector); its host measurements and the keep-the-gate recommendation are recorded in [`downtime-idle-gate-evaluation.md`](downtime-idle-gate-evaluation.md) (SA-0MTG5UPBR0028K50).
 
-**Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS`). Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
+**Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS` = 2 s, growing 1x, 2x per retry attempt). The backoff is **slot-aware** (SA-0MW0LROWQ000JVTM): the concurrency slot is released before the backoff sleep and re-acquired through the priority queue afterwards, so parallel audits never retry-storm a saturated proxy pool while one item backs off. Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
+
+**Actionable provider-error evidence (SA-0MW0LROWQ000JVTM AC2):** an exhausted provider-error path never surfaces as a bare `Connection error.` line. `_provider_error_evidence` assembles a stable, greppable diagnostic naming every field an operator needs to act:
+
+```text
+Pi provider error: <message>. Provider: <model>. Phase: <phase>. Attempts: <n>. Elapsed: <x>s. Manual review required. Remediation: re-run when the proxy pool has capacity, or set AUDIT_MAX_CONCURRENCY=1 to serialize concurrent audits, or re-run with --force.
+```
+
+The `Pi provider error: <message>` prefix is preserved for downstream consumers (the JSON payload's provider-error count greps it), `<phase>` is the `_phase_label(context)` name (`Phase 1 parent screening`, `Phase 1 child screening (<id>)`, `Phase 2 deep analysis`, `Phase 2 child deep analysis`, `Phase 2 batched deep analysis`), and `Attempts`/`Elapsed` reflect the retries actually made and the wall-clock duration including them.
 
 **Bounded JSON re-ask (SA-0MU32TCFM003B78I / SA-0MVI6VNDF001VE1S):** the Phase 1 parent/child screens and Phase 2 parent/child deep-analysis prompts are JSON-first — a strict **JSON contract** instruction is carried on the **first** call of every JSON-expecting phase: ``Return ONLY a single valid JSON array and nothing else: no prose before or after it, no Markdown code fences, and no trailing comma before a closing ']' or '}'``, with the ``index``/``verdict``/``evidence`` schema restated. Historically the strict schema was only on the re-ask, so a first response that used a fence or a trailing comma paid for a second full-length call (p50 461 s). The extractor tolerates leading/trailing prose, complete Markdown code fences, and — new — **trailing commas outside string literals** (a common model formatting slip; repaired in-place without reinterpreting values). When a response still cannot be parsed into an index-bearing verdict array, the runner issues **exactly one** bounded "[JSON RE-ASK] return only the JSON array" call, observable under the `verdict_reask` context, counted in the reliability summary as `verdict_reasks`, and bounded by the per-call timeout, before falling back to the conservative `partial` verdict. A persistent failure therefore never becomes `met`/`Yes`; the re-ask only recovers a usable array when the model can re-emit it. Genuine parse failures in the 48-day SorraAgents corpus were 7/272 (2.6%), dominated by empty/narrative/truncated responses that the re-ask targets.
 
@@ -1156,7 +1181,7 @@ issue` run emits **exactly one** machine-greppable summary line to stderr and
 appends it to the persisted report:
 
 ```
-AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n> parent_screen_timeouts=<n> elapsed_seconds=<x>
+AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n> parent_screen_timeouts=<n> elapsed_seconds=<x> run_id=<hex> started_at=<epoch>
 ```
 
 The keys (and their order) are the stable contract `RELIABILITY_SUMMARY_KEYS`;
@@ -1172,7 +1197,7 @@ SA-0MVI6VNDF001VE1S), `child_screen_timeouts` (child Phase-1 screens
 that hit their budget and were quarantined as `partial` —
 SA-0MVI3608M0080QLW), and `parent_screen_timeouts` (parent Phase-1 screens
 that hit their right-sized budget and were quarantined as `partial` —
-SA-0MVJ3Q662006RDJR). The line is emitted once per run via
+SA-0MVJ3Q662006RDJR). A **per-attempt identity** (SA-0MW0LROWQ000JVTM AC3) is appended AFTER the stable key set plus `elapsed_seconds`: `run_id=<hex>` (a fresh UUID4 hex regenerated by `_rel_reset()` at the top of every `cmd_issue` run) and `started_at=<epoch>` (the wall-clock start timestamp, seconds with millisecond precision). Because both are regenerated per attempt, an operator can always tell whether the numbers they are reading came from the attempt they just ran — a stale stored report (e.g. a previous run's summary kept because its report was never re-persisted) can never be mistaken for the current attempt, and existing dashboards keep their column positions (the two identity keys are appended, never interleaved). The line is emitted once per run via
 `emit_reliability_summary()` — from the
 normal report path and, where possible, from an early-exit `finally` (timeout
 or abort before report assembly) so partial runs are still measurable. It

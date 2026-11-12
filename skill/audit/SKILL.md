@@ -418,9 +418,13 @@ python3 $(skill_path audit)/scripts/audit_runner.py issue SA-123 --force        
 
 On runner failure (non-zero exit, timeout, exception), the report is wrapped with an `⚠ Script Execution Failure: <script_name> — <reason>` banner above and below (informational, no state changes; Python module `scripts.failure_notice` from the shared skills-root `scripts/` dir — note it lives one level above the audit scripts, unlike the `$(skill_path audit)/scripts/...` runner/persister; JSON key `script_failure`).
 
+The banner is placed **above** the report, so a wrapped report no longer leads with `Ready to close:`. Persistence still works because `persist_audit.py` submits the report **header-first** (SA-0MW0LRBJM008Q2MC): `wl update --audit-text` accepts only a first non-empty line of exactly `Ready to close: Yes` or `Ready to close: No` and rejects anything else (including the banner) with `audit-invalid-first-line`, so the persister relocates the verdict header to the top while keeping the banner fully visible in the body. The **full report is always preserved in `rawOutput`**: `wl audit-set --raw-output` stores the original report before the `--audit-text` step runs, so `wl audit-show` still exposes the complete per-AC report. A **persistence notice** in the audit-text field therefore means only that the final `--audit-text` step rejected the assembled content and a compact fallback was stored — the notice names the real rejection cause (`audit-invalid-first-line`, E2BIG, or a genuine malformed-JSON error) and its remediation; it never means the verdict itself was lost.
+
 ## Common failure modes
 
 - **Silent persistence failure:** `persist_audit.py` / `wl audit-set` returns success without storing — **always verify with `wl audit-show --json`**.
+- **Banner-first report rejected (`audit-invalid-first-line`):** `wl update --audit-text` accepts only `Ready to close: Yes` / `Ready to close: No` as the first non-empty line. `persist_audit.py` submits failure-notice-wrapped reports header-first (banner kept in the body), so this is normally handled; a residual `audit-invalid-first-line` means the first-line rule still rejected the content.
+- **Persistence notice ≠ lost verdict:** a notice in the audit-text field means that field's content was rejected and a compact fallback was stored — the notice names the real cause and its remediation. The full report is preserved in `rawOutput` and readable via `wl audit-show --json`.
 - `wl` unavailable/invalid JSON → report the error, do not claim success.
 - Agent-mode response parsing (Phase 2 JSON streams, `_extract_json_array`) is documented in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md).
 
