@@ -1142,7 +1142,10 @@ times before surfacing a provider-error diagnostic. Non-provider failures
 _PI_RETRY_BACKOFF_SECONDS = 2.0
 """Base backoff (seconds) between provider-error retries in ``_call_pi``.
 
-Backoff grows linearly: 1x, 2x, ... base per retry attempt.
+Backoff grows linearly: 1x, 2x, ... base per retry attempt. Each retry is
+slot-aware (SA-0MW0LROWQ000JVTM): the concurrency slot is released before the
+backoff sleep and re-acquired via the priority queue afterwards, so parallel
+audits do not retry-storm a saturated proxy pool while one item backs off.
 """
 
 #: Maximum number of characters of raw pi stream embedded in an unparseable
@@ -1182,6 +1185,10 @@ _rel_lock = threading.Lock()
 _rel_counters: dict[str, int] = {k: 0 for k in RELIABILITY_SUMMARY_KEYS}
 _rel_started_at: float | None = None
 _rel_emitted = False
+_rel_run_id: str | None = None
+"""Per-attempt run id generated in :func:`_rel_reset` (SA-0MW0LROWQ000JVTM AC3)."""
+_rel_started_at_epoch: float | None = None
+"""Wall-clock start timestamp (epoch seconds) set in :func:`_rel_reset`."""
 
 
 def _rel_incr(key: str, amount: int = 1) -> None:
@@ -1191,8 +1198,8 @@ def _rel_incr(key: str, amount: int = 1) -> None:
 
 
 def _rel_reset() -> None:
-    """Reset all reliability counters and the run start clock."""
-    global _rel_started_at, _rel_emitted
+    """Reset all reliability counters, the run clock and the attempt identity."""
+    global _rel_started_at, _rel_emitted, _rel_run_id, _rel_started_at_epoch
     with _rel_lock:
         for key in RELIABILITY_SUMMARY_KEYS:
             _rel_counters[key] = 0
@@ -1200,6 +1207,11 @@ def _rel_reset() -> None:
         # interferes with the elapsed-time guard's clock (or tests that count
         # monotonic() calls).
         _rel_started_at = time.perf_counter()
+        # Per-attempt identity (SA-0MW0LROWQ000JVTM AC3): a fresh run id and
+        # wall-clock start each reset so a stale stored report can never be
+        # mistaken for the current attempt.
+        _rel_started_at_epoch = time.time()
+        _rel_run_id = uuid.uuid4().hex
         _rel_emitted = False
 
 
@@ -1215,9 +1227,15 @@ def render_reliability_summary(elapsed_seconds: float | None = None) -> str:
     The line is ``AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n>
     parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n>
     concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n>
-    parent_screen_timeouts=<n> elapsed_seconds=<x>`` with stable keys in
+    parent_screen_timeouts=<n> elapsed_seconds=<x> run_id=<hex>
+    started_at=<epoch>`` with stable keys in
     :data:`RELIABILITY_SUMMARY_KEYS`. When *elapsed_seconds* is omitted the
     value is derived from the run start clock set by :func:`_rel_reset`.
+
+    ``run_id`` and ``started_at`` are appended AFTER the stable key set as a
+    per-attempt identity (SA-0MW0LROWQ000JVTM AC3) so an operator can always
+    tell whether the numbers they are reading came from the attempt they just
+    ran; existing dashboards keep their column positions.
     """
     counts = _rel_snapshot()
     parts = [f"{key}={counts.get(key, 0)}" for key in RELIABILITY_SUMMARY_KEYS]
@@ -1225,6 +1243,10 @@ def render_reliability_summary(elapsed_seconds: float | None = None) -> str:
         elapsed_seconds = time.perf_counter() - _rel_started_at
     if elapsed_seconds is not None:
         parts.append(f"elapsed_seconds={float(elapsed_seconds):.2f}")
+    if _rel_run_id is not None:
+        parts.append(f"run_id={_rel_run_id}")
+    if _rel_started_at_epoch is not None:
+        parts.append(f"started_at={_rel_started_at_epoch:.3f}")
     return RELIABILITY_SUMMARY_PREFIX + " " + " ".join(parts)
 
 
@@ -6379,6 +6401,33 @@ def _phase_label(context: str) -> str:
     return context or "unknown phase"
 
 
+def _provider_error_evidence(provider_error: str, context: str, model: str,
+                             attempts: int | None = None,
+                             elapsed_seconds: float | None = None) -> str:
+    """Build actionable provider-error evidence (SA-0MW0LROWQ000JVTM AC2).
+
+    Names the observed error, the model/provider, the phase, the attempt
+    count and the elapsed seconds, then states the concrete remediation so an
+    exhausted provider-error path is never a bare ``"Connection error."``
+    line. The stable ``Pi provider error: <message>`` prefix is preserved for
+    downstream consumers (the report's provider-error count greps it — see
+    :func:`_build_issue_json`).
+    """
+    parts = [f"Pi provider error: {provider_error.rstrip('.')}."]
+    parts.append(f"Provider: {model}.")
+    parts.append(f"Phase: {_phase_label(context)}.")
+    if attempts is not None:
+        parts.append(f"Attempts: {attempts}.")
+    if elapsed_seconds is not None:
+        parts.append(f"Elapsed: {float(elapsed_seconds):.1f}s.")
+    parts.append(
+        "Manual review required. Remediation: re-run when the proxy pool has "
+        "capacity, or set AUDIT_MAX_CONCURRENCY=1 to serialize concurrent "
+        "audits, or re-run with --force."
+    )
+    return " ".join(parts)
+
+
 def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              pi_bin: str = "pi",
              enable_tools: bool = False,
@@ -6596,7 +6645,10 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             ac_fallback_used.set()
         return {
             "verdict": "unmet",
-            "evidence": f"Pi provider error: {provider_error}. Phase: {_phase_label(context)}.",
+            "evidence": _provider_error_evidence(
+                provider_error, context, model,
+                attempts=attempt, elapsed_seconds=elapsed_seconds,
+            ),
             "raw_stdout": stdout,
             "raw_stderr": stderr,
             "extracted_text": "",
@@ -9842,6 +9894,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                 for ac in child_acs
             ]
             return ci, child_ac_results
+        screen_model = phase1_model
         try:
             result, batch, raw_text = _call_phase1_screen(
                 child.get("id", ""), f"child:{child.get('id', '')}", prompt,
@@ -9866,6 +9919,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                 "retrying child AC review with the full audit model",
                 file=sys.stderr,
             )
+            screen_model = full_model
             result, batch, raw_text = _call_phase1_screen(
                 child.get("id", ""), f"child:{child.get('id', '')}", prompt,
                 full_model, pi_bin, debug_log, timeout, ac_fallback_used,
@@ -9934,9 +9988,10 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
             # from the root-level result (e.g., a timeout message).
             if result.get("_provider_error"):
                 provider_error = result.get("_provider_error_message", "unknown")
-                evidence = (
-                    f"Pi provider error: {provider_error} — "
-                    "criterion could not be evaluated."
+                evidence = _provider_error_evidence(
+                    provider_error, f"child:{child.get('id', '')}", screen_model,
+                    attempts=result.get("_provider_error_attempts"),
+                    elapsed_seconds=result.get("elapsed_seconds"),
                 )
             else:
                 outer_evidence = _evidence_text(result.get("evidence"))
@@ -10509,6 +10564,11 @@ def _deep_analyze_child(
         if ac_fallback_used is not None:
             ac_fallback_used.set()
         provider_error = child_result.get("_provider_error_message", "unknown")
+        evidence = _provider_error_evidence(
+            provider_error, "phase2_child", resolved_model,
+            attempts=child_result.get("_provider_error_attempts"),
+            elapsed_seconds=child_result.get("elapsed_seconds"),
+        )
         print(
             f"Warning: Child deep analysis provider error for {child.get('id', '')}: "
             f"{provider_error}",
@@ -10519,10 +10579,7 @@ def _deep_analyze_child(
             error_acs.append({
                 "text": ac.get("text", ""),
                 "verdict": VERDICT_PARTIAL,
-                "evidence": (
-                    f"Pi provider error: {provider_error} \u2014 manual review required."
-                    " Phase: Phase 2 child deep analysis."
-                ),
+                "evidence": evidence,
             })
         updated = dict(child)
         updated["ac_results"] = error_acs
@@ -11090,6 +11147,11 @@ def _run_phase2_deep_analysis(
             if ac_fallback_used is not None:
                 ac_fallback_used.set()
             provider_error = result.get("_provider_error_message", "unknown")
+            evidence = _provider_error_evidence(
+                provider_error, "phase2_deep", resolved_model,
+                attempts=result.get("_provider_error_attempts"),
+                elapsed_seconds=result.get("elapsed_seconds"),
+            )
             print(
                 f"Warning: Phase 2 deep analysis provider error: {provider_error}",
                 file=sys.stderr,
@@ -11104,10 +11166,7 @@ def _run_phase2_deep_analysis(
                 error_acs.append({
                     "text": ac.get("text", ""),
                     "verdict": VERDICT_PARTIAL,
-                    "evidence": (
-                        f"Pi provider error: {provider_error} \u2014 manual review required."
-                        " Phase: Phase 2 deep analysis."
-                    ),
+                    "evidence": evidence,
                 })
             error_children = []
             for child in child_results:
@@ -11117,10 +11176,7 @@ def _run_phase2_deep_analysis(
                     updated_child_acs.append({
                         "text": ac.get("text", ""),
                         "verdict": VERDICT_PARTIAL,
-                        "evidence": (
-                            f"Pi provider error: {provider_error} \u2014 manual review required."
-                            " Phase: Phase 2 deep analysis."
-                        ),
+                        "evidence": evidence,
                     })
                 error_children.append(dict(child))
                 error_children[-1]["ac_results"] = updated_child_acs
@@ -14894,6 +14950,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             f"{_build_work_item_evidence_block(ctx.comments)}"
             f"Criteria: {ac_list_json}"
         )
+        screen_model = phase1_model
         result, batch, raw_text = _call_phase1_screen(
             issue_id, "parent", prompt, phase1_model, pi_bin, debug_log,
             timeout, ac_fallback_used, ctx.record_script_failure,
@@ -14917,6 +14974,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                 "retrying parent AC review with the full audit model",
                 file=sys.stderr,
             )
+            screen_model = ctx.resolved_model
             result, batch, raw_text = _call_phase1_screen(
                 issue_id, "parent", prompt, ctx.resolved_model, pi_bin,
                 debug_log, timeout, ac_fallback_used,
@@ -14982,9 +15040,10 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                 # actual provider diagnostic so operators can distinguish a
                 # transient model outage from a genuine unparseable response.
                 provider_error = result.get("_provider_error_message", "unknown")
-                evidence = (
-                    f"Pi provider error: {provider_error} — "
-                    "criterion could not be evaluated."
+                evidence = _provider_error_evidence(
+                    provider_error, "parent", screen_model,
+                    attempts=result.get("_provider_error_attempts"),
+                    elapsed_seconds=result.get("elapsed_seconds"),
                 )
             else:
                 outer_evidence = _evidence_text(result.get("evidence"))

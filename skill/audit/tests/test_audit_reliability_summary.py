@@ -46,8 +46,10 @@ class TestReliabilitySummaryContract:
         line = audit_runner.render_reliability_summary(elapsed_seconds=1.5)
         assert line.startswith(audit_runner.RELIABILITY_SUMMARY_PREFIX + " ")
         keys = [p.split("=")[0] for p in line.split(" ", 1)[1].split()]
+        # Per-attempt identity (SA-0MW0LROWQ000JVTM AC3) is appended AFTER the
+        # stable key set + elapsed_seconds so dashboards keep column positions.
         assert keys == list(audit_runner.RELIABILITY_SUMMARY_KEYS) + [
-            "elapsed_seconds"
+            "elapsed_seconds", "run_id", "started_at",
         ]
         assert "calls=3" in line and "provider_errors=1" in line
 
