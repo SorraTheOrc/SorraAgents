@@ -879,9 +879,10 @@ their meaning and types.
 sentinel is preserved: a failure (parsed report or not) still returns
 `None` from `_run_finish`. The classifier resolves the failing
 `(step, reason)` from the report's structured `steps` payload (precedence:
-`main_checkout_lock` → `main_checkout_guard` → `local_dev_fast_forward` →
-`push` → `build` → `build_churn` → `tests` → `ancestry_assertion` →
-`worktree_placement` → `diff`), never from `report["message"]` prose — every
+`full_suite_prelock` → `main_checkout_lock` → `main_checkout_guard` →
+`local_dev_fast_forward` → `push` → `build` → `build_churn` → `tests` →
+`ancestry_assertion` → `worktree_placement` → `diff`), never from
+`report["message"]` prose — every
 `finish` failure exit records a structured `steps` entry for this purpose.
 `kind` is one of `infrastructure`, `gate`, `unknown`:
 
@@ -895,6 +896,7 @@ sentinel is preserved: a failure (parsed report or not) still returns
 | `tests` + `tests_failed` | `gate` |
 | `build` + `build_failed` | `gate` |
 | `build_churn` + any reason | `gate` |
+| `full_suite_prelock` + any reason | `gate` |
 | `worktree_placement` + any reason | `gate` |
 | `diff` + `no_changes` | `gate` |
 | anything else | `unknown` (never `infrastructure`) |
@@ -1270,8 +1272,11 @@ semantics), so a red gate never leaves a stranded `in_progress` item.
 A clean change set costs exactly **one** suite execution per gate verdict:
 
 - `phase_finish` calls `run_gate_suite()` once, then `stage_tested_tree()`, then
-  commits. There is no second, duplicate run of the changed-scope suite, and no
-  full-suite run at finish (deferred to the dev-push gate).
+  commits. There is no second, duplicate run of the changed-scope suite. The
+  only **full**-scope run in `finish` is the dev-push gate's verdict, resolved
+  **once** before the main-checkout lock and bound to the would-be-commit tree
+  (SA-0MWFJS3820032YB4) — the push then serves it and does not execute it
+  again.
 - A **cache-served** verdict is served, not produced: the suite does not run a
   second time, and the attempt is recorded with `cached: true` plus the served
   entry's metadata so the reuse is visible rather than implicit.
@@ -2208,13 +2213,33 @@ Concurrency contract:
   The abort-path `_restore_repo_state` is deliberately unlocked: it runs in a
   process that may already hold the lock, and a dying process releases the
   lock itself.
-- **Per-checkout scope.** Finishes in different repositories on the same host
-  are unaffected (the lock file lives inside each checkout).
+- **The full-suite gate runs outside the lock (SA-0MWFJS3820032YB4).** The
+dev-push hook's full suite is the gate that protects `dev`, and executing it
+inside this critical section made every concurrent `finish` queue behind one
+~5-minute window. `finish` therefore resolves the gate's **tree-keyed**
+verdict for the would-be-commit tree *before* it takes the lock
+(`resolve_prelock_full_suite_verdict`, run against
+`run_tests(worktree, scope="full", fingerprint=<tree>)`); the push's
+`--gate-commit` run then serves that verdict (`verdict=cached`) instead of
+executing the suite. The lock covers only the mutations: commit →
+fast-forward → push → ancestry assertion. A **red** pre-lock verdict aborts
+before the lock — nothing is committed or pushed and the item is released to
+`open`. The guarantee is unchanged in both directions: the hook still binds
+its verdict to the pushed commit's tree (a different tree is a cache miss and
+the suite really runs), and a green pre-lock verdict is served *only* if the
+step-3d assertion proves the commit produces that same tree. Two escapes
+stand the pre-resolution down without weakening the gate: no would-be-commit
+tree to bind to (`not_a_git_worktree`) and the hook's own
+`TEST_SCOPE_SKIP=1`.
 - **Observability.** `report["steps"]["main_checkout_lock"]` records the lock
-  path, whether it was acquired, when, the configured bounded wait and the
+  path, whether it was acquired, when, the configured bounded wait, how long
+  the acquisition actually waited (`waited_seconds`) and the
   holder description when refused; `phase_start`'s
   `report["steps"]["sync_parent_branch"]` carries the same under `lock`.
-- **Hygiene reporting.** `scripts/hygiene_check.sh` reports a held lock
+  `report["steps"]["full_suite_prelock"]` records the pre-lock verdict: the
+  tree it is bound to (`fingerprint_kind="tree"`), `verdict`, whether it was
+  executed or served (`cached`), the tooling, `seconds` and `lock_held`
+  (always `false` — the suite never runs inside the lock). `scripts/hygiene_check.sh` reports a held lock
   (`check_main_checkout_lock`) and any **tracked-file deletions** in the main
   checkout (`check_tracked_deletions`) in both human and `--json` output,
   reusing its existing git-status dirty-checkout detection.
@@ -2392,7 +2417,8 @@ keys added for it are:
 | Report key | Meaning |
 |---|---|
 | `report["steps"]["main_checkout_guard"]` | The main checkout (`repo_root`), snapshot time and baseline size, one verify entry per stage reached (`refactor`, `build_failure`, `gate_failure`, `user_abort`, `pre_push`, `pre_worktree_removal`) with its time, verdict, offending paths and actor evidence, the own-fast-forward churn allow-list and the final verdict |
-| `report["steps"]["main_checkout_lock"]` | Lock path, whether it was acquired, when, and the holder description when the finish was refused |
+| `report["steps"]["main_checkout_lock"]` | Lock path, whether it was acquired, when, how long the acquisition waited (`waited_seconds`), and the holder description when the finish was refused |
+| `report["steps"]["full_suite_prelock"]` | The dev-push full-suite verdict resolved *before* the lock (SA-0MWFJS3820032YB4): the would-be-commit `tree` it is bound to, `verdict`, executed-vs-`cached`, `tooling`, `seconds`, and `lock_held` (always `false`) |
 | `report["steps"]["local_dev_fast_forward"]` | Whether the pre-push advance ran (`advanced`), why it refused (`reason`), the pre-advance and remote tips, and the `own_churn` allow-list |
 | `report["steps"]["local_dev_restore"]` | Whether a failed push restored local `dev` to `origin/dev`, and why not when it was skipped |
 | `report["steps"]["push"]` | The dev push outcome, plus `gate_evidence` (`root`, `head`, `pushed`, `full_suite` classification) when the push succeeded (SA-0MVTFMB7K002Y1F3) |
@@ -4154,6 +4180,14 @@ runs reported success.
   `IMPLEMENT_START_LOCK_TIMEOUT` (default 30 s) and then **skips** the refresh
   fail-open (`reason: "lock_held"`) — a start is never blocked by a finish.
   An indefinite wait is rejected outright, so no code path blocks forever.
+- **The full suite runs before the lock.** The dev-push hook executes the
+  `--scope full` gate while the pusher holds this lock, so `finish` resolves
+  the gate's tree-keyed verdict for the would-be-commit tree *before*
+  acquiring it (`resolve_prelock_full_suite_verdict` → `run_tests(...
+  scope="full", fingerprint=<tree>)`, SA-0MWFJS3820032YB4): the push then
+  serves the cached verdict and the lock covers only commit → fast-forward →
+  push → ancestry assertion. A red verdict aborts before the lock; the hook's
+  own tree binding still decides what the pushed commit may be.
 - **Crash-safe.** Ownership is the kernel's `flock`, released when the holder
   dies — `SIGKILL`, an exception or a hard crash included. The metadata in the
   lock file is for the refusal message only and never decides ownership, so a

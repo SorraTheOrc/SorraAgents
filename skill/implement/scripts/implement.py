@@ -3348,6 +3348,20 @@ DEFAULT_START_LOCK_TIMEOUT = 30.0
 ENV_FINISH_LOCK_TIMEOUT = "IMPLEMENT_FINISH_LOCK_TIMEOUT"
 ENV_START_LOCK_TIMEOUT = "IMPLEMENT_START_LOCK_TIMEOUT"
 
+#: Refs whose push is gated by the **full** suite in ``.githooks/pre-push``
+#: (``refs/heads/dev|main``). ``finish`` resolves that gate's verdict *before*
+#: it takes the main-checkout lock so the hook serves the tree-keyed verdict
+#: instead of executing the suite inside the exclusive window
+#: (SA-0MWFJS3820032YB4).
+FULL_SUITE_GATE_BRANCHES: tuple[str, ...] = ("dev", "main")
+
+#: The pre-push hook's own escape hatch for the dev-push full-suite gate.
+#: ``finish`` never runs a full suite the operator asked the gate to skip, so
+#: the pre-lock resolution stands down and the push proceeds exactly as the
+#: hook decides. It skips a *pre-resolution*, never the gate itself: the hook
+#: still enforces its verdict.
+ENV_TEST_SCOPE_SKIP = "TEST_SCOPE_SKIP"
+
 #: Override for the per-work-item child-lock store (test isolation).
 #: Unset in production; the worklog store resolved from the item id is used.
 #: ``phase_start`` acquires a real ``flock`` before its mocked steps, so an
@@ -3428,6 +3442,150 @@ def acquire_main_checkout_lock(
     """
     return RepoLock(repo_root, relpath=MAIN_CHECKOUT_LOCK_RELPATH).acquire(
         work_item_id, timeout=timeout
+    )
+
+
+def resolve_prelock_full_suite_verdict(
+    worktree_path: str,
+    gate_tree: dict[str, Any] | None,
+    *,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> dict[str, Any]:
+    """Resolve the dev-push full-suite verdict **before** the finish lock.
+
+    The dev-push gate (``.githooks/pre-push`` → ``run_tests.py --scope full
+    --gate-commit``) is what protects ``dev``. ``phase_finish`` used to reach
+    it only through the push, i.e. while holding the exclusive
+    main-checkout lock, so every concurrent finish serialised its ~5 min
+    suite behind the others (SA-0MWFJS3820032YB4).
+
+    The verdict is tree-keyed already (``fingerprint_kind="tree"``,
+    SA-0MW7C6BMZ00931JG), so it can be resolved early: the suite runs against
+    the **would-be-commit tree** of the change set — the exact tree the commit
+    will produce, because ``stage_tested_tree`` refuses to commit anything
+    else — and lands in the tree-keyed cache. The hook's ``--gate-commit`` run
+    then *serves* that entry (``verdict=cached``) instead of executing the
+    suite inside the lock.
+
+    Safety does not depend on this function. The lock still covers commit →
+    fast-forward → push → ancestry assertion; the hook still binds its verdict
+    to the pushed commit's tree, so a different tree is a cache miss and the
+    suite really runs; and a red verdict here aborts *before* the lock is
+    taken, so nothing is committed or pushed.
+
+    Args:
+        worktree_path: The worktree holding the change set — the checkout the
+            push (and therefore the hook's gate run) resolves its cache in.
+        gate_tree: The changed-scope gate's would-be-commit summary
+            (``report["steps"]["would_be_commit"]``); its ``tree`` is the
+            fingerprint the verdict is bound to.
+        parent_branch: The branch ``finish`` pushes to. Only
+            :data:`FULL_SUITE_GATE_BRANCHES` have a full-suite gate.
+
+    Returns:
+        A report entry recording whether a verdict was resolved, the tree it
+        is bound to, whether it was executed or served, how long it took, and
+        that no main-checkout lock was held while it ran.
+    """
+    tree = str((gate_tree or {}).get("tree") or "").strip()
+    entry: dict[str, Any] = {
+        "attempted": False,
+        "scope": "full",
+        "fingerprint_kind": "tree",
+        "tree": tree or None,
+        "lock_held": False,
+        "success": None,
+        "cached": False,
+        "seconds": 0.0,
+    }
+    if parent_branch not in FULL_SUITE_GATE_BRANCHES:
+        entry["skipped_reason"] = "branch_not_gated"
+        LOG.info(
+            "Pre-lock full-suite verdict: skipped — pushes to %s are not "
+            "gated by the dev-push full suite.",
+            parent_branch,
+        )
+        return entry
+    if not gate_tree or gate_tree.get("available") is False or not tree:
+        entry["skipped_reason"] = "no_would_be_commit_tree"
+        LOG.warning(
+            "Pre-lock full-suite verdict: skipped — no would-be-commit tree "
+            "to bind it to (%s). The dev-push hook still runs the suite, but "
+            "it does so inside the finish lock.",
+            (gate_tree or {}).get("reason") or "tree unavailable",
+        )
+        return entry
+    if os.environ.get(ENV_TEST_SCOPE_SKIP) == "1":
+        entry["skipped_reason"] = "test_scope_skip"
+        LOG.warning(
+            "%s=1 — the dev-push full-suite gate is bypassed, so finish does "
+            "not pre-resolve a verdict for tree %s.",
+            ENV_TEST_SCOPE_SKIP,
+            tree,
+        )
+        return entry
+
+    LOG.info(
+        "Resolving the dev-push full-suite verdict for tree %s before taking "
+        "the main-checkout lock (the pre-push hook will serve it)...",
+        tree,
+    )
+    started = time.monotonic()
+    result = run_tests(worktree_path, scope="full", fingerprint=tree)
+    entry.update(
+        {
+            "attempted": True,
+            "success": bool(result.get("success")),
+            "cached": bool(result.get("cached", False)),
+            "skipped": bool(result.get("skipped", False)),
+            "tooling": result.get("tooling"),
+            "failures": list(result.get("failures") or []),
+            "notices": list(result.get("notices") or []),
+            "seconds": round(time.monotonic() - started, 3),
+        }
+    )
+    cache_entry = result.get("cache_entry")
+    if cache_entry:
+        entry["cache_entry"] = dict(cache_entry)
+    if entry["success"]:
+        entry["verdict"] = "green"
+    else:
+        entry["verdict"] = "red"
+        entry["reason"] = "full_suite_red"
+        entry["failure_kind"] = _gate_failure_kind(result)
+        entry["detail"] = _gate_failure_detail(result)
+    LOG.info(
+        "Pre-lock full-suite verdict for tree %s: %s (%s, %.1fs, no lock held)",
+        tree,
+        entry["verdict"],
+        "served from cache" if entry["cached"] else "executed",
+        entry["seconds"],
+    )
+    return entry
+
+
+def _prelock_full_suite_failure_message(
+    work_item_id: str, verdict: dict[str, Any]
+) -> str:
+    """Abort message for a red pre-lock full-suite verdict.
+
+    The suite ran against the would-be-commit tree *before* the lock, so
+    nothing was committed or pushed: the failure is the **dev-push gate's**
+    verdict, resolved early, rather than a finish-gate failure
+    (SA-0MWFJS3820032YB4).
+    """
+    kind = verdict.get("failure_kind") or "unknown"
+    detail = verdict.get("detail") or ""
+    return (
+        "Dev-push full-suite verdict is RED for tree "
+        f"{verdict.get('tree')} (reason: {kind}).\n"
+        "Resolved before the finish lock was taken, so nothing was committed "
+        "or pushed and local dev was not advanced.\n\n"
+        f"{detail}\n\n"
+        f"Nothing is attributable to {work_item_id} yet; the item is "
+        "released to open.\n"
+        "Fix the failures and re-run:\n"
+        f"  python3 skill/implement/scripts/implement.py finish {work_item_id}"
     )
 
 
@@ -7892,14 +8050,22 @@ FINISH_GATE_REFUSALS: frozenset[tuple[str, str]] = frozenset({
     ("build_churn", FINISH_REASON_WILDCARD),
     ("worktree_placement", FINISH_REASON_WILDCARD),
     ("diff", "no_changes"),
+    # The dev-push full-suite verdict resolved before the lock
+    # (SA-0MWFJS3820032YB4): a red suite is a genuine gate failure — it must
+    # consume the finish-attempt budget and never be retried as a transient
+    # infrastructure refusal.
+    ("full_suite_prelock", FINISH_REASON_WILDCARD),
 })
 
 #: Consultation order for the structured ``steps`` payload of a failing
 #: ``finish`` report. When several steps failed, the first in this order is
-#: the primary cause; the mandated prefix (``main_checkout_lock`` → … →
-#: ``ancestry_assertion``) is followed by the two vocabulary steps that
-#: return before the lock step (``worktree_placement``, ``diff``).
+#: the primary cause; the pre-lock dev-push full-suite resolution
+#: (``full_suite_prelock``, SA-0MWFJS3820032YB4) comes first because it runs
+#: before the lock, then the mandated prefix (``main_checkout_lock`` → … →
+#: ``ancestry_assertion``), then the two vocabulary steps that return before
+#: the lock step (``worktree_placement``, ``diff``).
 FINISH_STEP_PRECEDENCE: tuple[str, ...] = (
+    "full_suite_prelock",
     "main_checkout_lock",
     "main_checkout_guard",
     "local_dev_fast_forward",
@@ -12207,24 +12373,58 @@ def phase_finish(
         for note in excluded_churn:
             LOG.info("Live-repo guard note: %s", note)
 
-    # ── Step 3b: Full-suite coverage moved to the dev-push gate ─────
-    # (SA-0MVECQUGF0064U81 — defer full-suite testing to integration.) No
-    # full suite runs here: the changed-scope validation above is the
-    # development-time (pre-commit) gate, kept fast so finish holds a
-    # host-wide "test" slot only for the affected tests. The FULL suite
-    # first runs at the dev-push integration gate — the pre-push hook
-    # (`.githooks/pre-push`) executes `run_tests.py --scope full
+    # ── Step 3a: Full-suite coverage stays at the dev-push gate ─────
+    # (SA-0MVECQUGF0064U81 — defer full-suite testing to integration.) The
+    # changed-scope validation above is the development-time (pre-commit)
+    # gate, kept fast so finish holds a host-wide fast-lane slot only for the
+    # affected tests. The FULL suite is the dev-push integration gate's — the
+    # pre-push hook (`.githooks/pre-push`) executes `run_tests.py --scope full
     # --strict-git-env` on pushes to dev/main, and the ship release gate
     # re-runs it on the merged dev→main tree — and that run populates the
     # main-checkout `.worklog/cache` that post-push verification and the
-    # audit skill consume read-only. Running the full suite here instead
-    # would (a) burn a slot for the whole suite duration per work item,
-    # (b) record a verdict no later consumer could safely reuse — before the
-    # gate was tree-bound it was cached under a pre-commit dirty git-state
-    # fingerprint (the verdict is now keyed by the would-be-commit tree SHA,
-    # SA-0MVQHVHXI007PQAB, but the dev-push gate still runs the full suite on
-    # the pushed commit), and (c) duplicate the push gate.
-    LOG.info("Changed-scope validation passed — full suite deferred to the dev-push gate")
+    # audit skill consume read-only. Two things make that safe to resolve
+    # here rather than in the hook (next step): the verdict is tree-bound
+    # (`fingerprint_kind="tree"`, SA-0MVQHVHXI007PQAB) and the hook re-binds
+    # it to the pushed commit, so a verdict about any other tree is never
+    # reused.
+    LOG.info(
+        "Changed-scope validation passed — the dev-push full suite is "
+        "resolved outside the main-checkout lock"
+    )
+
+    # ── Step 3b: Resolve the dev-push full-suite verdict WITHOUT the lock ──
+    # (SA-0MWFJS3820032YB4.) The dev-push hook runs `run_tests.py --scope full
+    # --gate-commit <sha>` while this run holds the exclusive main-checkout
+    # lock, so executing the suite there serialised every concurrent finish
+    # behind a single ~5 min window. The verdict is tree-keyed, so it is
+    # resolved here — against the would-be-commit tree the commit will
+    # produce, which `stage_tested_tree` proves below — and the hook's run is
+    # then served from the cache instead of executing the suite. The lock
+    # still covers only commit → fast-forward → push → ancestry assertion.
+    # A red verdict aborts here, before the lock: nothing is committed or
+    # pushed, and the hook's own tree binding remains the authority on what
+    # the pushed commit is allowed to be.
+    prelock_verdict = resolve_prelock_full_suite_verdict(
+        worktree_path, gate_tree, parent_branch=parent_branch
+    )
+    report["steps"]["full_suite_prelock"] = prelock_verdict
+    if prelock_verdict["attempted"] and not prelock_verdict["success"]:
+        msg = _prelock_full_suite_failure_message(work_item_id, prelock_verdict)
+        report["success"] = False
+        report["message"] = msg
+        wl_add_comment(work_item_id, msg)
+        # Failure-path guard verify after the pre-existing abort comment
+        # (SA-0MVXVBYXI000QMXM).
+        _record_main_checkout_verify("gate_failure", aborting=True)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        else:
+            LOG.error(msg)
+        return report
 
     # ── Step 3c: Single-owner main-checkout lock (WL-0MVPADZ1Z000FOSG AC5) ─
     # Everything from the commit onwards operates on the main checkout, so
@@ -12233,10 +12433,14 @@ def phase_finish(
     # kernel-released when the holder dies, and recorded in the report for
     # observability. The wait is bounded by ``IMPLEMENT_FINISH_LOCK_TIMEOUT``
     # (default 0 = fail fast), so a concurrent finish never hangs this one.
+    # The window deliberately excludes the full-suite run above: the lock is
+    # held only for the mutations (SA-0MWFJS3820032YB4).
     lock_timeout = _finish_lock_timeout()
+    lock_wait_started = time.monotonic()
     lock_fd, lock_refusal = acquire_main_checkout_lock(
         repo_root, work_item_id, timeout=lock_timeout
     )
+    lock_wait_seconds = round(time.monotonic() - lock_wait_started, 3)
     report["steps"]["main_checkout_lock"] = {
         "lock_path": str(_main_checkout_lock_path(repo_root)),
         "acquired": lock_fd is not None,
@@ -12244,6 +12448,7 @@ def phase_finish(
             datetime.now(timezone.utc).isoformat() if lock_fd is not None else None
         ),
         "timeout_seconds": lock_timeout,
+        "waited_seconds": lock_wait_seconds,
         "holder": lock_refusal if lock_fd is None else None,
     }
     if lock_fd is None:

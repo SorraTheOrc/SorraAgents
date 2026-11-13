@@ -27,6 +27,13 @@
 #    served verdict is visible to the pusher. The pushed-commit guard itself is
 #    unchanged.
 #
+#    `implement.py finish` resolves this gate's verdict for the would-be-commit
+#    tree BEFORE it takes the exclusive main-checkout lock, so a finish push is
+#    normally served cached (`verdict=cached`) and the ~5 min suite never runs
+#    while that lock is held (SA-0MWFJS3820032YB4). The tree binding is what
+#    makes the reuse safe: a push of any other tree is a cache miss and the
+#    suite really runs here.
+#
 # Set WORKLOG_SKIP_PRE_PUSH=1 to bypass worklog sync.
 # Set BRANCH_POLICY_SKIP=1 to bypass branch policy check (not recommended).
 # Set CONTEXT_BUDGET_SKIP=1 to bypass the context-budget gate (not recommended).

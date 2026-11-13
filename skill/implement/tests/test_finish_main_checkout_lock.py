@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MWFMO8V5005IHRI
+# smell: simplification
+# severity: medium
+# description: Use a single `with` statement with multiple contexts instead of nested `with` statements
+# -->
 """Main-checkout finish lock regression tests (WL-0MVPADZ1Z000FOSG AC5).
 
 ``implement.py finish`` operates on the shared main checkout (fast-forward,
@@ -13,6 +19,10 @@ Covered here:
 - ``phase_finish`` behaviour: refusal exits non-zero without touching the
   work item or commenting; a successful finish acquires and releases (a second
   finish can immediately re-acquire),
+- the dev-push full-suite gate runs **outside** the lock (SA-0MWFJS3820032YB4):
+  the lock is free while the suite runs, the verdict is keyed on the
+  would-be-commit tree, a red verdict aborts before the lock, and two
+  concurrent finishes overlap their suite runs instead of serialising them,
 - ``scripts/hygiene_check.sh`` reports a held lock and tracked-file deletions
   in both human and ``--json`` output.
 """
@@ -25,6 +35,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -354,6 +365,341 @@ def test_finish_success_acquires_and_releases_lock(tmp_path):
     fd, holder = implement.acquire_main_checkout_lock(repo, "WL-AFTER")
     assert fd is not None, f"lock not released after successful finish: {holder}"
     implement._release_main_checkout_lock(fd)
+
+
+# ---------------------------------------------------------------------------
+# The full-suite gate runs OUTSIDE the lock (SA-0MWFJS3820032YB4)
+# ---------------------------------------------------------------------------
+#
+# The dev-push full-suite gate used to be reached only through the push, i.e.
+# while the exclusive main-checkout lock was held, so concurrent finishes
+# serialised their ~5 min suite runs. ``finish`` now resolves the tree-keyed
+# verdict for the would-be-commit tree *before* it takes the lock; the
+# pre-push hook then serves that verdict instead of executing the suite. These
+# tests pin the ordering (observed from inside the suite run, never from
+# source greps) and the abort path (a red verdict never reaches the lock).
+
+
+def _probe_lock_free_during_full_scope(repo: str, observed: list[tuple[str, bool]]):
+    """A ``run_tests`` stand-in that observes the lock across a full run.
+
+    A full-scope invocation tries a non-blocking acquisition of the real
+    main-checkout lock. ``True`` means the lock was free while the suite ran;
+    ``False`` means it was held — the regression this item fixes.
+    """
+
+    def _fake(cwd, scope="changed", base_ref=None, fingerprint=None):
+        if scope != "full":
+            return _tests_result()
+        fd, _holder = implement.acquire_main_checkout_lock(repo, "WL-PROBE")
+        observed.append(("full_suite", fd is not None))
+        if fd is not None:
+            implement._release_main_checkout_lock(fd)
+        return {
+            **_tests_result(),
+            "scope": "full",
+            "tooling": "suite",
+            "git_fingerprint": fingerprint,
+        }
+
+    return _fake
+
+
+def test_prelock_full_suite_runs_while_the_lock_is_free(tmp_path):
+    """AC: the full suite is never executed while ``main-checkout.lock`` is held.
+
+    The lock state is observed from *inside* the full-suite invocation (the
+    suite's own non-blocking acquisition of the real lock file), which is the
+    property the item exists to guarantee.
+    """
+    repo = str(tmp_path / "main")
+    observed: list[tuple[str, bool]] = []
+    with _finish_harness(tmp_path, repo_root=repo), patch.object(
+        implement, "run_tests",
+        side_effect=_probe_lock_free_during_full_scope(repo, observed),
+    ):
+        report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    assert observed == [("full_suite", True)], (
+        "the dev-push full suite must run exactly once, with the main-checkout "
+        f"lock free (observed {observed!r})"
+    )
+    prelock = report["steps"]["full_suite_prelock"]
+    assert prelock["attempted"] is True
+    assert prelock["success"] is True
+    assert prelock["verdict"] == "green"
+    assert prelock["scope"] == "full"
+    assert prelock["lock_held"] is False
+
+
+def test_prelock_verdict_is_bound_to_the_would_be_commit_tree(tmp_path):
+    """The pre-lock verdict is keyed on the tree the commit will produce.
+
+    The hook's ``--gate-commit`` run derives the pushed commit's tree; only a
+    verdict keyed on that *same* tree is served. Anything else would either
+    re-run the suite inside the lock or, worse, trust a verdict about another
+    tree.
+    """
+    repo = str(tmp_path / "main")
+    calls: list[dict] = []
+
+    def _fake(cwd, scope="changed", base_ref=None, fingerprint=None):
+        calls.append(
+            {"cwd": cwd, "scope": scope, "fingerprint": fingerprint}
+        )
+        return {**_tests_result(), "scope": scope}
+
+    with _finish_harness(tmp_path, repo_root=repo):
+        with patch.object(implement, "run_tests", side_effect=_fake):
+            report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    full_runs = [call for call in calls if call["scope"] == "full"]
+    assert len(full_runs) == 1, full_runs
+    assert full_runs[0]["fingerprint"] == "abc1234", (
+        "the pre-lock run must be keyed on the changed-scope gate's "
+        "would-be-commit tree"
+    )
+    assert full_runs[0]["cwd"] == str(tmp_path / "wt"), (
+        "the verdict must land in the cache of the checkout the push runs from"
+    )
+    assert report["steps"]["full_suite_prelock"]["tree"] == "abc1234"
+    assert report["steps"]["full_suite_prelock"]["fingerprint_kind"] == "tree"
+
+
+def test_green_finish_lock_window_excludes_the_full_suite(tmp_path):
+    """AC: a green finish's lock window does not include the suite duration.
+
+    Ordering is recorded as events rather than inferred from timing: the suite
+    starts and finishes, and only then is the lock acquired.
+    """
+    repo = str(tmp_path / "main")
+    events: list[tuple[str, ...]] = []
+    real_acquire = implement.acquire_main_checkout_lock
+
+    def _fake_run_tests(cwd, scope="changed", base_ref=None, fingerprint=None):
+        if scope != "full":
+            return _tests_result()
+        events.append(("suite", "start"))
+        events.append(("suite", "end"))
+        return {**_tests_result(), "scope": "full"}
+
+    def _acquire(repo_root, work_item_id, timeout=0.0):
+        outcome = real_acquire(repo_root, work_item_id, timeout=timeout)
+        events.append(("lock", "acquired"))
+        return outcome
+
+    with _finish_harness(tmp_path, repo_root=repo), patch.object(
+        implement, "run_tests", side_effect=_fake_run_tests
+    ), patch.object(
+        implement, "acquire_main_checkout_lock", side_effect=_acquire
+    ):
+        report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    assert events == [
+        ("suite", "start"),
+        ("suite", "end"),
+        ("lock", "acquired"),
+    ], f"the lock must be taken only after the suite finished (observed {events!r})"
+    # The bounded-wait evidence the operator reads is recorded for the lock.
+    assert report["steps"]["main_checkout_lock"]["waited_seconds"] >= 0.0
+    assert report["steps"]["full_suite_prelock"]["lock_held"] is False
+
+
+def test_red_prelock_verdict_aborts_before_taking_the_lock(tmp_path):
+    """A red dev-push verdict aborts before the lock — nothing is published.
+
+    The gate's verdict still gates the push; it is simply resolved earlier.
+    Nothing may be committed, no lock may be taken and the item must be
+    released to ``open``.
+    """
+    repo = str(tmp_path / "main")
+    lock_calls: list[str] = []
+    red = {
+        "success": False,
+        "failures": ["tests/test_example.py::test_broken"],
+        "scope": "full",
+        "tooling": "suite",
+        "notices": [],
+    }
+    real_acquire = implement.acquire_main_checkout_lock
+
+    def _fake_run_tests(cwd, scope="changed", base_ref=None, fingerprint=None):
+        return red if scope == "full" else _tests_result()
+
+    def _acquire(repo_root, work_item_id, timeout=0.0):
+        lock_calls.append(work_item_id)
+        return real_acquire(repo_root, work_item_id, timeout=timeout)
+
+    with _finish_harness(tmp_path, repo_root=repo) as mocks, patch.object(
+        implement, "run_tests", side_effect=_fake_run_tests
+    ), patch.object(
+        implement, "acquire_main_checkout_lock", side_effect=_acquire
+    ), patch.object(implement, "git_commit") as commit:
+        report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is False
+    prelock = report["steps"]["full_suite_prelock"]
+    assert prelock["verdict"] == "red"
+    assert prelock["reason"] == "full_suite_red"
+    assert prelock["failure_kind"] == implement.GATE_FAILURE_TESTS
+    assert "main_checkout_lock" not in report["steps"], (
+        "a red dev-push verdict must abort before the lock is taken"
+    )
+    assert lock_calls == []
+    commit.assert_not_called()
+    assert "test_broken" in report["message"]
+    # The item is released to open and the failure is on the record.
+    assert any(
+        call.args[:2] == ("WL-TEST", "open")
+        for call in mocks["update_status"].call_args_list
+    ), mocks["update_status"].call_args_list
+    assert mocks["comment"].call_count == 1
+    # And the finish-failure classifier treats it as a gate failure, never as
+    # a retryable infrastructure refusal (drive must not spin on a red suite).
+    classified = implement.classify_finish_failure(report)
+    assert classified["kind"] == "gate", classified
+    assert classified["step"] == "full_suite_prelock"
+
+
+def test_prelock_skipped_without_a_would_be_commit_tree(tmp_path):
+    """No tree to bind the verdict to → stand down, the hook still gates.
+
+    Outside a git work tree there is no would-be-commit tree, so the verdict
+    cannot be tree-keyed in advance. Finish then behaves exactly as before
+    (the hook runs the suite), and the report says why.
+    """
+    repo = str(tmp_path / "main")
+    ran: list[str] = []
+
+    def _fake_run_tests(cwd, scope="changed", base_ref=None, fingerprint=None):
+        ran.append(scope)
+        return _tests_result()
+
+    no_tree = {
+        "available": False,
+        "reason": "not_a_git_worktree",
+        "notice": "no would-be-commit tree",
+        "staged_paths": [],
+    }
+    with _finish_harness(tmp_path, repo_root=repo), patch.object(
+        implement, "run_gate_suite", return_value=(_tests_result(), no_tree)
+    ), patch.object(implement, "run_tests", side_effect=_fake_run_tests):
+        report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    prelock = report["steps"]["full_suite_prelock"]
+    assert prelock["attempted"] is False
+    assert prelock["skipped_reason"] == "no_would_be_commit_tree"
+    assert prelock["lock_held"] is False
+    assert ran == [], "no full-scope run may happen without a tree to bind it to"
+
+
+def test_prelock_skipped_when_the_dev_push_gate_is_bypassed(tmp_path, monkeypatch):
+    """``TEST_SCOPE_SKIP=1`` skips the pre-resolution, never the hook's gate."""
+    monkeypatch.setenv("TEST_SCOPE_SKIP", "1")
+    repo = str(tmp_path / "main")
+    ran: list[str] = []
+
+    def _fake_run_tests(cwd, scope="changed", base_ref=None, fingerprint=None):
+        ran.append(scope)
+        return _tests_result()
+
+    with _finish_harness(tmp_path, repo_root=repo):
+        with patch.object(implement, "run_tests", side_effect=_fake_run_tests):
+            report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    prelock = report["steps"]["full_suite_prelock"]
+    assert prelock["attempted"] is False
+    assert prelock["skipped_reason"] == "test_scope_skip"
+    assert ran == []
+
+
+def test_prelock_helper_skips_branches_without_a_full_suite_gate(monkeypatch):
+    """Only ``dev``/``main`` pushes are gated by the full suite."""
+    called: list[str] = []
+    monkeypatch.setattr(
+        implement,
+        "run_tests",
+        lambda *args, **kwargs: called.append("run") or _tests_result(),
+    )
+
+    verdict = implement.resolve_prelock_full_suite_verdict(
+        "/nonexistent", {"tree": "a" * 40}, parent_branch="release"
+    )
+
+    assert verdict["attempted"] is False
+    assert verdict["skipped_reason"] == "branch_not_gated"
+    assert called == []
+
+
+def test_concurrent_finishes_overlap_their_full_suite_runs(tmp_path, monkeypatch):
+    """A concurrent finish no longer waits for another's full-suite run.
+
+    Two finishes run concurrently against one main checkout. Each must be
+    able to *enter* its full-suite run while the other is inside its own (the
+    barrier) and must find the main-checkout lock free while running it. Under
+    the previous ordering — the suite executed by the pre-push hook inside the
+    exclusive lock — the second finish could never reach its suite until the
+    first released: the barrier would break and this test would fail.
+
+    A bounded lock wait is configured because the two finishes still contend
+    for the short *mutating* window; that is the invariant this item keeps.
+    """
+    monkeypatch.setenv("IMPLEMENT_FINISH_LOCK_TIMEOUT", "30")
+    repo = str(tmp_path / "main")
+    #: Both finishes must be inside their suite at the same time.
+    inside_suite = threading.Barrier(2, timeout=30)
+    observed: list[tuple[str, bool]] = []
+    observed_lock = threading.Lock()
+
+    def _fake_run_tests(cwd, scope="changed", base_ref=None, fingerprint=None):
+        if scope != "full":
+            return _tests_result()
+        fd, _holder = implement.acquire_main_checkout_lock(repo, "WL-PROBE")
+        with observed_lock:
+            observed.append(("full_suite", fd is not None))
+        if fd is not None:
+            implement._release_main_checkout_lock(fd)
+        inside_suite.wait()
+        return {**_tests_result(), "scope": "full"}
+
+    reports: dict[str, dict] = {}
+
+    def _finish(label: str) -> None:
+        reports[label] = implement.phase_finish(
+            "WL-TEST", json_output=True, no_refactor=True
+        )
+
+    with _finish_harness(tmp_path, repo_root=repo):
+        with patch.object(implement, "run_tests", side_effect=_fake_run_tests):
+            threads = [
+                threading.Thread(target=_finish, args=(label,), daemon=True)
+                for label in ("a", "b")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+            assert not any(t.is_alive() for t in threads), (
+                "a concurrent finish did not complete — the full-suite runs "
+                "were serialised on the main-checkout lock"
+            )
+
+    assert set(reports) == {"a", "b"}
+    for label, report in reports.items():
+        assert report["success"] is True, (label, report["message"])
+        assert report["steps"]["main_checkout_lock"]["acquired"] is True
+        # The wait was for the short mutating window only, bounded by the
+        # configured timeout — never the other finish's suite duration.
+        assert report["steps"]["main_checkout_lock"]["waited_seconds"] < 30
+    assert observed == [("full_suite", True), ("full_suite", True)], (
+        "both finishes must observe a FREE main-checkout lock while their "
+        f"full suite runs (observed {observed!r})"
+    )
 
 
 # ---------------------------------------------------------------------------

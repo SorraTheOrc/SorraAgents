@@ -92,7 +92,11 @@ ref, the remedy and the `TEST_SCOPE_SKIP=1` escape hatch. The gate prints the
 tree it validated and the cache verdict (`gate-subject` / `gate-root` /
 `gate-verdict`, including `cache_hit` and `cache_age_seconds`, on `stderr`),
 and the hook mirrors the resulting cache entry into the main checkout so Step-9
-`--summary` and audit F3 can consume it. See
+`--summary` and audit F3 can consume it. `implement.py finish` resolves that
+tree-keyed verdict for the would-be-commit tree **before** it takes the
+exclusive main-checkout lock, so the ~5 min suite is never executed inside the
+window that serialises concurrent finishes — the lock covers only commit →
+fast-forward → push → ancestry assertion (SA-0MWFJS3820032YB4). See
 [`docs/dev/test-skill-reference.md`](docs/dev/test-skill-reference.md#04-pre-push-gate-subject-binding-sa-0mvtrbt50005dueh)
 and [`docs/dev/test-isolation.md`](docs/dev/test-isolation.md).
 

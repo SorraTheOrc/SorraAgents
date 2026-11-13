@@ -387,6 +387,29 @@ def _run_finish(tmp_path, monkeypatch, *, cache_entry=_GREEN_ENTRY,
                 },
             )
         )
+        # The dev-push full-suite verdict is resolved *before* the lock
+        # (SA-0MWFJS3820032YB4). Its ordering, tree binding and abort contract
+        # are covered by ``test_finish_main_checkout_lock.py``; this harness is
+        # about the post-push ordering, so the pre-lock resolution is recorded
+        # green instead of running a real full suite against the synthetic
+        # ``abc1234`` tree.
+        stack.enter_context(
+            patch.object(
+                implement,
+                "resolve_prelock_full_suite_verdict",
+                return_value={
+                    "attempted": True,
+                    "scope": "full",
+                    "fingerprint_kind": "tree",
+                    "tree": "abc1234",
+                    "lock_held": False,
+                    "success": True,
+                    "verdict": "green",
+                    "cached": False,
+                    "seconds": 0.0,
+                },
+            )
+        )
         stack.enter_context(patch.object(implement, "git_commit", return_value=True))
         stack.enter_context(
             patch.object(implement, "git_get_commit_hash", return_value="abc1234")

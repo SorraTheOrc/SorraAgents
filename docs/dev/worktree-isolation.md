@@ -421,6 +421,7 @@ Only these main-checkout mutations are legitimate during a worktree-scoped run:
 | A test run mutates the guarded checkout, or the main checkout of a worktree-scoped run | outer `guarded_run_all` guard and the inner `live_repo_guard` plugin (both snapshot **every reachable checkout**) | `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`), `skill/test/tests/test_guarded_run_all.py`, `tests/test_live_repo_mutation_guard.py` |
 | A foreign mutation of the main checkout is observed by `finish` (deletion **or** modification) | finish main-checkout guard (`_snapshot_main_checkout` → `_verify_main_checkout` on every pre-push abort path — `build_failure`, `gate_failure`, `user_abort` — at `pre_push` and at `pre_worktree_removal`; the refactor verify is advisory): aborts loudly, names every offending path, the concurrent-actor evidence and `git checkout -- <path>`; the item stays `open` | `skill/implement/tests/test_finish_main_checkout_guard.py` |
 | Two finishes operate on the same main checkout concurrently | per-checkout exclusive `flock` on `<main-checkout>/.worklog/locks/main-checkout.lock` (bounded wait, kernel-released, stale lock files never block): the second finish exits non-zero naming the holder, without touching the checkout or the work item | `skill/implement/tests/test_finish_main_checkout_lock.py` |
+| A concurrent finish's full-suite run serialises the others behind the lock | `finish` resolves the dev-push gate's tree-keyed verdict for the would-be-commit tree **before** taking the lock; the push serves it (`verdict=cached`) and the lock covers only commit → fast-forward → push → ancestry assertion (SA-0MWFJS3820032YB4) | `skill/implement/tests/test_finish_main_checkout_lock.py` |
 | A finish commit never reaches `origin/dev` (including the rebased replacement hash produced by non-fast-forward recovery) | post-push ancestry assertion (`git merge-base --is-ancestor <commit> refs/remotes/origin/dev`) fails closed: worktree + branch retained, item `open`, refusal comment posted | `tests/test_implement_finish_local_dev_verified_sync.py` |
 | A failed push leaves local `dev` pointing at an unpushed commit (the 2026-10-25 orphan shape) | push-failure restore returns local `dev` to `refs/remotes/origin/dev` (`reset --merge` when checked out, never `--hard`; compare-and-swap `update-ref` otherwise) | `tests/test_implement_finish_local_dev_verified_sync.py` |
 | A driven child writes to the main checkout instead of its worktree | placement guard in `phase_parent`/`phase_drive`: fails closed, names the offending paths, does not advance the parent | `skill/implement/tests/test_implement_parent_safety.py` |
@@ -429,9 +430,10 @@ Only these main-checkout mutations are legitimate during a worktree-scoped run:
 
 The finish-side details (report keys `report["steps"]["main_checkout_guard"]`,
 `report["steps"]["main_checkout_lock"]`, `["local_dev_fast_forward"]`,
-`["local_dev_restore"]` and `["ancestry_assertion"]`, the `own_churn`
-allow-list, the per-checkout lock contract and the refusal-recovery path) are
-documented in the
+`["local_dev_restore"]`, `["full_suite_prelock"]` and `["ancestry_assertion"]`,
+the `own_churn` allow-list, the per-checkout lock contract (which excludes the
+dev-push full-suite run — SA-0MWFJS3820032YB4) and the refusal-recovery path)
+are documented in the
 [implement skill reference](implement-skill-reference.md#finish-main-checkout-guard-wl-0mvpadz1z000fosg-ac3)
 and its
 [verified sync / ancestry assertion section](implement-skill-reference.md#verified-reversible-local-dev-sync-and-post-push-ancestry-assertion-sa-0mvpzg7a0000n66u).
