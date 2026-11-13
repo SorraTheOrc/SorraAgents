@@ -40,6 +40,7 @@ _REPO_ROOT = _SCRIPT_DIR.parents[2]
 
 import run_tests
 from run_tests import (
+    CHANGED_SCOPE_GROUP_INCOMPLETE,
     CHANGED_SCOPE_NO_CHANGES,
     CHANGED_SCOPE_NO_GROUP,
     CHANGED_SCOPE_NO_SOURCE,
@@ -673,8 +674,188 @@ _GROUP_CONFIG = {
 }
 
 
+#: Groups shaped like this repository's own ``implement`` group: a changed
+#: source under the group's path must still select a changed test file that
+#: lives outside it (SA-0MWA7OD8O001945I).
+_PYTEST_GROUP_CONFIG = {
+    "groups": {
+        "implement": {
+            "commands": ["pytest -q -r a --disable-warnings skill/implement/tests/"],
+            "paths": ["skill/implement/**"],
+        },
+    },
+}
+
+
+def _make_pytest_group_repo(tmp_path: Path, config: dict | None = None) -> Path:
+    """Create a hermetic pytest repo whose ``implement`` group maps to a path.
+
+    Layout mirrors the observed bug: the group covers ``skill/implement/**``
+    while the edit-authored test file lives in the root ``tests/`` tree that
+    the group's command never collects.
+    """
+    repo = tmp_path / "pytest_group_repo"
+    (repo / "skill" / "implement" / "scripts").mkdir(parents=True)
+    (repo / "skill" / "implement" / "tests").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / "pytest.ini").write_text("[pytest]\n")
+    (repo / "skill" / "implement" / "scripts" / "implement.py").write_text(
+        "x = 1\n"
+    )
+    (repo / "skill" / "implement" / "tests" / "test_implement.py").write_text(
+        "\n"
+    )
+    (repo / "tests" / "test_implement_drive.py").write_text("\n")
+    (repo / ".pi").mkdir()
+    (repo / ".pi" / "test-config.json").write_text(
+        json.dumps(config if config is not None else _PYTEST_GROUP_CONFIG),
+        encoding="utf-8",
+    )
+    _init_repo_with_dev(repo)
+    return repo
+
+
+#: Only **one** group matches here on purpose: group tie-breaking between two
+#: equally-matching groups is set-iteration order until
+#: SA-0MVEJIHIG003WTH9 makes it deterministic, so a union test that relied on
+#: a tie would flake under a different ``PYTHONHASHSEED``.
+_UNION_GROUP_CONFIG = {
+    "groups": {
+        "cli": {
+            "commands": ["npm --silent test -- tests/cli"],
+            "paths": ["tests/cli/**"],
+        },
+    },
+}
+
+
 class TestChangedScopeGroups:
     """Declared groups are honoured even when suiteCommands is present."""
+
+    def test_group_match_unions_changed_test_file_outside_group(
+        self, tmp_path: Path
+    ) -> None:
+        """AC2: a group match unions the changed test file it does not cover.
+
+        ``tests/cli/foo.test.ts`` matches the ``cli`` group; the changed
+        ``tests/unit/utils.test.ts`` lies outside that group's ``paths`` and
+        must be selected on its own merits, never dropped
+        (SA-0MWA7OD8O001945I).
+        """
+        repo = _make_vitest_repo(tmp_path, config=_UNION_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo,
+            base_ref="dev",
+            changed_files={"tests/cli/foo.test.ts", "tests/unit/utils.test.ts"},
+        )
+
+        assert selection.commands == [
+            "npm --silent test -- tests/cli",
+            "npx --no-install vitest run tests/unit/utils.test.ts",
+        ], selection.commands
+        assert selection.group == "cli"
+
+    def test_group_match_unions_changed_pytest_file_outside_group(
+        self, tmp_path: Path
+    ) -> None:
+        """AC2: the observed pytest case — group command + outside test file.
+
+        Reproduces SA-0MWA7OD8O001945I: ``skill/implement/scripts/implement.py``
+        matches the ``implement`` group, and the edit-authored
+        ``tests/test_implement_drive.py`` must still be executed.
+        """
+        repo = _make_pytest_group_repo(tmp_path)
+
+        selection = changed_scope_selection(
+            repo,
+            base_ref="dev",
+            changed_files={
+                "skill/implement/scripts/implement.py",
+                "tests/test_implement_drive.py",
+            },
+        )
+
+        assert selection.commands == [
+            "pytest -q -r a --disable-warnings skill/implement/tests/",
+            "pytest -q -r a --disable-warnings tests/test_implement_drive.py",
+        ], selection.commands
+        assert selection.group == "implement"
+
+    def test_group_only_match_emits_exactly_the_group_command(
+        self, tmp_path: Path
+    ) -> None:
+        """AC3: a group-only match is unchanged — the group command alone.
+
+        The changed file outside the group is a document, not a test, so
+        nothing is unioned and the single-match behaviour is byte-identical.
+        """
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo, base_ref="dev", changed_files={"tests/cli/foo.test.ts", "README.md"}
+        )
+
+        assert selection.commands == ["npm --silent test -- tests/cli"]
+        assert selection.group == "cli"
+
+    def test_group_match_fails_closed_when_outside_change_has_no_selection(
+        self, tmp_path: Path
+    ) -> None:
+        """AC1: never silently drop — an unselectable outside change fails closed.
+
+        ``src/unrelated.ts`` matches no group, is not a test file and maps to
+        no test, so the run cannot prove coverage: the selection returns no
+        commands (the consumer then runs the full suite) rather than a group
+        command that ignores the change.
+        """
+        repo = _make_vitest_repo(tmp_path, config=_GROUP_CONFIG)
+
+        selection = changed_scope_selection(
+            repo,
+            base_ref="dev",
+            changed_files={"tests/cli/foo.test.ts", "src/unrelated.ts"},
+        )
+
+        assert selection.commands is None
+        assert selection.reason == CHANGED_SCOPE_GROUP_INCOMPLETE
+
+    def test_group_union_reaches_the_run_suite_command_line(
+        self, tmp_path: Path
+    ) -> None:
+        """AC4: ``--scope changed`` on the observed change set runs the file.
+
+        End-to-end through :func:`run_suite`: the changed-file set is computed
+        from git (``skill/implement/scripts/implement.py`` +
+        ``tests/test_implement_drive.py``) exactly as the CLI does.
+        """
+        repo = _make_pytest_group_repo(tmp_path)
+        (repo / "skill" / "implement" / "scripts" / "implement.py").write_text(
+            "x = 2\n"
+        )
+        (repo / "tests" / "test_implement_drive.py").write_text("# changed\n")
+
+        captured: list[str] = []
+
+        def fake_run(cmd_list, **kwargs):
+            captured.append(" ".join(cmd_list))
+            return SimpleNamespace(returncode=0, stdout="passed", stderr="")
+
+        with mock.patch.object(run_tests, "_run_cmd", side_effect=fake_run), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite(
+                "all",
+                cwd=repo,
+                scope="changed",
+                base_ref="dev",
+                use_cache=False,
+                force=True,
+            )
+
+        assert result["scope"] == "changed"
+        joined = " | ".join(captured)
+        assert "skill/implement/tests/" in joined, captured
+        assert "tests/test_implement_drive.py" in joined, captured
 
     def test_suite_commands_present_with_matching_group(self, tmp_path: Path) -> None:
         """A matching group's commands are selected despite suiteCommands."""

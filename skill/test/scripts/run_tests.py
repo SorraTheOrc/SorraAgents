@@ -833,6 +833,12 @@ CHANGED_SCOPE_NO_SOURCE = "no changed source or test files"
 CHANGED_SCOPE_NO_GROUP = "no matching group and no convention-matched test files"
 CHANGED_SCOPE_NO_TESTS = "no convention-matched test files"
 CHANGED_SCOPE_NO_TOOLING = "selected test files have no runnable suite tooling"
+#: A group matched, but the change set also touches files its ``paths`` spec
+#: does not cover and no file-level command could be resolved for them, so a
+#: group-only command set would silently skip them (SA-0MWA7OD8O001945I).
+CHANGED_SCOPE_GROUP_INCOMPLETE = (
+    "matched group leaves changed files with no runnable test selection"
+)
 
 
 class ChangedScopeSelection(NamedTuple):
@@ -846,6 +852,53 @@ class ChangedScopeSelection(NamedTuple):
     commands: list[str] | None
     reason: str
     group: str | None = None
+
+
+def _changed_outside_group_paths(
+    changed: set[str], group_name: str, project_root: Path
+) -> set[str]:
+    """Return the changed paths the named group's ``paths`` spec does not cover.
+
+    A matched group runs a *coarse* command set (e.g. one directory), so any
+    changed file outside its ``paths`` patterns is invisible to that command
+    and needs its own file-level selection
+    (SA-0MWA7OD8O001945I).
+
+    Args:
+        changed: The changed-file set.
+        group_name: The group selected by :func:`select_group_from_changed_files`.
+        project_root: Project root holding ``.pi/test-config.json``.
+
+    Returns:
+        Changed paths not matched by any pattern in the group's ``paths``.
+        Empty when the group spec is unavailable (nothing to subtract, so the
+        caller keeps the historical group-only behaviour).
+    """
+    groups = _read_groups(project_root) or {}
+    spec = groups.get(group_name)
+    if spec is None:
+        return set()
+    paths_spec = spec.get("paths", [])
+    return {p for p in changed if not _paths_match_spec(p, paths_spec)}
+
+
+def _union_commands(*command_lists: list[str]) -> list[str]:
+    """Union command lists in argument order, de-duplicated.
+
+    Order is deterministic: the declared group commands first, then each
+    file-level command, with later duplicates dropped. A list that already
+    appears earlier is never repeated, so a group whose command happens to
+    equal the file-level command runs once.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for commands in command_lists:
+        for command in commands:
+            if command in seen:
+                continue
+            seen.add(command)
+            merged.append(command)
+    return merged
 
 
 def _selectable_changed(changed: set[str]) -> set[str]:
@@ -967,8 +1020,16 @@ def changed_scope_selection(
 
     1. **Declared ``groups``** in ``.pi/test-config.json`` — the smallest
        group whose ``paths`` match a changed file wins and its ``commands``
-       run. ``suiteCommands`` no longer disables selection: it defines the
-       *full* suite only, never the changed-scope subset.
+       run. Any changed file outside that group's ``paths`` is then unioned
+       in from the file-level selection below (group commands first, then
+       sorted file-level commands, de-duplicated), so a matched group can
+       never silently drop an edit-authored test file
+       (SA-0MWA7OD8O001945I). When nothing lies outside the group the result
+       is the group's commands alone, unchanged. When the outside files are
+       test/source files with no runnable file-level command, the selection
+       fails closed (``commands is None``) so the caller runs the full suite.
+       ``suiteCommands`` no longer disables selection: it defines the *full*
+       suite only, never the changed-scope subset.
     2. **Convention mapping** — a changed test file itself, or a source whose
        stem maps to a test file (pytest, node ``.mjs``, vitest
        ``.test.ts``/``.spec.ts``).
@@ -987,13 +1048,41 @@ def changed_scope_selection(
         return ChangedScopeSelection(None, CHANGED_SCOPE_NO_CHANGES)
 
     # 1. Declared named groups (coarser than file-level, but still targeted).
+    # A group's commands cover only its ``paths``; any changed file outside
+    # them is unioned in from the file-level selection rather than dropped
+    # (SA-0MWA7OD8O001945I). A group-only match keeps the historical result
+    # byte for byte.
     group_name = select_group_from_changed_files(changed, root)
     if group_name is not None:
         group_cmds = group_commands(group_name, root)
         if group_cmds:
-            return ChangedScopeSelection(
-                list(group_cmds), f"matched group '{group_name}'", group_name
-            )
+            uncovered = _changed_outside_group_paths(changed, group_name, root)
+            extra_cmds: list[str] = []
+            uncovered_selected: set[str] = set()
+            if uncovered:
+                uncovered_selected = {
+                    f
+                    for f in map_changed_to_tests(root, uncovered)
+                    if (root / f).exists()
+                }
+                extra_cmds = _commands_for_selected_tests(root, uncovered_selected)
+                if not extra_cmds and _selectable_changed(uncovered):
+                    # The group cannot prove coverage of those files and no
+                    # file-level command exists for them: fail closed to the
+                    # full suite instead of silently dropping a changed test
+                    # file (AC1). Non-selectable changes (docs, config) are
+                    # not tests and never force the fallback.
+                    return ChangedScopeSelection(
+                        None, CHANGED_SCOPE_GROUP_INCOMPLETE, group_name
+                    )
+            commands = _union_commands(list(group_cmds), extra_cmds)
+            reason = f"matched group '{group_name}'"
+            if extra_cmds:
+                reason += (
+                    f" + {len(uncovered_selected)} changed test file(s) "
+                    "outside the group"
+                )
+            return ChangedScopeSelection(commands, reason, group_name)
 
     groups_declared = _read_groups(root) is not None
     if not _selectable_changed(changed):
@@ -1037,9 +1126,10 @@ def changed_scope_commands(
 
     Returns None (meaning "fall back to the full suite") when no changed
     files exist, only non-source changes were made, no group matches, no
-    test file maps to the change, or the selected tests have no runnable
-    tooling. Call :func:`changed_scope_selection` when the specific fallback
-    reason is needed.
+    test file maps to the change, the selected tests have no runnable
+    tooling, or a matched group leaves changed source/test files with no
+    runnable selection of their own. Call :func:`changed_scope_selection`
+    when the specific fallback reason is needed.
     """
     return changed_scope_selection(
         project_root=project_root,

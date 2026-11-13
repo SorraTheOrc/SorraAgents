@@ -1140,7 +1140,14 @@ evidence.
    whose `paths` match a changed file wins and its `commands` run
    (SA-0MUJKF2HP001BR51). `suiteCommands` no longer disables selection: it
    defines the full suite only, never the changed-scope subset
-   (SA-0MVL7YOMJ006UMDO).
+   (SA-0MVL7YOMJ006UMDO). A group's commands only cover its own `paths`, so
+   any changed file **outside** them is unioned in from step 2: the emitted
+   command list is the group commands (declared order) followed by the
+   file-level commands (sorted), de-duplicated. A group-only match still
+   emits exactly the group commands, and when a changed source/test file
+   outside the group resolves to no runnable command the selection fails
+   closed to the full suite instead of silently dropping it
+   (SA-0MWA7OD8O001945I).
 2. **Convention mapping** — a changed file maps to its own tests:
    `src/foo.py` → `tests/test_foo.py`, a changed `tests/test_x.py` → itself,
    a changed `src/utils.ts` → `tests/unit/utils.test.ts`, a changed vitest
@@ -1192,6 +1199,7 @@ generic list (SA-0MVL7YOMJ006UMDO):
 | `no matching group and no convention-matched test files` | Groups are declared but none match, and no test maps to the change. |
 | `no convention-matched test files` | No group matched and no test maps to the change. |
 | `selected test files have no runnable suite tooling` | A test is selected (e.g. a `.test.ts`) but no pytest/node/vitest runner is declared. |
+| `matched group leaves changed files with no runnable test selection` | A group matched, but a changed source/test file outside its `paths` maps to no runnable command, so a group-only run would silently skip it. |
 
 A scoped run never silently skips testing. `changed_scope_selection()`
 returns the reason alongside the commands (`None` commands = fallback);
