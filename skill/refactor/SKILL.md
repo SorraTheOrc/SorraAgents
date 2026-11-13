@@ -255,6 +255,69 @@ existing config files need no change.
 | scene-gym divergence | Game scenes and Gym Scenes implementing different functionality — they must remain functionally equivalent; divergence indicates a bug in one or both implementations. Cross-references the [test-writing-guidelines.md](../shared/test-writing-guidelines.md) anti-patterns "Self-Referential Simulations" and "Duplicates of Existing Core Coverage" | Compare functionality between gym scene tests and their corresponding game scene tests (LLM review) | High |
 | inappropriate_intimacy | Classes that know too much about each other | LLM | Medium |
 
+## Finding identity and dedupe
+
+Every work item the refactor skill files for a detected smell carries a
+**machine-readable finding identity** so a later scan recognises the same
+smell instead of filing a clone.
+
+### Identity definition
+
+The identity of a finding is:
+
+```
+(<rule/smell code>, <repository-relative path>)
+```
+
+- The **rule/smell code** is the finding's `code` (e.g. `S112`, `F401`), or
+  its `smell_type` when no code is present.
+- The **path** is always repository-relative, normalised with the shared
+  `_repo_relative_path` helper. An absolute path, a `.worklog/worktrees/**`
+  prefix, and the line number are **never** part of the identity. The same
+  file scanned from an implement worktree and from the main checkout therefore
+  has one identity.
+- The identity is written as `<code>:<path>` and split on the **first** colon.
+  File paths containing a colon are out of scope (matching the audit-side
+  `CFP-Chore-Key` precedent).
+
+### Description markers
+
+Newly filed items embed the identity near the top of the description, so
+listing truncation cannot hide it:
+
+```
+Refactor-Finding-Key: <code>:<repository-relative path>
+Refactor-Fingerprint: <sha256>
+Refactor-Affected-Lines: <n>, <m>
+```
+
+- `Refactor-Finding-Key` is the exact identity the pre-creation guard matches.
+- `Refactor-Fingerprint` is the **sha256** of the target file's bytes, a NUL
+  separator, and the rule code. It changes when the file content or rule
+  changes and is stable otherwise; the path is not hashed, so worktree and
+  main-checkout scans agree. Re-verification (SA-0MW7Z1JCE009G6J3) consumes
+  this value to decide whether a finding still reproduces.
+- `Refactor-Affected-Lines` is the full, deduplicated, sorted list of observed
+  lines. It is preserved when duplicates are consolidated so line-level
+  reporting survives grouping.
+
+### Duplicate prevention
+
+Before creating an item the skill makes **one** lookup:
+
+```bash
+wl list "Refactor-Finding-Key:" --json
+```
+
+It parses every marker locally, ignores terminal (`completed`/`deleted`)
+items, normalises the paths, and compares the identity **exactly** — there is
+no substring matching anywhere. A re-found smell at a new line, from a
+different worktree, or with a truncated title still matches its existing item.
+
+When a batch run detects the same identity more than once, the findings are
+grouped into a **single** item whose `Refactor-Affected-Lines` marker is the
+union of every occurrence.
+
 ## REFACTOR Comments
 
 When a pre-existing smell is detected, a structured REFACTOR comment is injected:
