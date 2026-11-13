@@ -365,8 +365,8 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   [reference — worktree removal ownership](../../docs/dev/implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr).
 
   **Why rebuild?** `dist/` is gitignored; `git pull` does not update it.
-- **Close your response with:** `<work-item-id>: <concise-summary>\n\nWork
-  committed to dev`. Without `finish`, mark `in_review` manually via
+- **Close your response with:** `<work-item-id>: <concise-summary>` then
+  `Work committed to dev`. Without `finish`, mark `in_review` via
   `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`
   — never after `finish` returns.
 

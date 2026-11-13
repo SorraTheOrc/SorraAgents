@@ -5,8 +5,10 @@ correctly reflects that work has already been committed, rather than
 suggesting the operator commit the work themselves.
 
 The closing-message instruction lives in AGENTS_GLOBAL.md (the global
-agent guidance installed to ~/.pi/agent/AGENTS.md), not in the
-project-local AGENTS.md.
+agent guidance installed to ~/.pi/agent/AGENTS.md) and in the canonical
+skill/implement/SKILL.md. Both are checked in the repository checkout so the
+test is hermetic and worktree-local — it never depends on where (or whether)
+the global skill symlink is installed on the running machine.
 
 Related work item: SA-0MQ037ZH000403K0
 """
@@ -14,18 +16,15 @@ Related work item: SA-0MQ037ZH000403K0
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_PI_SKILLS_DIR = Path("/home/rgardler/.pi/agent/skills")
 
-# Files that should contain the closing message instruction.
-# Pi skills files are only checked when they exist (they may not be present on CI runners).
+# Files that should contain the closing message instruction. The canonical
+# repository copies are authoritative; the installed global skill is a
+# symlink to this repository's skill/ directory.
 _TARGET_FILES = [
     _REPO_ROOT / "AGENTS_GLOBAL.md",
+    _REPO_ROOT / "skill" / "implement" / "SKILL.md",
 ]
-_EXTRA_FILES = []
-for _path in [_PI_SKILLS_DIR / "implement" / "SKILL.md"]:
-    if _path.exists():
-        _EXTRA_FILES.append(_path)
-_ALL_TARGET_FILES = _TARGET_FILES + _EXTRA_FILES
+_ALL_TARGET_FILES = list(_TARGET_FILES)
 
 _OLD_PREAMBLE = "If you want to commit this work now I suggest the following commit message:"
 
