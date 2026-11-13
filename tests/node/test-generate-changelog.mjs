@@ -13,8 +13,9 @@
 
 import { strict as assert } from 'node:assert';
 import { spawnSync, execSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdtempSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 import { dirname, resolve, join } from 'node:path';
 
 // Real implementations imported for the new parent-filtering and
@@ -455,6 +456,44 @@ asyncTest('categorizeItems does not include items with a parentId', async () => 
       ...categorized.other,
     ];
     assert.ok(allEntries.every(e => !e.includes('SA-C1')), 'child work items should not appear as entries');
+  });
+});
+
+asyncTest('categorizeItems lazily fetches descriptions for skinny parent items (AC2/AC4)', async () => {
+  await withoutApiKey(async () => {
+    // Skinny items (no description), exactly as getCompletedOrInReviewItems now
+    // projects them. The description is only available via a lazy `wl show`
+    // fetch; the bug→feature reclassification below can only happen if that
+    // fetched description reaches the keyword classifier.
+    const items = [
+      { id: 'SA-E2E-1', title: 'Address failing widget', issueType: 'bug', parentId: null },
+    ];
+    const tmp = mkdtempSync(join(tmpdir(), 'wlshow-'));
+    const wlPath = join(tmp, 'wl');
+    writeFileSync(
+      wlPath,
+      '#!/usr/bin/env bash\n'
+      + 'case "$1" in\n'
+      + "  show) echo '{\"success\":true,\"workItem\":{\"id\":\"SA-E2E-1\",\"description\":\"Add a new feature and implement create support\"}}' ;;\n"
+      + '  update) exit 0 ;;\n'
+      + '  *) exit 0 ;;\n'
+      + 'esac\n',
+      { mode: 0o755 },
+    );
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${tmp}:${savedPath}`;
+    try {
+      const categorized = await categorizeItems(items);
+      assert.deepEqual(
+        categorized.features,
+        ['- Address failing widget (SA-E2E-1)'],
+        'the lazily-fetched description should drive the bug→feature reclassification',
+      );
+      assert.deepEqual(categorized.bugFixes, [], 'item should not remain a bug fix');
+    } finally {
+      process.env.PATH = savedPath;
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 });
 
