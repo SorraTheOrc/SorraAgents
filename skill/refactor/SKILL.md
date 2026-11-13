@@ -341,6 +341,33 @@ finding (SA-0MWE1EGLM002KE7Z):
   in comments so re-verification (SA-0MW7Z1JCE009G6J3) can rely on a stable
   record.
 
+### Consolidating the historical duplicate backlog
+
+The identity dedupe stops NEW duplicates, but the backlog accumulated while
+ dedupe was a substring match still holds clones. A one-off tool collapses it
+ using the same identity helper (SA-0MWE1ELZO004J1DY):
+
+```bash
+python3 $(skill_path refactor)/scripts/consolidate_duplicates.py          # dry run
+python3 $(skill_path refactor)/scripts/consolidate_duplicates.py --apply  # collapse
+```
+
+- **Dry-run is the default**: groups are listed (canonical = oldest open
+  item, then the duplicates) and ZERO worklog mutations occur; an accidental
+  run is harmless.
+- ``--apply`` keeps the canonical item, **unions** every member's affected
+  lines into its `Refactor-Affected-Lines` marker (no diagnostic detail is
+  lost), then comments each duplicate `superseded by <canonical> — duplicate
+  identity` and closes it with that recorded reason.
+- Audit-created false-positive chores that twin a consolidated identity are
+  **reported and cross-referenced, never auto-closed** — they carry
+  `needsProducerReview` by design.
+- Re-running after `--apply` is idempotent: closed duplicates are terminal
+  and no longer form groups. Both the modern `Refactor-Finding-Key` items and
+  the legacy (pre-marker) structured items are consolidated; paths are
+  normalised against the main checkout root, so worktree-prefix drift cannot
+  split one identity into multiple groups.
+
 ### Cross-family twin suppression (audit false-positive chores)
 
 The audit skill creator files `ruff <RULE> in <path>:<line> — candidate
