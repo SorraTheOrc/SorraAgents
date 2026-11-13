@@ -119,6 +119,22 @@ Instead:
   `o=m=p` payload (exit code 6, explicit `error`) before any `wl update`, so a
   zero-derived `Extra Small`/`Low` can never be persisted by any caller.
 
+## AC coverage review: whole criteria and the mapping convention
+
+`extract_acceptance_criteria` (in `skill/shared/tree_coverage.py`) extracts each
+AC **whole**: a hard-wrapped `- ` bullet's continuation lines are joined with a
+single space (re-joining a word broken by a trailing hyphen) until the next
+blank line, top-level list marker or `##` heading. The coverage review therefore
+compares complete criteria, not first physical lines. A child that restates the
+full parent criterion — however it is wrapped — produces a high Jaccard score and
+lets the review reach `proceed`.
+
+**Mapping convention.** A child AC should restate the parent criterion it
+implements in full. A `Covers parent ACn —` prefix alone is not a substitute:
+the similarity test compares whole criteria and ignores such prefixes, so
+restating only the first line of a wrapped parent AC leaves the criterion
+uncovered. See SA-0MUG36DQ2008DH3L.
+
 ## AC coverage review: triage-generated children are excluded
 
 The AC coverage review (`run_coverage_review` / `apply_coverage_review` in
