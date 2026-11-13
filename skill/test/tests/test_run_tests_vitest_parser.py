@@ -718,5 +718,133 @@ class TestAuditRunnerSharesTheParser:
         assert "cmd_failures = parse_node_failures(output)" not in source
 
 
+class TestRetryVerdictDiscard:
+    """A stage the runner accepted (status=0 + retry-clean/accepted-transient) is green.
+
+    The retry runner's final machine-readable verdict line
+    (``[vitest-runner] attempts=N status=S outcome=O args="..."``) is emitted
+    after every attempt sequence. A stage the runner accepted (``status=0``
+    with ``retry-clean`` or ``accepted-transient``) is green regardless of
+    what the superseded attempt printed — so ``parse_failures`` must NOT
+    harvest the discarded attempt's FAIL block as a suite failure (a
+    contention flake the runner already recovered from must not block the
+    release gate). Output with NO verdict line, or a non-green verdict
+    (``retry-failed`` / ``failed`` / any non-zero status), keeps every
+    genuine failure (CG-0MWEHG69O005VM17).
+    """
+
+    #: The flaked file named by the captured first browser attempt.
+    _FLAKED = "tests/core-engine/tf-runtime-integration.browser.test.ts"
+
+    def test_retry_clean_output_parses_to_no_failure_records(self) -> None:
+        """AC1: the superseded attempt's FAIL no longer becomes a suite failure."""
+        records = parse_failures(
+            fx.VITEST_RETRY_CLEAN_COMMAND, fx.VITEST_RETRY_CLEAN_OUTPUT
+        )
+
+        assert records == [], (
+            "the retry-runner accepted the stage (status=0 outcome=retry-clean), "
+            f"so no failure may be reported; got {[r['test_name'] for r in records]}"
+        )
+
+    def test_retry_clean_run_suite_reports_green(self, tmp_path: Path) -> None:
+        """AC1 end-to-end: run_suite success=True with the cache entry replayed."""
+        proc = fx.vitest_browser_failure(
+            exit_code=0, output=fx.VITEST_RETRY_CLEAN_OUTPUT
+        )
+        with mock.patch.object(run_tests, "_run_cmd", return_value=proc), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite(
+                "all",
+                cwd=_repo(tmp_path, fx.VITEST_RETRY_CLEAN_COMMAND),
+                use_cache=False,
+            )
+
+        assert result["success"] is True, (
+            "a retry-recovered stage is green: the release gate must not "
+            "force a re-run (exit 0 in the captured cache entry)"
+        )
+        assert result["failures"] == []
+        assert result["returncode"] == 0
+        assert result["exit_code"] == 0
+
+    def test_retry_failed_output_reports_every_failure(self) -> None:
+        """AC2 masking guard: a non-green verdict reports the failures.
+
+        ``outcome=retry-failed`` keeps the failures of BOTH attempts (fail-safe
+        direction): the discarded attempt-1 module-fetch block is not proven
+        transient once the retry itself failed, and attempt-2's assertion
+        failure is certainly genuine. At minimum the genuine second-attempt
+        failure must be listed.
+        """
+        records = parse_failures(
+            fx.VITEST_RETRY_CLEAN_COMMAND, fx.VITEST_RETRY_FAILED_OUTPUT
+        )
+
+        assert records, (
+            "the retry could not recover the stage (status=1 "
+            "outcome=retry-failed); no failure may be discarded"
+        )
+        names = [r["test_name"] for r in records]
+        assert any("boots the runtime" in n for n in names), (
+            "the genuine second-attempt failure must be listed; "
+            f"got {names}"
+        )
+        assert any("expected true to be false" in r["stdout_excerpt"] for r in records)
+
+    def test_genuine_failure_without_banner_is_reported(self) -> None:
+        """AC2 masking guard: no verdict line ⇒ current behaviour unchanged."""
+        records = parse_failures(
+            fx.VITEST_BROWSER_FAILURE_COMMAND, fx.VITEST_BROWSER_FAILURE_OUTPUT
+        )
+
+        assert len(records) == 2, "unchanged genuine-failure parsing"
+
+    def test_mixed_output_only_green_verdict_stage_discards(self) -> None:
+        """AC2 per-stage segmentation: a genuine tutorial failure still reports."""
+        records = parse_failures(
+            fx.VITEST_RETRY_CLEAN_COMMAND, fx.VITEST_RETRY_MIXED_OUTPUT
+        )
+
+        assert len(records) == 1, (
+            "only the tutorial failure may be a suite failure (the browser "
+            f"stage is retry-clean); got {[r['test_name'] for r in records]}"
+        )
+        assert "tests/e2e/tutorial-1.browser.test.ts" in records[0]["test_name"]
+        assert self._FLAKED not in records[0]["test_name"]
+
+    def test_accepted_transient_green_token_is_honoured(self) -> None:
+        """AC1: the accepted-transient token (status=0) is green too."""
+        records = parse_failures(
+            fx.VITEST_RETRY_CLEAN_COMMAND, fx.VITEST_ACCEPTED_TRANSIENT_OUTPUT
+        )
+
+        assert records == [], (
+            "accepted-transient means every error block matched an acceptable "
+            f"transient signature; got {[r['test_name'] for r in records]}"
+        )
+
+    def test_non_zero_runner_status_never_discards(self) -> None:
+        """Masking guard: ``status=1`` (even retry-failed) keeps the failures."""
+        records = parse_failures(
+            fx.VITEST_RETRY_CLEAN_COMMAND, fx.VITEST_RETRY_FAILED_OUTPUT
+        )
+
+        assert records, "status=1 must never discard a genuine failure"
+
+    def test_audit_route_classifies_retry_clean_the_same(self) -> None:
+        """AC5: the audit's shared route never sees an unparsed retry-clean."""
+        from audit.scripts import audit_runner
+
+        records = audit_runner.parse_failures(
+            fx.VITEST_RETRY_CLEAN_COMMAND, fx.VITEST_RETRY_CLEAN_OUTPUT
+        )
+
+        assert records == [], (
+            "the audit shares parse_failures, so an accepted retry is never "
+            "classified unparsed_failure"
+        )
+
+
 def audit_runner_path() -> Path:
     return _SKILLS_ROOT / "audit" / "scripts" / "audit_runner.py"

@@ -475,7 +475,7 @@ runner and the audit skill can never drift apart:
 | Command shape | Parser | Recognised failures |
 | --- | --- | --- |
 | `pytest …` | `parse_pytest_failures` | `FAILED <nodeid> - <message>` and `ERROR <nodeid>` short-summary lines, with the FAILURES/ERRORS section as the stack. |
-| vitest (`vitest`, `npx vitest`, `…/.bin/vitest`) | `parse_vitest_failures` | Vitest's default reporter: the `Failed Tests` block (`FAIL  [\|<project>\|] <file> > <suite> > <test>` plus the error, code frame and stack — the `\|<project>\|` pipe is optional, node-mode runs omit it) **and** the per-file tree (`❯ [\|<project>\|] <file> (N tests \| M failed)` with `× <suite> > <test>` markers and their `→ <message>` lines). A test reported in both places yields one record; `Test Files …`/`Tests …` summary lines never produce one. When neither pass matches — the gate's 1200-char output tail can strip the headers and markers, leaving only the `❯ <file>:<line>:<col>` frames with their source excerpts — the frames themselves are parsed as the failing locations (SA-0MWDLPF320060T0H). |
+| vitest (`vitest`, `npx vitest`, `…/.bin/vitest`) | `parse_vitest_failures` | Vitest's default reporter: the `Failed Tests` block (`FAIL  [\|<project>\|] <file> > <suite> > <test>` plus the error, code frame and stack — the `\|<project>\|` pipe is optional, node-mode runs omit it) **and** the per-file tree (`❯ [\|<project>\|] <file> (N tests \| M failed)` with `× <suite> > <test>` markers and their `→ <message>` lines). A test reported in both places yields one record; `Test Files …`/`Tests …` summary lines never produce one. When neither pass matches — the gate's 1200-char output tail can strip the headers and markers, leaving only the `❯ <file>:<line>:<col>` frames with their source excerpts — the frames themselves are parsed as the failing locations (SA-0MWDLPF320060T0H). **Retry-runner verdicts are honoured** (CG-0MWEHG69O005VM17): a stage ending `status=0` + `retry-clean`/`accepted-transient` has its FAIL records discarded as diagnostics (`discarded_failures`, non-fatal `retry_discarded_failures` notice), while stages with a non-zero status, a non-green outcome, or no verdict line keep every failure. |
 | anything else (TAP) | `parse_node_failures`, then the Vitest parser when TAP yields nothing | `not ok N - <name>` TAP failures. The Vitest fallback covers wrapper commands (`npm --silent test`) whose reporter cannot be inferred from the command line. |
 
 Every record carries `test_name` (for Vitest: file, suite and test),
@@ -484,6 +484,25 @@ Every record carries `test_name` (for Vitest: file, suite and test),
 colour codes are stripped, and the ASCII transliterations of the tree markers
 (`❯`→`>`, `×`→`x`) are accepted, so a captured or Windows-rendered log still
 parses (MS-0MW3UR8SX009YZWS).
+
+**Retry-runner verdicts (CG-0MWEHG69O005VM17).** The retry runner
+(`vitest-run-with-retry.ts`) ends every stage with a machine-readable verdict
+line (`[vitest-runner] attempts=N status=S outcome=O args="…"`). A stage
+whose verdict is `status=0` with `retry-clean` or `accepted-transient` is a
+stage the runner already accepted: the second attempt passed (or every error
+block was attributable to an acceptable transient signature), so the FAIL
+blocks printed by the superseded attempt are **discarded as diagnostics**, not
+harvested as suite failures. `parse_failures` segments the combined output at
+the verdict lines (per-stage segmentation) so a genuine failure in a
+non-green stage — or in output with no verdict line at all (e.g. a tutorial
+E2E section run by a different script) — of the same command is never masked;
+only green-verdict stages discard. Fail-safe direction: a mis-parsed or
+non-zero verdict (`retry-failed`, `failed`, `hang`, `coverage-failed`) only
+ever *keeps* failures. The discarded records surface additively as
+`discarded_failures` on the suite result (and aggregate) plus a stable notice
+text (`NOTICE_RETRY_DISCARDED` = `retry_discarded_failures`) naming the flaked
+file(s); `success` and the exit status are unchanged, so a recovered
+contention flake never forces a release-gate re-run.
 
 Before MS-0MW3UR8SX009YZWS only TAP was parsed, so a genuine **Vitest browser
 or unit assertion failure** produced `failures: []` and was classified
@@ -494,6 +513,13 @@ pin replays the captured browser-mode output
 (`skill/shared/tests/gate_failure_fixtures.py::VITEST_BROWSER_FAILURE_OUTPUT`) in
 `skill/test/tests/test_run_tests_vitest_parser.py` and
 `skill/test/tests/test_run_tests_failure_notices.py`.
+
+The captured retry-clean full-suite entry
+(`Tableau-Card-Engine/.worklog/cache/ce0b22f933c88660bc44ee97bca48193/` —
+unit `outcome=clean`, browser FAIL block, `[retry]` banner, browser
+`outcome=retry-clean`, exit 0) is the canonical fixture for the verdict
+discard: it replays green with the browser file's failure visible only on the
+`discarded_failures` diagnostic.
 
 **Tail-window rationale (SA-0MWDLPIA3003GKXV).** The frame-only pass is what
 makes the gate's 1200-character output tail (`implement.py::_tail_text` /
@@ -521,6 +547,7 @@ executable, wrapper error) keeps its `unparsed`/infrastructure classification.
 | `killed` | The child was terminated by a signal (`returncode < 0`, e.g. an OOM kill or a worker crash) and produced no parsable failure. |
 | `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). Vitest's default reporter — including browser mode — **is** parsed (see *Failure parsing* above), so a failing Vitest test is a structured failure, never this code. |
 | `state_changed_during_run` | The guarded checkout moved while a command executed (HEAD and/or the tracked tree it resolves to changed mid-run, e.g. a concurrent `implement.py finish` fast-forward); the mixed-tree verdict is quarantined (no cache entry under either state), the command's parsed failures are dropped and the suite is reported non-green with the distinct exit status 75 (`EX_TEMPFAIL`). The result carries the detail (checkout path + before/after commits) on `state_changed_during_run` — a non-empty dict for the suite, a list under the `run_all` aggregate; the human output prints a `notice: [state_changed_during_run] …` line naming the checkout movement and the required re-run. Runs whose only difference is churn attributable to another session (start-of-run-dirty → end-clean resolutions) are never flagged (SA-0MW3FF18I003KGZE AC3). |
+| `retry_discarded_failures` | **Non-fatal** (CG-0MWEHG69O005VM17): the runner accepted a stage (`status=0` + `retry-clean`/`accepted-transient`), so the FAIL records from its superseded attempt(s) were discarded as diagnostics — the suite stays **green** and the exit status is unchanged. The discarded records also appear on the structured `discarded_failures` field of the suite result / `run_all` aggregate, and the notice names the flaked file(s). A release gate consuming this output must NOT block on it. |
 
 **Precedence.** Structured (parsable) test failures always win: `killed` and
 `unparsed_failure` are set only when `failures` is empty, so a genuine code
@@ -546,9 +573,12 @@ to infer what happened from prose:
 | `slot_wait_seconds` | Seconds (float) — time spent queued for a host test slot, measured **once** by the pacer's `on_wait` callback (`paced_runner`) and never folded into `elapsed_seconds`. On a `slot_busy` result it is the elapsed bounded wait (nothing executed, so the whole window was queue wait). `0` when no wait occurred. |
 | `exit_code` | The command's process exit code (int), `null` when no child ran (timeout/slot busy/command not found). Negative means signal-terminated. |
 | `signal` | The terminating signal number when `exit_code < 0`, otherwise `null`. |
+| `discarded_failures` | Retry-recovered records (CG-0MWEHG69O005VM17), same shape as `failures`. Empty list except when a stage the retry runner accepted (`status=0` + `retry-clean`/`accepted-transient`) printed FAIL blocks on its superseded attempt: those records are surfaced here as additives diagnostics — **never** in `failures`, and never affecting `success`/the exit status. `null` only on result paths that never parsed output (timeout/slot-busy/command-not-found); `[]` otherwise. |
 
 **Aggregates (`run_all`).** Alongside the untouched per-suite detail under
-`suites`, the aggregate carries `notice_codes`, `elapsed_seconds_total` (sum
+`suites`, the aggregate carries `notice_codes`, `discarded_failures` (the
+per-suite retry-recovered records flattened with a `suite` attribution,
+CG-0MWEHG69O005VM17), `elapsed_seconds_total` (sum
 of the measured command executions; `null` when no suite executed anything)
 and `slot_wait_seconds` (sum of queue waits). Execution time and queue wait
 are summed **separately**, so a queued run can never look like a slow suite

@@ -262,6 +262,15 @@ NOTICE_KILLED = "killed"
 #: is empty (SA-0MVU8XRBQ000DG9D).
 NOTICE_UNPARSED_FAILURE = "unparsed_failure"
 
+#: Stable code for the **non-fatal** notice that a retry-runner stage was
+#: accepted (``status=0`` + ``retry-clean``/``accepted-transient``) and its
+#: superseded-attempt failures were discarded as diagnostics
+#: (CG-0MWEHG69O005VM17). A notice, never a failure: ``success`` stays green
+#: and the exit status is unchanged — the release gate must not need a re-run
+#: after an accepted retry. The discarded records also live on the structured
+#: ``discarded_failures`` field of the suite result.
+NOTICE_RETRY_DISCARDED = "retry_discarded_failures"
+
 #: Prefix of the no-free-slot notice produced by :func:`_test_concurrency_slot`.
 #: Exposed as a stable constant so a consumer handling a legacy result that
 #: predates ``notice_code`` can classify slot contention without duplicating
@@ -2124,6 +2133,98 @@ _VITEST_BLOCK_END_RE = re.compile(
     r"^\s*(?:⎯{3,}|─{3,}|Test Files\s|Tests\s|Start at\s|Duration\s|\[vitest-runner\])"
 )
 
+#: The retry runner's final machine-readable verdict line
+#: (``vitest-run-with-retry.ts::runSummary``):
+#: ``[vitest-runner] attempts=N status=S outcome=O args="..." expected=N ran=M``
+#: (or ``expected=unset`` when no expectation was supplied). Emitted via
+#: ``warn`` to stderr after every attempt sequence; a stage's combined output
+#: runs up to and including its own verdict line. ``status`` is the numeric
+#: attempt-sequence exit code (0/1/124 for a hang); the ``[retry] … Retrying
+#: once...`` banner is NOT a verdict line (CG-0MWEHG69O005VM17).
+_VITEST_RUNNER_VERDICT_RE = re.compile(
+    r"^\[vitest-runner\] attempts=\d+ status=(?P<status>\S+) "
+    r"outcome=(?P<outcome>[a-z-]+)",
+    re.MULTILINE,
+)
+
+#: The retry-runner outcomes that mean the stage's final verdict is GREEN
+#: after the retry mechanism ran: ``retry-clean`` (attempt 2 passed) and
+#: ``accepted-transient`` (every error block was attributable to an acceptable
+#: transient signature). Both require ``status=0`` to accompany them — the
+#: verdict line is only trusted when the runner itself reports zero.
+_VITEST_GREEN_RETRY_OUTCOMES = frozenset({"retry-clean", "accepted-transient"})
+
+
+def _split_vitest_runner_segments(
+    text: str,
+) -> list[tuple[str, tuple[str, str] | None]]:
+    """Split *text* into per-stage segments at the retry-runner verdict lines.
+
+    Each ``[vitest-runner]`` line ends the stage it summarises, so a segment
+    runs from the end of the previous verdict line (or the start of the
+    output) through the end of its own verdict line and carries that verdict
+    as ``(status, outcome)``. Text after the LAST verdict line (e.g. a
+    tutorial E2E section run by a different script that never emits a verdict
+    line) forms a trailing segment with verdict ``None`` — never discarded.
+
+    Returns a list of ``(segment_text, verdict)`` pairs, always non-empty
+    (output without any verdict line is one segment with verdict ``None``).
+    """
+    segments: list[tuple[str, tuple[str, str] | None]] = []
+    cursor = 0
+    for match in _VITEST_RUNNER_VERDICT_RE.finditer(text):
+        segment = text[cursor : match.end()]
+        verdict = (match.group("status"), match.group("outcome"))
+        segments.append((segment, verdict))
+        cursor = match.end()
+    tail = text[cursor:]
+    if tail:
+        segments.append((tail, None))
+    if not segments:
+        segments.append((text, None))
+    return segments
+
+
+def _is_green_retry_verdict(status: str, outcome: str) -> bool:
+    """Whether a runner verdict is the retry-accepted green outcome.
+
+    Only ``status=0`` accompanied by ``retry-clean`` or ``accepted-transient``
+    discards a stage's failures. Every other outcome (``clean``, ``failed``,
+    ``retry-failed``, ``coverage-failed``, ``hang``) or a non-zero status
+    keeps them — a mis-parsed verdict only ever *keeps* failures (fail-safe
+    direction, CG-0MWEHG69O005VM17).
+    """
+    return status == "0" and outcome in _VITEST_GREEN_RETRY_OUTCOMES
+
+
+def _parse_vitest_with_retry_verdict(
+    output: str,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Parse vitest output honouring the retry runner's per-stage verdicts.
+
+    Segments the combined output at each ``[vitest-runner]`` verdict line and
+    parses each stage independently. A stage whose verdict is green
+    (``status=0`` + ``retry-clean``/``accepted-transient``) contributes its
+    failures to the *discarded* list — the runner already proved the retry
+    recovered, so those records are diagnostics, not suite failures. Every
+    other stage (non-green verdict, or no verdict at all) contributes its
+    failures untouched, so a genuine failure in the same command's output is
+    never masked (per-stage segmentation, AC2).
+
+    Returns ``(failures, discarded)`` — the two lists share the record shape
+    of :func:`parse_vitest_failures`.
+    """
+    text = _ANSI_ESCAPE_RE.sub("", output)
+    failures: list[dict[str, str]] = []
+    discarded: list[dict[str, str]] = []
+    for segment, verdict in _split_vitest_runner_segments(text):
+        records = parse_vitest_failures(segment)
+        if verdict is not None and _is_green_retry_verdict(*verdict):
+            discarded.extend(records)
+        else:
+            failures.extend(records)
+    return failures, discarded
+
 
 def parse_vitest_failures(output: str) -> list[dict[str, str]]:
     """Parse Vitest's default-reporter output into structured failure records.
@@ -2270,19 +2371,48 @@ def parse_failures(command: str, output: str) -> list[dict[str, str]]:
     loop) so the two can never drift apart:
 
     * ``pytest`` commands → :func:`parse_pytest_failures` (unchanged);
-    * Vitest commands → :func:`parse_vitest_failures`;
+    * Vitest commands → :func:`parse_vitest_failures`, with the retry
+      runner's per-stage verdicts honoured (see
+      :func:`_parse_vitest_with_retry_verdict`);
     * anything else → :func:`parse_node_failures` (TAP, unchanged), falling
-      back to the Vitest parser when TAP yields nothing. The fallback covers
-      wrapper commands (``npm --silent test``) whose output shape cannot be
-      inferred from the command line; the Vitest markers are specific enough
-      that non-Vitest output still yields no records.
+      back to the retry-aware Vitest parser when TAP yields nothing. The
+      fallback covers wrapper commands (``npm --silent test``) whose output
+      shape cannot be inferred from the command line; the Vitest markers are
+      specific enough that non-Vitest output still yields no records.
     """
     if "pytest" in command:
         return parse_pytest_failures(output)
     if is_vitest_command(command):
-        return parse_vitest_failures(output)
+        return _parse_vitest_with_retry_verdict(output)[0]
     records = parse_node_failures(output)
-    return records or parse_vitest_failures(output)
+    return records or _parse_vitest_with_retry_verdict(output)[0]
+
+
+def parse_failures_with_retry_verdict(
+    command: str, output: str
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Shared :func:`parse_failures` plus the discarded retry-recovered records.
+
+    ``run_suite`` uses this so a green-verdict stage's discarded failures can
+    be reported as diagnostics (a stable notice / ``discarded_failures`` field)
+    without becoming suite failures; ``parse_failures`` delegates to it and
+    returns only the genuine failures. Both lists share the record shape of
+    :func:`parse_vitest_failures`.
+
+    Routing is identical to :func:`parse_failures`:
+
+    * ``pytest`` commands → :func:`parse_pytest_failures` (no discarded list);
+    * Vitest commands → :func:`_parse_vitest_with_retry_verdict`;
+    * anything else → TAP, falling back to the retry-aware Vitest parser.
+    """
+    if "pytest" in command:
+        return parse_pytest_failures(output), []
+    if is_vitest_command(command):
+        return _parse_vitest_with_retry_verdict(output)
+    records = parse_node_failures(output)
+    if records:
+        return records, []
+    return _parse_vitest_with_retry_verdict(output)
 
 
 # ---------------------------------------------------------------------------
@@ -2806,7 +2936,12 @@ def run_suite(
     single source of truth — instead of the hardcoded pytest+node pair. The
     failure parser is chosen per command (pytest commands → pytest parser,
     everything else → node parser), mirroring the audit's
-    ``_run_tests_via_test_skill``.
+    ``_run_tests_via_test_skill``. Parsing is retry-verdict aware
+    (CG-0MWEHG69O005VM17): failures from a stage the retry runner accepted
+    (``status=0`` + ``retry-clean``/``accepted-transient``) are carried on the
+    result's additive ``discarded_failures`` field plus a stable
+    ``notice``/``notice_code`` (``retry_discarded_failures``) — never in
+    ``failures`` and never changing ``success``/the exit status.
 
     *scope* ("full" or "changed") selects which tests run: ``full`` resolves
     the repo's full suite (existing behavior); ``changed`` resolves only
@@ -2976,6 +3111,12 @@ def run_suite(
     slot_lane = slot_lane_for(resolvable_scope, test_type)
 
     all_failures: list[dict[str, str]] = []
+    #: Failures harvested from stages the retry runner accepted
+    #: (``status=0`` + ``retry-clean``/``accepted-transient``): reported as
+    #: diagnostics (``discarded_failures`` + a stable notice), never as suite
+    #: failures, so a recovered contention flake does not turn a green tree red
+    #: (CG-0MWEHG69O005VM17).
+    all_discarded: list[dict[str, str]] = []
     overall_returncode = 0
     cached_flags: list[bool] = []
     cache_entries: list[dict[str, Any]] = []
@@ -3001,6 +3142,12 @@ def run_suite(
             "returncode": None,
             "command": command,
             "failures": [],
+            # Retry-recovered failures (CG-0MWEHG69O005VM17): records from
+            # stages the retry runner accepted (status=0 +
+            # retry-clean/accepted-transient), reported as diagnostics — never
+            # in ``failures`` and never affecting ``success``. Additive field;
+            # consumers that predate it simply never see it populated.
+            "discarded_failures": [],
             "notice": "",
             "notice_code": "",
             "stdout": _output_tail("\n".join(stdout_parts)),
@@ -3124,8 +3271,9 @@ def run_suite(
             # commands would run against the same unstable checkout and
             # contribute nothing usable.
             break
-        failures = parse_failures(cmd, output)
+        failures, discarded = parse_failures_with_retry_verdict(cmd, output)
         all_failures.extend(failures)
+        all_discarded.extend(discarded)
         if proc.returncode != 0:
             overall_returncode = proc.returncode
 
@@ -3146,14 +3294,33 @@ def run_suite(
             f"discarded — re-run the suite from a stable checkout."
         )
 
+    # Retry-recovered discard notice (CG-0MWEHG69O005VM17): informational,
+    # never a failure. A stage the retry runner accepted stays green; the
+    # notice names the flaked file(s) so an operator can still see what the
+    # retry recovered. Carried on ``discarded_failures`` (structured) and as a
+    # stable notice combination for per-suite printing.
+    discarded_notice = ""
+    discarded_notice_code = ""
+    if all_discarded:
+        discarded_notice_code = NOTICE_RETRY_DISCARDED
+        flaked = ", ".join(
+            sorted({f.get("test_name", "<unknown>") for f in all_discarded})
+        )
+        discarded_notice = (
+            f"[{NOTICE_RETRY_DISCARDED}] {len(all_discarded)} failure(s) on "
+            f"superseded attempt(s) were accepted as transient by the retry "
+            f"runner and discarded (not suite failures): {flaked}"
+        )
+
     result = _result(
         success=overall_returncode == 0 and not all_failures,
         returncode=overall_returncode,
         exit_code=overall_returncode,
         command=command,
         failures=all_failures,
-        notice=flagged_notice,
-        notice_code=flagged_notice_code,
+        discarded_failures=all_discarded,
+        notice=flagged_notice or discarded_notice,
+        notice_code=flagged_notice_code or discarded_notice_code,
         cached=use_cache and all(cached_flags) if cached_flags else False,
         state_changed_during_run=state_changed_detail,
     )
@@ -3261,6 +3428,10 @@ def run_all(
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
+    # Retry-recovered failures aggregated alongside ``failures``
+    # (CG-0MWEHG69O005VM17): each record gains the suite attribution, exactly
+    # as ``failures`` does, so a consumer sees which suite discarded what.
+    all_discarded: list[dict[str, str]] = []
 
     # Full-scope runs are the churn-heavy path behind the /tmp-inode defect
     # (SA-0MW2QED9M005FWOK): prune stale pytest roots once before executing so
@@ -3324,6 +3495,8 @@ def run_all(
             slot_wait_total += result.get("slot_wait_seconds") or 0.0
             for failure in result["failures"]:
                 all_failures.append({**failure, "suite": name})
+            for discarded in result.get("discarded_failures") or []:
+                all_discarded.append({**discarded, "suite": name})
             if result.get("notice"):
                 notices.append(result["notice"])
             if result.get("notice_code"):
@@ -3336,6 +3509,10 @@ def run_all(
         "success": all(r["success"] for r in results.values()),
         "suites": results,
         "failures": all_failures,
+        # Retry-recovered diagnostics (CG-0MWEHG69O005VM17): additive, never
+        # counted in ``success``/``failures`` — a stage the retry runner
+        # accepted stays green.
+        "discarded_failures": all_discarded,
         "notices": notices,
         "notice_codes": notice_codes,
         # Moved-checkout flags (SA-0MW3FF18I003KGZE): the detail behind each
