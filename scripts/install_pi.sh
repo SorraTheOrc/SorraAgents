@@ -156,29 +156,31 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_PI_CONFIG="$REPO_ROOT/.pi-config/agent"
 DEST_PI="$HOME/.pi/agent"
 
-# Helper to copy file with optional overwrite prompt
-copy_if_missing_or_prompt() {
-  local src="$1" dst="$2"
-  if [ -e "$dst" ]; then
-    read -r -e -p "File exists: $dst. Overwrite? [y/N]: " resp || true
-    case "$resp" in
-      [yY]|[yY][eE][sS]) cp -f "$src" "$dst" && echo "Overwrote $dst" ;; 
-      *) echo "Skipped $dst" ;;
-    esac
-  else
-    cp -a "$src" "$dst" && echo "Installed $dst"
+# Merge the tracked pi config into the destination directory.
+#
+# The merge helper (scripts/merge_pi_agent_config.py) is idempotent and
+# non-destructive: it adds/refreshes tracked providers and unions
+# enabledModels while preserving local-only providers, models, overrides and
+# settings; it writes a single timestamped <file>.bak.<ts> backup before the
+# first change, writes atomically, installs the tracked file whole when the
+# destination is missing, and never prompts (safe under stdin=/dev/null).
+# A non-zero exit (e.g. unparseable destination JSON, which the helper leaves
+# untouched) is warned about but does not abort the install.
+merge_agent_config() {
+  local tracked_dir="$1" dest_dir="$2"
+  local merge_out merge_rc=0
+  merge_out=$(python3 "$SCRIPT_DIR/merge_pi_agent_config.py" "$tracked_dir" "$dest_dir" 2>&1) || merge_rc=$?
+  printf '%s\n' "$merge_out"
+  if [ "$merge_rc" -ne 0 ]; then
+    echo "WARNING: pi config merge reported a problem (exit $merge_rc); existing files were left intact." >&2
   fi
 }
 
-# If the repo contains a .pi-config/agent, use it to create the global config
+# If the repo contains a .pi-config/agent, apply it to the global config
 if [ -d "$REPO_PI_CONFIG" ]; then
   echo "Installing global pi config from repository: $REPO_PI_CONFIG -> $DEST_PI"
   mkdir -p "$DEST_PI"
-  for f in settings.json models.json; do
-    if [ -e "$REPO_PI_CONFIG/$f" ]; then
-      copy_if_missing_or_prompt "$REPO_PI_CONFIG/$f" "$DEST_PI/$f"
-    fi
-  done
+  merge_agent_config "$REPO_PI_CONFIG" "$DEST_PI"
   # If an example auth exists in the repo, do NOT copy auth files. Instead instruct the user to login with pi
   if [ -e "$REPO_PI_CONFIG/auth.json.example" ] && [ ! -e "$DEST_PI/auth.json" ]; then
     echo "Authentication not configured. After installation run:"
