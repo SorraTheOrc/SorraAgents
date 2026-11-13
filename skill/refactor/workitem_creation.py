@@ -93,6 +93,20 @@ _FINDING_KEY_RE = re.compile(
 # suppress a fresh filing (SA-0MWE1E4GQ004E1JG AC3).
 FINDING_KEY_TERMINAL_STATUSES = frozenset({"completed", "deleted"})
 
+# Marker carried by every audit-created false-positive chore title. The audit
+# producer titles its chores ``ruff <RULE> in <path>:<line> — candidate false
+# positive — producer decision required``, so the refactor guard queries by
+# this marker and ignores the line when matching (SA-0MWE1EAR30045VHO AC1).
+AUDIT_FP_TITLE_MARKER = "candidate false positive"
+
+# Local parser for audit-family titles. Captures the linter, rule code and
+# ``<path>[:<line>]``; the trailing line is stripped separately so line drift
+# cannot break the cross-family identity.
+_AUDIT_FP_TITLE_RE = re.compile(
+    r"^(\S+)\s+(\S+)\s+in\s+(.+?)\s*—\s*candidate false positive",
+    re.IGNORECASE,
+)
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -220,6 +234,30 @@ def compute_content_fingerprint(
     digest.update(b"\x00")
     digest.update(_finding_code(smell).encode("utf-8"))
     return digest.hexdigest()
+
+
+def _parse_audit_fp_title(title: str) -> dict[str, str] | None:
+    """Parse an audit false-positive chore title into ``{code, path}``.
+
+    Accepts titles of the form ``<linter> <RULE> in <path>:<line> — candidate
+    false positive …``. The line (when present) is stripped from the path
+    because the finding identity never includes it; only the rule code and the
+    repository-relative path participate in the cross-family match
+    (SA-0MWE1EAR30045VHO AC1). Returns ``None`` when the title does not look
+    like an audit-family item.
+    """
+    match = _AUDIT_FP_TITLE_RE.match(str(title or "").strip())
+    if not match:
+        return None
+    _linter, code, path_and_line = match.groups()
+    path = path_and_line
+    if ":" in path:
+        head, _separator, tail = path.rpartition(":")
+        if tail.isdigit():
+            path = head
+    if not path:
+        return None
+    return {"code": code, "path": path}
 
 
 def _affected_lines(smell: dict[str, Any]) -> list[int]:
@@ -460,6 +498,76 @@ def _is_under_worklog_worktrees(relative_path: str) -> bool:
     return rel == WORKTREES_PREFIX or rel.startswith(WORKTREES_PREFIX + "/")
 
 
+def _find_existing_audit_twin(
+    smell: dict[str, Any], repo_root: str | None = None
+) -> dict[str, Any] | None:
+    """Find a live audit-created false-positive chore tracking the identity.
+
+    Closes the cross-family blindness (parent AC2): the refactor producer must
+    also see the audit ``ruff <RULE> in <path> — candidate false positive``
+    family (73 open items at filing) so the two producers cannot mint blind
+    twins for the same diagnostic. One ``wl list "candidate false positive"
+    --json`` call returns every audit chore; each title is parsed locally and
+    matched on (rule code, repository-relative path) after path
+    normalisation — never a substring, never a line number
+    (SA-0MWE1EAR30045VHO AC1). Only non-terminal chores count: a completed
+    chore no longer tracks the finding, so a fresh filing is allowed.
+
+    Args:
+        smell: A smell finding dict.
+        repo_root: Optional repository root used to normalise absolute paths.
+
+    Returns:
+        The matching audit item dict, or ``None`` when no live audit twin
+        exists (including when the lookup fails — fail-open, so a transient
+        ``wl`` problem never silently drops a finding).
+    """
+    if not shutil.which("wl"):
+        return None
+
+    target_code = _finding_code(smell)
+    target_path = _repo_relative_path(smell.get("file", ""), repo_root)
+    if not target_path:
+        return None
+
+    try:
+        result = subprocess.run(  # noqa: PLW1510
+            ["wl", "list", AUDIT_FP_TITLE_MARKER, "--json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    try:
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    work_items = data.get("workItems", data.get("data", []))
+    if not isinstance(work_items, list):
+        return None
+
+    for item in work_items:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status", "") or "").strip().lower()
+        if status in FINDING_KEY_TERMINAL_STATUSES:
+            continue
+        parsed = _parse_audit_fp_title(item.get("title", ""))
+        if not parsed:
+            continue
+        normalised_path = _repo_relative_path(parsed["path"], repo_root)
+        if parsed["code"] == target_code and normalised_path == target_path:
+            return item
+
+    return None
+
+
 def _find_existing_worklog_item(
     smell: dict[str, Any], repo_root: str | None = None
 ) -> dict[str, Any] | None:
@@ -595,6 +703,23 @@ def create_smell_work_item(
             smell_type,
             file_path,
             existing_item.get("id", "<unknown>"),
+        )
+        return None
+
+    # Guard 3.5: cross-family twin suppression (parent AC2). An open
+    # audit-created ``ruff <RULE> in <path> — candidate false positive``
+    # chore already tracks this identity, so minting a refactor item would
+    # create a blind twin. The audit chore carries ``needsProducerReview`` by
+    # design and is never closed or mutated here — only the creation is
+    # suppressed (SA-0MWE1EAR30045VHO AC1).
+    audit_twin = _find_existing_audit_twin(smell, repo_root)
+    if audit_twin is not None:
+        LOG.info(
+            "Skipping creation for %s in %s: audit-family item %s already "
+            "tracks this identity",
+            smell_type,
+            file_path,
+            audit_twin.get("id", "<unknown>"),
         )
         return None
 

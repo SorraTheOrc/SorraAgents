@@ -318,6 +318,30 @@ When a batch run detects the same identity more than once, the findings are
 grouped into a **single** item whose `Refactor-Affected-Lines` marker is the
 union of every occurrence.
 
+### Cross-family twin suppression (audit false-positive chores)
+
+The audit skill creator files `ruff <RULE> in <path>:<line> — candidate
+false positive` chores for ruff diagnostics it deems false positives. The
+refactor producer consults that family too, so the two producers cannot mint
+blind twins for the same diagnostic (SA-0MWE1EAR30045VHO):
+
+```bash
+wl list "candidate false positive" --json
+```
+
+The guard parses each audit chore's title, ignores the trailing line number,
+normalises the path, and suppresses creation when the (rule, repository-
+relative path) identity matches an open chore. Terminal (`completed`/
+`deleted`) audit chores never suppress. The audit chore itself is **never**
+closed or mutated — it carries `needsProducerReview` by design; only the
+refactor creation is skipped.
+
+In the reverse direction the audit producer consults open `Refactor-Finding-
+Key` items (one lookup per run) before minting a chore and embeds a
+`Refactor-Twin: <refactor-item-id>` cross-reference in the chore description
+when the identity matches — the chore is still created (a producer decision
+is required), but the twin is visible and linked.
+
 ## REFACTOR Comments
 
 When a pre-existing smell is detected, a structured REFACTOR comment is injected:

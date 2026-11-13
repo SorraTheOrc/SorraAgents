@@ -1419,6 +1419,14 @@ The ONLY relaxation of the audit's no-create rule, for tracking false positives:
   `_collect_audit_waivers` also honours a `findings` list on `auditWaiver` should
   a future store persist one.
 - **Never tracked**: `uncertain` and `genuine` findings get no work item.
+- **Cross-family twin cross-reference** (SA-0MWE1EAR30045VHO AC2): before
+  minting a NEW tracking chore the runner consults open Refactor-family items
+  once per run (`wl list "Refactor-Finding-Key:" --json`) and matches on
+  (rule, repository-relative path) — the line number is ignored so line drift
+  cannot break the match. On a match the chore description embeds
+  `Refactor-Twin: <refactor-item-id>` so the twin is visible and linked. The
+  chore is still created (it carries `needsProducerReview` by design) — it is
+  never auto-suppressed or auto-closed; only the cross-reference is added.
 - **Fail-safe** (`chore_failures`): a `wl create` failure never reverts the
   remediation commit; the affected finding stays blocking `genuine` (demoted with
   `chore_failed`) and the failure is recorded in the report.
