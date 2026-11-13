@@ -150,8 +150,10 @@ class TestImplementBodyThresholdCommitted:
             "implement SKILL.md body cannot silently regrow"
         )
         # 20,000 B originally (SA-0MVYDCUWA001Z8K0); 22,000 B after the
-        # no-op finish contract moved into the brief (SA-0MW74IL6B001AMQN).
-        assert data["skill_implement_md"] <= 22000
+        # no-op finish contract moved into the brief (SA-0MW74IL6B001AMQN);
+        # 22,500 B for the mandatory skill-session vs work-item AC note
+        # (SA-0MUUI6ZCX001RO8V).
+        assert data["skill_implement_md"] <= 22500
 
 
 # ── Bypass and fail-open behaviour ──────────────────────────────────────────

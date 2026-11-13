@@ -128,7 +128,7 @@ SA-0MT4DFE8Y004J8SP):
   "global_agents": 16268,
   "project_agents": 3875,
   "skills_prose": 2339,
-  "skill_implement_md": 22000,
+  "skill_implement_md": 22500,
   "total": 22482
 }
 ```
@@ -139,7 +139,7 @@ The implement skill's `SKILL.md` is inlined verbatim into **every**
 `/skill:implement` invocation, so its byte size is a per-turn cost separate
 from the startup surface above. It regrew ~5× after the F5 trim (15,447 B
 budget → 99,749 B by 2026-11-07), so it now has its own measured component
-and threshold: `skill_implement_md: 22000` (AC1/AC4; raised from 20,000 — see
+and threshold: `skill_implement_md: 22500` (AC1/AC4; raised from 20,000 — see
 the revision note below). The component is reported by `measure_context.py`
 and is **excluded from `total`** — it is not startup context, and the
 pre-push hook enforces it alongside the startup thresholds.
@@ -152,13 +152,21 @@ pre-push hook enforces it alongside the startup thresholds.
 > revised to **22,000 B** — the body is now 21,576 B, still ~78% below the
 > 99,749 B it started from. The ratchet stays: any further increase is a
 > conscious, recorded budget revision.
+>
+> **Report AC-semantics note (2026-11-13, SA-0MUUI6ZCX001RO8V):** every
+> report-rendering skill must now carry a mandatory note distinguishing the
+> **skill session's** own acceptance criteria from the **work item's feature
+> ACs** (work-item ACs live in the report's Use Cases section). The note adds
+> ~256 B to the implement brief, which sat only 7 B under the 22,000 B cap,
+> so the cap was revised to **22,500 B** (body 22,249 B). The same conscious
+> revision rule applies: this is recorded, not a silent regrowth.
 
 **Before/after composition of a cold implement turn** (chars/4 token
 estimate):
 
 | Component | Before (2026-11-07) | After | Notes |
 |---|---|---|---|
-| `skill/implement/SKILL.md` body | 99,749 B / ~24,937 tok | **21,576 B / ~5,394 tok** | ≥78% cut; ≤22,000 B gate (AC1, revised by SA-0MW74IL6B001AMQN) |
+| `skill/implement/SKILL.md` body | 99,749 B / ~24,937 tok | **22,249 B / ~5,562 tok** | ≥78% cut; ≤22,500 B gate (AC1, revised by SA-0MW74IL6B001AMQN and SA-0MUUI6ZCX001RO8V) |
 | System prompt (AGENTS_GLOBAL + project AGENTS + skills prose) | ~21,080 B / ~5,270 tok | ~21,274 B / ~5,318 tok | unchanged by this item |
 | **Cold implement turn (body + system)** | **~30,200 tok** | **~10,300 tok** | the intake-measured P50 was ~24–25k before further growth |
 
@@ -309,7 +317,8 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > were regenerated to the new measured surface rather than compacting the
 > guidance. `skill_implement_md` stayed at its 22,000 B cap: the SKILL.md
 > red-gate note was accommodated by trimming duplicated prose, not by raising
-> the threshold.
+> the threshold. (The cap was later revised to 22,500 B by
+> SA-0MUUI6ZCX001RO8V for the mandatory report AC-semantics note.)
 >
 > ### Enforcement (committed gate)
 >

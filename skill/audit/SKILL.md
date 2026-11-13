@@ -440,12 +440,17 @@ reconciles with the canonical template — render it as the **last step**:
 python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name audit \
   --headline "<1-3 sentence headline summary>" \
-  --ac "<AC# description>|<verification metric>|met" \
-  --ac "<...>|<...>|unmet" \
+  --ac "Work item assessed against acceptance criteria | audit report | met" \
+  --ac "Audit verdict determined and recorded | Ready to close line | met" \
+  --ac "Ready-to-close line added | persisted audit report | met" \
   [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```
+
+> **Note:** For the audit skill session, the verdict reflects the work item's state; the
+> report records the skill session's own success criteria (audit was performed). Work-item ACs are displayed
+> in the Use Cases section (SA-0MTQY7YM5009J6QR).
 
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, so the operator sees the report itself (not just the
