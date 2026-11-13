@@ -318,6 +318,29 @@ When a batch run detects the same identity more than once, the findings are
 grouped into a **single** item whose `Refactor-Affected-Lines` marker is the
 union of every occurrence.
 
+### Repeat findings: occurrence comments, never new items
+
+A smell re-found on an existing open identity is a **repeat**, not a new
+finding (SA-0MWE1EGLM002KE7Z):
+
+- **No new work item** is ever created for a repeat. The pre-creation guard
+  returns the existing item's id.
+- **Genuinely new lines** (not already present in the existing item's
+  `Refactor-Affected-Lines`) are recorded by appending a comment via
+  `wl comment add`:
+
+  ```
+  Refactor-Repeat: <code> in <path> — lines <n>, <m>
+  ```
+
+- **Identical line sets** (a re-scan of the exact same finding) are a silent
+  dedupe: nothing is appended, nothing is mutated — comment volume is
+  bounded by real re-occurrence, not by every scan.
+- The existing item's title, description identity marker and content
+  fingerprint are **never touched** by a repeat. The occurrence record lives
+  in comments so re-verification (SA-0MW7Z1JCE009G6J3) can rely on a stable
+  record.
+
 ### Cross-family twin suppression (audit false-positive chores)
 
 The audit skill creator files `ruff <RULE> in <path>:<line> — candidate

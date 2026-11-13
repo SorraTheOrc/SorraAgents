@@ -89,6 +89,13 @@ _FINDING_KEY_RE = re.compile(
     r"Refactor-Finding-Key:[ \t]*(\S+)", re.IGNORECASE
 )
 
+# Local parser for the affected-line list marker. Used to decide whether a
+# repeat finding observes genuinely new lines (append an occurrence comment)
+# or the identical line set (silent dedupe, SA-0MWE1EGLM002KE7Z).
+_AFFECTED_LINES_RE = re.compile(
+    r"Refactor-Affected-Lines:[ \t]*([0-9][0-9, \t]*)", re.IGNORECASE
+)
+
 # Statuses that no longer track a finding. A completed/deleted item must not
 # suppress a fresh filing (SA-0MWE1E4GQ004E1JG AC3).
 FINDING_KEY_TERMINAL_STATUSES = frozenset({"completed", "deleted"})
@@ -376,6 +383,35 @@ def build_smell_description(
     return "\n".join(p for p in parts if p)
 
 
+def build_repeat_comment(
+    smell: dict[str, Any], repo_root: str | None = None
+) -> str:
+    """Build the structured occurrence comment appended on a repeat finding.
+
+    A repeat finding on an existing open identity is recorded by appending a
+    comment — the item itself is never mutated, so its identity marker and
+    content fingerprint stay stable for re-verification
+    (SA-0MWE1EGLM002KE7Z AC2/AC3). The comment lists every newly observed
+    line so consolidation loses no diagnostic detail:
+
+        Refactor-Repeat: <code> in <path> — lines <n>, <m>
+
+    Args:
+        smell: The re-found smell finding dict.
+        repo_root: Optional repository root for path normalisation.
+
+    Returns:
+        The repeat-comment text.
+    """
+    code = _finding_code(smell)
+    path = _repo_relative_path(smell.get("file", ""), repo_root)
+    lines = _affected_lines(smell)
+    rendered_lines = ", ".join(str(n) for n in lines)
+    if rendered_lines:
+        return f"Refactor-Repeat: {code} in {path} — lines {rendered_lines}"
+    return f"Refactor-Repeat: {code} in {path}"
+
+
 def has_existing_smell_comment(file_path: str, smell_type: str) -> bool:
     """Check if a source file already has a REFACTOR comment for a smell type.
 
@@ -568,6 +604,53 @@ def _find_existing_audit_twin(
     return None
 
 
+def _existing_affected_lines(item: dict[str, Any]) -> set[int]:
+    """Parse the ``Refactor-Affected-Lines`` marker out of an item."""
+    haystack = f"{item.get('title', '')}\n{item.get('description', '')}"
+    match = _AFFECTED_LINES_RE.search(haystack)
+    if not match:
+        return set()
+    return {int(value) for value in re.findall(r"\d+", match.group(1))}
+
+
+def _append_repeat_comment(existing_item: dict[str, Any], smell: dict[str, Any],
+                           repo_root: str | None) -> bool:
+    """Append the occurrence comment for a repeat finding, best-effort.
+
+    The comment is appended via ``wl comment add``; a failed write is logged
+    and returns ``False`` — the finding was already tracked, so a failed
+    comment never blocks the scan (SA-0MWE1EGLM002KE7Z AC1).
+    """
+    item_id = existing_item.get("id")
+    if not item_id:
+        return False
+    text = build_repeat_comment(smell, repo_root)
+    try:
+        result = subprocess.run(  # noqa: PLW1510
+            [
+                "wl", "comment", "add", str(item_id),
+                "--comment", text,
+                "--author", "refactor",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        LOG.warning(
+            "Failed to append repeat comment to %s: %s", item_id, exc
+        )
+        return False
+    if result.returncode != 0:
+        LOG.warning(
+            "Failed to append repeat comment to %s (code %d): %s",
+            item_id, result.returncode, result.stderr.strip(),
+        )
+        return False
+    return True
+
+
 def _find_existing_worklog_item(
     smell: dict[str, Any], repo_root: str | None = None
 ) -> dict[str, Any] | None:
@@ -695,11 +778,22 @@ def create_smell_work_item(
         )
         return None
 
-    # Guard 3: Check worklog database for the exact finding identity (AC3)
+    # Guard 3: Check worklog database for the exact finding identity (AC3).
+    # A repeat finding does NOT create a new item: when the re-found smell
+    # observes genuinely new lines an occurrence comment is appended to the
+    # existing item and its id is returned; when the line set is identical
+    # the finding is a silent dedupe (None, nothing mutated)
+    # (SA-0MWE1EGLM002KE7Z AC1).
     existing_item = _find_existing_worklog_item(smell, repo_root)
     if existing_item is not None:
+        new_lines = set(_affected_lines(smell))
+        tracked_lines = _existing_affected_lines(existing_item)
+        if new_lines and not new_lines.issubset(tracked_lines):
+            _append_repeat_comment(existing_item, smell, repo_root)
+            return existing_item.get("id")
         LOG.info(
-            "Skipping creation for %s in %s: existing worklog item %s found",
+            "Skipping creation for %s in %s: existing worklog item %s found "
+            "(identical line set)",
             smell_type,
             file_path,
             existing_item.get("id", "<unknown>"),
