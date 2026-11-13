@@ -1762,13 +1762,29 @@ be another item's published commit), pushed a no-op and wrote
 `git_commit` now returns a structured `CommitOutcome`
 (`success`/`committed`/`hash`/`reason`); `bool(outcome)` keeps the historical
 success/failure contract, so a caller that only tests truthiness is unchanged.
-`phase_finish` branches on `committed`:
+`phase_finish` branches on `committed` **and** on whether an existing commit is
+attributable to the item (SA-0MW98UNVB0085LFA AC1):
 
-| Commit outcome | Signal present? | Behaviour |
+| Commit outcome | Signal / attribution | Behaviour |
 |---|---|---|
 | a commit was created | — | Fast-forward, push, ancestry assertions, terminal write (unchanged) |
+| clean tree, no new commit, an **attributable commit ahead of `origin/<parent_branch>`** | — | **Prior-run attribution**: the existing commit is named in the report, the completion comment and the retained-state interruption record, then fast-forwarded, pushed and finalised exactly like a fresh commit |
 | clean tree, no commit | `--verification-only` **or** `verification_only` in the state file | Verification-only finalisation: no-op push, terminal write; report and completion comment say “no changes / no commit” and never name a hash |
-| clean tree, no commit | neither | **Refused**: `success: false`, `steps.commit.reason = "no_commit_no_signal"`, no push, no terminal write, no completion comment; the item is released to `open` and the retained worktree is named with the exact opt-in |
+| clean tree, no commit, no attributable commit | neither | **Refused**: `success: false`, `steps.commit.reason = "no_commit_no_signal"`, no push, no terminal write, no completion comment; the item is released to `open` and the retained worktree is named with the exact opt-in |
+
+**Interrupted-push re-run (SA-0MW98UNVB0085LFA).** A finish interrupted during
+its push leaves a clean worktree whose commit already exists on the branch and
+on local `dev` but not on `origin/dev`. Re-running `finish` creates no new
+commit, so — instead of refusing — it attributes the **prior run's commit**:
+the newest commit ahead of `origin/<parent_branch>` whose message references
+the work-item id (`_commit_attribution`). The base is `origin/<parent_branch>`,
+not local `dev`, because after an interrupted push the commit is already on
+local `dev` and a local base would report “0 ahead”. Attribution stays strict:
+a commit that does not mention the item is never claimed, so ambient HEAD from
+another item is not attributed and a genuinely work-less worktree is still
+refused (`no_commit_no_signal`). The refusal wording states that no commit is
+attributable to the item — it never falsely claims “nothing was committed or
+pushed”.
 
 `start <id> --verification-only` records the flag in
 `.implement_state.json` (the single source of truth `drive` also reads);

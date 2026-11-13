@@ -60,6 +60,7 @@ if str(REPO_ROOT) in sys.path:
 sys.path.insert(0, str(REPO_ROOT))
 
 from skill.implement.scripts import implement
+from skill.shared import git_sandbox as gs
 
 #: The synthetic work item every test drives.
 _ITEM_ID = "SA-INTERRUPT1"
@@ -684,3 +685,325 @@ def test_rerun_after_a_push_only_interruption_converges(tmp_path):
     assert len(
         _with_prefix(harness.comments, implement.INTERRUPTION_COMMENT_MARKER)
     ) == 1
+
+
+# ---------------------------------------------------------------------------
+# AC1/AC3/AC4 — an interrupted-push re-run attributes the prior-run commit,
+# driven through the REAL ``git_commit`` boundary (not a truthy stub)
+# ---------------------------------------------------------------------------
+
+
+def _git(repo: Path, *args: str) -> str:
+    return gs.run_git(repo, args, check=True).stdout
+
+
+def _sandbox_with_unpushed_item_commit(tmp_path: Path) -> tuple[Path, Path, str]:
+    """Build the interrupted-push state: clean worktree, commit ahead of origin.
+
+    Models the live 2026-11-09 incident (SA-0MW74IKJE008JXDQ): the item commit
+    lives on the worktree branch **and** on local ``dev`` but was never pushed
+    to ``origin/dev``. The worktree is therefore clean, and a re-run of
+    ``finish`` creates no new commit — it must attribute the prior-run commit
+    instead of refusing (AC1/AC4 i).
+
+    Returns:
+        ``(main_checkout, worktree, short_commit_hash)``.
+    """
+    origin = gs.init_bare_remote(tmp_path / "origin.git")
+    main = gs.init_repo(tmp_path / "main")
+    (main / "README.md").write_text("base\n", encoding="utf-8")
+    (main / ".gitignore").write_text(".implement_state.json\n", encoding="utf-8")
+    gs.commit_all(main, "base")
+    gs.add_remote(main, "origin", str(origin))
+    gs.run_git(main, ["push", "-q", "origin", "dev"], check=True)
+
+    # The prior run's commit: on local dev, never on origin/dev (the push was
+    # interrupted). The message references the item id, so it is attributable.
+    (main / "feature.txt").write_text("work\n", encoding="utf-8")
+    full = gs.commit_all(main, f"{_ITEM_ID}: Implementation complete")
+
+    # The worktree forks from dev (HEAD == the item commit) and is clean.
+    worktree = gs.add_worktree(
+        main, tmp_path / "wt" / "wl-item", f"wl-{_ITEM_ID}-recovery", base="dev"
+    )
+    short = _git(main, "rev-parse", "--short", full).strip()
+    return main, worktree, short
+
+
+@contextlib.contextmanager
+def _real_git_finish_harness(worktree: Path, main: Path):
+    """Drive ``phase_finish`` over real git with ``git_commit`` unstubbed.
+
+    Unlike :func:`_finish_harness`, ``git_commit``, ``git_get_commit_hash`` and
+    the attribution helper run for real against the fixture repository, so the
+    interrupted-push re-run genuinely crosses the commit boundary (AC4 iii) and
+    a truthy stub can no longer mask it. Only the expensive, network and
+    lifecycle boundaries are patched.
+    """
+    state = implement.ImplementState(
+        work_item_id=_ITEM_ID,
+        worktree_path=str(worktree),
+        repo_root=str(main),
+        parent_branch="dev",
+    )
+    # A modelled store: the lifecycle helper reflects the item's live state, so
+    # its exception-path restore is honest (restoring a genuinely non-terminal
+    # item) and the success-path read-back sees the terminal transition.
+    item: dict = {
+        "status": "in-progress",
+        "stage": "plan_complete",
+        "assignee": "implement",
+    }
+    comments: list[dict] = []
+    progress: list[dict] = []
+    updates: list[tuple[tuple, dict]] = []
+
+    def _update_status(work_item_id, *args, **kwargs):
+        updates.append((args, kwargs))
+        status = args[0] if args else kwargs.get("status")
+        if status is not None:
+            item["status"] = str(status)
+        stage = kwargs.get("stage")
+        if stage is not None:
+            item["stage"] = str(stage)
+        if kwargs.get("assignee") is not None:
+            item["assignee"] = str(kwargs["assignee"])
+        return {"success": True}
+
+    def _add_comment(work_item_id, body):
+        comments.append({"comment": str(body), "author": "implement"})
+        return True
+
+    def _show(work_item_id, **kwargs):
+        return {
+            "workItem": dict(item),
+            "comments": [dict(entry) for entry in comments],
+        }
+
+    push = MagicMock(return_value=True)
+    real_set_progress = implement._set_finish_progress
+
+    def _capture_progress(**fields):
+        progress.append(dict(fields))
+        real_set_progress(**fields)
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                implement, "_discover_worktree", return_value=str(worktree)
+            )
+        )
+        stack.enter_context(patch.object(implement, "read_state", return_value=state))
+        stack.enter_context(
+            patch.object(implement, "_worktree_placement_violation", return_value=None)
+        )
+        stack.enter_context(
+            patch.object(implement, "run_build", return_value=_build_result())
+        )
+        stack.enter_context(
+            patch.object(
+                implement,
+                "run_gate_suite",
+                return_value=(
+                    _tests_result(),
+                    {
+                        "tree": "abc1234",
+                        "scope": "changed",
+                        "cached": False,
+                        "index_unchanged": True,
+                    },
+                ),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                implement,
+                "stage_tested_tree",
+                return_value={
+                    "success": True,
+                    "tree": "abc1234",
+                    "expected": "abc1234",
+                },
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                implement,
+                "_fast_forward_local_dev_for_push",
+                return_value={"success": True, "own_churn": [], "method": "stub"},
+            )
+        )
+        stack.enter_context(patch.object(implement, "_assert_push_subject"))
+        stack.enter_context(patch.object(implement, "git_push_to_dev", push))
+        stack.enter_context(
+            patch.object(
+                implement,
+                "_assert_commit_on_origin_dev",
+                return_value={"verified": True},
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                implement,
+                "_resolve_post_push_verification",
+                return_value=_green_verification(),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                implement, "cleanup_worktree_processes", return_value=_cleanup_result()
+            )
+        )
+        stack.enter_context(patch.object(implement, "remove_state"))
+        stack.enter_context(
+            patch.object(implement, "_remove_worktree", return_value=True)
+        )
+        stack.enter_context(
+            patch.object(
+                implement,
+                "_sync_parent_branch",
+                return_value={"method": "skipped", "success": True},
+            )
+        )
+        stack.enter_context(
+            patch.object(implement, "wl_add_comment", side_effect=_add_comment)
+        )
+        stack.enter_context(patch.object(implement, "_surface_postfix_prose"))
+        stack.enter_context(
+            patch.object(
+                implement, "_set_finish_progress", side_effect=_capture_progress
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                implement.StatusLifecycle,
+                "update_status",
+                MagicMock(side_effect=_update_status),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                implement.StatusLifecycle, "show", MagicMock(side_effect=_show)
+            )
+        )
+        yield SimpleNamespace(
+            run=lambda: implement.phase_finish(
+                _ITEM_ID, json_output=True, no_refactor=True
+            ),
+            comments=comments,
+            progress=progress,
+            updates=updates,
+            push=push,
+        )
+
+
+def test_interrupted_push_rerun_attributes_the_prior_commit(
+    tmp_path, monkeypatch
+):
+    """AC1/AC4 i+iii: a clean re-run publishes and finalises the prior commit.
+
+    The worktree is clean and one commit ahead of ``origin/dev``; the real
+    ``git_commit`` therefore creates nothing (``CommitOutcome.committed`` is
+    False). ``finish`` must attribute that prior-run commit, name it in the
+    report, the completion comment, the retained-state record and the push,
+    and converge to ``completed`` / ``in_review``.
+    """
+    monkeypatch.delenv(implement.DRIVE_RECURSION_ENV, raising=False)
+    monkeypatch.delenv(implement.KEEP_WORKTREE_ENV, raising=False)
+
+    main, worktree, short = _sandbox_with_unpushed_item_commit(tmp_path)
+
+    # Pre-condition (guards against a vacuous test): clean tree, one commit
+    # ahead of origin/dev, absent from origin/dev, message references the item.
+    assert _git(worktree, "status", "--porcelain").strip() == ""
+    assert _git(worktree, "rev-list", "--count", "origin/dev..HEAD").strip() == "1"
+    assert short not in _git(worktree, "rev-parse", "origin/dev")
+
+    with _real_git_finish_harness(worktree, main) as harness:
+        report = harness.run()
+
+    assert report["success"] is True, report["message"]
+
+    commit_step = report["steps"]["commit"]
+    assert commit_step["created"] is False, "the re-run must not create a commit"
+    assert commit_step["attributed"] == "prior_run"
+    assert commit_step["hash"] == short
+    assert report["hash"] == short
+    assert short in report["message"]
+
+    # The push path published the attributed commit (AC1).
+    assert harness.push.call_args.args[2] == short
+
+    # The completion comment names the prior-run commit (AC1).
+    completion = _with_prefix(
+        harness.comments, implement.COMPLETION_COMMENT_MARKER
+    )
+    assert len(completion) == 1, completion
+    assert f"Commit: {short}" in completion[0]
+    assert "No changes" not in completion[0]
+
+    # The retained-state interruption record names it too (AC1).
+    assert any(entry.get("commit") == short for entry in harness.progress)
+
+    # It converged to the terminal state.
+    assert any(
+        kwargs.get("status") == "completed"
+        and kwargs.get("stage") == "in_review"
+        for _args, kwargs in harness.updates
+    )
+    assert report["steps"]["status_readback"]["success"] is True
+
+
+def test_rerun_with_no_attributable_commit_still_refuses(tmp_path, monkeypatch):
+    """AC2/AC4 ii: a genuinely work-less worktree is still refused.
+
+    A clean worktree whose only commit ahead of ``origin/dev`` does **not**
+    reference the item is the ambient-branch false positive. ``finish`` must
+    refuse with ``no_commit_no_signal``, push nothing, post no completion
+    comment and write no terminal transition — proving the attribution cannot
+    be widened into claiming another item's commit.
+    """
+    monkeypatch.delenv(implement.DRIVE_RECURSION_ENV, raising=False)
+    monkeypatch.delenv(implement.KEEP_WORKTREE_ENV, raising=False)
+
+    origin = gs.init_bare_remote(tmp_path / "origin.git")
+    main = gs.init_repo(tmp_path / "main")
+    (main / "README.md").write_text("base\n", encoding="utf-8")
+    (main / ".gitignore").write_text(".implement_state.json\n", encoding="utf-8")
+    gs.commit_all(main, "base")
+    gs.add_remote(main, "origin", str(origin))
+    gs.run_git(main, ["push", "-q", "origin", "dev"], check=True)
+
+    # A commit ahead of origin/dev that references a DIFFERENT work item.
+    (main / "foreign.txt").write_text("someone else's work\n", encoding="utf-8")
+    gs.commit_all(main, "SA-OTHER9999: implementation")
+    worktree = gs.add_worktree(
+        main, tmp_path / "wt" / "wl-item", f"wl-{_ITEM_ID}-recovery", base="dev"
+    )
+
+    with _real_git_finish_harness(worktree, main) as harness:
+        report = harness.run()
+
+    assert report["success"] is False, report
+    assert report["steps"]["commit"]["reason"] == "no_commit_no_signal"
+    assert report["steps"]["commit"]["hash"] == ""
+    # Nothing was published and no completion comment was posted.
+    harness.push.assert_not_called()
+    assert not _with_prefix(
+        harness.comments, implement.COMPLETION_COMMENT_MARKER
+    )
+    # No terminal transition; the item was released to open.
+    assert not any(
+        kwargs.get("status") == "completed" for _args, kwargs in harness.updates
+    )
+    # ``_update_status`` binds the id to its own parameter, so the remaining
+    # positional args start at index 0 (``("open",)`` for the reset).
+    assert any(args and args[0] == "open" for args, _kwargs in harness.updates)
+    refusal = [
+        body
+        for body in _comment_bodies(harness.comments)
+        if "no_commit_no_signal" in body
+    ]
+    assert refusal, harness.comments
+    # AC3: the wording no longer claims "nothing was committed or pushed".
+    assert "nothing was committed or pushed" not in refusal[0]

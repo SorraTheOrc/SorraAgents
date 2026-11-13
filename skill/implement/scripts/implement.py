@@ -2099,6 +2099,95 @@ CHILD_NO_WORK = "no-work"
 CHILD_CLEAN = "clean"
 
 
+@dataclass(frozen=True)
+class CommitAttribution:
+    """Attribution of a worktree's HEAD to a work item.
+
+    Shared by :func:`_classify_child_worktree` and ``phase_finish``'s
+    prior-run attribution (SA-0MW98UNVB0085LFA AC1).
+
+    Attributes:
+        comparable: False when *base_ref* cannot be compared (missing ref or
+            git error); callers choose their own fail-open/fail-closed policy.
+        ahead: True when HEAD carries commits past *base_ref*.
+        hash: Short hash of the newest commit ahead of *base_ref* whose message
+            references the item id (``""`` when none is attributable).
+    """
+
+    comparable: bool
+    ahead: bool
+    hash: str = ""
+
+
+def _commit_attribution(
+    worktree_path: str | Path,
+    item_id: str,
+    base_ref: str,
+) -> CommitAttribution:
+    """Find the newest commit ahead of *base_ref* attributable to *item_id*.
+
+    A commit is attributable only when it is ahead of *base_ref* **and** its
+    message references *item_id* — an ambient commit that does not mention the
+    item is never claimed (SA-0MVYYL7X9008MGA1 AC2).
+
+    The *base_ref* is the caller's choice because the two callers need
+    different bases (SA-0MW98UNVB0085LFA AC1): :func:`_classify_child_worktree`
+    compares against the local parent branch, while ``phase_finish`` compares
+    against ``origin/<parent_branch>`` — after an interrupted push the commit
+    is already on local ``dev``, so a local-dev base would report "0 ahead".
+
+    Args:
+        worktree_path: The worktree whose HEAD is inspected.
+        item_id: The work-item id a commit message must reference.
+        base_ref: The ref the worktree forked from (local branch or remote ref).
+
+    Returns:
+        :class:`CommitAttribution`.
+    """
+    wt = Path(worktree_path)
+    ahead = run_cmd(
+        ["git", "rev-list", "--count", f"{base_ref}..HEAD"],
+        cwd=str(wt),
+        check=False,
+        capture=True,
+    )
+    if ahead.returncode != 0:
+        # Cannot compare (missing ref, git error): the caller decides whether
+        # to fail open (never discard real work) or fail closed (never claim
+        # an unattributable commit).
+        return CommitAttribution(comparable=False, ahead=False)
+    try:
+        count = int(ahead.stdout.strip())
+    except ValueError:
+        # Unparseable output: conservatively assume commits are ahead.
+        count = 1
+    if count <= 0:
+        return CommitAttribution(comparable=True, ahead=False)
+
+    log = run_cmd(
+        [
+            "git",
+            "-C",
+            str(wt),
+            "log",
+            f"{base_ref}..HEAD",
+            "--grep",
+            item_id,
+            "-n",
+            "1",
+            "--format=%h",
+        ],
+        check=False,
+        timeout=30,
+    )
+    attributed = (
+        log.stdout.strip()
+        if log.returncode == 0 and log.stdout.strip()
+        else ""
+    )
+    return CommitAttribution(comparable=True, ahead=True, hash=attributed)
+
+
 def _classify_child_worktree(
     child_id: str,
     worktree_path: str,
@@ -2163,32 +2252,14 @@ def _classify_child_worktree(
 
     # Commits ahead of the parent branch: only ones referencing this item are
     # attributable work; the rest are the ambient-branch false positive.
-    ahead = run_cmd(
-        ["git", "rev-list", "--count", f"{parent_branch}..HEAD"],
-        cwd=str(wt),
-        check=False,
-        capture=True,
-    )
-    commits_ahead = False
-    if ahead.returncode == 0:
-        try:
-            commits_ahead = int(ahead.stdout.strip()) > 0
-        except ValueError:
-            commits_ahead = True  # unparseable; conservatively assume commits
-    else:
+    attribution = _commit_attribution(wt, child_id, parent_branch)
+    if not attribution.comparable:
         # Cannot compare (missing ref, git error): fail open so a real change
         # is never silently discarded.
         return CHILD_WORK
-
-    if commits_ahead:
-        ref_check = run_cmd(
-            ["git", "-C", str(wt), "log", f"{parent_branch}..HEAD",
-             "--grep", child_id, "-n", "1", "--format=%H"],
-            check=False,
-            timeout=30,
-        )
-        if ref_check.returncode == 0 and ref_check.stdout.strip():
-            return CHILD_WORK
+    commits_ahead = attribution.ahead
+    if attribution.hash:
+        return CHILD_WORK
 
     # Precedence (documented above): real work > verification-only >
     # no-work > clean. A verification-only child is a deliberate no-commit
@@ -11643,8 +11714,13 @@ def phase_finish(
     item (``open``, empty assignee) and records the retained state once per
     commit: the published (or local) commit, the branch, whether the worktree
     survives and the resume command. Re-running ``finish`` then converges to
-    ``completed`` / ``in_review`` through the ordinary no-diff/no-op-push
-    path, and the completion comment (Step 9) is deduplicated on the marker
+    ``completed`` / ``in_review``: because the worktree is clean and its
+    commit already exists, the re-run creates no new commit, so it
+    **attributes the prior run's commit** — a commit ahead of
+    ``origin/<parent_branch>`` whose message references the work-item id — and
+    proceeds through the ordinary fast-forward/push path
+    (SA-0MW98UNVB0085LFA AC1). A genuinely work-less worktree is still
+    refused. The completion comment (Step 9) is deduplicated on the marker
     plus commit hash — so a recovered interruption never leaves a duplicate
     completion comment or a second terminal transition in one run.
 
@@ -12257,6 +12333,23 @@ def phase_finish(
                 commit_created = True
                 created_hash = ""
 
+            # AC1 (SA-0MW98UNVB0085LFA): a finish interrupted during its push
+            # leaves a **clean** worktree whose commit already exists on the
+            # branch. Re-running finish therefore creates no new commit — but
+            # the commit is attributable to a **prior run of this worktree**
+            # and must be used, not refused as a no-op. The base is
+            # ``origin/<parent_branch>``: after an interrupted push the commit
+            # is already on local ``dev``, so a local-dev base would report
+            # "0 ahead" and re-refuse. Attribution stays strict — only a
+            # commit whose message references this item counts, so ambient
+            # HEAD from another item is never claimed (parent epic AC2).
+            attributed_prior_hash = ""
+            if not commit_created and not verification_only:
+                attribution = _commit_attribution(
+                    worktree_path, work_item_id, f"origin/{parent_branch}"
+                )
+                attributed_prior_hash = attribution.hash
+
             if commit_created:
                 commit_hash = created_hash or git_get_commit_hash(worktree_path)
                 report["steps"]["commit"] = {
@@ -12267,11 +12360,32 @@ def phase_finish(
                     "message": commit_msg,
                 }
                 LOG.info("Committed at %s", commit_hash)
+            elif attributed_prior_hash:
+                # The commit exists but this run did not create it: reuse it
+                # for the report, the fast-forward/push and the terminal path
+                # exactly as the ordinary commit path does (AC1).
+                commit_hash = attributed_prior_hash
+                report["steps"]["commit"] = {
+                    "success": True,
+                    "committed": True,
+                    "created": False,
+                    "hash": commit_hash,
+                    "message": commit_msg,
+                    "attributed": "prior_run",
+                }
+                LOG.info(
+                    "No new commit; attributing prior-run commit %s "
+                    "(ahead of origin/%s) to %s.",
+                    commit_hash,
+                    parent_branch,
+                    work_item_id,
+                )
             else:
-                # No commit was created. Never surface the ambient HEAD (which
-                # may be another item's published commit) as this item's
-                # commit (AC2): the hash stays empty and the machinery below
-                # uses the worktree HEAD only to fast-forward/push a no-op.
+                # No commit attributable to this item. Never surface the
+                # ambient HEAD (which may be another item's published commit)
+                # as this item's commit (AC2): the hash stays empty and the
+                # machinery below uses the worktree HEAD only to
+                # fast-forward/push a no-op.
                 commit_hash = git_get_commit_hash(worktree_path)
                 report["steps"]["commit"] = {
                     "success": verification_only,
@@ -12291,13 +12405,20 @@ def phase_finish(
                     # published and no completion comment is posted; the
                     # outer handler releases the item to open. The report
                     # names the retained worktree and the exact opt-in.
+                    # AC3 (SA-0MW98UNVB0085LFA): the wording states that no
+                    # commit is attributable to this item — never the false
+                    # "nothing was committed or pushed" (an unattributable
+                    # commit may exist here).
                     msg = (
-                        f"Finish refused: no commit was created for "
-                        f"{work_item_id} (the worktree has no change set), and "
-                        f"no --verification-only signal is present.\n"
+                        f"Finish refused: no commit attributable to "
+                        f"{work_item_id} exists (the worktree is clean and "
+                        f"HEAD carries no commit ahead of origin/"
+                        f"{parent_branch} whose message references this item), "
+                        f"and no --verification-only signal is present.\n"
                         f"- Worktree: {worktree_path} (retained, branch "
                         f"{branch})\n"
-                        f"- Commit: none — nothing was committed or pushed.\n"
+                        f"- Commit: none attributable to this item — nothing "
+                        f"was pushed by this run.\n"
                         f"- No terminal transition was written; the item stays "
                         f"in its prior state (released to open).\n"
                         f"If this item genuinely needs no code change (evidence "
@@ -12314,10 +12435,10 @@ def phase_finish(
                     wl_add_comment(
                         work_item_id,
                         "Finish refused (no_commit_no_signal): no commit "
-                        "was created for this item.\n"
+                        "attributable to this item exists.\n"
                         f"- Worktree: {worktree_path} (retained)\n"
-                        "- Commit: none — nothing was committed or "
-                        "pushed.\n"
+                        "- Commit: none attributable to this item — "
+                        "nothing was pushed by this run.\n"
                         "- No terminal transition was written; the item "
                         "is released to open.\n"
                         "If the item genuinely needs no code change, "
@@ -12331,18 +12452,25 @@ def phase_finish(
                     "proceeds without a commit (worktree %s).",
                     worktree_path,
                 )
+
+            # A commit attributable to this item exists when this run created
+            # one or when a prior run of the worktree did (interrupted-push
+            # recovery, AC1). Everything that names "the item's commit" keys
+            # off this, never off ``commit_created`` alone.
+            has_item_commit = commit_created or bool(attributed_prior_hash)
+
             # Interruption context (SA-0MVXUSJJY009HMQ0 AC2): a signal from
             # here on names the committed (and, after Step 6, published) work
             # in its retained-state record instead of releasing the item
-            # unexplained. On the no-commit path there is no item commit to
-            # name — ``commit`` stays empty so the record never misattributes
-            # the ambient HEAD. ``pushed`` is set once Step 6 confirms the
-            # push.
+            # unexplained. On a genuinely no-commit path there is no item
+            # commit to name — ``commit`` stays empty so the record never
+            # misattributes the ambient HEAD. ``pushed`` is set once Step 6
+            # confirms the push.
             _set_finish_progress(
                 work_item_id=work_item_id,
                 worktree_path=worktree_path,
                 branch=branch,
-                commit=commit_hash if commit_created else "",
+                commit=commit_hash if has_item_commit else "",
                 pushed=False,
             )
 
@@ -13154,7 +13282,7 @@ def phase_finish(
             # it after the terminal write would bump ``updatedAt`` on an
             # already audit-ready item (and race the dispatcher).
             verdict_lines = "\n".join(_verdict_provenance_lines(report))
-            if commit_created:
+            if has_item_commit:
                 commit_line = f"- Commit: {commit_hash}\n"
             else:
                 # AC2: never name the ambient HEAD as this item's commit. A
@@ -13211,21 +13339,21 @@ def phase_finish(
                 COMPLETION_COMMENT_MARKER,
                 (
                     f"Commit: {commit_hash}"
-                    if commit_created
+                    if has_item_commit
                     else "No changes: no commit was created"
                 ),
             )
             report["steps"]["completion_comment"] = {
                 "posted": not completion_already_recorded,
                 "deduplicated": completion_already_recorded,
-                "commit": commit_hash if commit_created else "",
+                "commit": commit_hash if has_item_commit else "",
             }
             if completion_already_recorded:
                 LOG.info(
                     "Completion comment for %s (%s) is already "
                     "recorded; skipping the duplicate on the re-run.",
                     work_item_id,
-                    f"commit {commit_hash}" if commit_created else "no commit",
+                    f"commit {commit_hash}" if has_item_commit else "no commit",
                 )
             else:
                 wl_add_comment(work_item_id, completion_comment)
@@ -13457,7 +13585,7 @@ def phase_finish(
     removal_step = report["steps"].get("worktree_removal") or {}
 
     report["success"] = True
-    if commit_created:
+    if has_item_commit:
         report["hash"] = commit_hash
         report["message"] = (
             f"Implementation complete. Commit {commit_hash} pushed to dev."
@@ -13478,7 +13606,7 @@ def phase_finish(
         print("=" * 60)
         print(f"  ✅ Implementation complete for {work_item_id}")
         print("=" * 60)
-        if commit_created:
+        if has_item_commit:
             print(f"  Commit: {commit_hash}")
         else:
             print("  No changes — no commit was created (verification-only).")

@@ -66,13 +66,23 @@ Deep detail:
 
 ## No-op finish: refusal by default, `--verification-only` opt-in
 
-`finish` refuses a worktree that produced no commit: no push, no terminal
-write, no completion comment, `success: false` with
-`steps.commit.reason = "no_commit_no_signal"`, item released to `open`. It
-never attributes the ambient `dev` HEAD as this item's commit.
+`finish` refuses a worktree that produced no commit **attributable to the
+item**: no push, no terminal write, no completion comment, `success: false`
+with `steps.commit.reason = "no_commit_no_signal"`, item released to `open`.
+It never attributes the ambient `dev` HEAD as this item's commit.
 
-- **Produce work (default).** A clean, commit-less worktree is unfinished work:
-  re-enter it, produce what the acceptance criteria require, re-run `finish`.
+- **Interrupted-push re-run (recovered).** A finish interrupted during its
+  push leaves a **clean** worktree whose commit already exists on the branch.
+  Re-running `finish` creates no new commit, so it **attributes the prior
+  run's commit** — a commit ahead of `origin/<parent_branch>` whose message
+  references the item id — and publishes/finalises it exactly like a fresh
+  commit (it is named in the report, the completion comment, the
+  retained-state interruption record and the push). A genuinely work-less
+  worktree (no attributable commit ahead of `origin/<parent_branch>`) is still
+  refused, so another item's ambient commit is never claimed.
+- **Produce work (default).** A clean, commit-less worktree with no
+  attributable prior-run commit is unfinished work: re-enter it, produce what
+  the acceptance criteria require, re-run `finish`.
 - **Verification-only (opt-in).** `start <id> --verification-only` records the
   signal in `.implement_state.json`; `finish <id> --verification-only` supplies
   it directly. Either pushes a no-op, writes the terminal status and reports
