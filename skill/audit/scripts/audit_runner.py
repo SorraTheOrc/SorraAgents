@@ -893,6 +893,19 @@ without an accepted waiver, so a fresh chore is created instead of reusing
 the stale one (SA-0MVZNECSD005XB42 AC1).
 """
 
+# Marker embedded in a CFP chore's description when the same (rule, path)
+# identity is already tracked by an open Refactor-family item
+# (SA-0MWE1EAR30045VHO AC2). The chore's producer-decision purpose is
+# preserved — it is never auto-suppressed or auto-closed — but the twin is
+# made visible and linked.
+REFACTOR_TWIN_MARKER = "Refactor-Twin:"
+
+# Local parser for the refactor identity marker carried by Refactor-family
+# items (mirrors the refactor-side ``Refactor-Finding-Key`` precedent).
+_REFACTOR_FINDING_KEY_RE = re.compile(
+    r"Refactor-Finding-Key:[ \t]*(\S+)", re.IGNORECASE
+)
+
 AUDIT_WAIVER_MARKER = "AUDIT-FP-WAIVER:"
 """Comment marker that records a producer-accepted false positive.
 
@@ -13589,6 +13602,129 @@ def _load_tracked_cfp_chores(runner: Runner,
     return tracked
 
 
+def _repo_relative_path(path: str,
+                        repo_root_fn: object = None) -> str:
+    """Normalise *path* to the repository-relative form used by refactor keys.
+
+    A CFP finding may carry an absolute path (ruff reports the filename as
+    passed) while Refactor-family identities are always repository-relative
+    (SA-0MW7Z11PV003V7O2). Both sides must be normalised before the
+    cross-family comparison. This reuses the refactor skill's shared
+    ``_repo_relative_path`` helper when importable (the same helper the
+    worktree-path recording bug specifies) and falls back to a lightweight
+    local normaliser (strip ``./``/trailing slash; make absolute paths
+    relative to the detected project root) so twin matching never depends on
+    a successful cross-skill import.
+
+    Args:
+        path: The path to normalise.
+        repo_root_fn: Optional injected normaliser (tests); defaults to the
+            refactor helper or the local fallback.
+
+    Returns:
+        A POSIX-normalised, repository-relative path (``""`` for empties).
+    """
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if repo_root_fn is not None:
+        normalised = str(repo_root_fn(text)).strip()
+        return normalised
+    try:
+        from refactor.workitem_creation import _repo_relative_path as _rel
+        return str(_rel(text)).strip()
+    except (ImportError, ModuleNotFoundError):
+        value = text.replace("\\", "/")
+        if os.path.isabs(value):
+            try:
+                value = os.path.relpath(value, str(TARGET_PROJECT_ROOT))
+            except (ValueError, OSError):
+                pass
+        while value.startswith("./"):
+            value = value[2:]
+        if value != "/" and value:
+            value = value.rstrip("/")
+        return value
+
+
+def _normalise_refactor_key(key: str, repo_root_fn: object = None) -> str:
+    """Normalise a ``Refactor-Finding-Key`` for cross-family comparison."""
+    text = str(key or "").strip()
+    if ":" in text:
+        code, path = text.split(":", 1)
+    else:
+        code, path = text, ""
+    return f"{code.strip()}:{_repo_relative_path(path, repo_root_fn)}"
+
+
+def _load_refactor_finding_items(runner: Runner,
+                                 worklog_dir: str | None) -> dict[str, str]:
+    """Live Refactor-family items, keyed by finding identity (one lookup).
+
+    The refactor producer stores ``Refactor-Finding-Key: <code>:<path>`` in
+    every item description (SA-0MWE1E4GQ004E1JG). Consulting that family
+    before minting a CFP chore stops the audit producer from creating a
+    blind twin of an already-tracked refactor smell (SA-0MWE1EAR30045VHO
+    AC2). One ``wl list "Refactor-Finding-Key:" --json`` call returns every
+    carrying item; each marker is parsed locally and keyed by its normalised
+    identity. Only non-terminal items count.
+
+    A failed lookup returns an empty mapping: failing safe means creating
+    the chore (the cross-reference is best-effort, never a suppression).
+    """
+    try:
+        data = _run_wl(
+            runner, ["wl", "list", "Refactor-Finding-Key:", "--json"],
+            worklog_dir=worklog_dir,
+        )
+    except RuntimeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    by_key: dict[str, str] = {}
+    for item in data.get("workItems") or []:
+        if not isinstance(item, dict):
+            continue
+        status = (item.get("status") or "").strip().lower()
+        if status in CFP_CHORE_KEY_TERMINAL_STATUSES:
+            continue
+        item_id = item.get("id")
+        if not item_id:
+            continue
+        haystack = f"{item.get('title', '')}\n{item.get('description', '')}"
+        for found in _REFACTOR_FINDING_KEY_RE.findall(haystack):
+            by_key.setdefault(_normalise_refactor_key(found), item_id)
+    return by_key
+
+
+def _refactor_twin_id(refactor_items: dict[str, str],
+                      finding: dict) -> str | None:
+    """The Refactor item id tracking *finding*'s identity, or ``None``.
+
+    The identity is ``<code>:<repo-relative path>`` — the line number is
+    deliberately excluded so line drift cannot break the cross-family match
+    (SA-0MWE1EAR30045VHO AC1/AC2).
+    """
+    code = str(finding.get("code") or "?").strip()
+    file = str(finding.get("file") or "").strip()
+    if not code or not file:
+        return None
+    return refactor_items.get(
+        _normalise_refactor_key(f"{code}:{file}")
+    )
+
+
+def _augment_chore_with_refactor_twin(description: str,
+                                      twin_id: str) -> str:
+    """Append the ``Refactor-Twin: <id>`` cross-reference to a chore description."""
+    text = str(description or "").rstrip()
+    if not text:
+        return f"{REFACTOR_TWIN_MARKER} {twin_id}"
+    if REFACTOR_TWIN_MARKER in text:
+        return text
+    return f"{text}\n\n{REFACTOR_TWIN_MARKER} {twin_id}"
+
+
 def _is_cfp_tracker_item(wi: dict | None) -> bool:
     """Whether *wi* is an audit-generated candidate-false-positive tracker.
 
@@ -14176,6 +14312,7 @@ def _run_remediation_loop(
     # (SA-0MVZNECSD005XB42 AC1/AC3).
     seen_chores: dict[str, str] = {}
     tracked_chores: dict[str, str] | None = None
+    refactor_items: dict[str, str] | None = None
     for e in results["fp_screen_results"]:
         finding = e.get("finding", {}) if isinstance(e, dict) else {}
         if not (
@@ -14203,15 +14340,30 @@ def _run_remediation_loop(
             continue
         code = finding.get("code", "?")
         file = finding.get("file", "?")
+        # Cross-family twin consultation (SA-0MWE1EAR30045VHO AC2): before
+        # minting a NEW chore, check once per run whether an open
+        # Refactor-family item already tracks the same (rule, repo-relative
+        # path) identity. On a match the chore is still created (it carries
+        # needsProducerReview by design and is never auto-suppressed), but
+        # its description embeds a visible ``Refactor-Twin: <id>``
+        # cross-reference instead of leaving a blind parallel item.
+        if refactor_items is None:
+            refactor_items = _load_refactor_finding_items(runner, worklog_dir)
+        twin_id = _refactor_twin_id(refactor_items, finding)
+        description = _chore_description_for_cfp_decision(
+            finding, e, key, issue_id,
+        )
+        if twin_id:
+            description = _augment_chore_with_refactor_twin(
+                description, twin_id
+            )
         chore_id = _create_chore_item(
             runner,
             title=(
                 f"ruff {code} in {file}:{finding.get('line', 0)}"
                 f" — {FP_CHORE_ANNOTATION}"
             ),
-            description=_chore_description_for_cfp_decision(
-                finding, e, key, issue_id,
-            ),
+            description=description,
             worklog_dir=worklog_dir,
         )
         if chore_id:

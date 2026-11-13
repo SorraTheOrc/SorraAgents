@@ -398,10 +398,16 @@ Render the canonical report ([../report/SKILL.md](../report/SKILL.md)) as the
 
 ```bash
 python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
-  --skill-name <skill_name> --headline "<1-3 sentence summary>" \
-  --ac "<AC# description>|<verification metric>|met" \
+  --skill-name implement \
+  --headline "<1-3 sentence summary>" \
+  --ac "Worktree created | implement.py start | met" \
+  --ac "Build and tests green | build/test output | met" \
+  --ac "Commit pushed to dev | git log | met" \
   [--producer-actions "<...>"] [--notes "<...>"] [--next-action <review|plan|implement|...>]
 ```
+
+> **Note:** `--ac` records this skill session's own success criteria, not the
+> work item's feature ACs (shown in Use Cases; SA-0MTQY7YM5009J6QR).
 
 Then paste it verbatim into your final response and close with
 `<work-item-id>: <one-line summary>`. End with `</end_session>` on its own line

@@ -255,6 +255,93 @@ existing config files need no change.
 | scene-gym divergence | Game scenes and Gym Scenes implementing different functionality — they must remain functionally equivalent; divergence indicates a bug in one or both implementations. Cross-references the [test-writing-guidelines.md](../shared/test-writing-guidelines.md) anti-patterns "Self-Referential Simulations" and "Duplicates of Existing Core Coverage" | Compare functionality between gym scene tests and their corresponding game scene tests (LLM review) | High |
 | inappropriate_intimacy | Classes that know too much about each other | LLM | Medium |
 
+## Finding identity and dedupe
+
+Every work item the refactor skill files for a detected smell carries a
+**machine-readable finding identity** so a later scan recognises the same
+smell instead of filing a clone.
+
+### Identity definition
+
+The identity of a finding is:
+
+```
+(<rule/smell code>, <repository-relative path>)
+```
+
+- The **rule/smell code** is the finding's `code` (e.g. `S112`, `F401`), or
+  its `smell_type` when no code is present.
+- The **path** is always repository-relative, normalised with the shared
+  `_repo_relative_path` helper. An absolute path, a `.worklog/worktrees/**`
+  prefix, and the line number are **never** part of the identity. The same
+  file scanned from an implement worktree and from the main checkout therefore
+  has one identity.
+- The identity is written as `<code>:<path>` and split on the **first** colon.
+  File paths containing a colon are out of scope (matching the audit-side
+  `CFP-Chore-Key` precedent).
+
+### Description markers
+
+Newly filed items embed the identity near the top of the description, so
+listing truncation cannot hide it:
+
+```
+Refactor-Finding-Key: <code>:<repository-relative path>
+Refactor-Fingerprint: <sha256>
+Refactor-Affected-Lines: <n>, <m>
+```
+
+- `Refactor-Finding-Key` is the exact identity the pre-creation guard matches.
+- `Refactor-Fingerprint` is the **sha256** of the target file's bytes, a NUL
+  separator, and the rule code. It changes when the file content or rule
+  changes and is stable otherwise; the path is not hashed, so worktree and
+  main-checkout scans agree. Re-verification (SA-0MW7Z1JCE009G6J3) consumes
+  this value to decide whether a finding still reproduces.
+- `Refactor-Affected-Lines` is the full, deduplicated, sorted list of observed
+  lines. It is preserved when duplicates are consolidated so line-level
+  reporting survives grouping.
+
+### Duplicate prevention
+
+Before creating an item the skill makes **one** lookup:
+
+```bash
+wl list "Refactor-Finding-Key:" --json
+```
+
+It parses every marker locally, ignores terminal (`completed`/`deleted`)
+items, normalises the paths, and compares the identity **exactly** — there is
+no substring matching anywhere. A re-found smell at a new line, from a
+different worktree, or with a truncated title still matches its existing item.
+
+When a batch run detects the same identity more than once, the findings are
+grouped into a **single** item whose `Refactor-Affected-Lines` marker is the
+union of every occurrence.
+
+### Cross-family twin suppression (audit false-positive chores)
+
+The audit skill creator files `ruff <RULE> in <path>:<line> — candidate
+false positive` chores for ruff diagnostics it deems false positives. The
+refactor producer consults that family too, so the two producers cannot mint
+blind twins for the same diagnostic (SA-0MWE1EAR30045VHO):
+
+```bash
+wl list "candidate false positive" --json
+```
+
+The guard parses each audit chore's title, ignores the trailing line number,
+normalises the path, and suppresses creation when the (rule, repository-
+relative path) identity matches an open chore. Terminal (`completed`/
+`deleted`) audit chores never suppress. The audit chore itself is **never**
+closed or mutated — it carries `needsProducerReview` by design; only the
+refactor creation is skipped.
+
+In the reverse direction the audit producer consults open `Refactor-Finding-
+Key` items (one lookup per run) before minting a chore and embeds a
+`Refactor-Twin: <refactor-item-id>` cross-reference in the chore description
+when the identity matches — the chore is still created (a producer decision
+is required), but the twin is visible and linked.
+
 ## REFACTOR Comments
 
 When a pre-existing smell is detected, a structured REFACTOR comment is injected:
@@ -289,14 +376,19 @@ Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../re
 
 ```bash
 python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
-  --skill-name <skill_name> \
+  --skill-name refactor \
   --headline "<1-3 sentence headline summary>" \
-  --ac "<AC# description>|<verification metric>|met" \
-  --ac "<...>|<...>|unmet" \
+  --ac "Code smells detected across changed scope | smell report | met" \
+  --ac "Refactoring plan drafted and reviewed | plan note | met" \
+  --ac "Changes applied and verified | diffs/tests | met" \
   [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```
+
+> **Note:** ACs record the *skill session's* own deliverables — not the work item's feature
+> acceptance criteria (surfaced in the Use Cases section). Passing feature ACs would render
+> the session as "Not ready to ship" even though it completed successfully.
 
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, so the operator sees the report itself (not just the

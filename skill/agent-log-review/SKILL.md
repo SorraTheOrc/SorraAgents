@@ -132,12 +132,17 @@ Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../re
 python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name agent-log-review \
   --headline "<1-3 sentence headline summary>" \
-  --ac "<AC# description>|<verification metric>|met" \
-  --ac "<...>|<...>|unmet" \
+  --ac "Recent session logs analysed | analysed logs | met" \
+  --ac "Agent-confusion patterns identified | findings list | met" \
+  --ac "Skill-improvement work items filed | wl create | met" \
   [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```
+
+> **Note:** ACs record the *skill session's* own deliverables — not the work item's feature
+> acceptance criteria (surfaced in the Use Cases section). Passing feature ACs would render
+> the session as "Not ready to ship" even though it completed successfully.
 
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, then close with: `<work-item-id>: <one-line summary>`. Do NOT re-summarize the report in a different format — the report is the summary.

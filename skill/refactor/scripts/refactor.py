@@ -80,7 +80,10 @@ from refactor.session_boundary import (
     get_untracked_files,
 )
 from refactor.smell_detection import detect_smells, load_rules
-from refactor.workitem_creation import create_smell_work_items
+from refactor.workitem_creation import (
+    build_finding_key,
+    create_smell_work_items_mapped,
+)
 
 LOG = logging.getLogger("refactor.scripts.refactor")
 
@@ -433,9 +436,16 @@ def remediate_pre_existing(
         )
         return result
 
-    # Create work items for pre-existing smells
-    created_ids = create_smell_work_items(smells)
-    result["work_items_created"] = created_ids
+    # Create work items for pre-existing smells. Same-identity findings are
+    # grouped into one item, so the identity→item mapping (not a positional
+    # index) is what lets each smell's REFACTOR comment link to its item
+    # (SA-0MWE1E4GQ004E1JG AC4).
+    created_map = create_smell_work_items_mapped(smells)
+    result["work_items_created"] = [
+        work_item_id
+        for work_item_id in created_map.values()
+        if work_item_id
+    ]
 
     # Inject REFACTOR comments for successfully created work items
     for smell in smells:
@@ -443,13 +453,7 @@ def remediate_pre_existing(
         if not file_path:
             continue
 
-        # Find the matching work item ID (by index)
-        smell_index = smells.index(smell)
-        smell_work_item_id = (
-            created_ids[smell_index]
-            if smell_index < len(created_ids)
-            else None
-        )
+        smell_work_item_id = created_map.get(build_finding_key(smell))
 
         if not smell_work_item_id:
             LOG.warning(
