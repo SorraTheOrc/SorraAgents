@@ -99,7 +99,7 @@ def test_template_has_valid_tmpfiles_lines() -> None:
 
     for lineno, line in enumerate(_template_lines(), start=1):
         fields = line.split()
-        rule_type, path = fields[0], fields[1]
+        rule_type, _ = fields[0], fields[1]
         assert TYPE_RE.match(rule_type), (
             f"{TEMPLATE.name}:{lineno}: unsupported type {rule_type!r}"
         )
