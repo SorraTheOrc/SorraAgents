@@ -2940,6 +2940,66 @@ def _snapshot_main_checkout(repo_root: str) -> dict[str, Any]:
     }
 
 
+def _main_checkout_pre_check(
+    repo_root: str,
+    description: str,
+    expected_dirty: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Read-only pre-claim foreign-mutation check of the main checkout.
+
+    Promotes the Key-Files-aware dirty-tree gate **ahead of the claim**
+    (AH-0MWFH7P4D0058L0A): ``phase_start`` snapshots the main checkout before
+    claiming the item and before creating any worktree, and refuses when the
+    checkout holds tracked-file changes that cannot be attributed to the
+    operator's own intended work.
+
+    The check is deliberately **read-only** (AC6): it takes a status snapshot
+    and classifies it — it never writes to the worklog, never stashes and
+    never mutates the checkout. A refused start therefore leaves the item
+    ``open`` with no claim and no assignee (AC3), unlike a post-claim abort
+    which has to reset the status.
+
+    A dirty file is foreign to the start when it is not under ``.worklog/``,
+    not a project-declared expected-dirty path, and either overlaps the work
+    item's Key Files or cannot be judged relevant because the description has
+    no Key Files section. Pre-existing operator changes that the Key Files
+    prove unrelated do not block the start (the parent constraint that the
+    gate must not break an operator's intended main-checkout changes).
+
+    Args:
+        repo_root: Absolute path to the main checkout to inspect.
+        description: The work item description (Key Files relevance source).
+        expected_dirty: Project-declared expected-dirty path prefixes.
+
+    Returns:
+        A verdict mapping with ``verdict`` (``"pass"``/``"fail"``),
+        ``snapshot`` (the :func:`_snapshot_main_checkout` taken_at and status
+        map), ``decision`` (the :func:`classify_dirty_tree_relevance` result),
+        ``offending`` (paths to name in a refusal) and ``reason``.
+    """
+    snapshot = _snapshot_main_checkout(repo_root)
+    status_output = git_status(cwd=repo_root)
+    decision = classify_dirty_tree_relevance(
+        status_output, description, expected_dirty=expected_dirty
+    )
+    if decision["can_proceed"]:
+        offending: list[str] = []
+    elif decision["key_files"]:
+        # A Key Files section exists: name only the overlapping files.
+        offending = list(decision["relevant_files"])
+    else:
+        # Relevance cannot be judged without Key Files: every dirty path is
+        # potentially foreign, so name them all.
+        offending = list(decision["dirty_files"])
+    return {
+        "verdict": "pass" if decision["can_proceed"] else "fail",
+        "snapshot": snapshot,
+        "decision": decision,
+        "offending": offending,
+        "reason": decision["reason"],
+    }
+
+
 def _main_checkout_guard_violations(
     baseline: dict[str, Any],
     current: dict[str, Any],
@@ -11218,6 +11278,114 @@ def _phase_start_locked(
         else:
             print(f"\n\u26d4 {msg}\n")
         return report
+
+    # ── Step 2.7: Main-checkout pre-check (before the claim) ─────────
+    # AH-0MWFH7P4D0058L0A: detect a foreign tracked-file mutation of the main
+    # checkout *before* the item is claimed. Two concurrent sessions on one
+    # repository can otherwise leave writes in the main checkout that only the
+    # finish gate notices — by which point an unrelated item's finish is
+    # blocked. Refusing here leaves the item open with no assignee and creates
+    # no worktree (AC1/AC2/AC3); the check is strictly read-only (AC6).
+    #
+    # This is an *addition* to the existing Key-Files-aware dirty-tree gate
+    # (Step 6.05, which still runs after the claim): a decisive foreign
+    # mutation short-circuits the start here, while a fetch/extension failure or
+    # unrelated dirt keeps the historical flow unchanged.
+    repo_root = _get_repo_root() or str(Path.cwd().resolve())
+    pre_item: dict[str, Any] | None = None
+    if _current_checkout_is_linked_worktree():
+        report["main_checkout_pre_check"] = {
+            "verdict": "skipped",
+            "reason": "inside a linked worktree",
+        }
+        report["dirty_worktree"] = False
+        report["dirty_worktree_left_behind"] = []
+    else:
+        LOG.info("Checking the main checkout before claiming %s...", work_item_id)
+        # Read-only fetch: when the item cannot be fetched, defer to the
+        # post-claim fetch below, which releases the claim it then holds.
+        pre_item = wl_show(work_item_id) or None
+        pre_expected_dirty: tuple[str, ...] = ()
+        extension_error = False
+        try:
+            pre_extension = load_implement_extension(repo_root)
+            pre_expected_dirty = _parse_expected_dirty(pre_extension)
+        except SkillExtensionError as exc:
+            # A malformed extension is handled (and the claim released) by the
+            # post-claim Step 4 load; do not pre-empt it here.
+            LOG.warning(
+                "Skipping pre-claim main-checkout check: %s", exc
+            )
+            extension_error = True
+
+        if pre_item is None or extension_error:
+            report["main_checkout_pre_check"] = {
+                "verdict": "skipped",
+                "reason": (
+                    "work item unavailable"
+                    if pre_item is None
+                    else "extension error"
+                ),
+            }
+        else:
+            pre_check = _main_checkout_pre_check(
+                repo_root,
+                pre_item.get("description", ""),
+                expected_dirty=pre_expected_dirty,
+            )
+            report["main_checkout_pre_check"] = {
+                "verdict": pre_check["verdict"],
+                "snapshot_taken_at": pre_check["snapshot"]["taken_at"],
+                "snapshot_status": pre_check["snapshot"]["status"],
+                "offending": pre_check["offending"],
+                "reason": pre_check["reason"],
+            }
+            if pre_check["verdict"] == "fail":
+                offending = pre_check["offending"]
+                listing = "\n".join(
+                    f"  - {path}" for path in offending[:20]
+                ) or "  (see git status below)"
+                status_output = git_status(cwd=repo_root)
+                msg = (
+                    f"Main-checkout mutation detected before the claim. "
+                    f"Uncommitted changes exist in the main checkout at "
+                    f"{repo_root} that are foreign to {work_item_id}: another "
+                    f"session may be writing there, or the changes overlap "
+                    f"this item's Key Files.\n"
+                    f"Do NOT stash, commit, or revert the user's uncommitted "
+                    f"changes.\n"
+                    f"STOP and ask the operator how to proceed (commit, stash, "
+                    f"revert, or abort) — never touch the user's working tree "
+                    f"without explicit permission.\n"
+                    f"Reason: {pre_check['reason']}.\n"
+                    f"Offending paths:\n{listing}\n"
+                    f"The work item was NOT claimed (status left open, no "
+                    f"assignee) and no worktree was created.\n"
+                    f"\nGit status:\n{status_output}"
+                )
+                LOG.warning("Main-checkout pre-check failed:\n%s", status_output)
+                if not json_output:
+                    print(
+                        "\n⚠  Main-checkout mutation detected before the claim"
+                    )
+                    print("=" * 60)
+                    print(status_output)
+                    print("=" * 60)
+                    print(
+                        "Ask the operator how to proceed — do not stash, "
+                        "commit, or revert user changes without permission.\n"
+                    )
+                report["success"] = False
+                report["message"] = msg
+                report["dirty_worktree"] = True
+                report["dirty_decision"] = pre_check["decision"]
+                if json_output:
+                    print(format_json_output(report))
+                return report
+            report["dirty_worktree"] = False
+            report["dirty_worktree_left_behind"] = list(
+                pre_check["decision"]["dirty_files"]
+            )
 
     # ── Step 3: Claim the work item via shared helper ─────────────
     # Status-only claim: the workflow stage must NOT be advanced here.

@@ -414,12 +414,52 @@ Only these main-checkout mutations are legitimate during a worktree-scoped run:
 | Project-declared expected-dirty paths | the project (`.pi/skills_extensions/implement/extension.json` → `ignoreDirtyPaths`) | Read-only background state the project explicitly declares |
 | Nothing else | — | Any other tracked-file deletion or modification is foreign |
 
+### Pre-claim main-checkout guard (`phase_start`)
+
+The finish-side guard above detects a foreign mutation only when a finish is
+already in flight. A concurrent session that writes into the main checkout
+while **another** item is starting used to stay invisible until the next
+finish — at which point an unrelated, otherwise-complete item was blocked
+(AH-0MWFH7P4D0058L0A, discovered from AH-0MWEWYZLQ0078G0D).
+
+`implement.py start` now takes a **read-only** snapshot of the main checkout
+**before claiming** the item (`_main_checkout_pre_check` →
+`_snapshot_main_checkout` + `classify_dirty_tree_relevance`). When the
+checkout holds a tracked-file change that is foreign to the item, the start
+refuses and names every offending path, before any claim or worktree write:
+
+- a dirty path that overlaps the item's `## Key Files` section, or
+- any tracked-file change when the description has no `## Key Files` section
+  (relevance cannot be judged, so the guard stays conservative).
+
+Project-declared expected-dirty paths
+(`.pi/skills_extensions/implement/extension.json` → `ignoreDirtyPaths`) and
+dirt the Key Files prove **unrelated** do not block the start: the existing
+operator-changes pass-through is preserved. The guard is strictly read-only
+(no worklog write, no stash, no checkout mutation), so a refused start leaves
+the item `open` with no assignee and creates no worktree — it never has to
+reset a claim. The snapshot and verdict are recorded in
+`report["main_checkout_pre_check"]`.
+
+Resuming from inside the item's own linked worktree keeps the historical skip:
+the main checkout is not the surface that session writes to.
+
+**Consequences of breaking the invariant.** A foreign write that survives to
+a finish blocks that item, and can block unrelated sibling items whose finish
+observes the same mutated checkout — the 2026-11 incident blocked the docs item
+AH-0MWEWYZLQ0078G0D until the main checkout was restored. Recovery is
+documented below ([Recovery: the main checkout was
+mutated](#recovery-the-main-checkout-was-mutated)): move the changes into the
+item's worktree, discard them, or ask the operator — never stash, commit or
+revert another session's work without explicit permission.
+
 ### Refused or aborted mutations
 
 | Defect class | Enforcement point | Evidence |
 |---|---|---|
 | A test run mutates the guarded checkout, or the main checkout of a worktree-scoped run | outer `guarded_run_all` guard and the inner `live_repo_guard` plugin (both snapshot **every reachable checkout**) | `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`), `skill/test/tests/test_guarded_run_all.py`, `tests/test_live_repo_mutation_guard.py` |
 | A foreign mutation of the main checkout is observed by `finish` (deletion **or** modification) | finish main-checkout guard (`_snapshot_main_checkout` → `_verify_main_checkout` on every pre-push abort path — `build_failure`, `gate_failure`, `user_abort` — at `pre_push` and at `pre_worktree_removal`; the refactor verify is advisory): aborts loudly, names every offending path, the concurrent-actor evidence and `git checkout -- <path>`; the item stays `open` | `skill/implement/tests/test_finish_main_checkout_guard.py` |
+| A foreign mutation of the main checkout exists **before** a start claims its item | pre-claim guard in `phase_start` (`_main_checkout_pre_check`): read-only snapshot + Key-Files-aware classification; refuses, names the offending paths, leaves the item `open` and unclaimed, creates no worktree | `skill/implement/tests/test_phase_start_main_checkout_guard.py` |
 | Two finishes operate on the same main checkout concurrently | per-checkout exclusive `flock` on `<main-checkout>/.worklog/locks/main-checkout.lock` (bounded wait, kernel-released, stale lock files never block): the second finish exits non-zero naming the holder, without touching the checkout or the work item | `skill/implement/tests/test_finish_main_checkout_lock.py` |
 | A concurrent finish's full-suite run serialises the others behind the lock | `finish` resolves the dev-push gate's tree-keyed verdict for the would-be-commit tree **before** taking the lock; the push serves it (`verdict=cached`) and the lock covers only commit → fast-forward → push → ancestry assertion (SA-0MWFJS3820032YB4) | `skill/implement/tests/test_finish_main_checkout_lock.py` |
 | A finish commit never reaches `origin/dev` (including the rebased replacement hash produced by non-fast-forward recovery) | post-push ancestry assertion (`git merge-base --is-ancestor <commit> refs/remotes/origin/dev`) fails closed: worktree + branch retained, item `open`, refusal comment posted | `tests/test_implement_finish_local_dev_verified_sync.py` |
