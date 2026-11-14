@@ -11796,8 +11796,12 @@ def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], s
                     ):
                         branch = branch or ref_name
                         _add_sha(obj_name)
-        except Exception:  # noqa: S110, BLE001 -- best-effort; never fail the gate on ref resolution
-            pass
+        except Exception as exc:  # noqa: BLE001 -- best-effort; never fail the gate on ref resolution
+            print(
+                f"Merge gate: ref resolution for {issue_id} failed — "
+                f"git for-each-ref error: {exc}",
+                file=sys.stderr,
+            )
 
     # 2. Commits referenced in the item's description + comments. The
     #    work item is already fetched (``_phase_fetch_and_cq`` runs the
