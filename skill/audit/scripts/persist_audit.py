@@ -22,7 +22,7 @@ the PERSIST path targets the work item's own worklog store regardless of
 the caller's cwd (e.g. the skill install directory).
 
 Returns non-zero on failure.
-"""  # noqa: EXE001
+"""
 from __future__ import annotations
 
 import argparse
