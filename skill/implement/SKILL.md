@@ -38,10 +38,8 @@ passes and the test gate is green. `implement.py finish` validates with
 **changed scope only**; the **full suite first runs at the dev-push
 integration gate** (`run_tests.py --scope full` in the pre-push hook), and the
 ship release gate re-runs it on the merged dev→main tree
-(SA-0MVECQUGF0064U81, SA-0MT6BYQHB008DOGC). `finish` resolves that gate's
-tree-keyed verdict for the would-be-commit tree **before** it takes the
-main-checkout lock, so the hook serves the verdict instead of executing the
-suite inside the exclusive window (SA-0MWFJS3820032YB4).
+(SA-0MVECQUGF0064U81, SA-0MT6BYQHB008DOGC). `finish` resolves that verdict
+before taking the main-checkout lock (SA-0MWFJS3820032YB4).
 
 Privacy note: avoid secrets/tokens/PII in comments or PR bodies; mask/redact
 sensitive values.
@@ -264,8 +262,7 @@ and the stale-shared-resolution fail-closed gate.
   `wl create "<title>" --deps discovered-from:<work-item-id> --json`.
 - Once all ACs are met: **build** (no errors), then validate via `/skill:test`
   ([test skill](../test/SKILL.md)). `implement.py finish` runs a **changed-scope**
-  validation; the **full suite** is the dev-push gate's, resolved by `finish`
-  before the lock and executed once (the push serves that verdict).
+  validation; the **full suite** is the dev-push gate's, resolved pre-lock.
   `run_tests.py` must go through the test-skill runner — only it records the
   per-repo cache the audit reads. Update docs (except `CHANGELOG.md`).
 
