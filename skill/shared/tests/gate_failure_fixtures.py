@@ -167,6 +167,308 @@ VITEST_BROWSER_FAILURE_COMMAND = (
 )
 
 
+#: Captured Vitest **frame-only** tail (RISE-0MW5JFQCU001YYQK, fed to the
+#: gate by RISE-0MW4XICXH006AEVS / SA-0MW0NL3EW0009R4G). This is the *exact*
+#: last-1200-character gate tail of the ``tce-the-rising`` unit run that
+#: ``implement.py::_tail_text`` kept (``GATE_OUTPUT_TAIL_CHARS``): the suite
+#: output's ``FAIL |unit| …`` header, ``AssertionError:`` line and ``|project|``
+#: pipes all fell outside the window, leaving only the tail of the
+#: ``+ Received:`` README string, the ``❯ <file>:<line>:<col>`` frame, its
+#: source-excerpt lines and the ``⎯⎯[1/1]⎯`` separator. The pre-parse vitest
+#: parser (MS-0MW3UR8SX009YZWS) needs a ``|project|`` pipe or a ``×`` tree
+#: marker, so this tail parsed to ``failures: []`` → gate ``reason: unparsed``
+#: — wrong for a genuine assertion failure in the docs test. Recorded from the
+#: runner's cached stderr
+#: (``tce-the-rising/.worklog/cache/b4dcb0f7cff13a55d1a059e47351e445/stderr.txt``)
+#: with the 1200-char ``_tail_text`` rule applied — every line is evidence.
+VITEST_FRAME_ONLY_OUTPUT = r"""ed a tie a player win. the report also carries its machine-readable twin (`rising-sweep-1000-progressivefaceoff-tie-neutral.json`). the candidate table (`w = 0…6`) is flat: player win rate 36.8–37.3% and the vp spread −3.44…−3.37, both inside the batch's ±1.5-point win-rate standard error, so no candidate is distinguishable and **`w = 3` is retained** rather than moved to chase noise. the material shift in this report is the rule change itself (a drawn duel now removes the player's card too, and 16.1% of resolved face-offs tie), which belongs to the balance pass (rise-0mvp9zbrv0054kc4), not to a weight tune in this item. reproduce it with: ```bash npx tsx scripts/rising-cadence-report.ts --seeds 1000 \\ --slot-zero-weights 0,1,2,3,4,5,6 \\ --write docs/balance/rising-sweep-1000-progressivefaceoff-tie-neutral.md ``` "
+
+ ❯ tests/the-rising/the-rising-docs.test.ts:2129:20
+    2127|     // explicitly labelled history rather than a description of today'…
+    2128|     expect(readme).toMatch(/rising-sweep-1000-progressivefaceoff-tie-n…
+    2129|     expect(readme).toMatch(/not the parity target/);
+       |                    ^
+    2130|   });
+    2131| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯"""
+
+# ---------------------------------------------------------------------------
+# Retry-runner verdict fixtures (CG-0MWEHG69O005VM17)
+#
+# The retry runner (``vitest-run-with-retry.ts``) emits a final machine-
+# readable ``[vitest-runner] attempts=N status=S outcome=O args="..."`` line
+# to stderr after every attempt sequence (outcomes: ``clean``, ``failed``,
+# ``retry-clean``, ``retry-failed``, ``accepted-transient``,
+# ``coverage-failed``, ``hang``). A stage the runner accepted (``status=0``
+# with ``retry-clean`` / ``accepted-transient``) is green regardless of what
+# the superseded attempt printed — so ``parse_failures`` must NOT harvest the
+# discarded attempt's FAIL block as a suite failure. The canonical evidence is
+# the captured ``npm --silent test`` full-suite entry at
+# ``Tableau-Card-Engine/.worklog/cache/ce0b22f933c88660bc44ee97bca48193/``
+# (unit ``outcome=clean`` line, browser FAIL block for
+# ``tests/core-engine/tf-runtime-integration.browser.test.ts``, ``[retry]``
+# banner, browser ``outcome=retry-clean``, exit 0).
+#: The **canonical retry-clean** combined output (derived from the captured
+#: cache entry): the unit stage ends with its own ``clean`` verdict line, the
+#: browser stage's first attempt FAILs with a module-fetch error (the retryable
+#: transient signature), the ``[retry]`` banner announces the retry, the second
+#: attempt is green, and the stage ends ``status=0 outcome=retry-clean``. Exit
+#: code 0. A release gate replaying this output MUST report the suite green
+#: with the browser file's failure visible only as a discarded diagnostic.
+VITEST_RETRY_CLEAN_OUTPUT = r"""[vitest-runner] attempts=1 status=0 outcome=clean args="--project unit" expected=241 ran=241
+
+✓ |unit| tests/unit/score.test.ts (3 tests) 412ms
+
+ Test Files  241 passed (241)
+      Tests  241 passed (241)
+   Start at  04:27:52
+   Duration  85.68s (transform 0ms, setup 0ms, import 5.96s, tests 71.78s, environment 0ms)
+
+⎯⎯⎯⎯⎯⎯ Failed Suites 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |browser (chromium)| tests/core-engine/tf-runtime-integration.browser.test.ts [ tests/core-engine/tf-runtime-integration.browser.test.ts ]
+Error: Failed to import test file /ws/tests/core-engine/tf-runtime-integration.browser.test.ts
+Caused by: TypeError: Failed to fetch dynamically imported module: http://localhost:63315/ws/tests/core-engine/tf-runtime-integration.browser.test.ts?import&browserv=1794544156019
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 43 passed (44)
+      Tests  288 passed (288)
+   Start at  04:27:52
+   Duration  85.68s (transform 0ms, setup 0ms, import 5.96s, tests 71.78s, environment 0ms)
+
+JSON report written to /tmp/vitest-executed-0.json
+
+[retry] Vitest transient failure (worker RPC timeout, browser connection drop, or module fetch failure) detected with no attributable test failure. Retrying once...
+
+
+ RUN  v4.1.11 /ws
+
+✓ |browser (chromium)| tests/core-engine/tf-runtime-integration.browser.test.ts (3 tests) 162ms
+✓ |browser (chromium)| tests/smoke.phaser4.browser.test.ts (2 tests) 1ms
+
+ Test Files  44 passed (44)
+      Tests  291 passed (291)
+   Start at  04:29:18
+   Duration  87.57s (transform 0ms, setup 0ms, import 6.33s, tests 72.83s, environment 0ms)
+
+JSON report written to /tmp/vitest-executed-1.json
+[vitest-runner] attempts=2 status=0 outcome=retry-clean args="--project browser" expected=44 ran=44
+"""
+
+#: The command of the captured retry-clean run. ``npm --silent test`` is the
+#: project's full-suite ``suiteCommands`` entry, so the fixture also exercises
+#: the TAP-fallback routing path in ``parse_failures`` (the command line alone
+#: does not identify vitest).
+VITEST_RETRY_CLEAN_COMMAND = "npm --silent test"
+
+#: The **retry-failed** variant: the browser stage's FIRST attempt FAILs with
+#: the same module-fetch signature, the retry re-runs, and the SECOND attempt
+#: fails the SAME test for real — the runner ends ``status=1
+#: outcome=retry-failed``. Every failure must be reported (the retry could not
+#: recover the stage): a green-verdict discard must never mask it.
+VITEST_RETRY_FAILED_OUTPUT = r"""[vitest-runner] attempts=1 status=0 outcome=clean args="--project unit" expected=241 ran=241
+
+✓ |unit| tests/unit/score.test.ts (3 tests) 412ms
+
+ Test Files  241 passed (241)
+      Tests  241 passed (241)
+   Start at  04:27:52
+   Duration  85.68s (transform 0ms, setup 0ms, import 5.96s, tests 71.78s, environment 0ms)
+
+⎯⎯⎯⎯⎯⎯ Failed Suites 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |browser (chromium)| tests/core-engine/tf-runtime-integration.browser.test.ts [ tests/core-engine/tf-runtime-integration.browser.test.ts ]
+Error: Failed to import test file /ws/tests/core-engine/tf-runtime-integration.browser.test.ts
+Caused by: TypeError: Failed to fetch dynamically imported module: http://localhost:63315/ws/tests/core-engine/tf-runtime-integration.browser.test.ts?import&browserv=1794544156019
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 43 passed (44)
+      Tests  288 passed (288)
+   Start at  04:27:52
+   Duration  85.68s (transform 0ms, setup 0ms, import 5.96s, tests 71.78s, environment 0ms)
+
+JSON report written to /tmp/vitest-executed-0.json
+
+[retry] Vitest transient failure (worker RPC timeout, browser connection drop, or module fetch failure) detected with no attributable test failure. Retrying once...
+
+
+ RUN  v4.1.11 /ws
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |browser (chromium)| tests/core-engine/tf-runtime-integration.browser.test.ts > tf-runtime integration > boots the runtime
+AssertionError: expected true to be false
+ ❯ tests/core-engine/tf-runtime-integration.browser.test.ts:2129:20
+    2128|   const runtime = await bootRuntime();
+    2129|   expect(runtime.isReady).toBe(false);
+       |                    ^
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 43 passed (44)
+      Tests  288 passed (288)
+   Start at  04:29:18
+   Duration  87.57s (transform 0ms, setup 0ms, import 6.33s, tests 72.83s, environment 0ms)
+
+JSON report written to /tmp/vitest-executed-1.json
+[vitest-runner] attempts=2 status=1 outcome=retry-failed args="--project browser" expected=44 ran=44
+"""
+
+#: **Mixed** output for the per-stage segmentation guard: the browser stage is
+#: retry-clean (its failure must be discarded) while the tutorial E2E tail
+#: (run by a DIFFERENT script — no runner banner) genuinely fails. The same
+#: ``npm --silent test`` output therefore has a green-verdict stage AND a real
+#: failure: only the tutorial failure may be reported as a suite failure.
+VITEST_RETRY_MIXED_OUTPUT = r"""[vitest-runner] attempts=1 status=0 outcome=clean args="--project unit" expected=241 ran=241
+
+✓ |unit| tests/unit/score.test.ts (3 tests) 412ms
+
+ Test Files  241 passed (241)
+      Tests  241 passed (241)
+   Start at  04:27:52
+   Duration  85.68s (transform 0ms, setup 0ms, import 5.96s, tests 71.78s, environment 0ms)
+
+⎯⎯⎯⎯⎯⎯ Failed Suites 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |browser (chromium)| tests/core-engine/tf-runtime-integration.browser.test.ts [ tests/core-engine/tf-runtime-integration.browser.test.ts ]
+Error: Failed to import test file /ws/tests/core-engine/tf-runtime-integration.browser.test.ts
+Caused by: TypeError: Failed to fetch dynamically imported module: http://localhost:63315/ws/tests/core-engine/tf-runtime-integration.browser.test.ts?import&browserv=1794544156019
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 43 passed (44)
+      Tests  288 passed (288)
+   Start at  04:27:52
+   Duration  85.68s (transform 0ms, setup 0ms, import 5.96s, tests 71.78s, environment 0ms)
+
+JSON report written to /tmp/vitest-executed-0.json
+
+[retry] Vitest transient failure (worker RPC timeout, browser connection drop, or module fetch failure) detected with no attributable test failure. Retrying once...
+
+
+ RUN  v4.1.11 /ws
+
+✓ |browser (chromium)| tests/core-engine/tf-runtime-integration.browser.test.ts (3 tests) 162ms
+✓ |browser (chromium)| tests/smoke.phaser4.browser.test.ts (2 tests) 1ms
+
+ Test Files  44 passed (44)
+      Tests  291 passed (291)
+   Start at  04:29:18
+   Duration  87.57s (transform 0ms, setup 0ms, import 6.33s, tests 72.83s, environment 0ms)
+
+JSON report written to /tmp/vitest-executed-1.json
+[vitest-runner] attempts=2 status=0 outcome=retry-clean args="--project browser" expected=44 ran=44
+
+=== Tutorial E2E Tests ===
+
+ FAIL  |browser (chromium)| tests/e2e/tutorial-1.browser.test.ts > main-street tutorial part 1 > step 3
+error: Timed out waiting for Turn Summary dialog after end-of-turn presentation after 40000ms (cap 16000ms)
+ ❯ tests/e2e/tutorial-1.browser.test.ts:657:4
+    655| })
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+ Test Files  1 failed (1)
+      Tests  1 failed (1)
+   Start at  04:31:02
+   Duration  221.06s (transform 0ms, setup 0ms, collect 2.46s, tests 208.77s)
+"""
+
+#: The **accepted-transient** variant: the browser stage's failures are ALL
+#: attributable to an acceptable transient signature (the runner's contract for
+#: ``accepted-transient`` — every error block matched), the retry re-ran green,
+#: and the stage ends ``status=0 outcome=accepted-transient`` (the token name
+#: corrected in CG-0MWEHG69O005VM17; the AC wording "transient-accepted"
+#: mirrors the runner's actual ``runSummary(..., 'accepted-transient', ...)``).
+VITEST_ACCEPTED_TRANSIENT_OUTPUT = r"""[vitest-runner] attempts=1 status=0 outcome=clean args="--project unit" expected=241 ran=241
+
+✓ |unit| tests/unit/score.test.ts (3 tests) 412ms
+
+ Test Files  241 passed (241)
+      Tests  241 passed (241)
+   Start at  04:27:52
+   Duration  85.68s (transform 0ms, setup 0ms, import 5.96s, tests 71.78s, environment 0ms)
+
+⎯⎯⎯⎯⎯⎯ Failed Suites 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  |browser (chromium)| tests/core-engine/tf-runtime-integration.browser.test.ts [ tests/core-engine/tf-runtime-integration.browser.test.ts ]
+Error: Failed to import test file /ws/tests/core-engine/tf-runtime-integration.browser.test.ts
+Caused by: TypeError: Failed to fetch dynamically imported module: http://localhost:63315/ws/tests/core-engine/tf-runtime-integration.browser.test.ts?import&browserv=1794544156019
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 43 passed (44)
+      Tests  288 passed (288)
+   Start at  04:27:52
+   Duration  85.68s (transform 0ms, setup 0ms, import 5.96s, tests 71.78s, environment 0ms)
+
+JSON report written to /tmp/vitest-executed-0.json
+
+[retry] Vitest transient failure (worker RPC timeout, browser connection drop, or module fetch failure) detected with no attributable test failure. Retrying once...
+
+
+ RUN  v4.1.11 /ws
+
+✓ |browser (chromium)| tests/core-engine/tf-runtime-integration.browser.test.ts (3 tests) 162ms
+✓ |browser (chromium)| tests/smoke.phaser4.browser.test.ts (2 tests) 1ms
+
+ Test Files  44 passed (44)
+      Tests  291 passed (291)
+   Start at  04:29:18
+   Duration  87.57s (transform 0ms, setup 0ms, import 6.33s, tests 72.83s, environment 0ms)
+
+JSON report written to /tmp/vitest-executed-1.json
+[vitest-runner] attempts=2 status=0 outcome=accepted-transient args="--project browser" expected=44 ran=44
+"""
+
+
+#: The command of the captured ``tce-the-rising`` unit run. ``npm --silent
+#: test`` is the project's unit ``suiteCommands`` entry (``.pi/test-config.json``
+#: → ``vitest run --project unit``), so the fixture also exercises the
+#: TAP-fallback routing path in ``parse_failures`` ("npm --silent test" is not
+#: itself a vitest command line).
+VITEST_FRAME_ONLY_COMMAND = "npm --silent test"
+
+#: Supplementary hand-built frame-only tail (SA-0MWDLPF320060T0H): the same
+#: shape as :data:`VITEST_FRAME_ONLY_OUTPUT` — a README-diff tail, the
+#: ``❯ <file>:<line>:<col>`` frame and its source excerpt, no ``FAIL`` header
+#: and no ``|project|`` pipes — used by the parser slice's own unit tests so
+#: the frame fallback is exercised on a minimal, readable fixture as well as
+#: on the captured tail.
+VITEST_FRAME_ONLY_TAIL = (
+    "  diff --git a/README.md b/README.md\n"
+    "  index 0f4a2c1..b7e3d5a 100644\n"
+    "  --- a/README.md\n"
+    "  +++ b/README.md\n"
+    "  @@ -2125,6 +2125,7 @@ rising-sweep-1000-progressivefaceoff-tie-n…\n"
+    "  -the README states the parity target at progressive-faceoff\n"
+    "  +README parity target updated to progressive-faceoff-tie\n"
+    "  …\n"
+    " ❯ tests/the-rising/the-rising-docs.test.ts:2129:20\n"
+    "    2128|     expect(readme).toMatch(/rising-sweep-1000-progressivefaceoff-tie-n…/)\n"
+    "    2129|     expect(readme).toMatch(/not the parity target/);\n"
+    "       |                    ^\n"
+)
+
+#: Control for the frame-only contract: a **frame-less, marker-less** non-zero
+#: vitest-adjacent output. It carries no ``FAIL |project|`` header, no
+#: ``|project|`` pipes, no ``×``/``✓`` tree markers and no
+#: ``❯ <path>:<line>:<col>`` frame — so it must keep today's
+#: ``unparsed_failure`` → gate ``unparsed`` classification after the frame
+#: parser lands (the frame regex must not over-match an arrow + prose).
+VITEST_FRAME_LESS_OUTPUT = (
+    "node:internal/modules/run_main:142\n"
+    "  (node:12345) UnhandledPromiseRejectionWarning: boom\n"
+    "Vitest caught 1 unhandled error during the test run.\n"
+    " ❯ the run ended with no test failure markers to attribute.\n"
+    "Tests failed with exit code 1.\n"
+)
+
+
 def completed(
     *, stdout: str = "", stderr: str = "", returncode: int = 0
 ) -> subprocess.CompletedProcess:
@@ -265,6 +567,35 @@ def vitest_browser_failure(
     hand-written approximation of the reporter.
     """
     return completed(stdout=output, returncode=exit_code)
+
+
+def vitest_frame_only_failure(
+    *, exit_code: int = 1, output: str = VITEST_FRAME_ONLY_OUTPUT
+) -> subprocess.CompletedProcess:
+    """The captured frame-only Vitest tail (RISE-0MW5JFQCU001YYQK).
+
+    A genuine *code* failure whose ``FAIL`` header was trimmed away by the
+    gate's 1200-character tail window: only the ``❯ <file>:<line>:<col>``
+    frame and its source excerpt survive. The runner must still parse one
+    structured record so the gate reports ``test_failure`` — never
+    ``unparsed`` — for a tail the operator actually sees.
+    """
+    return completed(stdout=output, returncode=exit_code)
+
+
+def vitest_frame_less_failure(
+    *, exit_code: int = 1, output: str = VITEST_FRAME_LESS_OUTPUT
+) -> subprocess.CompletedProcess:
+    """A non-zero Vitest run with no failure markers at all.
+
+    The frame parser's control: output with an arrow + prose but no
+    ``❯ <path>:<line>:<col>`` frame, no ``|project|`` pipes and no tree
+    markers must keep today's ``unparsed_failure`` → ``unparsed``
+    classification (SA-0MW0NL3EW0009R4G AC: no regression to the
+    infrastructure vocabulary).
+    """
+    return completed(stdout=output, returncode=exit_code)
+
 
 
 def timeout_expired(timeout: int = FIXTURE_TIMEOUT) -> subprocess.TimeoutExpired:

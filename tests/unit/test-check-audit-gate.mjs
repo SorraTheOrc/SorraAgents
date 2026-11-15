@@ -246,6 +246,83 @@ describe('isTimeoutOrTransientAudit', () => {
 });
 
 // ---------------------------------------------------------------------------
+// isTimeoutOrTransientAudit / getAuditStatus — reliability-summary counters
+// are not transient markers (SA-0MWDPX9HM005V0WX).
+// `AUDIT_RELIABILITY_SUMMARY … timeouts=0 …` is persisted on every completed
+// run; `timeouts=0` means zero timeouts, yet the zero-whitespace `\s*` in the
+// timeout pattern matched the literal `timeouts` and classified a genuine
+// `Ready to close: No` verdict as transient (non-blocking).
+// ---------------------------------------------------------------------------
+const RELIABILITY_SUMMARY_LINE = [
+  'AUDIT_RELIABILITY_SUMMARY',
+  'calls=2 parse_ok=2 parse_failed=0',
+  'timeouts=0 child_skips=0 provider_errors=0 concurrency_waits=0 verdict_reasks=0',
+  'child_screen_timeouts=0 parent_screen_timeouts=0',
+  'elapsed_seconds=1.23 run_id=deadbeef started_at=1700000000.000',
+].join(' ');
+
+describe('isTimeoutOrTransientAudit - reliability-summary counters are not transient', () => {
+  test('returns false when the only timeout-shaped text is the reliability-summary counters', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({
+        rawOutput: `Ready to close: No\n\n## Summary\n\n2 of 3 acceptance criteria not met.\n\n${RELIABILITY_SUMMARY_LINE}`,
+      }),
+      false,
+    );
+  });
+
+  test('returns false for a bare `timeouts=0` counter token', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({ rawOutput: 'timeouts=0' }),
+      false,
+    );
+  });
+
+  test('returns false for the screen-timeout counter tokens', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({
+        rawOutput: 'child_screen_timeouts=0 parent_screen_timeouts=0',
+      }),
+      false,
+    );
+  });
+
+  test('still returns true for a genuine timeout marker alongside the summary', async () => {
+    const mod = await import(MODULE_PATH);
+    assert.equal(
+      mod.isTimeoutOrTransientAudit({
+        rawOutput: `Ready to close: No\n\nDeep analysis timed out — manual review required.\n\n${RELIABILITY_SUMMARY_LINE}`,
+      }),
+      true,
+    );
+  });
+});
+
+describe('getAuditStatus - genuine No verdict carrying a reliability summary', () => {
+  test('classifies a genuine No verdict (only counters match) as blocking, not transient', async () => {
+    const mod = await import(MODULE_PATH);
+    const auditData = {
+      success: true,
+      workItemId: 'SA-RS-1',
+      audit: {
+        readyToClose: false,
+        rawOutput: `Ready to close: No\n\n## Summary\n\n2 of 3 acceptance criteria for work item SA-RS-1 are not met.\n\n${RELIABILITY_SUMMARY_LINE}`,
+      },
+    };
+    const result = mod.getAuditStatus(
+      { id: 'SA-RS-1', title: 'Genuinely Not Ready (with summary)' },
+      auditData,
+    );
+    assert.equal(result.isBlocking, true, 'a genuine No verdict must block');
+    assert.equal(result.transient, false, 'reliability-summary counters must not mark it transient');
+    assert.equal(result.reason, 'Audit verdict: not ready to close');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // getAuditStatus / isTimeoutOrTransientAudit — transient classification markers
 // (C1, WL-0MW32Y8E90092TIM: verdict-assembly / verdict-persistence failures
 // must be distinguishable from a genuine "not ready to close" verdict).
@@ -2116,7 +2193,7 @@ describe('attemptAuditRemediation - post-remediation content freshness (parent A
 
     assert.equal(result.status, 'blocking');
     assert.match(result.reason, /time-stale but content changed/);
-    assert.match(result.reason, /issue SA-PROBE-1 --force/);
+    assert.match(result.reason, /issue SA-PROBE-1 (?:--strict )?--force/);
   });
 });
 
@@ -2181,7 +2258,7 @@ describe('checkAuditReadyToClose - no contradictory block invariant (parent AC3)
           );
           assert.match(
             String(entry.reason),
-            /issue SA-PROBE-1 --force/,
+            /issue SA-PROBE-1 (?:--strict )?--force/,
             `${label}: the reason must carry the --force remedy`,
           );
         }
@@ -2259,7 +2336,7 @@ describe('checkAuditReadyToClose - passing+stale block reasons (parent AC3)', ()
     const entry = report.blockingItems[0];
     assert.doesNotMatch(String(entry.reason), /Ready to close/);
     assert.match(String(entry.reason), /time-stale but content changed/);
-    assert.match(String(entry.reason), /issue SA-PROBE-1 --force/);
+    assert.match(String(entry.reason), /issue SA-PROBE-1 (?:--strict )?--force/);
     assert.equal(entry.summary, null, 'a blocking entry must not report a passing verdict');
   });
 });

@@ -404,6 +404,11 @@ is preserved: a finished item is never left on a hold.
 until the terminal write):
 
 1. build → changed-scope test gate → commit → dev push (pre-existing)
+
+   The changed-scope gate's node/vitest selection order (group → convention
+   mapping → full fallback) and its real-gate proof are documented in
+   [node-vitest-selection-order.md](node-vitest-selection-order.md)
+   (SA-0MW0LNT970057DM9).
 2. local `dev` fast-forward and post-push ancestry assertion (pre-existing)
 3. **read-only post-push verification** — resolve the full-suite verdict for
    the pushed tree from the test cache; never executes a suite. `green` /
@@ -874,9 +879,10 @@ their meaning and types.
 sentinel is preserved: a failure (parsed report or not) still returns
 `None` from `_run_finish`. The classifier resolves the failing
 `(step, reason)` from the report's structured `steps` payload (precedence:
-`main_checkout_lock` → `main_checkout_guard` → `local_dev_fast_forward` →
-`push` → `build` → `build_churn` → `tests` → `ancestry_assertion` →
-`worktree_placement` → `diff`), never from `report["message"]` prose — every
+`full_suite_prelock` → `main_checkout_lock` → `main_checkout_guard` →
+`local_dev_fast_forward` → `push` → `build` → `build_churn` → `tests` →
+`ancestry_assertion` → `worktree_placement` → `diff`), never from
+`report["message"]` prose — every
 `finish` failure exit records a structured `steps` entry for this purpose.
 `kind` is one of `infrastructure`, `gate`, `unknown`:
 
@@ -890,6 +896,7 @@ sentinel is preserved: a failure (parsed report or not) still returns
 | `tests` + `tests_failed` | `gate` |
 | `build` + `build_failed` | `gate` |
 | `build_churn` + any reason | `gate` |
+| `full_suite_prelock` + any reason | `gate` |
 | `worktree_placement` + any reason | `gate` |
 | `diff` + `no_changes` | `gate` |
 | anything else | `unknown` (never `infrastructure`) |
@@ -1059,6 +1066,20 @@ codes:
 | `infrastructure` | any other notice, or a live-repo mutation | Unattributable to a test, but explained by a notice. | Read the notices; the repo may have been mutated by a concurrent session. |
 | `unknown` | — | Last resort: no structured failure, no notice and no executed command. | Re-run the suite with the test skill to obtain diagnostics. It is unreachable for a timed-out, killed or non-zero run. |
 
+**Vitest frame fallback (SA-0MWDLPC3F005S9S2).** `test_failure` also wins when
+the runner built **no** structured record but the gate's bounded output tail
+(stderr first, then stdout — each already bounded by `_tail_text` at
+`GATE_OUTPUT_TAIL_CHARS` = 1200 chars) carries a Vitest stack frame
+(`❯ [<fn>] <file>:<line>:<col>`, matched by
+`gate_reason.vitest_frame_location`): the 1200-char window can strip the `FAIL`
+header and the `AssertionError:` line (for example a long README diff in the
+assertion message), leaving the frame as the failure's only surviving signal —
+such a non-zero run is classified `test_failure`, never `unparsed`
+(RISE-0MW5JFQCU001YYQK). The fallback replaces **only** the `unparsed`
+outcome: `timeout`, `killed`, `slot_contention` and `infrastructure` (including
+a live-repo mutation) are decided first, so a frame that merely survived in the
+tail can never reclassify them.
+
 The deciding **fact fields** travel with the verdict — on `test_phase` in the
 finish report and in the operator message under `Gate facts:` — so nothing has
 to be re-derived from prose:
@@ -1147,6 +1168,38 @@ dev-push integration gate — the pre-push hook's `run_tests.py --scope full`
 and the ship release gate (SA-0MVECQUGF0064U81). The tree-binding contract
 applies to whichever scope the gate runs.
 
+**Repeat finish (no diff, already pushed) and the full-scope fallback
+(SA-0MW0V9PEP004EJYV).** Re-running `finish` on a clean, fully-committed
+worktree (the documented recovery path after a failed push) leaves the
+changed-scope selector with nothing to select: with no changed files, group
+selection and the changed-file → test-file selector both come back empty and
+`run_tests()` falls back to the **full** suite — still tree-bound, still run
+inside `would_be_commit_index()`. Three properties make that repeat finish
+converge instead of failing the gate:
+
+- **The full-scope fallback is served from the dev-push tree entry.** The
+  pre-push hook's `run_tests.py --scope full --gate-commit <sha>` records its
+  green verdict under `fingerprint_kind="tree"` keyed on the pushed commit's
+  tree (SA-0MW7C6AYO0062GJB). A repeat finish fingerprints the same tree — on
+  a clean worktree the would-be-commit tree *is* the pushed commit's tree — so
+  the full-scope fallback's cache lookup hits that entry (same command, same
+  tree namespace, within TTL) and the suite is **not** re-executed. No entry
+  (or an expired one) genuinely re-runs the full suite and still converges;
+  the reuse is an optimisation, never a prerequisite.
+- **No test may stage into the inherited index.** The suite runs under the
+  gate's exported `GIT_INDEX_FILE`, and a fixture that honours it would trip
+  `verify_unchanged()` → `gate evidence invalid` (the observed failure on a
+  fresh repeat run). The repo-root `conftest.py`'s autouse `IndexWatch` names
+  the offending test; the fixture rule is `shared.git_sandbox.run_git` /
+  `fixture_git_env` (see `docs/dev/test-isolation.md` §9.7).
+- **The terminal read-back proves convergence.** The no-op push (branch
+  already on `dev`) still runs the post-push verification and `finish`
+  persists `completed`/`in_review` exactly like the push-with-diff path — see
+  [Terminal-status read-back](#terminal-status-read-back-no-op-push-guarantee-osl-0mvme1pi5005wu58)
+  below. Regression coverage:
+  `skill/implement/tests/test_finish_repeat_no_diff_cache.py` (cache-hit
+  repeat finish, fresh-run repeat finish, index unchanged).
+
 #### Verdict provenance (SA-0MVQHVJEX0071R7G)
 
 Every finish-gate verdict is self-describing. Each entry of
@@ -1219,8 +1272,11 @@ semantics), so a red gate never leaves a stranded `in_progress` item.
 A clean change set costs exactly **one** suite execution per gate verdict:
 
 - `phase_finish` calls `run_gate_suite()` once, then `stage_tested_tree()`, then
-  commits. There is no second, duplicate run of the changed-scope suite, and no
-  full-suite run at finish (deferred to the dev-push gate).
+  commits. There is no second, duplicate run of the changed-scope suite. The
+  only **full**-scope run in `finish` is the dev-push gate's verdict, resolved
+  **once** before the main-checkout lock and bound to the would-be-commit tree
+  (SA-0MWFJS3820032YB4) — the push then serves it and does not execute it
+  again.
 - A **cache-served** verdict is served, not produced: the suite does not run a
   second time, and the attempt is recorded with `cached: true` plus the served
   entry's metadata so the reuse is visible rather than implicit.
@@ -1462,7 +1518,7 @@ Recovery from the manual-push comment:
 git push origin <branch>:refs/heads/dev
 ```
 
-### Push transport retry (SA-0MVSJX5HS002DJHI AC4)
+### Push transport retry (SA-0MVSJX5HS002DJHI AC4, SA-0MW22SEMV00230O5 AC1)
 
 A transient transport close — `Connection to <host> closed by remote host`,
 `Connection reset by peer`, `remote end hung up unexpectedly` or
@@ -1472,14 +1528,29 @@ retry. `git_push_to_dev()` now retries those stderr patterns up to
 with jittered exponential backoff (`PUSH_RETRY_BASE_SECONDS = 2.0`, doubling,
 capped at `PUSH_RETRY_CAP_SECONDS = 30.0`, +/-25% jitter).
 
+**AC1 — auth/transport is infrastructure, never a bare push failure.** The
+classifier (`classify_push_failure`) extends the retryable set to the
+concurrent-run failures observed under multiple agent sessions:
+`Permission denied (publickey)`, `Could not read from remote repository`,
+`Connection reset` / `Connection timed out`, and a remote `Internal Server
+Error`. All are treated as transient transport — a fresh key handshake per
+connection (no `SSH_AUTH_SOCK`), a connect timeout/reset or a GitHub-side 5xx
+— retried on the bounded budget with backoff, and reported on exhaustion as
+`reason: transport` (infrastructure, on the drive classifier's infra
+allow-list). Branch-policy rejections (`GH006`), hook declines and
+non-fast-forward errors are deliberately **not** in the retryable set: those
+are content conditions that retrying cannot fix (`classify_push_failure`
+returns `content`, a hard stop).
+
 - **Same cwd, same argv:** the retry re-runs the identical
   `git push origin <branch>:refs/heads/dev` from the same checkout, so the
   pre-push gate runs again against the same tree and serves its cached
-  full-suite entry. Nothing bypasses the gate.
-- **Everything else fails as before:** auth failures (`Permission denied`),
-  branch-policy refusals and a non-fast-forward rejection are never retried.
-  A non-fast-forward keeps its dedicated rebase-and-retry recovery, and a
-  push timeout raises `PushTimeoutError` immediately.
+  full-suite entry — N transport retries never mean N full suites (AC6).
+  Nothing bypasses the gate.
+- **Everything else fails as before:** branch-policy refusals and a
+  non-fast-forward rejection are never retried. A non-fast-forward keeps its
+  dedicated rebase-and-retry recovery, and a push timeout raises
+  `PushTimeoutError` immediately.
 - **Observable:** every attempt logs `attempt N/3`, the delay and the same cwd;
   the attempt bound and backoff are module constants, and the sleep is the
   `_push_retry_sleep()` seam used by the hermetic tests. The trail is also
@@ -1487,7 +1558,60 @@ capped at `PUSH_RETRY_CAP_SECONDS = 30.0`, +/-25% jitter).
   entries of `{attempt, delay_seconds, reason}`), which `phase_finish` exposes
   on `report["steps"]["push"]` for both a successful and a gate-refused push —
   so a `--json` finish report shows the attempt trail, not just a log line
-  (SA-0MVXEQEI500641SJ AC3).
+  (SA-0MVXEQEI500641SJ AC3). Auth/connect/5xx retries record `reason:
+  "transport"` in the trail; a connection close records `"transport_close"`.
+
+### Bounded leaf push loop, already-landed short-circuit and push outcomes
+(SA-0MW22SEMV00230O5 AC2/AC3/AC4/AC5/AC6/AC7)
+
+A plain leaf `finish` now absorbs the failures that used to strand items
+under concurrent runs (a driven child was already retried on the infra budget
+by `phase_drive`; the leaf was not):
+
+- **Non-fast-forward is rebase-and-retried within the bounded budget.**
+  `phase_finish` runs the push in a loop capped at `DEFAULT_INFRA_RETRY_LIMIT`
+  rounds; each round fetches `origin/dev`, rebases the feature branch onto
+  it and re-pushes from the worktree. A *second* concurrent advance (the
+  observed repeated-race case) is recovered instead of failing the item. A
+  rebase conflict is a genuine stop: `_recover_non_fast_forward_push` raises
+  with an actionable message and never forces or silently mutates the worktree.
+  Exhaustion records `reason: non_fast_forward` with `retries`/`budget` on the
+  push step and posts a comment with the manual recovery commands.
+- **Already-landed short-circuit (AC3/AC5).** Before the push, `finish` asks
+  `_commit_is_on_origin_dev` — a **remote-verified** ancestry query that
+  fetches `origin` first, never trusting a stale remote-tracking ref. When
+  the commit is already an ancestor of `origin/dev` the push is treated as
+  satisfied and **skipped** (`outcome: already_pushed`): re-running `finish`
+  over a commit that an earlier run published converges straight to
+  `in_review`, and a transport flake can never regress a landed item. The
+  remote-verified result is also used as Step 6a's ancestry assertion (the
+  fetch is not repeated).
+- **No open regression by a transport failure (AC5).** A transport/connection
+  failure re-checks remote ancestry before failing: if the commit landed
+  concurrently it converges (`outcome: already_pushed`), and the outer
+  failure handler reclassifies an already-landed commit as
+  `push_landed_but_unverified` — never the misleading "push it manually".
+- **Push outcomes (AC4).** Every `finish` push step and its work-item comment
+  name the outcome: `pushed` (this run landed it), `already_pushed` (it was
+  already on `origin/dev`), `push_failed` (nothing landed — the specific
+  `reason` names why: `transport`, `timeout`, `non_fast_forward`, a
+  `gate_reason=…` code, …), or `push_landed_but_unverified` (landed, but the
+  post-push full-suite verdict could not be proven from the read-only cache,
+  or the ancestry assertion failed).
+- **At most one full-suite gate per finish (AC6).** Transport/fast-forward
+  retries only re-run the **push**; the tree-keyed gate verdict is served from
+  the cache, and the changed-scope gate (Step 3) is never re-entered by the
+  retry loop.
+- **Load-flake gate failures are labelled, not misread as code failures
+  (AC7).** When a gate refusal's stderr names suite *load* errors (`Cannot
+  find package …`, `Cannot find module …`, `MODULE_NOT_FOUND` — a missing
+  shared build, an import failure), `phase_finish` retries the identical tree
+  exactly once. When the retry passes, `report[steps][push][load_flake]`
+  records `{failed_on_attempt, reason: "load_flake"}` and the log says
+  *suite failed to load on attempt N, passed unmodified on attempt N+1* — so
+  an environment flake under concurrent load reads as infrastructure, never
+  as a regression. A reproducible load failure (both attempts fail) still
+  blocks the push: the gate is never weakened.
 
 ### SSH keepalives and the transport-lost failure (SA-0MVWNHLQQ002TFZR)
 
@@ -1592,7 +1716,10 @@ paths — the push-with-diff path and the no-op-push path (a worktree branch
 with no diff from `origin/dev`, e.g. a verification-only item whose evidence
 is a worklog comment). The reproduction on OSL-0MVME1PI5005WU58 confirmed
 that no step discards or overwrites that write, so the guarantee is enforced
-rather than assumed.
+rather than assumed. A **repeat finish** (re-running `finish` on an
+already-pushed, clean worktree — the failed-push recovery path) converges
+through this same no-op-push read-back; see the full-scope-fallback note
+above]
 
 After the `with` block (Step 8b), `phase_finish` calls
 `_assert_terminal_status(work_item_id)`, which:
@@ -1640,13 +1767,29 @@ be another item's published commit), pushed a no-op and wrote
 `git_commit` now returns a structured `CommitOutcome`
 (`success`/`committed`/`hash`/`reason`); `bool(outcome)` keeps the historical
 success/failure contract, so a caller that only tests truthiness is unchanged.
-`phase_finish` branches on `committed`:
+`phase_finish` branches on `committed` **and** on whether an existing commit is
+attributable to the item (SA-0MW98UNVB0085LFA AC1):
 
-| Commit outcome | Signal present? | Behaviour |
+| Commit outcome | Signal / attribution | Behaviour |
 |---|---|---|
 | a commit was created | — | Fast-forward, push, ancestry assertions, terminal write (unchanged) |
+| clean tree, no new commit, an **attributable commit ahead of `origin/<parent_branch>`** | — | **Prior-run attribution**: the existing commit is named in the report, the completion comment and the retained-state interruption record, then fast-forwarded, pushed and finalised exactly like a fresh commit |
 | clean tree, no commit | `--verification-only` **or** `verification_only` in the state file | Verification-only finalisation: no-op push, terminal write; report and completion comment say “no changes / no commit” and never name a hash |
-| clean tree, no commit | neither | **Refused**: `success: false`, `steps.commit.reason = "no_commit_no_signal"`, no push, no terminal write, no completion comment; the item is released to `open` and the retained worktree is named with the exact opt-in |
+| clean tree, no commit, no attributable commit | neither | **Refused**: `success: false`, `steps.commit.reason = "no_commit_no_signal"`, no push, no terminal write, no completion comment; the item is released to `open` and the retained worktree is named with the exact opt-in |
+
+**Interrupted-push re-run (SA-0MW98UNVB0085LFA).** A finish interrupted during
+its push leaves a clean worktree whose commit already exists on the branch and
+on local `dev` but not on `origin/dev`. Re-running `finish` creates no new
+commit, so — instead of refusing — it attributes the **prior run's commit**:
+the newest commit ahead of `origin/<parent_branch>` whose message references
+the work-item id (`_commit_attribution`). The base is `origin/<parent_branch>`,
+not local `dev`, because after an interrupted push the commit is already on
+local `dev` and a local base would report “0 ahead”. Attribution stays strict:
+a commit that does not mention the item is never claimed, so ambient HEAD from
+another item is not attributed and a genuinely work-less worktree is still
+refused (`no_commit_no_signal`). The refusal wording states that no commit is
+attributable to the item — it never falsely claims “nothing was committed or
+pushed”.
 
 `start <id> --verification-only` records the flag in
 `.implement_state.json` (the single source of truth `drive` also reads);
@@ -2070,13 +2213,33 @@ Concurrency contract:
   The abort-path `_restore_repo_state` is deliberately unlocked: it runs in a
   process that may already hold the lock, and a dying process releases the
   lock itself.
-- **Per-checkout scope.** Finishes in different repositories on the same host
-  are unaffected (the lock file lives inside each checkout).
+- **The full-suite gate runs outside the lock (SA-0MWFJS3820032YB4).** The
+dev-push hook's full suite is the gate that protects `dev`, and executing it
+inside this critical section made every concurrent `finish` queue behind one
+~5-minute window. `finish` therefore resolves the gate's **tree-keyed**
+verdict for the would-be-commit tree *before* it takes the lock
+(`resolve_prelock_full_suite_verdict`, run against
+`run_tests(worktree, scope="full", fingerprint=<tree>)`); the push's
+`--gate-commit` run then serves that verdict (`verdict=cached`) instead of
+executing the suite. The lock covers only the mutations: commit →
+fast-forward → push → ancestry assertion. A **red** pre-lock verdict aborts
+before the lock — nothing is committed or pushed and the item is released to
+`open`. The guarantee is unchanged in both directions: the hook still binds
+its verdict to the pushed commit's tree (a different tree is a cache miss and
+the suite really runs), and a green pre-lock verdict is served *only* if the
+step-3d assertion proves the commit produces that same tree. Two escapes
+stand the pre-resolution down without weakening the gate: no would-be-commit
+tree to bind to (`not_a_git_worktree`) and the hook's own
+`TEST_SCOPE_SKIP=1`.
 - **Observability.** `report["steps"]["main_checkout_lock"]` records the lock
-  path, whether it was acquired, when, the configured bounded wait and the
+  path, whether it was acquired, when, the configured bounded wait, how long
+  the acquisition actually waited (`waited_seconds`) and the
   holder description when refused; `phase_start`'s
   `report["steps"]["sync_parent_branch"]` carries the same under `lock`.
-- **Hygiene reporting.** `scripts/hygiene_check.sh` reports a held lock
+  `report["steps"]["full_suite_prelock"]` records the pre-lock verdict: the
+  tree it is bound to (`fingerprint_kind="tree"`), `verdict`, whether it was
+  executed or served (`cached`), the tooling, `seconds` and `lock_held`
+  (always `false` — the suite never runs inside the lock). `scripts/hygiene_check.sh` reports a held lock
   (`check_main_checkout_lock`) and any **tracked-file deletions** in the main
   checkout (`check_tracked_deletions`) in both human and `--json` output,
   reusing its existing git-status dirty-checkout detection.
@@ -2254,7 +2417,8 @@ keys added for it are:
 | Report key | Meaning |
 |---|---|
 | `report["steps"]["main_checkout_guard"]` | The main checkout (`repo_root`), snapshot time and baseline size, one verify entry per stage reached (`refactor`, `build_failure`, `gate_failure`, `user_abort`, `pre_push`, `pre_worktree_removal`) with its time, verdict, offending paths and actor evidence, the own-fast-forward churn allow-list and the final verdict |
-| `report["steps"]["main_checkout_lock"]` | Lock path, whether it was acquired, when, and the holder description when the finish was refused |
+| `report["steps"]["main_checkout_lock"]` | Lock path, whether it was acquired, when, how long the acquisition waited (`waited_seconds`), and the holder description when the finish was refused |
+| `report["steps"]["full_suite_prelock"]` | The dev-push full-suite verdict resolved *before* the lock (SA-0MWFJS3820032YB4): the would-be-commit `tree` it is bound to, `verdict`, executed-vs-`cached`, `tooling`, `seconds`, and `lock_held` (always `false`) |
 | `report["steps"]["local_dev_fast_forward"]` | Whether the pre-push advance ran (`advanced`), why it refused (`reason`), the pre-advance and remote tips, and the `own_churn` allow-list |
 | `report["steps"]["local_dev_restore"]` | Whether a failed push restored local `dev` to `origin/dev`, and why not when it was skipped |
 | `report["steps"]["push"]` | The dev push outcome, plus `gate_evidence` (`root`, `head`, `pushed`, `full_suite` classification) when the push succeeded (SA-0MVTFMB7K002Y1F3) |
@@ -3004,13 +3168,18 @@ so an agent could not tell *fix the code* from *retry later*.
   (`report["steps"]["local_dev_fast_forward"]["retry"]`), so the main
   checkout's `dev` tracks the pushed commit. A second refusal is recorded and
   never fails the finish.
-- **Transient transport closes retry.** `Connection … closed by remote host`,
-  `Connection reset by peer`, `remote end hung up unexpectedly` and
-  `kex_exchange_identification` are retried up to 3 attempts with jittered
-  exponential backoff from the **same cwd**, so the gate re-runs and serves its
-  cached full-suite entry. Auth, branch-policy and non-fast-forward errors are
-  never retried (non-fast-forward keeps its dedicated rebase recovery), and a
-  timeout still raises `PushTimeoutError` immediately.
+- **Transient transport closes and auth/connect failures retry.**
+  `Connection … closed by remote host`, `Connection reset by peer`, `remote
+  end hung up unexpectedly` and `kex_exchange_identification` are retried up
+  to 3 attempts with jittered exponential backoff from the **same cwd**, so
+  the gate re-runs and serves its cached full-suite entry. AC1
+  (SA-0MW22SEMV00230O5) extends the retryable set to the concurrent-run
+  auth/transport signatures (`Permission denied (publickey)`, `Could not
+  read from remote repository`, connect timeouts/resets, a remote `Internal
+  Server Error`), reported on exhaustion as `reason: transport`
+  (infrastructure). Branch-policy and non-fast-forward errors are never
+  retried as transport (non-fast-forward keeps its dedicated rebase
+  recovery), and a timeout still raises `PushTimeoutError` immediately.
 - **SSH keepalives keep the idle gate connection alive** (SA-0MVWNHLQQ002TFZR).
   The pre-push full suite runs *after* git opens the SSH connection and
   produces no SSH traffic, so a remote that closes idle connections (GitHub)
@@ -3051,6 +3220,16 @@ act, and every reason never lands on `unknown` with an empty `failures` list.
 | `slot_contention` | No host test slot within the bounded wait (`slot_busy`). | Wait a staggered delay, or raise `TEST_LOCK_TIMEOUT`. The wait is reported separately from execution. |
 | `infrastructure` | Explained by a runner notice but not attributable to a test (includes a live-repo mutation). | Read the notices; the checkout may have been mutated by a concurrent session. |
 | `unknown` | Last resort: no structured failure, no notice and no executed command. | Re-run the suite with the test skill to obtain diagnostics. |
+
+A non-zero Vitest run whose failed-test output was trimmed by the gate's
+1200-character tail down to a bare `❯ <file>:<line>:<col>` frame (the `FAIL`
+header and `AssertionError:` line lost, e.g. to a long README diff in the
+assertion message) is still `test_failure`, never `unparsed`: the frame is the
+failure's surviving signal and is reported as the failing location
+(`gate_reason.vitest_frame_location`, SA-0MWDLPC3F005S9S2). The frame fallback
+replaces only the `unparsed` outcome — timeout, killed, slot-contention and
+infrastructure verdicts are decided first and are never reclassified by a
+surviving frame.
 
 The deciding **fact fields** accompany every classified failure:
 
@@ -3760,9 +3939,10 @@ Guards (deterministic, in `phase_parent`):
   blocker to continue the chain.
 - **Worktree placement guard** — a non-terminal child whose worktree holds no
   work (no dirty files, no commits ahead of the parent branch) while the main
-  checkout is dirty outside `.worklog/` has written to the main checkout; the
-  phase fails closed with the offending paths (and does not advance the
-  parent) instead of silently proceeding.
+  checkout is dirty outside `.worklog/` — **or a registered sibling worktree
+  of the same repository holds changes** (SA-0MW5FIJNQ002Z24I) — has written
+  outside its own worktree; the phase fails closed with the offending
+  surfaces (and does not advance the parent) instead of silently proceeding.
 - A parent with no children or all-terminal children behaves as today.
 
 Worktree isolation per child is preserved: every child is implemented in
@@ -4000,6 +4180,14 @@ runs reported success.
   `IMPLEMENT_START_LOCK_TIMEOUT` (default 30 s) and then **skips** the refresh
   fail-open (`reason: "lock_held"`) — a start is never blocked by a finish.
   An indefinite wait is rejected outright, so no code path blocks forever.
+- **The full suite runs before the lock.** The dev-push hook executes the
+  `--scope full` gate while the pusher holds this lock, so `finish` resolves
+  the gate's tree-keyed verdict for the would-be-commit tree *before*
+  acquiring it (`resolve_prelock_full_suite_verdict` → `run_tests(...
+  scope="full", fingerprint=<tree>)`, SA-0MWFJS3820032YB4): the push then
+  serves the cached verdict and the lock covers only commit → fast-forward →
+  push → ancestry assertion. A red verdict aborts before the lock; the hook's
+  own tree binding still decides what the pushed commit may be.
 - **Crash-safe.** Ownership is the kernel's `flock`, released when the holder
   dies — `SIGKILL`, an exception or a hard crash included. The metadata in the
   lock file is for the refusal message only and never decides ownership, so a
@@ -4038,12 +4226,46 @@ message, `report["steps"]["main_checkout_lock"]`, or
 (`ps -p <pid>`). A dead holder's lock file does not block you: re-run `finish`
 (or `start`) — there is nothing to clean up.
 
-**Ancestry assertion or non-fast-forward recovery refused.** The worktree and
-the feature branch are **retained**, the work item stays `open` (never
-`in_review`), and a comment records the commit, the target ref, the reason,
-the branch and the worktree path. The commit is complete and already
-published on its feature branch — only its arrival on `origin/dev` failed.
-Publish it, then re-run `finish`:
+**A transient transport/auth failure (SA-0MW22SEMV00230O5 AC1).** `finish`
+retries it automatically on a bounded budget with backoff and only refuses
+when the budget is spent — and even then it says so plainly: the push step
+reports `reason: transport` (infrastructure), never a bare "push failed" and
+never the misleading "commit is local and can be pushed manually" hint (an
+auth refusal means the connection never completed; nothing was rejected).
+Re-running `finish` retries the same way — no manual work needed.
+
+**A non-fast-forward rejection (AC2).** `finish` rebases onto `origin/dev`
+and re-attempts within the bounded budget; only a dev that *keeps* advancing
+past the budget refuses (the push step records `retries`/`budget`), and a
+rebase conflict stops with an actionable message. The recovery is otherwise
+manual only in the exhausted/conflicted case:
+
+```bash
+cd <retained worktree>
+git fetch origin dev
+git rebase origin/dev          # resolve conflicts if dev advanced
+git push origin HEAD:refs/heads/dev
+python3 $(skill_path implement)/scripts/implement.py finish <work-item-id>
+```
+
+**The commit already landed (`already_pushed`, AC3/AC5).** If the commit is
+remote-verified (fetch first — never a stale remote-tracking ref) to already
+be an ancestor of `origin/dev`, `finish` treats the push as satisfied, skips
+the re-push and proceeds straight to the terminal transition — so an item
+whose commit landed in an earlier run is completed by a plain re-run, and a
+transport failure can never take a landed item back to `open`. If the
+read-only full-suite cache cannot prove a green verdict for that already-landed
+tree, the run proceeds with a recorded notice (the dev-push gate ran when the
+commit landed; the audit re-verifies, F3); a *red* cached verdict still
+refuses (`push_landed_but_unverified`).
+
+**Ancestry assertion refused.** The worktree and the feature branch are
+**retained**, the work item stays `open` (never `in_review`), and a comment
+records the commit, the target ref, the reason, the branch and the worktree
+path. The commit is complete and already published on its feature branch —
+only its arrival on `origin/dev` failed (recorded `push_landed_but_unverified`
+when the push claimed success but ancestry could not be proven). Publish it,
+then re-run `finish`.
 
 ```bash
 cd <retained worktree>

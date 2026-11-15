@@ -163,6 +163,14 @@ class FakeGitBoundary:
                 stderr="",
             )
 
+        # -- git merge-base --is-ancestor: not an ancestor (a freshly-
+        # committed feature branch is not yet on origin/dev), so the pre-push
+        # already-landed check (SA-0MW22SEMV00230O5) proceeds to the push --
+        if cmd_name == "merge-base":
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="", stderr=""
+            )
+
         # -- git push: always succeeds (stubbed) --
         if cmd_name == "push":
             return subprocess.CompletedProcess(
@@ -372,6 +380,23 @@ def _mocked_phase_finish(
         )
         stack.enter_context(
             patch.object(implement, "git_push_to_dev", return_value=True)
+        )
+        # The post-push ancestry assertion (Step 6a) resolves against the
+        # stubbed main checkout; model a published commit so the terminal
+        # path is exercised (the assertion's own fail-closed behaviour has
+        # dedicated coverage in test_implement_finish_local_dev_verified_sync.py,
+        # SA-0MVPZG7A0000N66U).
+        stack.enter_context(
+            patch.object(
+                implement,
+                "_assert_commit_on_origin_dev",
+                return_value={
+                    "verified": True,
+                    "resolved_commit": _FAKE_COMMIT,
+                    "target": "refs/remotes/origin/dev",
+                    "target_tip": _FAKE_COMMIT,
+                },
+            )
         )
         # The dev push now runs from the worktree and its subject guard reads
         # the real git HEAD (SA-0MVUTXJ4300301ZN); this harness uses a

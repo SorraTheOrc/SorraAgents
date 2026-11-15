@@ -355,10 +355,21 @@ class TestMakeAutoplanDecisionIdempotence:
 
 
 class TestRunEffortAndRisk:
-    """Verify the effort-and-risk orchestrator invocation."""
+    """Verify the effort-and-risk orchestrator invocation.
 
-    @patch("subprocess.run")
-    def test_successful_invocation(self, mock_run):
+    Since SA-0MW0LPXXY0002CQ0 the wrapper derives its payload from the work
+    item's children (via ``_wl_show_with_children``) and returns ``None``
+    without invoking the orchestrator when no real effort inputs exist. The
+    tests therefore stub the child fetch rather than relying on the old
+    hard-coded zero payload.
+    """
+
+    _EPIC_SHOW = (
+        {"id": "SA-TEST", "stage": "plan_complete"},
+        [{"id": "C1", "title": "Child", "effort": "Small", "risk": "Low"}],
+    )
+
+    def test_successful_invocation(self):
         """Successful orchestrator run returns parsed JSON."""
         mock_proc = MagicMock()
         mock_proc.returncode = 0
@@ -367,71 +378,120 @@ class TestRunEffortAndRisk:
             "risk": {"level": "Low", "score": 2},
         })
         mock_proc.stderr = ""
-        mock_run.return_value = mock_proc
 
-        result = run_effort_and_risk("SA-TEST")
+        with (
+            patch(
+                "command.plan_helpers._wl_show_with_children",
+                return_value=self._EPIC_SHOW,
+            ),
+            patch("subprocess.run", return_value=mock_proc),
+        ):
+            result = run_effort_and_risk("SA-TEST")
+
         assert result is not None
         assert result["effort"]["tshirt"] == "Small"
         assert result["risk"]["level"] == "Low"
 
-    @patch("subprocess.run")
-    def test_failure_returns_none(self, mock_run):
+    def test_failure_returns_none(self):
         """Failed orchestrator run returns None."""
         mock_proc = MagicMock()
         mock_proc.returncode = 1
         mock_proc.stdout = ""
         mock_proc.stderr = "error"
-        mock_run.return_value = mock_proc
 
-        result = run_effort_and_risk("SA-TEST")
+        with (
+            patch(
+                "command.plan_helpers._wl_show_with_children",
+                return_value=self._EPIC_SHOW,
+            ),
+            patch("subprocess.run", return_value=mock_proc),
+        ):
+            result = run_effort_and_risk("SA-TEST")
+
         assert result is None
 
-    @patch("subprocess.run")
-    def test_invalid_json_returns_none(self, mock_run):
+    def test_invalid_json_returns_none(self):
         """Invalid JSON output returns None."""
         mock_proc = MagicMock()
         mock_proc.returncode = 0
         mock_proc.stdout = "not json"
         mock_proc.stderr = ""
-        mock_run.return_value = mock_proc
 
-        result = run_effort_and_risk("SA-TEST")
+        with (
+            patch(
+                "command.plan_helpers._wl_show_with_children",
+                return_value=self._EPIC_SHOW,
+            ),
+            patch("subprocess.run", return_value=mock_proc),
+        ):
+            result = run_effort_and_risk("SA-TEST")
+
         assert result is None
 
-    @patch("subprocess.run")
-    def test_error_key_in_result_returns_none(self, mock_run):
+    def test_error_key_in_result_returns_none(self):
         """Result with 'error' key returns None."""
         mock_proc = MagicMock()
         mock_proc.returncode = 0
         mock_proc.stdout = json.dumps({"error": "Something went wrong"})
         mock_proc.stderr = ""
-        mock_run.return_value = mock_proc
 
-        result = run_effort_and_risk("SA-TEST")
+        with (
+            patch(
+                "command.plan_helpers._wl_show_with_children",
+                return_value=self._EPIC_SHOW,
+            ),
+            patch("subprocess.run", return_value=mock_proc),
+        ):
+            result = run_effort_and_risk("SA-TEST")
+
         assert result is None
 
-    @patch("subprocess.run")
-    def test_invokes_orchestrate_script(self, mock_run):
-        """Verifies the correct orchestrate_estimate.py is invoked."""
+    def test_no_real_inputs_returns_none_without_orchestrator(self):
+        """No child effort labels -> unknown, orchestrator never invoked."""
+        with (
+            patch(
+                "command.plan_helpers._wl_show_with_children",
+                return_value=(
+                    {"id": "SA-TEST", "stage": "plan_complete"},
+                    [{"id": "C1", "title": "Child", "effort": "", "risk": ""}],
+                ),
+            ),
+            patch("subprocess.run") as mock_run,
+        ):
+            result = run_effort_and_risk("SA-TEST")
+
+        assert result is None
+        mock_run.assert_not_called()
+
+    def test_invokes_orchestrate_script(self):
+        """Verifies the correct orchestrate_estimate.py is invoked with child-derived inputs."""
         mock_proc = MagicMock()
         mock_proc.returncode = 0
         mock_proc.stdout = json.dumps({"effort": {"tshirt": "Small"}, "risk": {"level": "Low", "score": 0}})
         mock_proc.stderr = ""
-        mock_run.return_value = mock_proc
 
-        run_effort_and_risk("SA-TEST")
+        with (
+            patch(
+                "command.plan_helpers._wl_show_with_children",
+                return_value=self._EPIC_SHOW,
+            ),
+            patch("subprocess.run", return_value=mock_proc) as mock_run,
+        ):
+            run_effort_and_risk("SA-TEST")
 
         # Check that the correct script path and target_id were used
         call_args = mock_run.call_args[0][0]
         assert "python3" in call_args or "python" in call_args
         assert any("orchestrate_estimate.py" in arg for arg in call_args)
 
-        # Verify the input payload contains the target_id
+        # Verify the input payload contains the target_id and real inputs
         kwargs = mock_run.call_args[1]
         input_data = kwargs.get("input")
         assert input_data is not None
         payload = json.loads(input_data)
         assert payload["issue_id"] == "SA-TEST"
+        assert payload["items"], "expected child-derived WBS rows"
+        assert sum(row["m"] for row in payload["items"]) > 0
 
 
 # =========================================================================

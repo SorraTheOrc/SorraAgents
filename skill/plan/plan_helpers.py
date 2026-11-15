@@ -124,6 +124,43 @@ def normalise_effort_label(value: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Child-derived effort/risk inputs (SA-0MW0LPXXY0002CQ0)
+# ---------------------------------------------------------------------------
+
+# Representative hours per stored child effort label, used to derive an epic's
+# effort from its children. Values are midpoints of the effort-and-risk
+# t-shirt thresholds
+# (``skill/effort-and-risk/references/t-shirt_sizes.json``): XS 0-4,
+# S 4-24, M 24-80, L 80-240, XL 240+. XL is unbounded, so its lower bound is
+# used conservatively. These inputs are ONLY used when a child carries a
+# stored effort label; without one the estimate is treated as unknown rather
+# than a zero payload (the defect this module previously had).
+_EFFORT_LABEL_TO_HOURS: dict[str, float] = {
+    "Extra Small": 2.0,
+    "Small": 14.0,
+    "Medium": 52.0,
+    "Large": 160.0,
+    "Extra Large": 240.0,
+}
+
+# Conservative probability/impact pair per stored risk label, feeding the
+# orchestrator's risk aggregation from a work item's children (and itself).
+# The products land in the intended ``level_from_score`` bands:
+# Low <= 5, Medium <= 12, High <= 19, Critical > 19 (wl's ``Severe``).
+_RISK_LABEL_TO_PI: dict[str, tuple[float, float]] = {
+    "Low": (1.0, 1.0),
+    "Medium": (2.0, 3.0),
+    "High": (4.0, 4.0),
+    "Severe": (5.0, 4.0),
+}
+
+# Neutral (Medium) probability/impact used when no risk label is available.
+# Using Medium instead of Low prevents an unknown risk from being stamped as
+# a confident ``Low`` (the skip-threshold input).
+_DEFAULT_UNKNOWN_RISK_PI: tuple[float, float] = _RISK_LABEL_TO_PI["Medium"]
+
+
+# ---------------------------------------------------------------------------
 # Key Files validation helpers
 # ---------------------------------------------------------------------------
 
@@ -504,34 +541,149 @@ def is_effort_risk_computed(work_item: dict, comments: list[dict]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _flatten_children(children: list[dict] | None) -> list[dict]:
+    """Return every descendant child, depth-first (nested runs flattened)."""
+    out: list[dict] = []
+    for child in children or []:
+        if not isinstance(child, dict):
+            continue
+        out.append(child)
+        out.extend(_flatten_children(child.get("children")))
+    return out
+
+
+def _wl_show_with_children(
+    work_item_id: str,
+    runner: Callable[..., Any] | None = None,
+) -> tuple[dict, list[dict]]:
+    """Fetch a work item and its children via ``wl show <id> --children --json``.
+
+    Returns ``(work_item, children)``; both are empty when the fetch fails (an
+    unreadable item is treated as unknown, never as a zero estimate).
+    """
+    cmd = ["wl", "show", work_item_id, "--children", "--json"]
+    cmd[1:1] = resolve_worklog_flags(cmd)
+    proc = _execute_subprocess(cmd, runner=runner)
+    if proc.returncode != 0:
+        logger.warning(
+            "wl show --children failed target=%s stderr=%s",
+            work_item_id, proc.stderr,
+        )
+        return {}, []
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        logger.warning("wl show --children invalid JSON target=%s", work_item_id)
+        return {}, []
+    if not isinstance(data, dict) or data.get("success") is False:
+        logger.warning("wl show --children returned error target=%s", work_item_id)
+        return {}, []
+    work_item = data.get("workItem") or {}
+    children = _flatten_children(data.get("children"))
+    return work_item, children
+
+
+def derive_effort_risk_payload(
+    work_item: dict,
+    children: list[dict] | None,
+    target_id: str | None = None,
+) -> dict | None:
+    """Derive an effort-and-risk orchestrator payload from a work item + children.
+
+    Child work items that carry a stored ``effort`` t-shirt label contribute a
+    non-zero WBS row (hours derived from the effort-and-risk thresholds); child
+    and item ``risk`` labels contribute probability/impact pairs.
+
+    Returns ``None`` when there are **no real effort inputs** (no child carries
+    an effort label). Callers MUST treat ``None`` as *unknown* — fall back to
+    full planning and leave the work item's ``effort``/``risk`` untouched —
+    rather than posting the zeroed placeholder that made every autoplan run
+    report ``Extra Small``/``Low`` (SA-0MW0LPXXY0002CQ0).
+    """
+    flat_children = _flatten_children(children)
+    items: list[dict] = []
+    risk_children: list[dict] = []
+
+    for child in flat_children:
+        label = normalise_effort_label(child.get("effort"))
+        hours = _EFFORT_LABEL_TO_HOURS.get(label)
+        if hours is not None:
+            items.append({
+                "id": child.get("id", ""),
+                "title": child.get("title", ""),
+                "o": round(hours * 0.75, 2),
+                "m": round(hours, 2),
+                "p": round(hours * 1.5, 2),
+            })
+        risk_label = (child.get("risk") or "").strip()
+        pi = _RISK_LABEL_TO_PI.get(risk_label)
+        if pi is not None:
+            risk_children.append({
+                "id": child.get("id", ""),
+                "title": child.get("title", ""),
+                "probability": pi[0],
+                "impact": pi[1],
+            })
+
+    if not items:
+        return None
+
+    assumptions = ["Effort derived from the work item's child t-shirt estimates"]
+    item_risk_label = (work_item.get("risk") or "").strip()
+    parent_pi = _RISK_LABEL_TO_PI.get(item_risk_label)
+    if parent_pi is None:
+        parent_pi = _DEFAULT_UNKNOWN_RISK_PI
+        if not risk_children:
+            assumptions.append(
+                "Risk defaulted to Medium: no risk estimate on the item "
+                "or its children"
+            )
+
+    return {
+        "issue_id": target_id or work_item.get("id", ""),
+        "items": items,
+        "parent": {"probability": parent_pi[0], "impact": parent_pi[1]},
+        "children": risk_children,
+        "certainty": 100,
+        "assumptions": assumptions,
+        "unknowns": [],
+    }
+
+
 def run_effort_and_risk(
     target_id: str,
     runner: Callable[..., Any] | None = None,
 ) -> dict | None:
     """Run the effort-and-risk orchestration skill for a work item.
 
-    Invokes ``skill/effort-and-risk/scripts/orchestrate_estimate.py`` via
-    subprocess (or via the provided runner) and returns the parsed JSON
-    result.
+    The payload is **derived from the work item and its children** (see
+    ``derive_effort_risk_payload``); the historical hard-coded zero payload is
+    gone. When no real effort inputs exist, returns ``None`` without invoking
+    the orchestrator — no zeroed estimate is written and the caller falls back
+    to full planning (SA-0MW0LPXXY0002CQ0).
 
     When ``runner`` is provided, the payload is appended as a trailing CLI
     argument (the convention used by FakeRunner in tests). When
     ``runner`` is None, the payload is supplied via stdin (production use).
 
     Returns None on failure (non-zero exit, invalid JSON, or error key in
-    result).
+    result) or when no real inputs exist.
     """
     # Resolve repo root: this file is at skill/plan/plan_helpers.py,
     # so parents[0]=skill/plan/, parents[1]=skill/, parents[2]=repo root
     repo_root = Path(__file__).resolve().parents[2]
     orchestrate_script = repo_root / "skill" / "effort-and-risk" / "scripts" / "orchestrate_estimate.py"
-    payload = json.dumps({
-        "issue_id": target_id,
-        "o": 0, "m": 0, "p": 0,
-        "certainty": 100,
-        "assumptions": ["Auto-generated by autoplan decision"],
-        "unknowns": [],
-    })
+
+    work_item, children = _wl_show_with_children(target_id, runner=runner)
+    payload_dict = derive_effort_risk_payload(work_item, children, target_id=target_id)
+    if payload_dict is None:
+        logger.info(
+            "plan_helpers.effort_risk.no_inputs target=%s — unknown, skipping "
+            "orchestrator (full planning fallback)",
+            target_id,
+        )
+        return None
+    payload = json.dumps(payload_dict)
 
     cmd = ["python3", str(orchestrate_script)]
     logger.info("plan_helpers.effort_risk.start target=%s", target_id)
@@ -715,19 +867,29 @@ def make_autoplan_decision(
     er_result = run_effort_and_risk(target_id, runner=runner)
 
     if er_result is None:
-        logger.info("plan_helpers.effort_risk_failed_defaults_to_plan target=%s", target_id)
-        tshirt = "unknown"
-        risk_level = "unknown"
-        risk_score = 0
-    else:
-        tshirt = normalise_effort_label(er_result.get("effort", {}).get("tshirt", ""))
-        risk_level = er_result.get("risk", {}).get("level", "")
-        risk_score = er_result.get("risk", {}).get("score", 0)
-        do_plan = not (tshirt in effort_skip and risk_level in risk_skip)
+        # Unknown: no real estimator inputs (or the estimator failed). Never
+        # write effort/risk and never post a zeroed decision comment — that is
+        # exactly the behaviour that silently skipped planning for epics
+        # (SA-0MW0LPXXY0002CQ0). Fall back to full planning and leave the
+        # existing fields untouched; with no ``autoplan-decision-hash`` marker,
+        # a later run can still compute a genuine estimate.
+        existing_effort = normalise_effort_label(item.get("effort"))
+        existing_risk = (item.get("risk") or "").strip()
         logger.info(
-            "plan_helpers.autoplan.result target=%s tshirt=%s risk=%s do_plan=%s",
-            target_id, tshirt, risk_level, do_plan,
+            "plan_helpers.effort_risk_unknown_defaults_to_plan target=%s "
+            "effort=%r risk=%r",
+            target_id, existing_effort, existing_risk,
         )
+        return True, "plan_complete", {"effort": existing_effort, "risk": existing_risk}
+
+    tshirt = normalise_effort_label(er_result.get("effort", {}).get("tshirt", ""))
+    risk_level = er_result.get("risk", {}).get("level", "")
+    risk_score = er_result.get("risk", {}).get("score", 0)
+    do_plan = not (tshirt in effort_skip and risk_level in risk_skip)
+    logger.info(
+        "plan_helpers.autoplan.result target=%s tshirt=%s risk=%s do_plan=%s",
+        target_id, tshirt, risk_level, do_plan,
+    )
 
     effort_risk = {"effort": tshirt, "risk": risk_level}
 

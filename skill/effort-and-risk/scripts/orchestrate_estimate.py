@@ -323,7 +323,22 @@ def main():
             print(json.dumps({"error": "missing required field: issue_id"}))
             sys.exit(2)
 
-        # 3. Fetch the issue stage (exits with codes 3-5 on failure)
+        # 2b. Defence in depth (SA-0MW0LPXXY0002CQ0): an all-zero O/M/P payload
+        # has no real effort inputs. Refuse to aggregate it into a confident
+        # XS/Low estimate — report an explicit "unknown" error so callers fall
+        # back to full planning instead of silently skipping it. This also
+        # guarantees no ``wl update`` writes a zero-derived effort/risk.
+        if o == 0 and m == 0 and p == 0:
+            print(json.dumps({
+                "error": (
+                    "no effort inputs: o/m/p are all zero; refusing to derive "
+                    "a t-shirt size and risk level"
+                ),
+                "issue_id": issue_id,
+            }))
+            sys.exit(6)
+
+        # 3. Fetch the issue stage (exits with codes 3-6 on failure)
         with Timer("fetch_issue_stage"):
             input_stage = _fetch_issue_stage(issue_id)
 

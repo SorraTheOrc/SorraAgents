@@ -586,3 +586,72 @@ class TestCmdIssueAbortRecovery:
             )
         assert rc == 0
         assert not state_path.exists()
+
+
+class TestStaleArtifactsBeforeRun:
+    """AC2 (SA-0MW0LRHBD0081YRP): a stale abort-recovery state file or
+    debug JSONL left by a previous run cannot change a retry's verdict,
+    counters or lifecycle, and is cleaned up exactly as a fresh run does.
+    """
+
+    def test_stale_state_file_is_never_read_and_is_cleaned_up(
+            self, tmp_path, monkeypatch):
+        """A pre-existing state file is overwritten, never read, then removed.
+
+        The audit runner only writes/removes the state file; it never reads a
+        pre-existing one, so a stale file cannot short-circuit a retry.
+        """
+        monkeypatch.setenv(audit_runner._AUDIT_STATE_FILE_ENV, str(tmp_path))
+        state_path = _state_path(tmp_path)
+        state_path.write_text(json.dumps({
+            "issue_id": "TEST-1",
+            "original_status": "blocked",
+            "original_stage": "idea",
+        }))
+
+        updates: list = []
+        _run_issue(
+            updates,
+            "Ready to close: Yes\n\n## Summary\nAll met.",
+            status="completed", stage="in_review",
+        )
+
+        # The stale content never leaked into any lifecycle command: the
+        # runner wrote its own pre-audit state and never read the stale file.
+        for cmd in updates:
+            joined = " ".join(cmd)
+            assert "--status blocked" not in joined
+            assert "--stage idea" not in joined
+
+        # A normal terminal transition still applied (no restore/retry).
+        terminal = [c for c in updates if "--stage" in c]
+        assert terminal, "no terminal lifecycle transition recorded"
+        joined_terminal = " ".join(terminal[-1])
+        assert "--status completed" in joined_terminal
+        assert "--stage in_review" in joined_terminal
+
+        # Counters reflect only this run: the mocked pipeline makes no pi
+        # calls, so they stay at zero — the stale file injected nothing.
+        assert audit_runner._rel_snapshot()["calls"] == 0
+
+        # The state file is cleaned up as today.
+        assert not state_path.exists()
+
+    def test_stale_debug_jsonl_is_removed_on_success(self, tmp_path,
+                                                     monkeypatch):
+        """A stale debug JSONL from a previous run is removed on success."""
+        monkeypatch.setenv(audit_runner._AUDIT_STATE_FILE_ENV, str(tmp_path))
+        debug_path = tmp_path / "audit_debug_TEST-1.jsonl"
+        debug_path.write_text('{"stale": true}\n')
+
+        updates: list = []
+        with mock.patch.object(
+            audit_runner, "_default_debug_log_path", return_value=debug_path,
+        ):
+            _run_issue(
+                updates,
+                "Ready to close: Yes\n\n## Summary\nAll met.",
+                status="completed", stage="in_review",
+            )
+
+        assert not debug_path.exists()

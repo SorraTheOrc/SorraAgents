@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# <!-- REFACTOR-SA-0MWD28TXD000ZO2F
+# smell: security
+# severity: high
+# description: `try`-`except`-`pass` detected, consider logging the exception
+# -->
 # <!-- REFACTOR-SA-0MW2SWB2A005CS2B
 # smell: unknown
 # severity: low
@@ -371,6 +376,53 @@ it processes only its own single item (AC1 trigger).
 """
 AUDIT_BATCH_DISABLE_ENV = "AUDIT_BATCH_DRAIN"
 """Opt-out env var: set to ``0`` to disable automatic post-audit drain.
+"""
+
+# ---------------------------------------------------------------------------
+# Proxy audit lease client (LP-0MW96A9GW009KVF7, parent AC1/AC2)
+# ---------------------------------------------------------------------------
+# The audit skill acquires a cross-host audit-tier lease from the proxy
+# (``POST /llama/local/audit/lease``, LP-0MW95FYMH006XYNK) for the lifetime
+# of a run, renews it periodically, and releases it at exit. At most
+# ``audit_admission.max_audits`` (default 1) audits hold a lease across ALL
+# client hosts, so a second host's audit WAITS (429 ``audit-budget-saturated``
+# + ``retry_after_s``) instead of competing for the one local GPU — the
+# parent epic serialises audits at the shared resource, not per host.
+#
+# The client is fail-safe by construction (parent constraint): a proxy error
+# or timeout never blocks an audit indefinitely — the acquire path waits a
+# bounded number of retries, then proceeds WITHOUT a lease (legacy per-host
+# behaviour preserved, documented fallback). A missing/unreachable proxy
+# therefore degrades to today's single-host guards, never to a hang.
+AUDIT_LEASE_ENABLED_ENV = "AUDIT_LEASE_ENABLED"
+"""Env var: set to ``0`` to disable the proxy audit-lease acquisition.
+
+The lease is best-effort and fail-safe, but a host that never wants to
+participate in cross-host serialisation (e.g. an isolated CI box) can
+opt out with this. Default: enabled (``1``).
+"""
+AUDIT_LEASE_ENABLED_DEFAULT = True
+AUDIT_LEASE_ENDPOINT_PATH = "/llama/local/audit/lease"
+AUDIT_LEASE_ENDPOINT_RENEW_PATH = "/llama/local/audit/lease/renew"
+AUDIT_LEASE_TIMEOUT_ENV = "AUDIT_LEASE_TIMEOUT"
+AUDIT_LEASE_TIMEOUT_DEFAULT = 5.0
+"""Per-lease HTTP request timeout (seconds; fail-open on expiry).
+"""
+AUDIT_LEASE_ACQUIRE_RETRIES_ENV = "AUDIT_LEASE_ACQUIRE_RETRIES"
+AUDIT_LEASE_ACQUIRE_RETRIES_DEFAULT = 3
+"""Bounded acquire retries on ``audit-budget-saturated`` (AC1 wait semantics):
+
+the second audit waits up to this many bounded retries for the running
+holder to finish, honouring the proxy's ``retry_after_s`` hint between
+attempts (never a tight spin).
+"""
+_AUDIT_LEASE_STATE: dict | None = None
+"""Module-level lease state ``{session_id, lease_id, ...}`` held by the
+current process's outermost ``cmd_issue`` run. ``None`` when no lease is
+held. Nested/recursive ``cmd_issue`` calls (children, batch drains) see
+``None`` only when the outer call failed to acquire — Python's
+module-level singleton keeps the lease across phase functions without a
+separate context object.
 """
 _AUDIT_TS_FORMAT = "%Y-%m-%dT%H:%M:%S"
 _AUDIT_TICKET_COUNTER = itertools.count()
@@ -841,6 +893,19 @@ without an accepted waiver, so a fresh chore is created instead of reusing
 the stale one (SA-0MVZNECSD005XB42 AC1).
 """
 
+# Marker embedded in a CFP chore's description when the same (rule, path)
+# identity is already tracked by an open Refactor-family item
+# (SA-0MWE1EAR30045VHO AC2). The chore's producer-decision purpose is
+# preserved — it is never auto-suppressed or auto-closed — but the twin is
+# made visible and linked.
+REFACTOR_TWIN_MARKER = "Refactor-Twin:"
+
+# Local parser for the refactor identity marker carried by Refactor-family
+# items (mirrors the refactor-side ``Refactor-Finding-Key`` precedent).
+_REFACTOR_FINDING_KEY_RE = re.compile(
+    r"Refactor-Finding-Key:[ \t]*(\S+)", re.IGNORECASE
+)
+
 AUDIT_WAIVER_MARKER = "AUDIT-FP-WAIVER:"
 """Comment marker that records a producer-accepted false positive.
 
@@ -923,6 +988,53 @@ fail-open partial (execution-dependent ACs stay partial) instead of
 invoking the test skill. Precedence: ``--no-execute`` flag > env var >
 auto-execute on cache miss (default).
 """
+
+AUDIT_STRICT_ENV = "AUDIT_STRICT"
+"""Environment variable name for the audit test-failure mode.
+
+When set to a truthy value (``1``/``true``/``yes``/``on``) the audit runs in
+STRICT test-failure mode: any failing test fails the audit (today's
+behaviour). Any other non-empty value (``0``/``false``/``no``/``off``) forces
+PERMISSIVE mode. Unset means the default, which is PERMISSIVE
+(SA-0MW0JJ36Z000AF57 AC1). Precedence: ``--strict``/``--no-strict`` flag >
+this env var > permissive default.
+"""
+
+TEST_FAILURE_MODE_STRICT = "strict"
+TEST_FAILURE_MODE_PERMISSIVE = "permissive"
+
+TEST_FAILURE_MODE_SECTION = "## Test Failure Mode"
+"""Report section header recording the resolved test-failure mode + evidence."""
+
+TEST_FAILURE_MODE_PREFIX = "Test failure mode: "
+"""Greppable report metadata line: ``Test failure mode: <mode> (source: <src>)``.
+
+Persisted with the report so the freshness gate can compare mode strength
+(SA-0MW0JJ36Z000AF57 AC7) and a producer can see which mode produced a
+verdict without re-running the audit.
+"""
+
+#: Path-convention patterns that mark a failing test as integration/end-to-end
+#: (never excusable). Anything else is unit-classified. Unclassifiable failures
+#: classify as integration so the verdict fails closed (SA-0MW0JJ36Z000AF57
+#: AC4). Matched case-insensitively against the POSIX-style failure path.
+_INTEGRATION_PATH_PATTERNS: tuple[str, ...] = (
+    "tests/integration/",
+    "tests/e2e/",
+    "tests/manual/",
+    "_e2e",
+    "integration",
+)
+
+#: Shared test-infrastructure paths whose modification makes ANY failure
+#: potentially affected (a changed ``conftest.py`` or helper can break any
+#: test), so permissive mode must not excuse failures (AC4).
+_SHARED_TEST_INFRA_PATTERNS: tuple[str, ...] = (
+    "conftest.py",
+    "tests/helpers/",
+    "tests/fixtures/",
+    "tests/support/",
+)
 
 AUTO_GREEN_RUN_BLOCK_HEADER = "AUTO-VERIFIED GREEN RUN"
 """Header of the automatic full-suite verification block injected into prompts.
@@ -1043,7 +1155,10 @@ times before surfacing a provider-error diagnostic. Non-provider failures
 _PI_RETRY_BACKOFF_SECONDS = 2.0
 """Base backoff (seconds) between provider-error retries in ``_call_pi``.
 
-Backoff grows linearly: 1x, 2x, ... base per retry attempt.
+Backoff grows linearly: 1x, 2x, ... base per retry attempt. Each retry is
+slot-aware (SA-0MW0LROWQ000JVTM): the concurrency slot is released before the
+backoff sleep and re-acquired via the priority queue afterwards, so parallel
+audits do not retry-storm a saturated proxy pool while one item backs off.
 """
 
 #: Maximum number of characters of raw pi stream embedded in an unparseable
@@ -1083,6 +1198,10 @@ _rel_lock = threading.Lock()
 _rel_counters: dict[str, int] = {k: 0 for k in RELIABILITY_SUMMARY_KEYS}
 _rel_started_at: float | None = None
 _rel_emitted = False
+_rel_run_id: str | None = None
+"""Per-attempt run id generated in :func:`_rel_reset` (SA-0MW0LROWQ000JVTM AC3)."""
+_rel_started_at_epoch: float | None = None
+"""Wall-clock start timestamp (epoch seconds) set in :func:`_rel_reset`."""
 
 
 def _rel_incr(key: str, amount: int = 1) -> None:
@@ -1092,8 +1211,8 @@ def _rel_incr(key: str, amount: int = 1) -> None:
 
 
 def _rel_reset() -> None:
-    """Reset all reliability counters and the run start clock."""
-    global _rel_started_at, _rel_emitted
+    """Reset all reliability counters, the run clock and the attempt identity."""
+    global _rel_started_at, _rel_emitted, _rel_run_id, _rel_started_at_epoch
     with _rel_lock:
         for key in RELIABILITY_SUMMARY_KEYS:
             _rel_counters[key] = 0
@@ -1101,6 +1220,11 @@ def _rel_reset() -> None:
         # interferes with the elapsed-time guard's clock (or tests that count
         # monotonic() calls).
         _rel_started_at = time.perf_counter()
+        # Per-attempt identity (SA-0MW0LROWQ000JVTM AC3): a fresh run id and
+        # wall-clock start each reset so a stale stored report can never be
+        # mistaken for the current attempt.
+        _rel_started_at_epoch = time.time()
+        _rel_run_id = uuid.uuid4().hex
         _rel_emitted = False
 
 
@@ -1116,9 +1240,15 @@ def render_reliability_summary(elapsed_seconds: float | None = None) -> str:
     The line is ``AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n>
     parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n>
     concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n>
-    parent_screen_timeouts=<n> elapsed_seconds=<x>`` with stable keys in
+    parent_screen_timeouts=<n> elapsed_seconds=<x> run_id=<hex>
+    started_at=<epoch>`` with stable keys in
     :data:`RELIABILITY_SUMMARY_KEYS`. When *elapsed_seconds* is omitted the
     value is derived from the run start clock set by :func:`_rel_reset`.
+
+    ``run_id`` and ``started_at`` are appended AFTER the stable key set as a
+    per-attempt identity (SA-0MW0LROWQ000JVTM AC3) so an operator can always
+    tell whether the numbers they are reading came from the attempt they just
+    ran; existing dashboards keep their column positions.
     """
     counts = _rel_snapshot()
     parts = [f"{key}={counts.get(key, 0)}" for key in RELIABILITY_SUMMARY_KEYS]
@@ -1126,6 +1256,10 @@ def render_reliability_summary(elapsed_seconds: float | None = None) -> str:
         elapsed_seconds = time.perf_counter() - _rel_started_at
     if elapsed_seconds is not None:
         parts.append(f"elapsed_seconds={float(elapsed_seconds):.2f}")
+    if _rel_run_id is not None:
+        parts.append(f"run_id={_rel_run_id}")
+    if _rel_started_at_epoch is not None:
+        parts.append(f"started_at={_rel_started_at_epoch:.3f}")
     return RELIABILITY_SUMMARY_PREFIX + " " + " ".join(parts)
 
 
@@ -2200,10 +2334,54 @@ def _audit_time_is_fresh(audit_time: datetime, update_time: datetime) -> bool:
     return audit_time > threshold
 
 
+def _extract_test_failure_mode(report_text: str) -> str | None:
+    """Extract the stored test-failure mode from a persisted report (AC7).
+
+    Reads the ``Test failure mode: <mode> (source: …)`` metadata line. Returns
+    ``"strict"``/``"permissive"`` or ``None`` for a legacy report that
+    predates the mode line (treated as permissive by the freshness comparison
+    so a strict run re-runs).
+    """
+    if not report_text:
+        return None
+    for line in report_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(TEST_FAILURE_MODE_PREFIX):
+            value = stripped[len(TEST_FAILURE_MODE_PREFIX):].split("(", 1)[0].strip().lower()
+            if value in (TEST_FAILURE_MODE_STRICT, TEST_FAILURE_MODE_PERMISSIVE):
+                return value
+    return None
+
+
+def _freshness_mode_allows(
+    stored_report: str, required_strict: bool | None,
+) -> bool:
+    """Decide whether a stored audit may satisfy a run of the required mode (AC7).
+
+    - ``required_strict is None`` → no mode requirement (legacy callers): allow.
+    - A stored non-passing verdict (``Ready to close: No``) is always re-run
+      regardless of mode (freshness only reuses passes).
+    - A stored *passing* verdict: a STRICT run reuses it only when it was
+      produced by a strict run; a PERMISSIVE run may reuse either (strict or
+      permissive) because permissive is the weaker mode.
+    - A legacy passing report with no mode line is treated as permissive, so a
+      strict run re-runs it.
+    """
+    if required_strict is None:
+        return True
+    if _parse_ready_to_close(stored_report) != "yes":
+        return True
+    stored_mode = _extract_test_failure_mode(stored_report)
+    if required_strict:
+        return stored_mode == TEST_FAILURE_MODE_STRICT
+    return True
+
+
 def _check_audit_freshness(runner: Runner, issue_id: str,
                            worklog_dir: str | None = None,
                            work_item: dict | None = None,
-                           audit_sink: dict | None = None) -> str | None:
+                           audit_sink: dict | None = None,
+                           required_strict: bool | None = None) -> str | None:
     """Check if there's a fresh audit for the work item.
 
     Two-stage freshness gate:
@@ -2284,6 +2462,10 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
             # fail open and let the pipeline re-run.
             return None
         if current_fingerprint == stored_fingerprint:
+            # Mode-strength guard (AC7): a strict run must never reuse a
+            # permissive pass; a permissive run may reuse a strict pass.
+            if not _freshness_mode_allows(raw_output, required_strict):
+                return None
             return raw_output
         # Content changed → stale → re-run the pipeline.
         return None
@@ -2310,6 +2492,8 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
         return None  # Unparseable timestamps → not fresh (fail open)
 
     if _audit_time_is_fresh(audit_time, update_time):
+        if not _freshness_mode_allows(raw_output, required_strict):
+            return None
         return raw_output
 
     # Persistence-write tolerance (SA-0MTHC710X003ORZM, mirrors the child
@@ -2323,6 +2507,8 @@ def _check_audit_freshness(runner: Runner, issue_id: str,
     if timedelta(0) <= write_delta <= timedelta(
         seconds=AUDIT_PERSIST_WRITE_TOLERANCE_SECONDS
     ):
+        if not _freshness_mode_allows(raw_output, required_strict):
+            return None
         return raw_output
 
     return None
@@ -3913,11 +4099,653 @@ def _test_skill_run_prompt_block(sha: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Test-failure modes: strict vs permissive (SA-0MW0JJ36Z000AF57)
+# ---------------------------------------------------------------------------
+#
+# The audit supports two test-failure modes:
+#   * STRICT     — any failing test fails the audit (today's behaviour).
+#   * PERMISSIVE — a failing UNIT test that is provably unrelated to the
+#                  audited item's changes is excused; integration/end-to-end
+#                  failures, affected failures and inconclusive failures always
+#                  fail (fail closed).
+#
+# The default is PERMISSIVE. The release gate (ship) passes ``--strict`` so a
+# permissive pass can never leak into a release (AC6/AC7).
+
+
+def _resolve_strict_mode(cli_strict: bool | None) -> tuple[bool, str]:
+    """Resolve the audit test-failure mode (AC1).
+
+    Precedence: ``--strict``/``--no-strict`` flag > ``AUDIT_STRICT`` env var >
+    permissive default. Returns ``(strict, source)`` where ``source`` is one of
+    ``"flag"``, ``"env"`` or ``"default"`` — recorded once in the report so
+    the resolution is auditable.
+
+    ``cli_strict`` is ``True``/``False`` when a flag was passed and ``None``
+    when it was not.
+    """
+    if cli_strict is not None:
+        return bool(cli_strict), "flag"
+    env_value = os.environ.get(AUDIT_STRICT_ENV)
+    if env_value is not None and env_value.strip() != "":
+        truthy = env_value.strip().lower() in ("1", "true", "yes", "on")
+        return truthy, "env"
+    return False, "default"
+
+
+def _test_failure_mode_name(strict: bool) -> str:
+    """Return the canonical mode name (``strict`` / ``permissive``)."""
+    return TEST_FAILURE_MODE_STRICT if strict else TEST_FAILURE_MODE_PERMISSIVE
+
+
+def _failure_path(failure: dict) -> str:
+    """Best-effort POSIX path of the failing test file.
+
+    Failure records carry ``test_name`` as ``path::test`` (pytest) or a bare
+    test name (node). Falls back to the first path-like token in
+    ``stdout_excerpt``/``stack_trace``. Returns ``""`` when no path can be
+    determined (the caller then fails closed by classifying as integration).
+    """
+    test_name = str(failure.get("test_name", "")).strip()
+    if "::" in test_name:
+        candidate = test_name.split("::", 1)[0].strip()
+        if candidate:
+            return candidate.replace("\\", "/")
+    if test_name and ("/" in test_name or test_name.endswith(('.py', '.js', '.mjs', '.ts'))):
+        return test_name.replace("\\", "/")
+    for field_name in ("stdout_excerpt", "stack_trace"):
+        text = str(failure.get(field_name, "") or "")
+        match = re.search(r"([\w./-]+\.(?:py|js|mjs|cjs|ts|tsx))", text)
+        if match:
+            return match.group(1).replace("\\", "/")
+    return ""
+
+
+def _classify_test_failure_scope(failure: dict) -> str:
+    """Classify a failure as ``unit`` or ``integration`` (AC4).
+
+    Path-convention table: ``tests/integration/**``, ``tests/e2e/**``,
+    ``tests/manual/**``, ``**/*_e2e*`` and ``**/*integration*`` are
+    integration/end-to-end. Everything else is unit. A failure whose path
+    cannot be determined is **integration** so the verdict fails closed.
+    """
+    path = _failure_path(failure).lower()
+    if not path:
+        return "integration"
+    normalised = path if path.startswith("/") else f"/{path}"
+    for pattern in _INTEGRATION_PATH_PATTERNS:
+        if pattern.startswith("tests/"):
+            if f"/{pattern}" in normalised:
+                return "integration"
+        elif pattern in normalised:
+            return "integration"
+    return "unit"
+
+
+def _module_tokens(path: str) -> set[str]:
+    """Return import-ish tokens for a changed source path.
+
+    ``skill/audit/scripts/audit_runner.py`` yields
+    ``{"audit_runner", "audit.scripts.audit_runner"}``. Used to match a
+    failing test's import statements against the item's changed modules.
+    """
+    posix = path.replace("\\", "/").strip()
+    if not posix:
+        return set()
+    tokens: set[str] = set()
+    stem = posix.rsplit("/", 1)[-1]
+    for suffix in (".py", ".js", ".mjs", ".cjs", ".ts", ".tsx"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    if stem and stem != "__init__":
+        tokens.add(stem)
+    parts = posix.rsplit("/", 1)[0].split("/") if "/" in posix else []
+    # Drop generic top-level dirs so dotted tokens are meaningful.
+    parts = [p for p in parts if p not in ("", ".", "src", "lib")]
+    if parts:
+        dotted_parts = parts + ([stem] if stem else [])
+        # Add every dotted suffix so an import of ``audit.scripts.audit_runner``
+        # matches a path rooted at a skills dir (``skill/audit/scripts/...``)
+        # as well as the full dotted name.
+        for start in range(len(dotted_parts)):
+            tokens.add(".".join(dotted_parts[start:]))
+    return tokens
+
+
+def _test_imports(test_path: str, project_root: str | Path) -> set[str]:
+    """Collect module tokens imported by a test file (best-effort, read-only)."""
+    path = Path(project_root) / test_path
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return set()
+    tokens: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        # ``from pkg.mod import name`` → the imported module is pkg.mod.name.
+        from_import = re.match(r"from\s+([\w.]+)\s+import\s+(.+)", stripped)
+        if from_import:
+            module, names = from_import.group(1), from_import.group(2)
+            tokens.add(module)
+            for raw_name in names.split(","):
+                name = raw_name.strip().split(" as ")[0].strip().strip("()")
+                if name and name != "*":
+                    tokens.add(name)
+                    tokens.add(f"{module}.{name}")
+            continue
+        m = re.match(r"import\s+([\w.]+)", stripped)
+        if m:
+            tokens.add(m.group(1))
+        for m in re.finditer(r"require\(['\"]([^'\"]+)['\"]\)", stripped):
+            tokens.add(m.group(1))
+        m2 = re.match(r"import\s+.*?from\s+['\"]([^'\"]+)['\"]", stripped)
+        if m2:
+            tokens.add(m2.group(1))
+    return tokens
+
+
+def _normalise_touched(touched_files: Sequence[str] | None) -> list[str]:
+    return [t.replace("\\", "/").strip() for t in (touched_files or []) if t and t.strip()]
+
+
+def _failure_relatedness(
+    failure: dict,
+    touched_files: Sequence[str] | None,
+    key_files: Sequence[str] | None,
+    project_root: str | Path,
+) -> tuple[str, str]:
+    """Decide whether a failure is ``affected``/``unrelated``/``inconclusive``.
+
+    Returns ``(verdict, evidence)``. The deterministic mapping decides the
+    clear cases (AC4):
+
+    1. A changed shared test-infrastructure file (``conftest.py``,
+       ``tests/helpers/**`` …) makes EVERY failure *affected*.
+    2. The failing test file is itself a changed file → *affected*.
+    3. A changed source module the test imports → *affected*.
+    4. Otherwise *inconclusive* (the caller may baseline-compare).
+
+    No git or suite execution happens here — pure filesystem/heuristic work.
+    """
+    touched = _normalise_touched(touched_files)
+    key = _normalise_touched(key_files)
+    changed = list(dict.fromkeys(touched + key))
+    if not changed:
+        return "inconclusive", "no changed-file list available"
+
+    for path in changed:
+        lowered = path.lower()
+        for pattern in _SHARED_TEST_INFRA_PATTERNS:
+            if lowered.endswith(pattern) or f"/{pattern}" in f"/{lowered}":
+                return "affected", f"changed shared test infrastructure: {path}"
+
+    failure_path = _failure_path(failure)
+    if not failure_path:
+        return "inconclusive", "failing test path undeterminable"
+
+    normalised_changed = {c.lstrip("/").lower() for c in changed}
+    if failure_path.lstrip("/").lower() in normalised_changed:
+        return "affected", f"failing test file is a changed file: {failure_path}"
+
+    changed_tokens: set[str] = set()
+    for path in changed:
+        changed_tokens |= _module_tokens(path)
+    if not changed_tokens:
+        return "inconclusive", "no importable changed modules"
+
+    imports = _test_imports(failure_path, project_root)
+    for imported in imports:
+        # Direct dotted-prefix or bare-module match against any changed module.
+        base = imported.rsplit(".", 1)[-1]
+        if imported in changed_tokens or base in changed_tokens:
+            return "affected", (
+                f"test imports changed module '{imported}' ({failure_path})"
+            )
+    return "inconclusive", f"no deterministic link from {failure_path} to changed files"
+
+
+def _resolve_baseline_commit(runner: Callable[..., subprocess.CompletedProcess]) -> str | None:
+    """Resolve the item's pre-change commit for baseline comparison (AC4).
+
+    Uses ``git merge-base HEAD origin/dev``: for an unmerged item this is the
+    pre-change base (the failure should NOT reproduce if the change caused it),
+    and for an already-merged item it equals HEAD (a pre-existing failure
+    reproduces → unrelated). Falls back to ``origin/dev`` when the merge-base
+    is unavailable. Returns ``None`` when git cannot resolve a baseline (the
+    caller then fails closed to *affected*).
+    """
+    for argv in (
+        ["git", "merge-base", "HEAD", "origin/dev"],
+        ["git", "rev-parse", "origin/dev"],
+    ):
+        try:
+            proc = runner(argv)
+        except Exception:  # noqa: BLE001, S112 -- a git error tries the next fallback
+            continue
+        if getattr(proc, "returncode", 1) == 0:
+            sha = (getattr(proc, "stdout", "") or "").strip()
+            if sha:
+                return sha
+    return None
+
+
+def _baseline_unrelated(
+    failures: Sequence[dict],
+    project_root: str | Path,
+    baseline_commit: str | None,
+    *,
+    run_test: Callable[[dict, str], bool] | None = None,
+    worktree_runner: Callable[[list[str], str], subprocess.CompletedProcess] | None = None,
+    timeout: int = AUDIT_TEST_SKILL_RUN_TIMEOUT,
+) -> dict[int, tuple[str, str]]:
+    """Baseline-compare inconclusive failures at the pre-change commit (AC4).
+
+    Re-runs **only** the supplied (inconclusive) failures in a scratch
+    worktree checked out at *baseline_commit*:
+
+    * fails identically at baseline → ``unrelated``;
+    * passes at baseline            → ``affected`` (the change broke it);
+    * cannot run at baseline        → ``affected`` (fail closed).
+
+    Returns ``{failure_index: (verdict, evidence)}`` where verdict is
+    ``unrelated``/``affected``. Never raises: any git/exec failure degrades to
+    *affected* with the reason recorded (Never-block F4 — never a crash, and the
+    verdict fails closed).
+
+    Execution is injectable: production passes ``run_test``/``worktree_runner``
+    defaults that use the paced runner; unit tests pass fakes so no real suite
+    runs (per the shared test-writing guidelines).
+    """
+    verdicts: dict[int, tuple[str, str]] = {}
+    indexes = list(range(len(failures)))
+    if not indexes:
+        return verdicts
+    if not baseline_commit:
+        for idx in indexes:
+            verdicts[idx] = ("affected", "no baseline commit available")
+        return verdicts
+    # Safety gate (test-writing guidelines: no real suite execution in tests;
+    # and no recursion under an owning suite run). A real baseline re-runs the
+    # failing tests, so it must never execute while another suite owns the
+    # checkout (LIVE_REPO_GUARD_ACTIVE) or while running inside a test process
+    # (PYTEST_CURRENT_TEST). In those contexts every failure fails closed to
+    # *affected* with no worktree and no execution. Production audits pass a
+    # real ``run_test`` (or run outside a test process) and baseline normally.
+    if run_test is None and (
+        os.environ.get(LIVE_REPO_GUARD_ACTIVE_ENV) or _suite_run_in_progress()
+        or os.environ.get("PYTEST_CURRENT_TEST")
+    ):
+        for idx in indexes:
+            verdicts[idx] = (
+                "affected",
+                (
+                    "baseline execution suppressed in a guarded/test "
+                    "context (fail closed)"
+                ),
+            )
+        return verdicts
+
+    runner = worktree_runner or _default_baseline_worktree_runner
+    worktree_path = ""
+    try:
+        proc = runner(
+            ["git", "worktree", "add", "--detach", "--force",
+             str(Path(project_root) / ".worklog" / "worktrees" / "audit-baseline"),
+             baseline_commit],
+            str(project_root),
+        )
+        if getattr(proc, "returncode", 1) != 0:
+            reason = (getattr(proc, "stderr", "") or "").strip()
+            for idx in indexes:
+                verdicts[idx] = (
+                    "affected", f"baseline worktree unavailable: {reason}",
+                )
+            return verdicts
+        worktree_path = str(
+            Path(project_root) / ".worklog" / "worktrees" / "audit-baseline"
+        )
+        executor = run_test or _default_baseline_test_executor
+        for idx in indexes:
+            try:
+                still_fails = bool(executor(failures[idx], worktree_path))
+            except Exception as exc:  # noqa: BLE001 -- fail closed, never crash
+                verdicts[idx] = ("affected", f"baseline run error: {exc}")
+                continue
+            if still_fails:
+                verdicts[idx] = (
+                    "unrelated",
+                    f"fails identically at baseline {baseline_commit[:10]}",
+                )
+            else:
+                verdicts[idx] = (
+                    "affected",
+                    f"passes at baseline {baseline_commit[:10]} (change broke it)",
+                )
+        return verdicts
+    except Exception as exc:  # noqa: BLE001 -- fail closed, never crash
+        for idx in indexes:
+            verdicts.setdefault(idx, ("affected", f"baseline error: {exc}"))
+        return verdicts
+    finally:
+        if worktree_path:
+            try:
+                runner(["git", "worktree", "remove", "--force", worktree_path],
+                       str(project_root))
+            except Exception:  # noqa: BLE001, S110 -- cleanup best-effort
+                pass
+
+
+def _default_baseline_worktree_runner(
+    argv: list[str], cwd: str,
+) -> subprocess.CompletedProcess:
+    """Run a baseline git command (never live-repo-guarded — it is a scratch tree)."""
+    return subprocess.run(
+        argv, cwd=cwd, capture_output=True, text=True, check=False,
+    )
+
+
+def _default_baseline_test_executor(failure: dict, worktree_path: str) -> bool:
+    """Re-run a single failing test at the baseline worktree; True if it fails.
+
+    Uses the paced runner (test-skill semaphore) so nested/concurrent baseline
+    runs are bounded, and stands down under ``LIVE_REPO_GUARD_ACTIVE`` (never
+    recurse into another suite). Returns ``True`` (still failing) when the run
+    cannot be executed, so the caller fails closed to *affected*.
+    """
+    if (_suite_run_in_progress()
+            or os.environ.get(LIVE_REPO_GUARD_ACTIVE_ENV)
+            or os.environ.get("PYTEST_CURRENT_TEST")):
+        return True
+    command = str(failure.get("suite_command", "") or "").strip()
+    test_name = str(failure.get("test_name", "") or "").strip()
+    if not command:
+        return True
+    if test_name and "::" in test_name:
+        command = f"{command} {test_name.split(' ', 1)[0]}"
+    try:
+        proc = paced_runner()(
+            command, cwd=worktree_path, capture_output=True, text=True,
+        )
+    except Exception:  # noqa: BLE001 -- treat unmaterialised baseline as failing
+        return True
+    return getattr(proc, "returncode", 1) != 0
+
+
+def _evaluate_red_suite(
+    failures: Sequence[dict],
+    *,
+    strict: bool,
+    touched_files: Sequence[str] | None = None,
+    key_files: Sequence[str] | None = None,
+    project_root: str | Path = ".",
+    baseline_commit: str | None = None,
+    baseline_runner: Callable[..., dict[int, tuple[str, str]]] | None = None,
+) -> dict:
+    """Evaluate a RED suite under the resolved mode (AC2/AC3 single helper).
+
+    Returns a deterministic verdict dict::
+
+      {
+        "outcome": "excused" | "blocked",
+        "mode": "strict" | "permissive",
+        "failures": [{test_name, path, scope, relatedness, evidence,
+                      blocking}],
+        "blocking": [test_name...],
+        "excused": [test_name...],
+        "baseline_commit": <commit or None>,
+        "reasons": [str...],
+      }
+
+    *strict* → every failure is blocking (byte-for-byte today's behaviour).
+    *permissive* → only unrelated UNIT failures are excused; integration,
+    affected and unresolved-inconclusive failures block (fail closed).
+
+    Deterministic and reproducible from the input alone when a
+    ``baseline_runner`` result is supplied; the excusal decision is recorded in
+    the persisted report so a reviewer can reproduce it (AC Constraint).
+    """
+    mode = _test_failure_mode_name(strict)
+    records: list[dict] = []
+    reasons: list[str] = []
+
+    def _record(failure: dict, scope: str, relatedness: str, evidence: str,
+                blocking: bool) -> None:
+        records.append({
+            "test_name": str(failure.get("test_name", "")),
+            "path": _failure_path(failure),
+            "scope": scope,
+            "relatedness": relatedness,
+            "evidence": evidence,
+            "blocking": blocking,
+        })
+
+    if strict:
+        for failure in failures:
+            _record(failure, _classify_test_failure_scope(failure),
+                    "affected", "strict mode: every failure blocks", True)
+        if not failures:
+            reasons.append("strict mode: red suite with no parseable failures")
+        return {
+            "outcome": "blocked",
+            "mode": mode,
+            "failures": records,
+            "blocking": [r["test_name"] for r in records if r["blocking"]],
+            "excused": [],
+            "baseline_commit": baseline_commit,
+            "reasons": reasons,
+        }
+
+    # Permissive: classify + deterministic relatedness, then baseline only the
+    # inconclusive unit failures (AC4).
+    resolved: list[dict] = []
+    inconclusive_positions: list[int] = []
+    for failure in failures:
+        scope = _classify_test_failure_scope(failure)
+        if scope == "integration":
+            resolved.append({
+                "failure": failure, "scope": scope,
+                "relatedness": "affected",
+                "evidence": "integration/end-to-end failure is never excused",
+            })
+            continue
+        relatedness, evidence = _failure_relatedness(
+            failure, touched_files, key_files, project_root,
+        )
+        if relatedness == "inconclusive":
+            inconclusive_positions.append(len(resolved))
+        resolved.append({
+            "failure": failure, "scope": scope,
+            "relatedness": relatedness, "evidence": evidence,
+        })
+
+    if inconclusive_positions:
+        runner = baseline_runner or _baseline_unrelated
+        baseline_failures = [resolved[i]["failure"] for i in inconclusive_positions]
+        baseline_verdicts = runner(
+            baseline_failures, project_root, baseline_commit,
+        )
+        for local_idx, position in enumerate(inconclusive_positions):
+            verdict, base_evidence = baseline_verdicts.get(
+                local_idx, ("affected", "no baseline verdict (fail closed)")
+            )
+            entry = resolved[position]
+            entry["relatedness"] = verdict
+            entry["evidence"] = f"{entry['evidence']}; baseline: {base_evidence}"
+
+    for entry in resolved:
+        blocking = entry["relatedness"] != "unrelated"
+        _record(
+            entry["failure"], entry["scope"], entry["relatedness"],
+            entry["evidence"], blocking,
+        )
+
+    blocking_names = [r["test_name"] for r in records if r["blocking"]]
+    excused_names = [r["test_name"] for r in records if not r["blocking"]]
+    if blocking_names:
+        reasons.append(
+            "permissive mode: blocking failures remain: "
+            + ", ".join(blocking_names)
+        )
+    outcome = "blocked" if blocking_names or not records else "excused"
+    if not records:
+        reasons.append("permissive mode: red suite with no parseable failures")
+    return {
+        "outcome": outcome,
+        "mode": mode,
+        "failures": records,
+        "blocking": blocking_names,
+        "excused": excused_names,
+        "baseline_commit": baseline_commit,
+        "reasons": reasons,
+    }
+
+
+def _cached_red_failures(
+    project_root: str | Path, commands: Sequence[str] | None = None,
+) -> list[dict]:
+    """Parse structured failures from RED cached full-suite entries (AC4).
+
+    Reads the per-repo test cache READ-ONLY (``query_cached``) for each
+    full-suite command and parses the stored stdout/stderr of any non-zero
+    entry. Returns ``[]`` when no cached entry is red or none yields a
+    parseable failure record — the caller then executes the suite as on a
+    cache miss.
+    """
+    root = Path(project_root).resolve()
+    if commands is None:
+        commands = full_suite_commands(root)
+    failures: list[dict] = []
+    for command in commands:
+        try:
+            entry = query_cached(command, cwd=str(root), ttl=AUDIT_CACHE_TTL_SECONDS)
+        except Exception:  # noqa: BLE001, S112 -- a cache error is treated as a miss
+            continue
+        if not entry or int(entry.get("exit_code", 0)) == 0:
+            continue
+        output = f"{entry.get('stdout', '')}\n{entry.get('stderr', '')}"
+        for failure in parse_failures(command, output):
+            failure["suite_command"] = command
+            failures.append(failure)
+    return failures
+
+
+def _cached_red_evaluation(
+    project_root: str | Path,
+    *,
+    strict: bool,
+    touched_files: Sequence[str] | None,
+    key_files: Sequence[str] | None,
+    baseline_commit: str | None,
+    baseline_runner: Callable[..., dict[int, tuple[str, str]]] | None = None,
+) -> dict | None:
+    """Classify a cached-red full-suite entry under the mode (AC4).
+
+    Returns the ``_evaluate_red_suite`` verdict, or ``None`` when the cached
+    output yields no parseable failure record (the caller then executes the
+    suite as on a cache miss). Strict mode never calls this — it keeps today's
+    cached-red fail-open-partial behaviour unchanged.
+    """
+    failures = _cached_red_failures(project_root)
+    if not failures:
+        return None
+    return _evaluate_red_suite(
+        failures,
+        strict=strict,
+        touched_files=touched_files,
+        key_files=key_files,
+        project_root=project_root,
+        baseline_commit=baseline_commit,
+        baseline_runner=baseline_runner,
+    )
+
+
+def _excused_red_prompt_block(evaluation: dict, sha: str | None) -> str:
+    """Build the EXCUSED-RED evidence block injected into audit prompts (AC2).
+
+    Analogous to the GREEN-RUN blocks: tells the model the suite is red but the
+    only failures were proven unrelated unit failures, so execution-dependent
+    criteria MAY be marked met. Names each excused failure and its evidence so
+    the decision is auditable in the prompt.
+    """
+    lines = [
+        (
+            "EXCUSED-RED SUITE — The full project test suite is RED, but every "
+            "failing test is a UNIT failure proven UNRELATED to this work item's "
+            "changes (permissive audit mode)."
+        ),
+    ]
+    if sha:
+        lines.append(f"Audited commit: {sha}.")
+    for record in evaluation.get("failures", []):
+        if record.get("blocking"):
+            continue
+        lines.append(
+            f"- {record.get('test_name')} "
+            f"[{record.get('scope')}/{record.get('relatedness')}]: "
+            f"{record.get('evidence')}"
+        )
+    lines.append(
+        "Execution-dependent criteria (e.g. 'full test suite passes') MAY be "
+        "marked met based on this excused-red evidence. The audit runner "
+        "manages test execution: Do NOT execute tests yourself. Do NOT "
+        "execute any other state-modifying command (wl, git, …) — the "
+        "read-only mandate otherwise remains in force."
+    )
+    return "\n".join(lines) + "\n\n"
+
+
+def _format_test_failure_mode_section(evaluation: dict | None, *, strict: bool,
+                                     source: str) -> str:
+    """Render the persisted ``## Test Failure Mode`` section (AC5).
+
+    Lists the resolved mode, its resolution source, and — for every evaluated
+    failure — the classification, relatedness verdict and evidence, plus the
+    baseline commit when one was used. Empty string when no red suite was
+    evaluated (green happy path stays byte-identical).
+    """
+    mode = _test_failure_mode_name(strict)
+    header = [
+        "",
+        TEST_FAILURE_MODE_SECTION,
+        "",
+        f"Mode: {mode} (source: {source})",
+    ]
+    if not evaluation:
+        header.append("No red test suite evaluated this run.")
+        return "\n".join(header) + ""
+    header.append(f"Outcome: {evaluation.get('outcome')}")
+    baseline = evaluation.get("baseline_commit")
+    if baseline:
+        header.append(f"Baseline commit: {baseline}")
+    failures = evaluation.get("failures", [])
+    if failures:
+        header.append("")
+        header.append("| Test | Scope | Relatedness | Blocking | Evidence |")
+        header.append("|------|-------|-------------|----------|----------|")
+        for record in failures:
+            evidence = str(record.get("evidence", "")).replace("|", "\\|")
+            header.append(
+                f"| {record.get('test_name')} | {record.get('scope')} | "
+                f"{record.get('relatedness')} | "
+                f"{'yes' if record.get('blocking') else 'no'} | {evidence} |"
+            )
+    for reason in evaluation.get("reasons", []):
+        header.append(f"- {reason}")
+    return "\n".join(header) + ""
+
+
 def _run_tests_via_test_skill(
     cwd: str | Path,
     timeout: int = AUDIT_TEST_SKILL_RUN_TIMEOUT,
     parent_work_item_id: str | None = None,
     head_sha: str | None = None,
+    strict: bool = False,
+    touched_files: Sequence[str] | None = None,
+    key_files: Sequence[str] | None = None,
+    baseline_commit: str | None = None,
+    baseline_runner: Callable[..., dict[int, tuple[str, str]]] | None = None,
 ) -> dict:
     """Execute the full project test suite via the test skill's runner.
 
@@ -3958,6 +4786,10 @@ def _run_tests_via_test_skill(
     results: list[dict] = []
     failures: list[dict] = []
     triaged: list[dict] = []
+    #: Red-suite mode evaluation (SA-0MW0JJ36Z000AF57): strict vs permissive.
+    #: Populated only when the suite is red; ``None`` for a green run so the
+    #: happy path stays byte-identical (no excusal work on green).
+    red_evaluation: dict | None = None
     #: Commands whose guarded checkout moved while they executed
     #: (SA-0MW3FF18I003KGZE AC4): their output is a mixed-tree verdict, so
     #: nothing is parsed from it and NOTHING is triaged — a moved checkout must
@@ -4076,6 +4908,26 @@ def _run_tests_via_test_skill(
                     "error": str(exc),
                 })
 
+    # Evaluate a red suite under the resolved test-failure mode (AC2/AC3).
+    # A green suite performs NO excusal work (no new suite executions, happy
+    # path unchanged). ``state_changed`` runs are quarantined and never
+    # excused — their verdict is discarded and the run stays red.
+    excused = False
+    excused_block = ""
+    if not success and not notice and not state_changed and failures:
+        red_evaluation = _evaluate_red_suite(
+            failures,
+            strict=strict,
+            touched_files=touched_files,
+            key_files=key_files,
+            project_root=project_root,
+            baseline_commit=baseline_commit,
+            baseline_runner=baseline_runner,
+        )
+        excused = red_evaluation["outcome"] == "excused"
+        if excused:
+            excused_block = _excused_red_prompt_block(red_evaluation, head_sha)
+
     if not notice and state_changed:
         notice = (
             "[state_changed_during_run] checkout moved during the run for "
@@ -4100,6 +4952,12 @@ def _run_tests_via_test_skill(
         "results": results,
         "failures": failures,
         "triaged": triaged,
+        # Mode evaluation (SA-0MW0JJ36Z000AF57): ``success`` stays the honest
+        # red/green fact; ``excused`` is True only when permissive mode proved
+        # every failure unrelated (so execution-dependent ACs may be met).
+        "red_evaluation": red_evaluation,
+        "excused": excused,
+        "excused_block": excused_block,
         # The flagged commands (SA-0MW3FF18I003KGZE AC4) so the audit report
         # can name the checkout movement and the required re-run.
         "state_changed_during_run": state_changed,
@@ -4587,17 +5445,23 @@ def _log_batch_metrics(metrics: dict) -> None:
     """Emit the batch-drain metrics line to stderr (AC5).
 
     Fields: ``batch_start``, ``batch_end``, ``items_processed``,
-    ``queue_remaining``, ``items_included``. Every batch run (even a
-    zero-item run) emits exactly one line so the dispatcher can observe
-    window utilization.
+    ``queue_remaining``, ``items_included``, and the additive per-project map
+    ``projects_included`` (AC4 of LP-0MW96A9GW009KVF7: which repositories
+    contributed to this window). Every batch run (even a zero-item run)
+    emits exactly one line so the dispatcher can observe window utilization.
     """
+    _projects = metrics.get("projects_included") or {}
+    projects_summary = " ".join(
+        f"project={k}:{len(v)}" for k, v in sorted(_projects.items())
+    )
     print(
         "Audit batch drain: "
         f"batch_start={metrics.get('batch_start')} "
         f"batch_end={metrics.get('batch_end')} "
         f"items_processed={metrics.get('items_processed', 0)} "
         f"queue_remaining={metrics.get('queue_remaining', 0)} "
-        f"items_included={metrics.get('items_included', [])}",
+        f"items_included={metrics.get('items_included', [])} "
+        f"projects_included={_projects}{' ' + projects_summary if projects_summary else ''}",
         file=sys.stderr,
     )
 
@@ -4613,6 +5477,13 @@ def _enqueue_pending_audit_items(max_items: int | None = None,
     FIFO within tier), and enqueues up to ``max_items`` work-item ids into
     the batch queue. Enqueue is idempotent (the shared queue returns the
     existing entry for a duplicate id), so re-priming never duplicates.
+
+    Each entry is stamped with the **owning project root** (AC1 of
+    LP-0MW96A9GW009KVF7): the worklog root the item was discovered from,
+    derived from *worklog_dir* when given, else the prefix-to-sibling scan.
+    A drain that later dequeues the entry routes it against that root (AC3),
+    so a repo-A drain can no longer audit a repo-B item against repo A's
+    worklog. Legacy entries (no root) keep today's single-root behaviour (AC5).
 
     Returns the list of enqueued work-item ids (already-queued items are
     included in the return value but not re-written).
@@ -4649,12 +5520,35 @@ def _enqueue_pending_audit_items(max_items: int | None = None,
             continue
         raw = ((item or {}).get("priority") or "").strip().lower()
         prio = _PRIORITY_VALUE.get(raw, Priority.MEDIUM)
-        queue.enqueue(item_id, prio, timeout=_resolve_batch_timeout())
+        # AC1: stamp the owning project root so a cross-project drain routes
+        # this item against ITS worklog (AC3), not the drainer's default. The
+        # root is the parent of the worklog dir the item was discovered from
+        # (explicit override, else the same prefix-to-sibling resolution a
+        # drain would use).
+        project_root = _discovered_project_root(item_id, worklog_dir=worklog_dir)
+        queue.enqueue(item_id, prio, timeout=_resolve_batch_timeout(),
+                      project_root=project_root)
         enqueued.append(item_id)
     return enqueued
 
 
-def _batch_drain_cycle(audit_one: Callable[[str, int], int],
+def _discovered_project_root(item_id: str,
+                             worklog_dir: str | None = None) -> str | None:
+    """Resolve the project root that owns *item_id* (AC1/AC3).
+
+    Returns the checkout root (parent of the ``.worklog`` dir) when
+    determinable — explicit *worklog_dir* first, else the prefix-to-sibling
+    scan — and ``None`` when ownership cannot be determined (legacy entry,
+    unknown prefix, no sibling match). Callers fail open: ``None`` keeps
+    today's single-root routing.
+    """
+    owning = _resolve_owning_project_root(item_id, worklog_dir=worklog_dir)
+    if owning is None:
+        return None
+    return str(owning)
+
+
+def _batch_drain_cycle(audit_one: Callable[[str, int, str | None], int],
                        max_items: int | None = None,
                        timeout: float | None = None,
                        worklog_dir: str | None = None,
@@ -4668,19 +5562,25 @@ def _batch_drain_cycle(audit_one: Callable[[str, int], int],
       2. Skip ``audit:`` admission tickets, the caller's own primary item
          (*skip_ids*), and duplicates (defensive; the queue holds work-item
          ids).
-      3. Audit the item via ``audit_one(item_id, priority)``. The caller's
-         callback owns the concurrency slot discipline (each item's pi
-         calls acquire/release slots host-wide), so the slot is released
-         between items — another process can use it before the next item
-         is dequeued (AC4).
+      3. Audit the item via ``audit_one(item_id, priority, project_root)``.
+         The caller's callback owns the concurrency slot discipline (each
+         item's pi calls acquire/release slots host-wide), so the slot is
+         released between items — another process can use it before the next
+         item is dequeued (AC4). Cross-project routing (LP-0MW96A9GW009KVF7
+         AC3): the entry's ``project_root`` is passed through, so a repo-A
+         drain audits a repo-B item against repo B's own worklog root, not a
+         shared default. Legacy entries (``project_root`` None) pass ``None``
+         — today's single-root behaviour (AC5).
       4. Continue until the queue is empty, ``max_items`` is reached, or
          the wall-clock *timeout* (AC3) elapses — whichever comes first.
          Remaining items stay queued for the next window.
 
     Returns a metrics dict ``{batch_start, batch_end, items_processed,
-    queue_remaining, items_included}`` and emits the AC5 metrics line.
-    Errors from a single item's audit are caught per-item (logged, item
-    still counted as processed) so one bad item never aborts the window.
+    queue_remaining, items_included}`` plus the additive per-project map
+    ``projects_included`` (AC4: which repositories contributed to this
+    window) and emits the AC5 metrics line. Errors from a single item's audit
+    are caught per-item (logged, item still counted as processed) so one bad
+    item never aborts the window.
     """
     max_items = _resolve_batch_max_items() if max_items is None else max_items
     timeout = _resolve_batch_timeout() if timeout is None else timeout
@@ -4689,6 +5589,7 @@ def _batch_drain_cycle(audit_one: Callable[[str, int], int],
     batch_start_ts = time.strftime(_AUDIT_TS_FORMAT, time.localtime(batch_start))
     items_processed = 0
     items_included: list[str] = []
+    projects_included: dict[str, list[str]] = {}
     seen: set[str] = set()
 
     while items_processed < max_items:
@@ -4705,8 +5606,11 @@ def _batch_drain_cycle(audit_one: Callable[[str, int], int],
             continue
         seen.add(item_id)
         items_included.append(item_id)
+        project_root = getattr(entry, "project_root", None)
+        if project_root:
+            projects_included.setdefault(str(project_root), []).append(item_id)
         try:
-            audit_one(item_id, entry.priority)
+            audit_one(item_id, entry.priority, project_root)
         except Exception as exc:  # noqa: BLE001 — per-item isolation
             print(
                 f"Warning: batch item {item_id} audit failed: {exc}",
@@ -4722,6 +5626,7 @@ def _batch_drain_cycle(audit_one: Callable[[str, int], int],
         "items_processed": items_processed,
         "queue_remaining": queue_remaining,
         "items_included": items_included,
+        "projects_included": projects_included,
     }
     _log_batch_metrics(metrics)
     return metrics
@@ -4842,6 +5747,211 @@ def _query_proxy_mode(base_url: str | None = None,
         return mode if isinstance(mode, str) else None
     except Exception:  # noqa: BLE001 — best-effort, fail-open
         return None
+
+
+# ---------------------------------------------------------------------------
+# Proxy audit lease client (LP-0MW96A9GW009KVF7, parent AC1/AC2)
+# ---------------------------------------------------------------------------
+# Acquire/renew/release the cross-host audit-tier lease around a run. Fail-
+# safe (parent constraint): every call is best-effort — a proxy error or
+# timeout never blocks the audit; the acquire path waits a bounded number of
+# retries on ``audit-budget-saturated`` and then proceeds WITHOUT a lease
+# (legacy per-host behaviour preserved). See the constants block above for
+# the rationale.
+
+def _audit_lease_enabled() -> bool:
+    """True when the proxy audit-lease acquisition is enabled."""
+    raw = os.environ.get(AUDIT_LEASE_ENABLED_ENV)
+    if raw is None:
+        return AUDIT_LEASE_ENABLED_DEFAULT
+    return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _audit_lease_timeout() -> float:
+    """Per-lease HTTP request timeout (seconds)."""
+    raw = os.environ.get(AUDIT_LEASE_TIMEOUT_ENV)
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    return AUDIT_LEASE_TIMEOUT_DEFAULT
+
+
+def _audit_lease_acquire_retries() -> int:
+    """Bounded acquire retries on ``audit-budget-saturated`` (>= 0)."""
+    raw = os.environ.get(AUDIT_LEASE_ACQUIRE_RETRIES_ENV)
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return AUDIT_LEASE_ACQUIRE_RETRIES_DEFAULT
+
+
+def _audit_lease_post(endpoint: str, payload: dict,
+                      timeout: float | None = None) -> dict | None:
+    """POST *payload* to *endpoint* on the proxy; return parsed JSON or None.
+
+    Never raises (fail-open): a network error, timeout, non-JSON body or
+    non-2xx status returns ``None`` — the lease is best-effort.
+    """
+    try:
+        url = _proxy_base_url().rstrip("/") + endpoint
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout or _audit_lease_timeout()) as resp:
+            if resp.status >= 400:
+                return None
+            text = resp.read().decode("utf-8")
+        return json.loads(text) if text.strip() else None
+    except Exception:  # noqa: BLE001 — best-effort, fail-open
+        return None
+
+
+def _audit_lease_delete(endpoint: str,
+                        timeout: float | None = None) -> dict | None:
+    """DELETE *endpoint* on the proxy; return parsed JSON or None.
+
+    Never raises (fail-open): release is best-effort — a crashed holder's
+    lease expires via the proxy's TTL backstop regardless.
+    """
+    try:
+        url = _proxy_base_url().rstrip("/") + endpoint
+        req = urllib.request.Request(url, method="DELETE")
+        with urllib.request.urlopen(req, timeout=timeout or _audit_lease_timeout()) as resp:
+            if resp.status >= 400:
+                return None
+            text = resp.read().decode("utf-8")
+        return json.loads(text) if text.strip() else None
+    except Exception:  # noqa: BLE001 — best-effort, fail-open
+        return None
+
+
+def _audit_lease_acquire(session_id: str) -> dict | None:
+    """Acquire (or idempotently renew) the audit lease for *session_id*.
+
+    Waits up to :func:`_audit_lease_acquire_retries` bounded retries when the
+    proxy reports ``audit-budget-saturated`` (honouring the hinted
+    ``retry_after_s`` between attempts), then fails OPEN: returns ``None`` so
+    the audit proceeds under legacy per-host guards — a second host's audit
+    never hangs indefinitely behind the running holder (parent AC1
+    "waits rather than competing" + fail-safe constraint). Returns the
+    lease payload dict on success.
+    """
+    payload = {"session_id": session_id}
+    for attempt in range(_audit_lease_acquire_retries() + 1):
+        result = _audit_lease_post(AUDIT_LEASE_ENDPOINT_PATH, payload)
+        if result is None:
+            return None  # proxy error/timeout — fail open
+        if result.get("admit"):
+            return result
+        # Saturated: wait the hinted bound (or a 1 s floor) then retry.
+        reason = result.get("reason")
+        if reason == "audit-budget-saturated":
+            retry_after = result.get("retry_after_s")
+            try:
+                wait = max(1.0, float(retry_after)) if retry_after else 1.0
+            except (TypeError, ValueError):
+                wait = 1.0
+            # Bounded: never more than the fail-safe ceiling per attempt.
+            wait = min(wait, 30.0)
+            if attempt < _audit_lease_acquire_retries():
+                time.sleep(wait)
+                continue
+            print(
+                "Audit lease: proxy reports audit-budget-saturated after "
+                f"{_audit_lease_acquire_retries()} retries — proceeding "
+                "without the cross-host lease (legacy per-host guards).",
+                file=sys.stderr,
+            )
+            return None
+        return None
+    return None
+
+
+def _audit_lease_renew(session_id: str) -> bool:
+    """Renew the audit lease for *session_id* (True on acknowledged renew)."""
+    result = _audit_lease_post(
+        AUDIT_LEASE_ENDPOINT_RENEW_PATH, {"session_id": session_id}
+    )
+    return bool(result and result.get("renewed"))
+
+
+def _audit_lease_release(session_id: str) -> bool:
+    """Release the audit lease for *session_id* (True on acknowledged release)."""
+    endpoint = AUDIT_LEASE_ENDPOINT_PATH + "/" + _url_quote(session_id)
+    result = _audit_lease_delete(endpoint)
+    return bool(result and result.get("released") is True)
+
+
+def _url_quote(value: str) -> str:
+    """Percent-encode a path segment (session ids are scheme/underscore safe)."""
+    from urllib.parse import quote
+
+    return quote(value, safe="")
+
+
+def _audit_run_session_id(issue_id: str) -> str:
+    """Stable per-run audit session id for the lease.
+
+    Matches the proxy's audit-tier identification (the ``audit-`` prefix):
+    ``audit-<issue>-lease-<uuid8>``, built ONCE per process so the
+    acquire/renew/release round-trip uses one identity for the whole run.
+    """
+    short = uuid.uuid4().hex[:8]
+    safe_issue = _sanitize_session_id_segment(issue_id or "project")
+    return f"audit-{safe_issue}-lease-{short}"
+
+
+def audit_lease_begin(issue_id: str) -> str | None:
+    """Acquire the audit lease for a run; return the session id, or None.
+
+    Called once at the start of the outermost ``cmd_issue`` run. Disabled via
+    ``AUDIT_LEASE_ENABLED=0``; fail-open on proxy errors and on saturation
+    (bounded waits, then legacy behaviour). The module-level
+    :data:`_AUDIT_LEASE_STATE` records the held session id so nested calls
+    (children, batch drains) reuse it instead of double-acquiring.
+    """
+    global _AUDIT_LEASE_STATE
+    if not _audit_lease_enabled():
+        return None
+    if _AUDIT_LEASE_STATE is not None:
+        return _AUDIT_LEASE_STATE["session_id"]  # nested run — already held
+    session_id = _audit_run_session_id(issue_id)
+    result = _audit_lease_acquire(session_id)
+    if result is None:
+        return None
+    _AUDIT_LEASE_STATE = {"session_id": session_id, "lease_id": result.get("lease_id")}
+    print(
+        "Audit lease acquired: session=" + session_id
+        + f" lease_id={result.get('lease_id')} "
+        + f"live={result.get('live')} available={result.get('available')}",
+        file=sys.stderr,
+    )
+    return session_id
+
+
+def audit_lease_renew_current() -> None:
+    """Renew the process's held audit lease (no-op when none held)."""
+    if _AUDIT_LEASE_STATE is None:
+        return
+    _audit_lease_renew(_AUDIT_LEASE_STATE["session_id"])
+
+
+def audit_lease_end() -> None:
+    """Release the process's held audit lease (idempotent, fail-open)."""
+    global _AUDIT_LEASE_STATE
+    if _AUDIT_LEASE_STATE is None:
+        return
+    session_id = _AUDIT_LEASE_STATE["session_id"]
+    released = _audit_lease_release(session_id)
+    if released:
+        print(f"Audit lease released: session={session_id}", file=sys.stderr)
+    _AUDIT_LEASE_STATE = None
 
 
 def _explicit_parallelism_request() -> int | None:
@@ -5304,6 +6414,33 @@ def _phase_label(context: str) -> str:
     return context or "unknown phase"
 
 
+def _provider_error_evidence(provider_error: str, context: str, model: str,
+                             attempts: int | None = None,
+                             elapsed_seconds: float | None = None) -> str:
+    """Build actionable provider-error evidence (SA-0MW0LROWQ000JVTM AC2).
+
+    Names the observed error, the model/provider, the phase, the attempt
+    count and the elapsed seconds, then states the concrete remediation so an
+    exhausted provider-error path is never a bare ``"Connection error."``
+    line. The stable ``Pi provider error: <message>`` prefix is preserved for
+    downstream consumers (the report's provider-error count greps it — see
+    :func:`_build_issue_json`).
+    """
+    parts = [f"Pi provider error: {provider_error.rstrip('.')}."]
+    parts.append(f"Provider: {model}.")
+    parts.append(f"Phase: {_phase_label(context)}.")
+    if attempts is not None:
+        parts.append(f"Attempts: {attempts}.")
+    if elapsed_seconds is not None:
+        parts.append(f"Elapsed: {float(elapsed_seconds):.1f}s.")
+    parts.append(
+        "Manual review required. Remediation: re-run when the proxy pool has "
+        "capacity, or set AUDIT_MAX_CONCURRENCY=1 to serialize concurrent "
+        "audits, or re-run with --force."
+    )
+    return " ".join(parts)
+
+
 def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
              pi_bin: str = "pi",
              enable_tools: bool = False,
@@ -5521,7 +6658,10 @@ def _call_pi(prompt: str, model: str = DEFAULT_MODEL,
             ac_fallback_used.set()
         return {
             "verdict": "unmet",
-            "evidence": f"Pi provider error: {provider_error}. Phase: {_phase_label(context)}.",
+            "evidence": _provider_error_evidence(
+                provider_error, context, model,
+                attempts=attempt, elapsed_seconds=elapsed_seconds,
+            ),
             "raw_stdout": stdout,
             "raw_stderr": stderr,
             "extracted_text": "",
@@ -8313,6 +9453,57 @@ def _parse_child_audit_verdict(raw_output: str,
     return False, "not_ready", audited_at
 
 
+def _get_child_content_fresh_verdict(
+    runner: Runner, child_id: str,
+    worklog_dir: str | None = None,
+    child: dict | None = None,
+) -> tuple[bool | None, str | None]:
+    """Return ``(verdict, audited_at)`` for a CONTENT-fresh stored child audit.
+
+    Strict content gate (SA-0MVZ3SMK6007431I AC1/AC2): the stored report must
+    carry a **v2 content fingerprint** that matches the child's current
+    content (title + description) AND parse a ``Ready to close:`` verdict.
+    Unlike :func:`_get_child_audit_verdict` this never trusts a legacy
+    fingerprint-less report through the fail-open time-gate floor — such a
+    report is not provably content-fresh, so callers fall back to a real
+    screen (backwards compatible with the pre-existing behaviour).
+
+    *child* may be supplied when the caller already holds the item data
+    (avoids a redundant ``wl show``); otherwise the current fingerprint is
+    computed from ``wl show`` — the same source :func:`_persist_child_audit`
+    used to embed the stored fingerprint.
+
+    Returns ``(None, None)`` when the child has no audit, the audit is
+    legacy/unversioned, the content changed, or no verdict parses.
+    """
+    try:
+        data = _run_wl(runner, ["wl", "audit-show", child_id, "--json"],
+                       worklog_dir=worklog_dir)
+    except RuntimeError:
+        return None, None
+    audit = data.get("audit") if isinstance(data, dict) else None
+    if not audit:
+        return None, None
+    raw_output = audit.get("rawOutput")
+    audited_at = audit.get("auditedAt")
+    if not raw_output or not audited_at:
+        return None, None
+    stored_fingerprint = _extract_content_fingerprint(raw_output)
+    if stored_fingerprint is None:
+        return None, None  # legacy / unversioned → not provably content-fresh
+    current_fingerprint = _compute_content_fingerprint(
+        runner, child_id, worklog_dir=worklog_dir, work_item=child,
+    )
+    if current_fingerprint is None or current_fingerprint != stored_fingerprint:
+        return None, None
+    verdict, _reason, _audited_at = _parse_child_audit_verdict(
+        raw_output, audited_at,
+    )
+    if verdict is None:
+        return None, None
+    return verdict, audited_at
+
+
 def _fetch_audited_at(runner: Runner, issue_id: str,
                       worklog_dir: str | None = None) -> str | None:
     """Return the audit's ``auditedAt`` for a work item (None when unavailable).
@@ -8716,6 +9907,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                 for ac in child_acs
             ]
             return ci, child_ac_results
+        screen_model = phase1_model
         try:
             result, batch, raw_text = _call_phase1_screen(
                 child.get("id", ""), f"child:{child.get('id', '')}", prompt,
@@ -8740,6 +9932,7 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
                 "retrying child AC review with the full audit model",
                 file=sys.stderr,
             )
+            screen_model = full_model
             result, batch, raw_text = _call_phase1_screen(
                 child.get("id", ""), f"child:{child.get('id', '')}", prompt,
                 full_model, pi_bin, debug_log, timeout, ac_fallback_used,
@@ -8808,9 +10001,10 @@ def _phase1_review_child_acs(ci: int, child: dict, phase1_model: str,
             # from the root-level result (e.g., a timeout message).
             if result.get("_provider_error"):
                 provider_error = result.get("_provider_error_message", "unknown")
-                evidence = (
-                    f"Pi provider error: {provider_error} — "
-                    "criterion could not be evaluated."
+                evidence = _provider_error_evidence(
+                    provider_error, f"child:{child.get('id', '')}", screen_model,
+                    attempts=result.get("_provider_error_attempts"),
+                    elapsed_seconds=result.get("elapsed_seconds"),
                 )
             else:
                 outer_evidence = _evidence_text(result.get("evidence"))
@@ -9383,6 +10577,11 @@ def _deep_analyze_child(
         if ac_fallback_used is not None:
             ac_fallback_used.set()
         provider_error = child_result.get("_provider_error_message", "unknown")
+        evidence = _provider_error_evidence(
+            provider_error, "phase2_child", resolved_model,
+            attempts=child_result.get("_provider_error_attempts"),
+            elapsed_seconds=child_result.get("elapsed_seconds"),
+        )
         print(
             f"Warning: Child deep analysis provider error for {child.get('id', '')}: "
             f"{provider_error}",
@@ -9393,10 +10592,7 @@ def _deep_analyze_child(
             error_acs.append({
                 "text": ac.get("text", ""),
                 "verdict": VERDICT_PARTIAL,
-                "evidence": (
-                    f"Pi provider error: {provider_error} \u2014 manual review required."
-                    " Phase: Phase 2 child deep analysis."
-                ),
+                "evidence": evidence,
             })
         updated = dict(child)
         updated["ac_results"] = error_acs
@@ -9964,6 +11160,11 @@ def _run_phase2_deep_analysis(
             if ac_fallback_used is not None:
                 ac_fallback_used.set()
             provider_error = result.get("_provider_error_message", "unknown")
+            evidence = _provider_error_evidence(
+                provider_error, "phase2_deep", resolved_model,
+                attempts=result.get("_provider_error_attempts"),
+                elapsed_seconds=result.get("elapsed_seconds"),
+            )
             print(
                 f"Warning: Phase 2 deep analysis provider error: {provider_error}",
                 file=sys.stderr,
@@ -9978,10 +11179,7 @@ def _run_phase2_deep_analysis(
                 error_acs.append({
                     "text": ac.get("text", ""),
                     "verdict": VERDICT_PARTIAL,
-                    "evidence": (
-                        f"Pi provider error: {provider_error} \u2014 manual review required."
-                        " Phase: Phase 2 deep analysis."
-                    ),
+                    "evidence": evidence,
                 })
             error_children = []
             for child in child_results:
@@ -9991,10 +11189,7 @@ def _run_phase2_deep_analysis(
                     updated_child_acs.append({
                         "text": ac.get("text", ""),
                         "verdict": VERDICT_PARTIAL,
-                        "evidence": (
-                            f"Pi provider error: {provider_error} \u2014 manual review required."
-                            " Phase: Phase 2 deep analysis."
-                        ),
+                        "evidence": evidence,
                     })
                 error_children.append(dict(child))
                 error_children[-1]["ac_results"] = updated_child_acs
@@ -10291,6 +11486,15 @@ class _AuditContext:
     max_child_audits: int | None
     run_tests: bool
     no_execute: bool = False
+    # Audit test-failure mode (SA-0MW0JJ36Z000AF57). ``strict`` is resolved once
+    # in cmd_issue from --strict/--no-strict > AUDIT_STRICT > permissive default;
+    # ``strict_source`` records how it was resolved for the persisted report.
+    strict: bool = False
+    strict_source: str = "default"
+    # Red-suite evaluation + rendered report section (set on the F3 / merge-gate
+    # paths when the suite is red; None/"" for a green run).
+    test_failure_evaluation: dict | None = None
+    test_failure_mode_section: str = ""
     max_citations_per_ac: int | None = None
     child_in_main_slot: bool = False
     """Resolved from env var / CLI flag / default true by cmd_issue
@@ -10351,6 +11555,27 @@ class _AuditContext:
         return (
             Path(self.per_audit_project_root)
             if self.per_audit_project_root else TARGET_PROJECT_ROOT
+        )
+
+    execution_worktree: str = ""
+    """Fresh detached origin/dev worktree used for execution-dependent work
+    (SA-0MW4ZRLSI005PHL6 AC1).
+
+    Created by ``_phase_gate`` before F3 suite execution and removed by
+    ``cmd_issue``'s finally block. Empty when the worktree could not be
+    created (fail-open: execution falls back to ``per_audit_project_root``).
+    The F3 full-suite gate and the Phase 1/2 file-scope manifest resolve
+    against it so an un-pushed in-flight commit parked on the launch checkout
+    can never contaminate an audit.
+    """
+
+    @property
+    def execution_root(self) -> Path:
+        """Execution base: the fresh origin/dev worktree when available,
+        else the per-audit target root (fail-open)."""
+        return (
+            Path(self.execution_worktree)
+            if self.execution_worktree else self.per_audit_root
         )
 
     resolved_model: str = DEFAULT_MODEL
@@ -10571,8 +11796,12 @@ def _resolve_item_integration_evidence(ctx: _AuditContext) -> tuple[list[str], s
                     ):
                         branch = branch or ref_name
                         _add_sha(obj_name)
-        except Exception:  # noqa: S110, BLE001 -- best-effort; never fail the gate on ref resolution
-            pass
+        except Exception as exc:  # noqa: BLE001 -- best-effort; never fail the gate on ref resolution
+            print(
+                f"Merge gate: ref resolution for {issue_id} failed — "
+                f"git for-each-ref error: {exc}",
+                file=sys.stderr,
+            )
 
     # 2. Commits referenced in the item's description + comments. The
     #    work item is already fetched (``_phase_fetch_and_cq`` runs the
@@ -10822,7 +12051,44 @@ def _integrate_into_dev(ctx: _AuditContext,
             test_rc = suite_result.get("returncode", 1)
             evidence.append(f"project test suite ('all') -> rc={test_rc}")
             if not suite_result.get("success", False):
-                return False, "\n".join(evidence) + "\nIntegration failed: test suite failed."
+                # Test-failure mode (SA-0MW0JJ36Z000AF57): in permissive mode a
+                # red integration suite is excused only when every failure is a
+                # unit failure proven unrelated. The pre-integration origin/dev
+                # sha is the baseline: a failure that reproduces there too is
+                # pre-existing and unrelated. Strict mode keeps today's
+                # fail-closed behaviour unchanged.
+                suite_failures = suite_result.get("failures") or []
+                try:
+                    touched = _resolve_touched_files(
+                        ctx.runner, ctx.issue_id, worklog_dir=ctx.worklog_dir,
+                    )
+                except Exception:  # noqa: BLE001 -- fail open to no mapping
+                    touched = None
+                evaluation = _evaluate_red_suite(
+                    suite_failures,
+                    strict=ctx.strict,
+                    touched_files=touched,
+                    key_files=_extract_key_files(ctx.description or ""),
+                    project_root=str(worktree_path),
+                    baseline_commit=dev_sha,
+                )
+                ctx.test_failure_evaluation = evaluation
+                ctx.test_failure_mode_section = _format_test_failure_mode_section(
+                    evaluation, strict=ctx.strict, source=ctx.strict_source,
+                )
+                if evaluation["outcome"] == "excused":
+                    evidence.append(
+                        "permissive mode: red integration suite excused — all "
+                        "failures are unrelated unit failures (baseline "
+                        f"{dev_sha[:10]}); excused: "
+                        + ", ".join(evaluation.get("excused", []))
+                    )
+                else:
+                    if ctx.strict:
+                        evidence.append("strict mode: any failing test blocks "
+                                        "integration")
+                    return False, ("\n".join(evidence)
+                                   + "\nIntegration failed: test suite failed.")
         else:
             # Fallback: run pytest/node suite commands if the test-skill
             # runner is unavailable; best-effort.
@@ -10859,6 +12125,215 @@ def _integrate_into_dev(ctx: _AuditContext,
             pass
 
 
+# ---------------------------------------------------------------------------
+# Fresh origin/dev execution worktree + ahead/divergent guard
+# (SA-0MW4ZRLSI005PHL6 AC1/AC2)
+# ---------------------------------------------------------------------------
+
+#: Prefix of the fresh origin/dev execution worktree directory name. Kept
+#: distinct from the merge gate's ``audit-merge-<id>`` worktree so the two
+#: never collide.
+_EXECUTION_WORKTREE_PREFIX = "audit-exec"
+
+#: A value that looks like a git object name (short or full sha). Used to
+#: reject a mocked/garbage runner output before treating it as a resolved
+#: commit — a fake runner that answers unknown commands with a JSON success
+#: blob must never be read as ``origin/dev`` or as ahead commits.
+_SHA_LIKE_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def _looks_like_sha(value: str) -> bool:
+    """True when *value* is a git object name (7–40 lowercase hex chars)."""
+    return bool(_SHA_LIKE_RE.match((value or "").strip()))
+
+
+def _ensure_execution_worktree_submodules(worktree_path: Path) -> bool:
+    """Initialise git submodules inside a fresh execution worktree.
+
+    Mirrors ``implement.py::_ensure_submodules`` (SA-0MSN52GGN002B0AZ): a
+    ``git worktree add`` leaves a tracked gitlink's submodule directory
+    empty, so a project whose suite imports a submodule (e.g.
+    tce-the-rising's ``core/``) fails every suite command at startup. Run
+    **before** the ``node_modules`` symlink (ordering hazard
+    SA-0MVTOR53E003IIEQ).
+
+    Best-effort: a failure never aborts the audit — the execution worktree
+    is then no worse than the launch checkout. Returns ``True`` when
+    submodules were initialised (or there are none).
+    """
+    if not (worktree_path / ".gitmodules").is_file():
+        return True
+    # Scrub repository-overriding env (the ``implement.py finish`` gate exports
+    # a temporary ``GIT_INDEX_FILE`` for the suite it runs — SA-0MVWQ4FZ4003S0GE;
+    # a leaked ``GIT_DIR``/``GIT_WORK_TREE``/``GIT_INDEX_FILE`` would redirect
+    # the submodule update off this worktree).
+    env = {
+        k: v for k, v in os.environ.items()
+        if not (k == "GIT_INDEX_FILE" or k in {
+            "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR",
+            "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+        })
+    }
+    try:
+        # ``-c protocol.file.allow=always`` mirrors the merge-gate/fixture
+        # convention (the fixture registers its local-path submodule with the
+        # same flag): git >= 2.38 blocks the ``file`` transport by default
+        # (``fatal: transport 'file' not allowed``), which would silently
+        # fail *every* local-path submodule initialisation. Tracked remote
+        # submodules are unaffected (https/file semantics are unchanged by
+        # the flag).
+        proc = subprocess.run(
+            ["git", "-c", "protocol.file.allow=always",
+             "submodule", "update", "--init", "--recursive"],
+            cwd=str(worktree_path), capture_output=True, text=True,
+            check=False, timeout=600, env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
+
+
+def _create_execution_worktree(owning_root: Path, runner: Runner,
+                               issue_id: str) -> tuple[Path | None, str]:
+    """Create a fresh detached worktree at the latest ``origin/dev``.
+
+    AC1 (SA-0MW4ZRLSI005PHL6): the F3 full-suite gate must execute against
+    the merged, checked-in dev state — never a stale/dirty launch checkout.
+    Fetches ``origin/dev`` first (so the worktree is at the latest delivered
+    tip), creates a detached worktree, initialises submodules *before*
+    symlinking the shared ``node_modules`` (ordering hazard
+    SA-0MVTOR53E003IIEQ; symlink convention SA-0MSGS763C006SM1B), and
+    returns the worktree path.
+
+    Returns ``(worktree_path, evidence)``. ``worktree_path`` is ``None``
+    when the worktree could not be created — callers fall back to the launch
+    checkout (fail-open; an execution worktree is an improvement, never a
+    new hard dependency).
+    """
+    evidence: list[str] = []
+    try:
+        proc = runner(["git", "fetch", "origin", "dev"])
+        if proc.returncode != 0:
+            return None, "git fetch origin dev failed; execution worktree unavailable"
+        proc = runner(["git", "rev-parse", "--verify", "origin/dev"])
+        if proc.returncode != 0 or not _looks_like_sha(proc.stdout):
+            return None, "origin/dev unresolvable; execution worktree unavailable"
+        dev_sha = proc.stdout.strip()
+        worktree_path = (
+            owning_root / ".worklog" / "worktrees"
+            / f"{_EXECUTION_WORKTREE_PREFIX}-{issue_id}"
+        )
+        if worktree_path.exists():
+            runner(["git", "worktree", "remove", "--force", str(worktree_path)])
+        proc = runner(["git", "worktree", "add", "--detach",
+                       str(worktree_path), dev_sha])
+        # A mocked/garbage runner can report rc=0 without creating the
+        # worktree; require the directory AND its git file to exist before
+        # treating the worktree as the execution base (fail-open otherwise).
+        if proc.returncode != 0 or not worktree_path.exists() \
+                or not (worktree_path / ".git").exists():
+            return None, (
+                "git worktree add at origin/dev failed "
+                f"(rc={proc.returncode}); execution worktree unavailable"
+            )
+        evidence.append(
+            f"execution worktree created at {worktree_path} "
+            f"(detached at origin/dev {dev_sha[:10]})"
+        )
+        # Submodules BEFORE the node_modules symlink (SA-0MVTOR53E003IIEQ).
+        if _ensure_execution_worktree_submodules(worktree_path):
+            evidence.append("submodules initialised in execution worktree")
+        else:
+            evidence.append("submodule initialisation skipped/failed (best-effort)")
+        # Reuse the merge-gate node_modules symlink convention
+        # (SA-0MSGS763C006SM1B): never npm-install inside a worktree.
+        if (owning_root / "node_modules").exists() \
+                and not (worktree_path / "node_modules").exists():
+            try:
+                (worktree_path / "node_modules").symlink_to(
+                    owning_root / "node_modules", target_is_directory=True
+                )
+                evidence.append("node_modules symlinked into execution worktree")
+            except OSError:
+                evidence.append("node_modules symlink failed (best-effort)")
+        return worktree_path, "\n".join(evidence)
+    except Exception as exc:  # noqa: BLE001 -- fail-open: fall back to launch
+        return None, f"execution worktree creation error: {exc}"
+
+
+def _remove_execution_worktree(owning_root: Path | None, runner: Runner,
+                               worktree_path: str | None) -> None:
+    """Remove the fresh origin/dev execution worktree (best-effort).
+
+    AC1 (SA-0MW4ZRLSI005PHL6): the execution worktree is removed after the
+    audit so it never accumulates under ``.worklog/worktrees``. Removing a
+    worktree never touches the main checkout's tracked content.
+    """
+    if not worktree_path:
+        return
+    try:
+        runner(["git", "worktree", "remove", "--force", str(worktree_path)])
+    except Exception:  # noqa: BLE001 -- cleanup best-effort
+        pass
+
+
+def _launch_checkout_divergence(owning_root: Path, runner: Runner,
+                                launch_root: Path,
+                                ) -> tuple[bool, list[str], str]:
+    """Detect a main checkout ahead of / divergent from ``origin/dev``.
+
+    AC2 (SA-0MW4ZRLSI005PHL6): an audit must never run against un-pushed
+    in-flight work parked on the owning repo's MAIN checkout. The
+    stale-audit-base guard (SA-0MT9EK1UU000DT1R) only flags *behind*
+    (delivered on origin/dev, absent from HEAD); this flags *ahead/divergent*
+    (local HEAD contains commits not in origin/dev), the 2026-11-06
+    RISE-0MW19AROF0035FRH incident shape (1 un-pushed commit, 6 behind).
+
+    **Scope (AC5).** Only applies when the launch checkout IS the owning
+    repo's main checkout. A feature-worktree launch
+    (``<owning>/.worklog/worktrees/wl-<id>-*``) legitimately has a HEAD
+    ahead of origin/dev (the item's own un-pushed work); the behind-only
+    guard suffices there, so this returns ``(False, [], "")``.
+
+    Returns ``(divergent, ahead_commits, evidence)``. Fail-open on any git
+    error (an unresolvable origin/dev or a git failure never blocks an
+    audit).
+    """
+    try:
+        launch = Path(launch_root).resolve()
+        owning = Path(owning_root).resolve()
+    except OSError:
+        return False, [], ""
+    if launch != owning:
+        # Not the main checkout (a worktree launch): legitimately ahead.
+        return False, [], ""
+    try:
+        # Ensure origin/dev is current so the comparison is meaningful.
+        runner(["git", "fetch", "origin", "dev"])
+        proc = runner(["git", "rev-parse", "--verify", "origin/dev"])
+        if proc.returncode != 0 or not _looks_like_sha(proc.stdout):
+            return False, [], ""
+        proc = runner(["git", "rev-list", "origin/dev..HEAD"])
+        if proc.returncode != 0:
+            return False, [], ""
+        ahead = [
+            ln.strip() for ln in proc.stdout.splitlines()
+            if _looks_like_sha(ln)
+        ]
+    except Exception:  # noqa: BLE001 -- fail-open
+        return False, [], ""
+    if not ahead:
+        return False, [], ""
+    shown = ahead[:10]
+    evidence = (
+        f"the launch checkout {launch} is ahead of origin/dev by "
+        f"{len(ahead)} un-pushed commit(s) not present on origin/dev: "
+        + ", ".join(shown)
+        + (" …" if len(ahead) > len(shown) else "")
+    )
+    return True, ahead, evidence
+
+
 def _audit_base_freshness(ctx: _AuditContext,
                           commits: list[str],
                           branch: str) -> tuple[bool, str, list[str], str | None]:
@@ -10887,8 +12362,11 @@ def _audit_base_freshness(ctx: _AuditContext,
     Fail-open semantics: a candidate that is NOT an ancestor of origin/dev
     (e.g. an unrelated/context citation, or an unresolvable sha) is skipped;
     candidates whose presence in HEAD cannot be verified due to a git error
-    are treated as present. The guard only flags the deterministic
-    stale-checkout case (delivered on origin/dev, absent from HEAD).
+    are treated as present. The guard flags the deterministic
+    stale-checkout case (delivered on origin/dev, absent from HEAD) AND —
+    AC2 of SA-0MW4ZRLSI005PHL6 — the ahead/divergent main-checkout case
+    (local HEAD contains commits not in ``origin/dev``: un-pushed in-flight
+    work parked on the checkout being audited).
     """
     evidence: list[str] = []
     missing: list[str] = []
@@ -10898,6 +12376,36 @@ def _audit_base_freshness(ctx: _AuditContext,
         evidence.append(f"local audit base HEAD resolved to {head_sha}")
     else:
         evidence.append("local audit base HEAD could not be resolved")
+
+    # AC2 (SA-0MW4ZRLSI005PHL6): belt-and-braces ahead/divergent check. The
+    # early guard in ``_phase_gate`` catches this BEFORE F3 execution; this
+    # records the same condition in the merge-gate evidence (which the
+    # report surfaces) so a caller that reaches the gate another way still
+    # refuses to audit un-pushed in-flight work. Only fires when the launch
+    # checkout is the owning repo's MAIN checkout (worktree launches
+    # legitimately sit ahead — AC5).
+    owning = Path(ctx.owning_root) if ctx.owning_root else None
+    ahead_commits: list[str] = []
+    if owning is not None:
+        # The checkout the audit resolves git against is the per-audit root
+        # (the launch checkout, or the owning root on a foreign-cwd launch).
+        # ``_launch_checkout_divergence`` only fires when that checkout IS
+        # the owning repo's main checkout (a worktree launch legitimately
+        # sits ahead — AC5).
+        divergent, ahead_commits, divergence_evidence = _launch_checkout_divergence(
+            owning, ctx.runner, ctx.per_audit_root,
+        )
+        if divergent:
+            evidence.append(
+                "Audit-base divergence check: " + divergence_evidence
+                + " — STALE (launch checkout ahead/divergent from origin/dev)"
+            )
+        else:
+            evidence.append(
+                "Audit-base divergence check: launch checkout is at "
+                "origin/dev (or a worktree launch) — OK"
+            )
+    divergent_missing = list(ahead_commits)
 
     candidates: list[str] = []
     seen: set[str] = set()
@@ -10958,6 +12466,10 @@ def _audit_base_freshness(ctx: _AuditContext,
             "no delivered-commit candidates — nothing to verify (fail-open)"
         )
 
+    if divergent_missing:
+        # Ahead/divergent is stale regardless of delivered-commit ancestry.
+        return False, "\n".join(evidence), missing + divergent_missing, head_sha
+
     return not missing, "\n".join(evidence), missing, head_sha
 
 
@@ -10986,10 +12498,11 @@ def _audit_base_freshness_guard_passes(ctx: _AuditContext,
         "The item's delivered work IS merged into the owning repo's "
         "origin/dev, but the local checkout the audit resolves its git "
         "scope against (HEAD "
-        f"{head_sha or '<unresolved>'}) does NOT contain the delivered "
-        "commit(s): "
+        f"{head_sha or '<unresolved>'}) is stale or divergent from "
+        "origin/dev: commit(s) "
         + ", ".join(missing)
-        + ". The audit would run against a stale tree and report "
+        + ". The audit would run against a stale/contaminated tree "
+        "(missing delivered work or un-pushed in-flight work) and report "
         "misleading verdicts."
     )
     print(
@@ -11282,6 +12795,75 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     per_audit_root = git_root
     runner = _cwd_aware_runner(git_root, runner)
     ctx.runner = runner
+    # Publish the per-audit root EARLY: the AC1/AC2 helpers below (execution
+    # worktree + divergence guard) read ``ctx.per_audit_root`` / ``ctx.
+    # execution_root``, whose ``per_audit_root`` property falls back to the
+    # cwd-derived ``TARGET_PROJECT_ROOT`` while ``per_audit_project_root`` is
+    # empty. Set it now (idempotently reassigned at the gate's end) so the F3
+    # execution base resolves to the owning/launch root, never the framework
+    # cwd (SA-0MW4ZRLSI005PHL6).
+    ctx.per_audit_project_root = str(per_audit_root)
+
+    # ------------------------------------------------------------------
+    # AC2 (SA-0MW4ZRLSI005PHL6): refuse to audit a main checkout that is
+    # ahead of / divergent from origin/dev. Evaluated HERE — right after
+    # owning-root resolution and BEFORE the F3 suite auto-execution below —
+    # so a contaminated run never executes (and never triages spurious
+    # critical ``test-failure`` children against the audited item).
+    #
+    # Belt-and-braces with the fresh origin/dev execution worktree (AC1):
+    # the worktree makes the launch checkout irrelevant for F3, and this
+    # early abort prevents the wasted execution entirely. Scope (AC5): only
+    # fires when the launch checkout IS the owning repo's main checkout — a
+    # feature worktree legitimately sits ahead of origin/dev.
+    # ------------------------------------------------------------------
+    divergent, ahead_commits, divergence_evidence = _launch_checkout_divergence(
+        owning_root, runner, TARGET_PROJECT_ROOT,
+    )
+    if divergent:
+        error = (
+            f"Refusing to audit {issue_id}: {divergence_evidence}. An audit "
+            f"must never run against un-pushed in-flight work parked on the "
+            f"main checkout. Push/merge the commits to origin/dev (or "
+            f"launch the audit from a clean worktree at origin/dev) and "
+            f"re-run."
+        )
+        if json_mode:
+            print(json.dumps({
+                "error": error,
+                "launch_checkout_divergence": {
+                    "ahead_commits": ahead_commits,
+                    "remediation": (
+                        "push/merge the un-pushed commits to origin/dev, or "
+                        "launch the audit from a clean worktree at "
+                        "origin/dev, then re-run"
+                    ),
+                },
+            }, indent=2))
+        else:
+            print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    # ------------------------------------------------------------------
+    # AC1 (SA-0MW4ZRLSI005PHL6): resolve a fresh, detached worktree at the
+    # latest origin/dev as the execution base for execution-dependent work.
+    # Fail-open: when the worktree cannot be created the audit proceeds
+    # against ``per_audit_root`` (today's behaviour) rather than blocking.
+    # ------------------------------------------------------------------
+    execution_worktree_path, execution_worktree_evidence = _create_execution_worktree(
+        owning_root, runner, issue_id,
+    )
+    if execution_worktree_path is not None:
+        ctx.execution_worktree = str(execution_worktree_path)
+        ctx.merge_gate_evidence += (
+            "\nExecution worktree (fresh origin/dev):\n"
+            + execution_worktree_evidence
+        )
+    else:
+        ctx.merge_gate_evidence += (
+            "\nExecution worktree (fresh origin/dev): "
+            + execution_worktree_evidence
+        )
 
     # Resolve the operator-attested green test run (if any). The attestation
     # is external evidence: the runner NEVER executes the test suite itself
@@ -11344,14 +12926,108 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
                 )
             else:
                 head_sha = _resolve_audited_head(runner)
+                # Relatedness inputs for permissive mode (SA-0MW0JJ36Z000AF57):
+                # resolved lazily here (F3 runs only on a cache miss), so the
+                # green happy path incurs no extra ``wl`` call. The touched
+                # files are the item's changed-file set; key files come from
+                # the description when the fetch phase has not run yet.
+                f3_touched: list[str] | None = None
+                f3_key: list[str] = []
+                try:
+                    f3_touched = _resolve_touched_files(
+                        runner, issue_id, worklog_dir=worklog_dir,
+                    )
+                except Exception:  # noqa: BLE001 -- fail open to no mapping
+                    f3_touched = None
+                if ctx.description:
+                    f3_key = _extract_key_files(ctx.description)
+                # AC1 (SA-0MW4ZRLSI005PHL6): execute the F3 suite in the fresh
+                # origin/dev execution worktree — never the launch checkout.
                 test_run = _run_tests_via_test_skill(
-                    cwd=per_audit_root,
+                    cwd=ctx.execution_root,
                     parent_work_item_id=issue_id,
                     head_sha=head_sha,
+                    strict=ctx.strict,
+                    touched_files=f3_touched,
+                    key_files=f3_key,
+                    baseline_commit=_resolve_baseline_commit(runner),
                 )
+                if test_run.get("red_evaluation") is not None:
+                    ctx.test_failure_evaluation = test_run["red_evaluation"]
                 if test_run["success"] and head_sha is not None:
                     green_run_block = _test_skill_run_prompt_block(head_sha)
                     test_skill_run_sha = head_sha
+                elif test_run.get("excused") and test_run.get("excused_block"):
+                    # Permissive mode: red suite whose only failures are proven
+                    # unrelated unit failures → inject the excused-red evidence
+                    # so execution-dependent ACs may be marked met (AC2).
+                    green_run_block = test_run["excused_block"]
+                    if head_sha is not None:
+                        test_skill_run_sha = head_sha
+        elif (not no_execute and auto_status == _FULL_SUITE_CACHE_RED
+              and not ctx.strict
+              and not (_suite_run_in_progress() and not run_tests)):
+            # Cached-red permissive classification (SA-0MW0JJ36Z000AF57,
+            # desired-change item 4): a RED cached full-suite entry is
+            # classified from the already-stored output rather than being
+            # accepted as blocking-by-default. If the cached output yields no
+            # parseable failure record, execute the suite as on a miss. Strict
+            # mode never reaches here (keeps today's cached-red behaviour).
+            cached_touched: list[str] | None = None
+            try:
+                cached_touched = _resolve_touched_files(
+                    runner, issue_id, worklog_dir=worklog_dir,
+                )
+            except Exception:  # noqa: BLE001 -- fail open to no mapping
+                cached_touched = None
+            cached_eval = _cached_red_evaluation(
+                per_audit_root,
+                strict=ctx.strict,
+                touched_files=cached_touched,
+                key_files=_extract_key_files(ctx.description or ""),
+                baseline_commit=_resolve_baseline_commit(runner),
+            )
+            if cached_eval is not None:
+                ctx.test_failure_evaluation = cached_eval
+                if cached_eval["outcome"] == "excused":
+                    head_sha = _resolve_audited_head(runner)
+                    green_run_block = _excused_red_prompt_block(
+                        cached_eval, head_sha,
+                    )
+                    if head_sha is not None:
+                        test_skill_run_sha = head_sha
+                # A blocked cached-red stays fail-open partial (today's
+                # behaviour) with the evidence recorded on ctx.
+            elif (run_tests
+                  or not (_suite_run_in_progress()
+                          or os.environ.get("PYTEST_CURRENT_TEST"))):
+                # No parseable failures in the cached output → execute the
+                # suite as on a miss (AC4). Suppressed under an owning suite
+                # run or inside a test process so a nested/real suite can
+                # never be spawned (the shared test-writing guideline: no real
+                # suite execution in tests); in those contexts cached-red keeps
+                # today's fail-open-partial behaviour.
+                head_sha = _resolve_audited_head(runner)
+                # AC1 (SA-0MW4ZRLSI005PHL6): execute in the fresh origin/dev
+                # execution worktree, never the launch checkout.
+                test_run = _run_tests_via_test_skill(
+                    cwd=ctx.execution_root,
+                    parent_work_item_id=issue_id,
+                    head_sha=head_sha,
+                    strict=ctx.strict,
+                    touched_files=cached_touched,
+                    key_files=_extract_key_files(ctx.description or ""),
+                    baseline_commit=_resolve_baseline_commit(runner),
+                )
+                if test_run.get("red_evaluation") is not None:
+                    ctx.test_failure_evaluation = test_run["red_evaluation"]
+                if test_run["success"] and head_sha is not None:
+                    green_run_block = _test_skill_run_prompt_block(head_sha)
+                    test_skill_run_sha = head_sha
+                elif test_run.get("excused") and test_run.get("excused_block"):
+                    green_run_block = test_run["excused_block"]
+                    if head_sha is not None:
+                        test_skill_run_sha = head_sha
 
     # ------------------------------------------------------------------
     # Capture original status + stage before the freshness gate / status
@@ -11424,7 +13100,8 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
         fresh_report = _check_audit_freshness(runner, issue_id,
                                               worklog_dir=worklog_dir,
                                               work_item=wi,
-                                              audit_sink=prior_audit_sink)
+                                              audit_sink=prior_audit_sink,
+                                              required_strict=ctx.strict)
         prior_audit = prior_audit_sink or None
         if fresh_report is not None:
             # D1 (SA-0MW2J7NGP006CIEG AC1): a stored report whose own header
@@ -11927,6 +13604,129 @@ def _load_tracked_cfp_chores(runner: Runner,
         for found in _CFP_CHORE_KEY_RE.findall(haystack):
             tracked.setdefault(found, chore_id)
     return tracked
+
+
+def _repo_relative_path(path: str,
+                        repo_root_fn: object = None) -> str:
+    """Normalise *path* to the repository-relative form used by refactor keys.
+
+    A CFP finding may carry an absolute path (ruff reports the filename as
+    passed) while Refactor-family identities are always repository-relative
+    (SA-0MW7Z11PV003V7O2). Both sides must be normalised before the
+    cross-family comparison. This reuses the refactor skill's shared
+    ``_repo_relative_path`` helper when importable (the same helper the
+    worktree-path recording bug specifies) and falls back to a lightweight
+    local normaliser (strip ``./``/trailing slash; make absolute paths
+    relative to the detected project root) so twin matching never depends on
+    a successful cross-skill import.
+
+    Args:
+        path: The path to normalise.
+        repo_root_fn: Optional injected normaliser (tests); defaults to the
+            refactor helper or the local fallback.
+
+    Returns:
+        A POSIX-normalised, repository-relative path (``""`` for empties).
+    """
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if repo_root_fn is not None:
+        normalised = str(repo_root_fn(text)).strip()
+        return normalised
+    try:
+        from refactor.workitem_creation import _repo_relative_path as _rel
+        return str(_rel(text)).strip()
+    except (ImportError, ModuleNotFoundError):
+        value = text.replace("\\", "/")
+        if os.path.isabs(value):
+            try:
+                value = os.path.relpath(value, str(TARGET_PROJECT_ROOT))
+            except (ValueError, OSError):
+                pass
+        while value.startswith("./"):
+            value = value[2:]
+        if value != "/" and value:
+            value = value.rstrip("/")
+        return value
+
+
+def _normalise_refactor_key(key: str, repo_root_fn: object = None) -> str:
+    """Normalise a ``Refactor-Finding-Key`` for cross-family comparison."""
+    text = str(key or "").strip()
+    if ":" in text:
+        code, path = text.split(":", 1)
+    else:
+        code, path = text, ""
+    return f"{code.strip()}:{_repo_relative_path(path, repo_root_fn)}"
+
+
+def _load_refactor_finding_items(runner: Runner,
+                                 worklog_dir: str | None) -> dict[str, str]:
+    """Live Refactor-family items, keyed by finding identity (one lookup).
+
+    The refactor producer stores ``Refactor-Finding-Key: <code>:<path>`` in
+    every item description (SA-0MWE1E4GQ004E1JG). Consulting that family
+    before minting a CFP chore stops the audit producer from creating a
+    blind twin of an already-tracked refactor smell (SA-0MWE1EAR30045VHO
+    AC2). One ``wl list "Refactor-Finding-Key:" --json`` call returns every
+    carrying item; each marker is parsed locally and keyed by its normalised
+    identity. Only non-terminal items count.
+
+    A failed lookup returns an empty mapping: failing safe means creating
+    the chore (the cross-reference is best-effort, never a suppression).
+    """
+    try:
+        data = _run_wl(
+            runner, ["wl", "list", "Refactor-Finding-Key:", "--json"],
+            worklog_dir=worklog_dir,
+        )
+    except RuntimeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    by_key: dict[str, str] = {}
+    for item in data.get("workItems") or []:
+        if not isinstance(item, dict):
+            continue
+        status = (item.get("status") or "").strip().lower()
+        if status in CFP_CHORE_KEY_TERMINAL_STATUSES:
+            continue
+        item_id = item.get("id")
+        if not item_id:
+            continue
+        haystack = f"{item.get('title', '')}\n{item.get('description', '')}"
+        for found in _REFACTOR_FINDING_KEY_RE.findall(haystack):
+            by_key.setdefault(_normalise_refactor_key(found), item_id)
+    return by_key
+
+
+def _refactor_twin_id(refactor_items: dict[str, str],
+                      finding: dict) -> str | None:
+    """The Refactor item id tracking *finding*'s identity, or ``None``.
+
+    The identity is ``<code>:<repo-relative path>`` — the line number is
+    deliberately excluded so line drift cannot break the cross-family match
+    (SA-0MWE1EAR30045VHO AC1/AC2).
+    """
+    code = str(finding.get("code") or "?").strip()
+    file = str(finding.get("file") or "").strip()
+    if not code or not file:
+        return None
+    return refactor_items.get(
+        _normalise_refactor_key(f"{code}:{file}")
+    )
+
+
+def _augment_chore_with_refactor_twin(description: str,
+                                      twin_id: str) -> str:
+    """Append the ``Refactor-Twin: <id>`` cross-reference to a chore description."""
+    text = str(description or "").rstrip()
+    if not text:
+        return f"{REFACTOR_TWIN_MARKER} {twin_id}"
+    if REFACTOR_TWIN_MARKER in text:
+        return text
+    return f"{text}\n\n{REFACTOR_TWIN_MARKER} {twin_id}"
 
 
 def _is_cfp_tracker_item(wi: dict | None) -> bool:
@@ -12516,6 +14316,7 @@ def _run_remediation_loop(
     # (SA-0MVZNECSD005XB42 AC1/AC3).
     seen_chores: dict[str, str] = {}
     tracked_chores: dict[str, str] | None = None
+    refactor_items: dict[str, str] | None = None
     for e in results["fp_screen_results"]:
         finding = e.get("finding", {}) if isinstance(e, dict) else {}
         if not (
@@ -12543,15 +14344,30 @@ def _run_remediation_loop(
             continue
         code = finding.get("code", "?")
         file = finding.get("file", "?")
+        # Cross-family twin consultation (SA-0MWE1EAR30045VHO AC2): before
+        # minting a NEW chore, check once per run whether an open
+        # Refactor-family item already tracks the same (rule, repo-relative
+        # path) identity. On a match the chore is still created (it carries
+        # needsProducerReview by design and is never auto-suppressed), but
+        # its description embeds a visible ``Refactor-Twin: <id>``
+        # cross-reference instead of leaving a blind parallel item.
+        if refactor_items is None:
+            refactor_items = _load_refactor_finding_items(runner, worklog_dir)
+        twin_id = _refactor_twin_id(refactor_items, finding)
+        description = _chore_description_for_cfp_decision(
+            finding, e, key, issue_id,
+        )
+        if twin_id:
+            description = _augment_chore_with_refactor_twin(
+                description, twin_id
+            )
         chore_id = _create_chore_item(
             runner,
             title=(
                 f"ruff {code} in {file}:{finding.get('line', 0)}"
                 f" — {FP_CHORE_ANNOTATION}"
             ),
-            description=_chore_description_for_cfp_decision(
-                finding, e, key, issue_id,
-            ),
+            description=description,
             worklog_dir=worklog_dir,
         )
         if chore_id:
@@ -13246,7 +15062,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     if acs and acs[0] != "No acceptance criteria defined.":
         ac_list_json = json.dumps([{"index": i, "text": ac} for i, ac in enumerate(acs)])
         file_scope = _build_file_scope_manifest(
-            work_item, [], runner=runner, project_root=ctx.per_audit_root,
+            work_item, [], runner=runner, project_root=ctx.execution_root,
         )
         # Validate the FILE SCOPE manifest covers the item repository
         # (LP-0MSQ32HNR007AI6B): a manifest built from the wrong scope
@@ -13290,6 +15106,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             f"{_build_work_item_evidence_block(ctx.comments)}"
             f"Criteria: {ac_list_json}"
         )
+        screen_model = phase1_model
         result, batch, raw_text = _call_phase1_screen(
             issue_id, "parent", prompt, phase1_model, pi_bin, debug_log,
             timeout, ac_fallback_used, ctx.record_script_failure,
@@ -13313,6 +15130,7 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                 "retrying parent AC review with the full audit model",
                 file=sys.stderr,
             )
+            screen_model = ctx.resolved_model
             result, batch, raw_text = _call_phase1_screen(
                 issue_id, "parent", prompt, ctx.resolved_model, pi_bin,
                 debug_log, timeout, ac_fallback_used,
@@ -13378,9 +15196,10 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
                 # actual provider diagnostic so operators can distinguish a
                 # transient model outage from a genuine unparseable response.
                 provider_error = result.get("_provider_error_message", "unknown")
-                evidence = (
-                    f"Pi provider error: {provider_error} — "
-                    "criterion could not be evaluated."
+                evidence = _provider_error_evidence(
+                    provider_error, "parent", screen_model,
+                    attempts=result.get("_provider_error_attempts"),
+                    elapsed_seconds=result.get("elapsed_seconds"),
                 )
             else:
                 outer_evidence = _evidence_text(result.get("evidence"))
@@ -14317,10 +16136,33 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                                 ),
                             }]
                     elif child["id"] in gap_child_ids:
-                        # Parent has gaps and this child owns the affected files
-                        # → full audit (AC3).
-                        cr["child_audit_ready"] = False
-                        pending_children.append((len(child_results), child))
+                        # Parent has gaps and this child owns the affected files.
+                        # Before re-screening, check whether the child already
+                        # has a content-fresh stored audit (AC1): if so the
+                        # child's own audit already evaluated its ACs and the
+                        # parent can reuse those verdicts without a fresh
+                        # Phase 1 screen. The content-fingerprint gate is
+                        # required here (strict — legacy fingerprint-less
+                        # audits are re-screened, preserving prior behaviour).
+                        verdict, audited_at = (None, None)
+                        if not force:
+                            verdict, audited_at = _get_child_content_fresh_verdict(
+                                runner, child["id"], worklog_dir=worklog_dir,
+                                child=child,
+                            )
+                        if verdict is not None:
+                            # Content-fresh stored audit — adopt its verdicts
+                            # and skip re-screening (AC1).
+                            cr["child_audit_ready"] = verdict is True
+                            cr["child_audit_not_ready"] = verdict is False
+                            cr["reused_from"] = audited_at
+                            cr["ac_results"] = _child_acs_from_own_audit(
+                                child, runner, worklog_dir=worklog_dir,
+                            )
+                        else:
+                            # No content-fresh audit — full audit required (AC3).
+                            cr["child_audit_ready"] = False
+                            pending_children.append((len(child_results), child))
                     else:
                         # Unrelated child → not audited (AC3), does not block.
                         cr["pass_through"] = "unrelated_to_gaps"
@@ -14443,6 +16285,22 @@ def _phase_children(ctx: _AuditContext) -> int | None:
                         # re-persisting it would overwrite the child's own
                         # fingerprint-bearing report and break future
                         # content-gate reuse.
+                        continue
+                    # AC2 guard: never persist a PENDING (unserviced
+                    # in-main-slot) child report over a child audit that is
+                    # content-fresh (matching v2 fingerprint) and carries
+                    # real, non-pending verdicts. This is the loop-breaking
+                    # guard: a serviced child's authoritative audit must
+                    # survive a parent re-run that merely re-emitted its
+                    # screens. A genuine (non-pending) re-audit result still
+                    # persists, and legacy fingerprint-less audits keep their
+                    # pre-existing behaviour.
+                    if (not force
+                            and _pending_main_slot_child_ids([child])
+                            and _get_child_content_fresh_verdict(
+                                runner, child["id"],
+                                worklog_dir=worklog_dir,
+                            )[0] is not None):
                         continue
                     child_fingerprint = _compute_content_fingerprint(
                         runner, child["id"], worklog_dir=worklog_dir,
@@ -14599,6 +16457,24 @@ def _phase_report(ctx: _AuditContext) -> int:
 
         report = _assemble_report()
 
+        # Test-failure mode persistence (SA-0MW0JJ36Z000AF57 AC5/AC7): record
+        # the resolved mode (greppable, so the freshness gate can compare mode
+        # strength) and the `## Test Failure Mode` evidence section. Appended
+        # AFTER the report body so the leading `Ready to close:` line and the
+        # fingerprint line are unchanged for existing parsers.
+        mode_metadata = (
+            f"{TEST_FAILURE_MODE_PREFIX}"
+            f"{_test_failure_mode_name(ctx.strict)} "
+            f"(source: {ctx.strict_source})"
+        )
+        mode_section = ctx.test_failure_mode_section or (
+            _format_test_failure_mode_section(
+                ctx.test_failure_evaluation,
+                strict=ctx.strict, source=ctx.strict_source,
+            )
+        )
+        report = report + "\n" + mode_metadata + "\n" + mode_section + "\n"
+
         # Per-run reliability summary (R7 AC1): emit exactly one stable,
         # machine-greppable line to stderr and append it to the report so it
         # is persisted with the audit.
@@ -14651,6 +16527,16 @@ def _phase_report(ctx: _AuditContext) -> int:
                 stale_pending_ids=stale_pending_ids,
             )
             payload["child_persist_results"] = child_persist_results
+            # Test-failure mode + excusal evidence in the --json payload (AC2/
+            # AC5): the same data as the persisted `## Test Failure Mode`
+            # section so machine consumers see which mode ran and, for every
+            # excused failure, its classification and relatedness evidence.
+            payload["test_failure_mode"] = {
+                "mode": _test_failure_mode_name(ctx.strict),
+                "strict": ctx.strict,
+                "source": ctx.strict_source,
+                "evaluation": ctx.test_failure_evaluation,
+            }
             # Include script failure info in JSON output
             if ctx.script_failure:
                 payload["script_failure"] = {
@@ -15615,7 +17501,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               checkpoint_dir: str | None = None,
               no_checkpoint: bool = False,
               child_in_main_slot: bool | None = None,
-              batch_drain: bool | None = None) -> int:
+              batch_drain: bool | None = None,
+              strict: bool | None = None) -> int:
     """Audit a single work item.
 
     *batch_drain* (SA-0MTG5TP5Z008QBL5) controls the post-audit batch
@@ -15740,6 +17627,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
         green_run=green_run, audit_children=audit_children,
         max_child_audits=max_child_audits, run_tests=run_tests,
         no_execute=no_execute,
+        strict=_resolve_strict_mode(strict)[0],
+        strict_source=_resolve_strict_mode(strict)[1],
         max_citations_per_ac=max_citations_per_ac,
         explicit_checkpoint_dir=checkpoint_dir,
         no_checkpoint=no_checkpoint,
@@ -15747,6 +17636,12 @@ def cmd_issue(issue_id: str, persist: bool = True,
     rc = _phase_gate(ctx)
     if rc is not None:
         return rc
+
+    # Cross-host audit lease (LP-0MW96A9GW009KVF7, parent AC1/AC2): acquire
+    # the proxy's audit-tier lease for the lifetime of this run. Fail-open —
+    # a missing lease (proxy down / saturated after bounded retries) proceeds
+    # under legacy per-host guards, never blocks the audit.
+    audit_lease_begin(issue_id)
 
     ctx.checkpoint = _open_checkpoint_store(ctx, checkpoint_dir, no_checkpoint)
 
@@ -15809,6 +17704,11 @@ def cmd_issue(issue_id: str, persist: bool = True,
             fail_report = _append_producer_review_metadata(
                 _build_merge_gate_failure_report(ctx), ctx.producer_review,
             )
+            # Test-failure mode evidence for a blocked integration (AC5):
+            # record the resolved mode + per-failure classification so a
+            # reviewer can see why the merge gate failed closed.
+            if ctx.test_failure_mode_section:
+                fail_report = fail_report + "\n" + ctx.test_failure_mode_section + "\n"
             if ctx.json_mode:
                 print(json.dumps({
                     "merge_gate": {
@@ -15832,10 +17732,14 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # them.
             _capture_exempt_children_snapshot(ctx)
             _phase1_parent_screening(ctx)
+            # Renew the cross-host audit lease between phases so a long run
+            # never loses its lease mid-audit (LP-0MW96A9GW009KVF7).
+            audit_lease_renew_current()
             rc = _phase_children(ctx)
             if rc is not None:
                 pass
             else:
+                audit_lease_renew_current()
                 rc = _phase_report(ctx)
     except AuditScopeError as exc:
         # Scope error (LP-0MSQ32HNR007AI6B): the Phase 2 FILE SCOPE
@@ -15877,6 +17781,20 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # lifecycle raises unexpectedly.
             if ctx.abort_state_path:
                 _cleanup_audit_state(ctx.abort_state_path)
+            # Remove the fresh origin/dev execution worktree (AC1,
+            # SA-0MW4ZRLSI005PHL6) so it never accumulates under
+            # ``.worklog/worktrees``. Best-effort and never touches the main
+            # checkout's tracked content.
+            _remove_execution_worktree(
+                Path(ctx.owning_root) if ctx.owning_root else None,
+                ctx.runner, ctx.execution_worktree,
+            )
+            # Release the cross-host audit lease (LP-0MW96A9GW009KVF7,
+            # parent AC1/AC2) now that the run is complete — every exit path
+            # (success, scope error, abort, crashed-pi cleanup) frees the
+            # slot for the next audit on ANY host. The proxy's TTL backstop
+            # covers a crashed holder regardless.
+            audit_lease_end()
     if rc == 0 and ctx.checkpoint is not None:
         if ctx.checkpoint.budget_exceeded_children():
             # Budget-exceeded children remain unverified: KEEP the checkpoint
@@ -15933,18 +17851,28 @@ def _maybe_run_batch_drain(ctx: _AuditContext) -> None:
     )
 
 
-def _batch_audit_one(origin: _AuditContext) -> Callable[[str, int], int]:
+def _batch_audit_one(origin: _AuditContext) -> Callable[[str, int, str | None], int]:
     """Build the per-item audit callback for a batch drain.
 
     Returns a closure that audits a drained work item via the full
     ``cmd_issue`` pipeline (claim, freshness, phase gates, persist,
     verified lifecycle). Every drained item shares the origin run's
-    configuration (model, worklog dir, persistence, etc.) but runs with
+    configuration (model, persistence, etc.) but runs with
     ``batch_drain=False`` so the drain cannot recurse. The callback owns
     slot discipline: each item's pi calls acquire/release host-wide slots,
     so the concurrency slot is free between items (AC4).
+
+    Cross-project routing (LP-0MW96A9GW009KVF7 AC3): ``worklog_root`` is the
+    owning project checkout root stamped at enqueue; the item is audited
+    against ``<root>/.worklog`` instead of the origin run's default, so a
+    repo-A drain audits a repo-B item against repo B's own worklog. A
+    ``None`` root (legacy entry / undeterminable ownership) keeps the
+    origin's ``worklog_dir`` fallback (AC5).
     """
-    def _audit_one(item_id: str, priority: int) -> int:
+    def _audit_one(item_id: str, priority: int, worklog_root: str | None = None) -> int:
+        per_item_wl = worklog_root
+        if per_item_wl:
+            per_item_wl = str(Path(worklog_root) / ".worklog")
         return cmd_issue(
             item_id,
             persist=origin.persist,
@@ -15958,7 +17886,7 @@ def _batch_audit_one(origin: _AuditContext) -> Callable[[str, int], int]:
             json_mode=origin.json_mode,
             debug_log=origin.debug_log,
             force=origin.force,
-            worklog_dir=origin.worklog_dir,
+            worklog_dir=per_item_wl or origin.worklog_dir,
             batch_phase2=origin.batch_phase2,
             green_run=origin.green_run,
             audit_children=origin.audit_children,
@@ -16178,7 +18106,8 @@ def cmd_batch(max_items: int | None = None,
               force: bool = False,
               worklog_dir: str | None = None,
               max_citations_per_ac: int | None = None,
-              green_run: str | None = None) -> int:
+              green_run: str | None = None,
+              strict: bool | None = None) -> int:
     """Batch drain: audit up to N queued in_review items per window.
 
     The standalone batch entry point (SA-0MTG5TP5Z008QBL5): primes the
@@ -16232,7 +18161,16 @@ def cmd_batch(max_items: int | None = None,
                 print("No pending in_review items to audit.")
             return 0
 
-    def _audit_one(item_id: str, priority: int) -> int:
+    def _audit_one(item_id: str, priority: int, worklog_root: str | None = None) -> int:
+        # AC3 (LP-0MW96A9GW009KVF7): route each drained item against ITS
+        # owning worklog root. ``worklog_root`` is the project checkout root
+        # stamped at enqueue time; the wl store is ``<root>/.worklog``. A
+        # legacy entry (or a nil root — ownership undeterminable) falls back
+        # to the drainer's own *worklog_dir* (today's single-root behaviour,
+        # AC5).
+        per_item_wl = worklog_root
+        if per_item_wl:
+            per_item_wl = str(Path(worklog_root) / ".worklog")
         return cmd_issue(
             item_id,
             persist=persist,
@@ -16244,9 +18182,10 @@ def cmd_batch(max_items: int | None = None,
             json_mode=json_mode,
             debug_log=debug_log,
             force=force,
-            worklog_dir=worklog_dir,
+            worklog_dir=per_item_wl or worklog_dir,
             max_citations_per_ac=max_citations_per_ac,
             green_run=green_run,
+            strict=strict,
             checkpoint_dir=None,
             no_checkpoint=True,
             batch_drain=False,
@@ -16435,6 +18374,24 @@ def build_parser() -> argparse.ArgumentParser:
                              "runner auto-executes the repo's actual suite on a miss "
                              "via the test skill."
                          ))
+    p_issue.add_argument("--strict", dest="strict", action="store_true",
+                         default=None,
+                         help=(
+                             "STRICT test-failure mode: any failing test fails the "
+                             "audit (today's behaviour). Default is PERMISSIVE, where "
+                             "an unrelated unit failure is excused. Precedence: this "
+                             "flag > --no-strict > AUDIT_STRICT env > permissive "
+                             "default. The ship release gate always passes --strict "
+                             "(SA-0MW0JJ36Z000AF57)."
+                         ))
+    p_issue.add_argument("--no-strict", dest="strict", action="store_false",
+                         default=None,
+                         help=(
+                             "PERMISSIVE test-failure mode (the default): a failing "
+                             "unit test proven unrelated to the item's changes is "
+                             "excused; integration/end-to-end, affected and "
+                             "inconclusive failures still fail the audit."
+                         ))
     p_issue.add_argument("--checkpoint-dir", default=None,
                          help=(
                              "Directory for audit phase checkpoints (default: "
@@ -16525,6 +18482,16 @@ def build_parser() -> argparse.ArgumentParser:
                              f"(default: audit.max_citations_per_ac config key or "
                              f"{_DEFAULT_MAX_CITATIONS_PER_AC})"
                          ))
+    p_batch.add_argument("--strict", dest="strict", action="store_true",
+                         default=None,
+                         help=(
+                             "STRICT test-failure mode for every audited item "
+                             "(default permissive; see `issue --strict` and "
+                             "AUDIT_STRICT; SA-0MW0JJ36Z000AF57)."
+                         ))
+    p_batch.add_argument("--no-strict", dest="strict", action="store_false",
+                         default=None,
+                         help="PERMISSIVE test-failure mode (the default).")
     p_batch.add_argument("--green-run", default=None, metavar="SHA|HEAD",
                          help=(
                              "Operator-attested green test run for execution-dependent "
@@ -16679,7 +18646,8 @@ def main(argv: list[str] | None = None) -> int:
                             max_citations_per_ac=_resolve_max_citations_per_ac(
                                 args.max_citations_per_ac
                             ),
-                            green_run=args.green_run)
+                            green_run=args.green_run,
+                            strict=getattr(args, "strict", None))
             print(_root_timer.render(), file=sys.stderr)
         return _rc
     elif args.command == "project":
@@ -16774,7 +18742,8 @@ def _run_issue_command(args) -> int:
                         child_in_main_slot=getattr(
                             args, "child_in_main_slot", None
                         ),
-                        batch_drain=getattr(args, "batch_drain", None))
+                        batch_drain=getattr(args, "batch_drain", None),
+                        strict=getattr(args, "strict", None))
         finally:
             # Ensure the reliability summary is emitted even on an early exit
             # (exception/timeout before _phase_report) — R7 AC4.

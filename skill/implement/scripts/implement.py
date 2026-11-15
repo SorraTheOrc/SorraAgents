@@ -423,6 +423,13 @@ PANE_SESSIONS_ENV = "IMPLEMENT_DRIVE_PANE_SESSIONS"
 #: Default focus behaviour for pane-driven children: never steal the caller's
 #: focus. ``--focus`` switches to each new child pane instead.
 DEFAULT_PANE_FOCUS = False
+#: Seconds of slack added to the default pane client's own subprocess timeout
+#: above the child budget (SA-0MW7PAKSF008H8OH). The herdr CLI owns the wait
+#: verdict — its ``--timeout`` value is the child budget — so the client's
+#: ``subprocess.run(timeout=...)`` must sit *above* that: a turn that runs its
+#: full budget is stopped by the CLI's own timeout error, never killed by the
+#: client's 60 s default.
+PANE_CLIENT_TIMEOUT_SLACK = 60.0
 #: Environment keys a pane child must receive explicitly (the recursion guard,
 #: the worktree marker and — when present — the per-child lock token).
 #: Deliberately an allow-list: the whole inherited environment is never
@@ -2092,6 +2099,95 @@ CHILD_NO_WORK = "no-work"
 CHILD_CLEAN = "clean"
 
 
+@dataclass(frozen=True)
+class CommitAttribution:
+    """Attribution of a worktree's HEAD to a work item.
+
+    Shared by :func:`_classify_child_worktree` and ``phase_finish``'s
+    prior-run attribution (SA-0MW98UNVB0085LFA AC1).
+
+    Attributes:
+        comparable: False when *base_ref* cannot be compared (missing ref or
+            git error); callers choose their own fail-open/fail-closed policy.
+        ahead: True when HEAD carries commits past *base_ref*.
+        hash: Short hash of the newest commit ahead of *base_ref* whose message
+            references the item id (``""`` when none is attributable).
+    """
+
+    comparable: bool
+    ahead: bool
+    hash: str = ""
+
+
+def _commit_attribution(
+    worktree_path: str | Path,
+    item_id: str,
+    base_ref: str,
+) -> CommitAttribution:
+    """Find the newest commit ahead of *base_ref* attributable to *item_id*.
+
+    A commit is attributable only when it is ahead of *base_ref* **and** its
+    message references *item_id* — an ambient commit that does not mention the
+    item is never claimed (SA-0MVYYL7X9008MGA1 AC2).
+
+    The *base_ref* is the caller's choice because the two callers need
+    different bases (SA-0MW98UNVB0085LFA AC1): :func:`_classify_child_worktree`
+    compares against the local parent branch, while ``phase_finish`` compares
+    against ``origin/<parent_branch>`` — after an interrupted push the commit
+    is already on local ``dev``, so a local-dev base would report "0 ahead".
+
+    Args:
+        worktree_path: The worktree whose HEAD is inspected.
+        item_id: The work-item id a commit message must reference.
+        base_ref: The ref the worktree forked from (local branch or remote ref).
+
+    Returns:
+        :class:`CommitAttribution`.
+    """
+    wt = Path(worktree_path)
+    ahead = run_cmd(
+        ["git", "rev-list", "--count", f"{base_ref}..HEAD"],
+        cwd=str(wt),
+        check=False,
+        capture=True,
+    )
+    if ahead.returncode != 0:
+        # Cannot compare (missing ref, git error): the caller decides whether
+        # to fail open (never discard real work) or fail closed (never claim
+        # an unattributable commit).
+        return CommitAttribution(comparable=False, ahead=False)
+    try:
+        count = int(ahead.stdout.strip())
+    except ValueError:
+        # Unparseable output: conservatively assume commits are ahead.
+        count = 1
+    if count <= 0:
+        return CommitAttribution(comparable=True, ahead=False)
+
+    log = run_cmd(
+        [
+            "git",
+            "-C",
+            str(wt),
+            "log",
+            f"{base_ref}..HEAD",
+            "--grep",
+            item_id,
+            "-n",
+            "1",
+            "--format=%h",
+        ],
+        check=False,
+        timeout=30,
+    )
+    attributed = (
+        log.stdout.strip()
+        if log.returncode == 0 and log.stdout.strip()
+        else ""
+    )
+    return CommitAttribution(comparable=True, ahead=True, hash=attributed)
+
+
 def _classify_child_worktree(
     child_id: str,
     worktree_path: str,
@@ -2156,32 +2252,14 @@ def _classify_child_worktree(
 
     # Commits ahead of the parent branch: only ones referencing this item are
     # attributable work; the rest are the ambient-branch false positive.
-    ahead = run_cmd(
-        ["git", "rev-list", "--count", f"{parent_branch}..HEAD"],
-        cwd=str(wt),
-        check=False,
-        capture=True,
-    )
-    commits_ahead = False
-    if ahead.returncode == 0:
-        try:
-            commits_ahead = int(ahead.stdout.strip()) > 0
-        except ValueError:
-            commits_ahead = True  # unparseable; conservatively assume commits
-    else:
+    attribution = _commit_attribution(wt, child_id, parent_branch)
+    if not attribution.comparable:
         # Cannot compare (missing ref, git error): fail open so a real change
         # is never silently discarded.
         return CHILD_WORK
-
-    if commits_ahead:
-        ref_check = run_cmd(
-            ["git", "-C", str(wt), "log", f"{parent_branch}..HEAD",
-             "--grep", child_id, "-n", "1", "--format=%H"],
-            check=False,
-            timeout=30,
-        )
-        if ref_check.returncode == 0 and ref_check.stdout.strip():
-            return CHILD_WORK
+    commits_ahead = attribution.ahead
+    if attribution.hash:
+        return CHILD_WORK
 
     # Precedence (documented above): real work > verification-only >
     # no-work > clean. A verification-only child is a deliberate no-commit
@@ -2777,10 +2855,14 @@ def _main_checkout_offending_paths(
     """Return the non-``.worklog/`` dirty paths in a checkout.
 
     Used by the implementation-placement gates to name the offending files
-    when work landed in the main checkout instead of a worktree.
+    when work landed outside the worktree — in the main checkout or in a
+    registered sibling worktree (SA-0MW5FIJNQ002Z24I). The scanner is
+    generic over any checkout root of the repository: the main checkout for
+    the classic case, or each sibling root for the sibling case.
 
     Args:
-        repo_root: Absolute path to the main checkout root.
+        repo_root: Absolute path to a checkout root of the repository (the
+            main checkout, or one of its linked worktrees).
         expected_dirty: Project-declared path prefixes to exclude.
 
     Returns:
@@ -2855,6 +2937,66 @@ def _snapshot_main_checkout(repo_root: str) -> dict[str, Any]:
     return {
         "taken_at": datetime.now(timezone.utc).isoformat(),
         "status": _main_checkout_status_map(repo_root),
+    }
+
+
+def _main_checkout_pre_check(
+    repo_root: str,
+    description: str,
+    expected_dirty: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Read-only pre-claim foreign-mutation check of the main checkout.
+
+    Promotes the Key-Files-aware dirty-tree gate **ahead of the claim**
+    (AH-0MWFH7P4D0058L0A): ``phase_start`` snapshots the main checkout before
+    claiming the item and before creating any worktree, and refuses when the
+    checkout holds tracked-file changes that cannot be attributed to the
+    operator's own intended work.
+
+    The check is deliberately **read-only** (AC6): it takes a status snapshot
+    and classifies it — it never writes to the worklog, never stashes and
+    never mutates the checkout. A refused start therefore leaves the item
+    ``open`` with no claim and no assignee (AC3), unlike a post-claim abort
+    which has to reset the status.
+
+    A dirty file is foreign to the start when it is not under ``.worklog/``,
+    not a project-declared expected-dirty path, and either overlaps the work
+    item's Key Files or cannot be judged relevant because the description has
+    no Key Files section. Pre-existing operator changes that the Key Files
+    prove unrelated do not block the start (the parent constraint that the
+    gate must not break an operator's intended main-checkout changes).
+
+    Args:
+        repo_root: Absolute path to the main checkout to inspect.
+        description: The work item description (Key Files relevance source).
+        expected_dirty: Project-declared expected-dirty path prefixes.
+
+    Returns:
+        A verdict mapping with ``verdict`` (``"pass"``/``"fail"``),
+        ``snapshot`` (the :func:`_snapshot_main_checkout` taken_at and status
+        map), ``decision`` (the :func:`classify_dirty_tree_relevance` result),
+        ``offending`` (paths to name in a refusal) and ``reason``.
+    """
+    snapshot = _snapshot_main_checkout(repo_root)
+    status_output = git_status(cwd=repo_root)
+    decision = classify_dirty_tree_relevance(
+        status_output, description, expected_dirty=expected_dirty
+    )
+    if decision["can_proceed"]:
+        offending: list[str] = []
+    elif decision["key_files"]:
+        # A Key Files section exists: name only the overlapping files.
+        offending = list(decision["relevant_files"])
+    else:
+        # Relevance cannot be judged without Key Files: every dirty path is
+        # potentially foreign, so name them all.
+        offending = list(decision["dirty_files"])
+    return {
+        "verdict": "pass" if decision["can_proceed"] else "fail",
+        "snapshot": snapshot,
+        "decision": decision,
+        "offending": offending,
+        "reason": decision["reason"],
     }
 
 
@@ -3266,6 +3408,20 @@ DEFAULT_START_LOCK_TIMEOUT = 30.0
 ENV_FINISH_LOCK_TIMEOUT = "IMPLEMENT_FINISH_LOCK_TIMEOUT"
 ENV_START_LOCK_TIMEOUT = "IMPLEMENT_START_LOCK_TIMEOUT"
 
+#: Refs whose push is gated by the **full** suite in ``.githooks/pre-push``
+#: (``refs/heads/dev|main``). ``finish`` resolves that gate's verdict *before*
+#: it takes the main-checkout lock so the hook serves the tree-keyed verdict
+#: instead of executing the suite inside the exclusive window
+#: (SA-0MWFJS3820032YB4).
+FULL_SUITE_GATE_BRANCHES: tuple[str, ...] = ("dev", "main")
+
+#: The pre-push hook's own escape hatch for the dev-push full-suite gate.
+#: ``finish`` never runs a full suite the operator asked the gate to skip, so
+#: the pre-lock resolution stands down and the push proceeds exactly as the
+#: hook decides. It skips a *pre-resolution*, never the gate itself: the hook
+#: still enforces its verdict.
+ENV_TEST_SCOPE_SKIP = "TEST_SCOPE_SKIP"
+
 #: Override for the per-work-item child-lock store (test isolation).
 #: Unset in production; the worklog store resolved from the item id is used.
 #: ``phase_start`` acquires a real ``flock`` before its mocked steps, so an
@@ -3346,6 +3502,150 @@ def acquire_main_checkout_lock(
     """
     return RepoLock(repo_root, relpath=MAIN_CHECKOUT_LOCK_RELPATH).acquire(
         work_item_id, timeout=timeout
+    )
+
+
+def resolve_prelock_full_suite_verdict(
+    worktree_path: str,
+    gate_tree: dict[str, Any] | None,
+    *,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> dict[str, Any]:
+    """Resolve the dev-push full-suite verdict **before** the finish lock.
+
+    The dev-push gate (``.githooks/pre-push`` → ``run_tests.py --scope full
+    --gate-commit``) is what protects ``dev``. ``phase_finish`` used to reach
+    it only through the push, i.e. while holding the exclusive
+    main-checkout lock, so every concurrent finish serialised its ~5 min
+    suite behind the others (SA-0MWFJS3820032YB4).
+
+    The verdict is tree-keyed already (``fingerprint_kind="tree"``,
+    SA-0MW7C6BMZ00931JG), so it can be resolved early: the suite runs against
+    the **would-be-commit tree** of the change set — the exact tree the commit
+    will produce, because ``stage_tested_tree`` refuses to commit anything
+    else — and lands in the tree-keyed cache. The hook's ``--gate-commit`` run
+    then *serves* that entry (``verdict=cached``) instead of executing the
+    suite inside the lock.
+
+    Safety does not depend on this function. The lock still covers commit →
+    fast-forward → push → ancestry assertion; the hook still binds its verdict
+    to the pushed commit's tree, so a different tree is a cache miss and the
+    suite really runs; and a red verdict here aborts *before* the lock is
+    taken, so nothing is committed or pushed.
+
+    Args:
+        worktree_path: The worktree holding the change set — the checkout the
+            push (and therefore the hook's gate run) resolves its cache in.
+        gate_tree: The changed-scope gate's would-be-commit summary
+            (``report["steps"]["would_be_commit"]``); its ``tree`` is the
+            fingerprint the verdict is bound to.
+        parent_branch: The branch ``finish`` pushes to. Only
+            :data:`FULL_SUITE_GATE_BRANCHES` have a full-suite gate.
+
+    Returns:
+        A report entry recording whether a verdict was resolved, the tree it
+        is bound to, whether it was executed or served, how long it took, and
+        that no main-checkout lock was held while it ran.
+    """
+    tree = str((gate_tree or {}).get("tree") or "").strip()
+    entry: dict[str, Any] = {
+        "attempted": False,
+        "scope": "full",
+        "fingerprint_kind": "tree",
+        "tree": tree or None,
+        "lock_held": False,
+        "success": None,
+        "cached": False,
+        "seconds": 0.0,
+    }
+    if parent_branch not in FULL_SUITE_GATE_BRANCHES:
+        entry["skipped_reason"] = "branch_not_gated"
+        LOG.info(
+            "Pre-lock full-suite verdict: skipped — pushes to %s are not "
+            "gated by the dev-push full suite.",
+            parent_branch,
+        )
+        return entry
+    if not gate_tree or gate_tree.get("available") is False or not tree:
+        entry["skipped_reason"] = "no_would_be_commit_tree"
+        LOG.warning(
+            "Pre-lock full-suite verdict: skipped — no would-be-commit tree "
+            "to bind it to (%s). The dev-push hook still runs the suite, but "
+            "it does so inside the finish lock.",
+            (gate_tree or {}).get("reason") or "tree unavailable",
+        )
+        return entry
+    if os.environ.get(ENV_TEST_SCOPE_SKIP) == "1":
+        entry["skipped_reason"] = "test_scope_skip"
+        LOG.warning(
+            "%s=1 — the dev-push full-suite gate is bypassed, so finish does "
+            "not pre-resolve a verdict for tree %s.",
+            ENV_TEST_SCOPE_SKIP,
+            tree,
+        )
+        return entry
+
+    LOG.info(
+        "Resolving the dev-push full-suite verdict for tree %s before taking "
+        "the main-checkout lock (the pre-push hook will serve it)...",
+        tree,
+    )
+    started = time.monotonic()
+    result = run_tests(worktree_path, scope="full", fingerprint=tree)
+    entry.update(
+        {
+            "attempted": True,
+            "success": bool(result.get("success")),
+            "cached": bool(result.get("cached", False)),
+            "skipped": bool(result.get("skipped", False)),
+            "tooling": result.get("tooling"),
+            "failures": list(result.get("failures") or []),
+            "notices": list(result.get("notices") or []),
+            "seconds": round(time.monotonic() - started, 3),
+        }
+    )
+    cache_entry = result.get("cache_entry")
+    if cache_entry:
+        entry["cache_entry"] = dict(cache_entry)
+    if entry["success"]:
+        entry["verdict"] = "green"
+    else:
+        entry["verdict"] = "red"
+        entry["reason"] = "full_suite_red"
+        entry["failure_kind"] = _gate_failure_kind(result)
+        entry["detail"] = _gate_failure_detail(result)
+    LOG.info(
+        "Pre-lock full-suite verdict for tree %s: %s (%s, %.1fs, no lock held)",
+        tree,
+        entry["verdict"],
+        "served from cache" if entry["cached"] else "executed",
+        entry["seconds"],
+    )
+    return entry
+
+
+def _prelock_full_suite_failure_message(
+    work_item_id: str, verdict: dict[str, Any]
+) -> str:
+    """Abort message for a red pre-lock full-suite verdict.
+
+    The suite ran against the would-be-commit tree *before* the lock, so
+    nothing was committed or pushed: the failure is the **dev-push gate's**
+    verdict, resolved early, rather than a finish-gate failure
+    (SA-0MWFJS3820032YB4).
+    """
+    kind = verdict.get("failure_kind") or "unknown"
+    detail = verdict.get("detail") or ""
+    return (
+        "Dev-push full-suite verdict is RED for tree "
+        f"{verdict.get('tree')} (reason: {kind}).\n"
+        "Resolved before the finish lock was taken, so nothing was committed "
+        "or pushed and local dev was not advanced.\n\n"
+        f"{detail}\n\n"
+        f"Nothing is attributable to {work_item_id} yet; the item is "
+        "released to open.\n"
+        "Fix the failures and re-run:\n"
+        f"  python3 skill/implement/scripts/implement.py finish {work_item_id}"
     )
 
 
@@ -4737,6 +5037,39 @@ class PushTransportLostError(RuntimeError):
         )
 
 
+class PushTransportExhaustedError(RuntimeError):
+    """Raised when the bounded auth/transport retries are exhausted (AC1).
+
+    Distinct from :class:`PushTransportLostError`: there the SSH connection
+    closed on an established session (possibly discarding a green gate);
+    here the transport refused the connection outright — auth rejected
+    (``Permission denied (publickey)``), ``Could not read from remote
+    repository``, a connect timeout/reset, or a remote ``Internal Server
+    Error`` — N times. Nothing is wrong with the code: the condition is
+    classified as **infrastructure** (``reason: transport``), so ``finish``
+    reports it as such instead of the old misleading "commit is local and
+    can be pushed manually" hint (SA-0MW22SEMV00230O5 AC1).
+    """
+
+    def __init__(
+        self,
+        commit_hash: str,
+        branch: str,
+        stderr: str,
+        attempts: int,
+    ) -> None:
+        self.commit_hash = commit_hash
+        self.branch = branch
+        self.stderr = stderr
+        self.attempts = attempts
+        super().__init__(
+            f"Push to dev failed (transient transport) after {attempts} "
+            f"attempt(s): {stderr}. Commit {commit_hash} on branch "
+            f"{branch} is local. This is an infrastructure condition, not a "
+            f"content rejection — re-running finish retries automatically."
+        )
+
+
 class PushSubjectMismatchError(RuntimeError):
     """Raised when the dev push would gate a tree other than the pushed commit.
 
@@ -5333,18 +5666,89 @@ def _post_push_verification_refusal(
     return message, comment
 
 
+#: Push-failure taxonomy (SA-0MW22SEMV00230O5 AC1/AC4).
+#: :func:`classify_push_failure` maps a failed ``git push`` stderr onto one of
+#: these stable outcomes, so the retry decisions in :func:`git_push_to_dev` and
+#: the report/comment vocabulary in :func:`phase_finish` never parse prose
+#: twice and a signature is classified identically wherever it appears.
+PUSH_FAILURE_TRANSPORT = "transport"  # transient auth/transport — infra
+PUSH_FAILURE_NON_FAST_FORWARD = "non_fast_forward"
+PUSH_FAILURE_GATE = "gate"  # a stable ``gate_reason=`` line
+PUSH_FAILURE_CONTENT = "content"  # a real rejection retrying cannot fix
+PUSH_FAILURE_UNKNOWN = "unknown"
+
+#: Auth/transport signatures treated as **infrastructure** (AC1): they are
+#: retried on the bounded budget below and reported as such, never as a bare
+#: "push failed". The four close patterns are the original transport-close set
+#: (SA-0MVSJX5HS002DJHI AC4); the rest are the observed concurrent-run
+#: failures — a fresh key handshake per connection (no ``SSH_AUTH_SOCK``), a
+#: connect timeout/reset and a GitHub-side 5xx. Branch-policy refusals
+#: (``GH006``), hook declines and non-fast-forward rejections are deliberately
+#: **not** here: those are content conditions that retrying cannot fix.
 PUSH_TRANSPORT_RETRY_PATTERNS: tuple[str, ...] = (
     "closed by remote host",
     "connection reset by peer",
     "remote end hung up unexpectedly",
     "kex_exchange_identification",
+    "permission denied (publickey)",
+    "could not read from remote repository",
+    "connection reset",
+    "connection timed out",
+    "connect to host",
+    "internal server error",
 )
+#: The four connection-closed patterns that mean "the SSH connection closed on
+#: an established session" (distinct outcome ``connection_closed`` from the
+#: general transport set, SA-0MVWNHLQQ002TFZR AC3).
+PUSH_TRANSPORT_CLOSE_PATTERNS: tuple[str, ...] = (
+    "closed by remote host",
+    "connection reset by peer",
+    "remote end hung up unexpectedly",
+    "kex_exchange_identification",
+)
+
+#: Content rejections a retry cannot fix: branch policy (``GH006``), remote
+#: hooks that refuse the update. Classified ``content`` — a hard stop, never
+#: retried as transport (AC1's "distinct from a real content rejection").
+PUSH_CONTENT_REJECTION_PATTERNS: tuple[str, ...] = (
+    "protected branch update failed",
+    "gh006",
+    "hook declined",
+    "pre-receive hook declined",
+)
+
 #: Bounded retry policy (AC4): the initial attempt plus two retries with
 #: jittered exponential backoff. A retry re-runs the identical argv/cwd/env, so
 #: the pre-push gate runs again and serves its cached full-suite entry.
 PUSH_RETRY_MAX_ATTEMPTS = 3
 PUSH_RETRY_BASE_SECONDS = 2.0
 PUSH_RETRY_CAP_SECONDS = 30.0
+
+#: Suite-*load* signatures that mark a full-suite gate failure as an
+#: environment/load flake rather than a code failure (AC7): the suite could
+#: not be collected/loaded at all (a missing shared build, an import failure)
+#: — retrying the identical tree usually passes. A reproducer that fails again
+#: on the retry still blocks the push: the gate is never weakened.
+PUSH_GATE_LOAD_FLAKE_PATTERNS: tuple[str, ...] = (
+    "cannot find package",
+    "cannot find module",
+    "cannot find './",
+    "module_not_found",
+    "failed to load",
+    "could not be loaded",
+    "unable to import",
+    "cannot import",
+    "import error",
+    "error: cannot find",
+    "modulenotfounderror",
+)
+
+#: A load-flake gate failure is retried exactly once on the identical tree:
+#: one diagnostic re-run distinguishes "environment flake" from "real
+#: failure" without multiplying the gate cost (AC7). Transport retries never
+#: consume this budget — they serve the tree-keyed cached verdict instead
+#: (AC6).
+PUSH_GATE_LOAD_FLAKE_RETRY_LIMIT = 1
 
 #: SSH keepalive options injected into the dev-push child environment
 #: (SA-0MVWNHLQQ002TFZR AC1/AC2). ``.githooks/pre-push`` runs the full suite
@@ -5450,15 +5854,87 @@ class PushGateFailureError(RuntimeError):
         )
 
 
-def _is_retryable_push_transport(stderr: str) -> bool:
-    """Whether *stderr* names a transient transport close (retryable).
+def classify_push_failure(stderr: str) -> str:
+    """Classify a failed ``git push`` stderr into a stable outcome (pure).
 
-    Only the recognised transport patterns retry. Auth failures, branch-policy
-    refusals and non-fast-forward errors must fail as they do today — masking
-    them behind a retry would turn a real error into a slow one.
+    The single, table-driven taxonomy for push failures
+    (SA-0MW22SEMV00230O5 AC1/AC4). Both :func:`git_push_to_dev` (which
+    decides whether to retry) and :func:`phase_finish` (which decides what
+    to report) consume it, so the five observed signatures — auth refusal,
+    ``Could not read from remote repository``, connect reset/timeout,
+    remote ``Internal Server Error`` and the concurrent non-fast-forward
+    race — are classified identically everywhere.
+
+    Outcomes:
+
+    * :data:`PUSH_FAILURE_NON_FAST_FORWARD` — dev advanced concurrently; the
+      caller rebases onto ``origin/dev`` and re-attempts.
+    * :data:`PUSH_FAILURE_TRANSPORT` — a transient auth/transport signature
+      (infrastructure): bounded retry with backoff, never a content stop.
+    * :data:`PUSH_FAILURE_GATE` — the pre-push hook printed a stable
+      ``gate_reason=`` line: the suite/slot/tooling refused the push.
+    * :data:`PUSH_FAILURE_CONTENT` — a real rejection (branch policy, hook
+      declined) that retrying cannot fix.
+    * :data:`PUSH_FAILURE_UNKNOWN` — anything else (never retried as
+      transport; fail-safe).
+
+    A ``gate_reason=`` line wins over the transport patterns because those
+    phrases can appear in the gate's own output (e.g. ``Connection timed
+    out``) while the hook's reason is authoritative for a refused push.
     """
     lower = (stderr or "").lower()
-    return any(pattern in lower for pattern in PUSH_TRANSPORT_RETRY_PATTERNS)
+    if "non-fast-forward" in lower or "fetch first" in lower or (
+        "remote contains work" in lower
+    ):
+        return PUSH_FAILURE_NON_FAST_FORWARD
+    if _GATE_REASON_LINE_RE.search(stderr or ""):
+        return PUSH_FAILURE_GATE
+    if any(pattern in lower for pattern in PUSH_TRANSPORT_RETRY_PATTERNS):
+        return PUSH_FAILURE_TRANSPORT
+    if any(pattern in lower for pattern in PUSH_CONTENT_REJECTION_PATTERNS):
+        return PUSH_FAILURE_CONTENT
+    return PUSH_FAILURE_UNKNOWN
+
+
+def _is_transport_close(stderr: str) -> bool:
+    """Whether *stderr* names a connection-closed transport (not auth/etc.).
+
+    The four original close patterns keep the distinct *connection_closed*
+    outcome (the SSH connection died on an established session, possibly
+    discarding a green gate verdict — SA-0MVWNHLQQ002TFZR). Auth refusals,
+    connect timeouts and remote 5xx are transient transport too, but they
+    never ran a gate, so they surface as ``transport`` instead.
+    """
+    lower = (stderr or "").lower()
+    return any(pattern in lower for pattern in PUSH_TRANSPORT_CLOSE_PATTERNS)
+
+
+def _is_gate_load_flake(stderr: str | None) -> bool:
+    """Whether a refused gate's output names suite *load* errors (AC7).
+
+    A full-suite gate whose failures are files that could not be *loaded*
+    (``Cannot find package '@worklog/shared/...'`` — a missing shared build,
+    an import failure) is an environment condition, not a code failure:
+    the identical tree passes moments later when the sibling's build has
+    landed. The retry is bounded (see :data:`PUSH_GATE_LOAD_FLAKE_RETRY_LIMIT`)
+    and a reproducible load failure still blocks the push.
+    """
+    lower = (stderr or "").lower()
+    return any(pattern in lower for pattern in PUSH_GATE_LOAD_FLAKE_PATTERNS)
+
+
+def _is_retryable_push_transport(stderr: str) -> bool:
+    """Whether *stderr* names a transient auth/transport failure (retryable).
+
+    AC1 (SA-0MW22SEMV00230O5): auth refusals, ``Could not read from remote
+    repository``, connect timeouts/resets and a remote ``Internal Server
+    Error`` are all classified as transient transport — the observed
+    concurrent-run failures — so they are retried on the bounded budget with
+    backoff instead of failing a leaf ``finish`` outright. Branch-policy
+    refusals (``GH006``), hook declines and non-fast-forward errors are
+    **not** retryable: those are content conditions that retrying cannot fix.
+    """
+    return classify_push_failure(stderr) == PUSH_FAILURE_TRANSPORT
 
 
 def _push_transport_backoff(
@@ -5771,18 +6247,20 @@ def git_push_to_dev(
                     _attach_trail(evidence_out, attempt)
                 return True
 
-            # Failure: detect non-fast-forward errors (dev advanced
-            # concurrently). AC1/AC2: raise a recoverable exception so the
-            # caller can rebase and retry instead of failing with information
-            # loss. Remotes word this differently: SSH/HTTPS report
-            # "non-fast-forward", while local/file remotes report "fetch
-            # first" / "remote contains work that you do not have locally".
-            lower = stderr_str.lower()
-            if (
-                "non-fast-forward" in lower
-                or "fetch first" in lower
-                or "remote contains work" in lower
-            ):
+            # Failure: classify it once (SA-0MW22SEMV00230O5 AC1/AC4). The
+            # taxonomy decides whether the attempt is retried (transient
+            # auth/transport, with backoff), deserves rebase-and-retry
+            # (concurrent non-fast-forward), or is a hard stop (gate refusal,
+            # content rejection) — never parsed twice.
+            failure_kind = classify_push_failure(stderr_str)
+
+            # Non-fast-forward: dev advanced concurrently. AC1/AC2: raise a
+            # recoverable exception so the caller can rebase and retry
+            # instead of failing with information loss. Remotes word this
+            # differently: SSH/HTTPS report "non-fast-forward", while
+            # local/file remotes report "fetch first" / "remote contains
+            # work that you do not have locally".
+            if failure_kind == PUSH_FAILURE_NON_FAST_FORWARD:
                 rebase_cmd = (
                     f"git rebase origin/dev && git push origin "
                     f"{branch}:refs/heads/dev"
@@ -5791,11 +6269,13 @@ def git_push_to_dev(
                     commit_hash or "unknown", branch, stderr_str, rebase_cmd,
                 )
 
-            # Transient transport close: retry from the SAME cwd (the worktree
+            # Transient auth/transport: retry from the SAME cwd (the worktree
             # that holds the pushed commit), so the gate re-runs against the
-            # identical tree and serves its cached entry.
+            # identical tree and serves its cached full-suite entry (AC6 — N
+            # transport retries never mean N full suites). AC1 extended the
+            # retryable set to the concurrent-run auth/connect/5xx signatures.
             if (
-                _is_retryable_push_transport(stderr_str)
+                failure_kind == PUSH_FAILURE_TRANSPORT
                 and attempt < PUSH_RETRY_MAX_ATTEMPTS
             ):
                 delay = _push_transport_backoff(attempt)
@@ -5803,15 +6283,22 @@ def git_push_to_dev(
                     {
                         "attempt": attempt,
                         "delay_seconds": round(delay, 3),
-                        "reason": "transport_close",
+                        "reason": (
+                            "transport_close"
+                            if _is_transport_close(stderr_str)
+                            else "transport"
+                        ),
                     }
                 )
                 LOG.warning(
                     "git push to dev attempt %d/%d failed with a transient "
-                    "transport error; retrying in %.1fs from the same cwd %s. "
-                    "stderr: %s",
+                    "transport error (%s); retrying in %.1fs from the same "
+                    "cwd %s. stderr: %s",
                     attempt,
                     PUSH_RETRY_MAX_ATTEMPTS,
+                    "connection closed"
+                    if _is_transport_close(stderr_str)
+                    else "auth/connect/remote-5xx",
                     delay,
                     cwd,
                     _stderr_tail(stderr_str),
@@ -5819,18 +6306,50 @@ def git_push_to_dev(
                 _push_retry_sleep(delay)
                 continue
 
-            # The retries are exhausted and the failure is still a transport
-            # close: the suite may have been green, but the ref update never
-            # reached origin. Raise a *distinct* failure (AC3) instead of
-            # returning a generic False, so `finish` can report
-            # "transport lost" rather than silence after "full suite green".
-            if _is_retryable_push_transport(stderr_str):
+            # The retries are exhausted and the failure is still transient
+            # transport: nothing reached origin, so classify the exhaustion
+            # distinctly — never a bare "push failed" (AC1). A connection
+            # close may have discarded a green gate verdict (the suite ran
+            # before git contacted the remote), so it keeps its dedicated
+            # ``connection_closed`` outcome (SA-0MVWNHLQQ002TFZR AC3); an
+            # auth/connect/5xx exhaustion reports ``transport``.
+            if failure_kind == PUSH_FAILURE_TRANSPORT:
+                if _is_transport_close(stderr_str):
+                    if evidence_out is not None:
+                        evidence_out.clear()
+                        evidence_out.update(
+                            {
+                                "success": False,
+                                "reason": "connection_closed",
+                                "gate_reason": None,
+                                "transport_lost": True,
+                                "stderr_tail": _stderr_tail(stderr_str),
+                            }
+                        )
+                        _attach_trail(evidence_out, attempt)
+                    LOG.error(
+                        "git push to dev transport lost (attempt %d/%d): the "
+                        "SSH connection closed before the ref update, so a "
+                        "green suite verdict (if any) was discarded. This is "
+                        "NOT a test failure. stderr: %s",
+                        attempt,
+                        PUSH_RETRY_MAX_ATTEMPTS,
+                        _stderr_tail(stderr_str),
+                    )
+                    raise PushTransportLostError(
+                        commit_hash or "unknown",
+                        branch,
+                        _stderr_tail(stderr_str),
+                        attempt,
+                    )
+                # Auth/connect/remote-5xx exhaustion — infrastructure, not a
+                # content rejection (AC1).
                 if evidence_out is not None:
                     evidence_out.clear()
                     evidence_out.update(
                         {
                             "success": False,
-                            "reason": "connection_closed",
+                            "reason": PUSH_FAILURE_TRANSPORT,
                             "gate_reason": None,
                             "transport_lost": True,
                             "stderr_tail": _stderr_tail(stderr_str),
@@ -5838,15 +6357,15 @@ def git_push_to_dev(
                     )
                     _attach_trail(evidence_out, attempt)
                 LOG.error(
-                    "git push to dev transport lost (attempt %d/%d): the SSH "
-                    "connection closed before the ref update, so a green "
-                    "suite verdict (if any) was discarded. This is NOT a "
-                    "test failure. stderr: %s",
+                    "git push to dev failed (transient transport) after "
+                    "%d/%d attempts: the auth/connect/remote failure repeated "
+                    "despite backoff. This is an infrastructure condition, "
+                    "NOT a content rejection. stderr: %s",
                     attempt,
                     PUSH_RETRY_MAX_ATTEMPTS,
                     _stderr_tail(stderr_str),
                 )
-                raise PushTransportLostError(
+                raise PushTransportExhaustedError(
                     commit_hash or "unknown",
                     branch,
                     _stderr_tail(stderr_str),
@@ -5872,6 +6391,11 @@ def git_push_to_dev(
                 }
                 if pushed_commit_guard is not None:
                     failure["pushed_commit_guard"] = pushed_commit_guard
+                # AC4 (SA-0MW22SEMV00230O5): a content rejection (branch
+                # policy, hook declined) is taxonomy-visible, distinct from a
+                # transient transport failure and from a bare failed push.
+                if failure_kind in (PUSH_FAILURE_CONTENT, PUSH_FAILURE_UNKNOWN):
+                    failure["reason"] = failure_kind
                 evidence_out.update(failure)
                 _attach_trail(evidence_out, attempt)
             LOG.error(
@@ -5890,6 +6414,7 @@ def git_push_to_dev(
                     PushNonFastForwardError,
                     PushGateFailureError,
                     PushTransportLostError,
+                    PushTransportExhaustedError,
                 ),
             ):
                 raise
@@ -7585,14 +8110,22 @@ FINISH_GATE_REFUSALS: frozenset[tuple[str, str]] = frozenset({
     ("build_churn", FINISH_REASON_WILDCARD),
     ("worktree_placement", FINISH_REASON_WILDCARD),
     ("diff", "no_changes"),
+    # The dev-push full-suite verdict resolved before the lock
+    # (SA-0MWFJS3820032YB4): a red suite is a genuine gate failure — it must
+    # consume the finish-attempt budget and never be retried as a transient
+    # infrastructure refusal.
+    ("full_suite_prelock", FINISH_REASON_WILDCARD),
 })
 
 #: Consultation order for the structured ``steps`` payload of a failing
 #: ``finish`` report. When several steps failed, the first in this order is
-#: the primary cause; the mandated prefix (``main_checkout_lock`` → … →
-#: ``ancestry_assertion``) is followed by the two vocabulary steps that
-#: return before the lock step (``worktree_placement``, ``diff``).
+#: the primary cause; the pre-lock dev-push full-suite resolution
+#: (``full_suite_prelock``, SA-0MWFJS3820032YB4) comes first because it runs
+#: before the lock, then the mandated prefix (``main_checkout_lock`` → … →
+#: ``ancestry_assertion``), then the two vocabulary steps that return before
+#: the lock step (``worktree_placement``, ``diff``).
 FINISH_STEP_PRECEDENCE: tuple[str, ...] = (
+    "full_suite_prelock",
     "main_checkout_lock",
     "main_checkout_guard",
     "local_dev_fast_forward",
@@ -8078,6 +8611,81 @@ def _restore_local_dev_after_failed_push(
         target_tip,
         current,
     )
+    return result
+
+
+def _commit_is_on_origin_dev(
+    repo_root: str,
+    commit_hash: str | None,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> dict[str, Any]:
+    """Non-raising, remote-verified ancestry query (AC3/AC5).
+
+    Whether *commit_hash* is already an ancestor of the pushed
+    ``refs/remotes/origin/<parent>`` — **verified against the remote**, never
+    a stale remote-tracking ref: the remote-tracking ref is refreshed with a
+    ``git fetch`` first (exactly like :func:`_assert_commit_on_origin_dev`).
+    ``finish`` uses this before the push to short-circuit an already-landed
+    commit (``outcome: already_pushed``) and, on a transport failure, to
+    prove the commit is not stranded before releasing the item to ``open``
+    (never a transport regression for a landed commit — SA-0MW22SEMV00230O5
+    AC3/AC5).
+
+    Fail-open by design: any uncertainty — an empty/unresolvable commit, a
+    failed fetch, an unresolvable remote tip — resolves to ``verified: False``
+    so the caller pushes and lets the remote arbitrate (a wrong "already
+    landed" verdict would silently skip a push that was actually needed).
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        commit_hash: The commit to check (short or full hash; ``None``/empty
+            means nothing to verify).
+        parent_branch: The shared parent branch (default: ``dev``).
+
+    Returns:
+        Dict with ``verified``, ``commit``, ``resolved_commit``, ``target``,
+        ``origin_tip`` and ``fetched`` — the same shape
+        :func:`_assert_commit_on_origin_dev` returns, usable as the post-push
+        ancestry assertion on the already-landed path.
+    """
+    target_ref = f"refs/remotes/origin/{parent_branch}"
+    result: dict[str, Any] = {
+        "verified": False,
+        "commit": commit_hash,
+        "resolved_commit": None,
+        "target": target_ref,
+        "origin_tip": None,
+        "fetched": False,
+    }
+    if not commit_hash:
+        return result
+    fetch_result = run_cmd(
+        ["git", "fetch", "origin", parent_branch],
+        cwd=repo_root,
+        check=False,
+        timeout=120,
+    )
+    result["fetched"] = fetch_result.returncode == 0
+    resolved = _resolve_full_commit(repo_root, commit_hash)
+    origin_tip = _resolve_origin_parent_tip(repo_root, parent_branch)
+    result["resolved_commit"] = resolved
+    result["origin_tip"] = origin_tip
+    if not resolved or not origin_tip or not result["fetched"]:
+        # Cannot prove it — fail open so the caller pushes.
+        return result
+    ancestor_result = run_cmd(
+        ["git", "merge-base", "--is-ancestor", resolved, target_ref],
+        cwd=repo_root,
+        check=False,
+    )
+    result["verified"] = ancestor_result.returncode == 0
+    if result["verified"]:
+        LOG.info(
+            "%s already on %s (remote-verified via fetch): the push is "
+            "satisfied, skipping the re-push.",
+            resolved,
+            target_ref,
+        )
     return result
 
 
@@ -9146,6 +9754,39 @@ def _reported_exit_code(test_result: dict[str, Any]) -> int | None:
     return None
 
 
+#: `` ❯ [<fn>] <file>:<line>:<col>`` — a Vitest stack frame
+#: (RISE-0MW5JFQCU001YYQK, SA-0MWDLPF320060T0H). Mirrored from the shared
+#: classifier's ``gate_reason._VITEST_FRAME_RE`` (pinned by a consistency
+#: test) so the compatibility fallback body in ``_gate_failure_kind`` and the
+#: detail renderer agree with the single shared classifier without importing
+#: the runner.
+_VITEST_FRAME_RE = re.compile(
+    r"^\s*(?:❯|>)\s+(?:\S+\s+)?(?P<loc>\S+:\d+:\d+)\s*$",
+    re.MULTILINE,
+)
+
+
+def _gate_vitest_frame(test_result: dict[str, Any] | None) -> str | None:
+    """The first ``❯ <file>:<line>:<col>`` Vitest frame in the result tails.
+
+    Consults the already-carried bounded ``stdout``/``stderr`` tails that
+    ``_adapt_guarded_result`` set (``GATE_OUTPUT_TAIL_CHARS``), stderr first —
+    the stream ``_gate_failure_detail`` prefers. ``None`` when neither tail
+    carries a frame, so a genuinely unparsable run (ENOSPC, missing
+    executable) is never fabricated into a code failure.
+    """
+    if not isinstance(test_result, dict):
+        return None
+    for key in ("stderr", "stdout"):
+        tail = test_result.get(key)
+        if not isinstance(tail, str):
+            continue
+        match = _VITEST_FRAME_RE.search(tail)
+        if match:
+            return match.group("loc")
+    return None
+
+
 def _gate_failure_kind(test_result: dict[str, Any]) -> str:
     """Classify why the test gate failed.
 
@@ -9185,9 +9826,21 @@ def _gate_failure_kind(test_result: dict[str, Any]) -> str:
         return GATE_FAILURE_TIMEOUT
     if _NOTICE_KILLED in notice_codes:
         return GATE_FAILURE_KILLED
+    exit_code = _reported_exit_code(test_result)
+    # Vitest frame fallback (SA-0MWDLPC3F005S9S2) — mirror of the shared
+    # classifier: a non-zero run whose bounded output tail carries a
+    # ``❯ <file>:<line>:<col>`` frame is a genuine code failure even when no
+    # structured failure record could be built. Replaces ONLY the ``unparsed``
+    # outcome: timeout / signal-kill / slot-contention / infrastructure
+    # notices above still win.
+    if (
+        exit_code is not None
+        and exit_code > 0
+        and _gate_vitest_frame(test_result) is not None
+    ):
+        return GATE_FAILURE_TESTS
     if _NOTICE_UNPARSED_FAILURE in notice_codes:
         return GATE_FAILURE_UNPARSED
-    exit_code = _reported_exit_code(test_result)
     if exit_code is not None:
         if exit_code < 0:
             return GATE_FAILURE_KILLED
@@ -9209,6 +9862,15 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
     failures = [str(f) for f in (test_result.get("failures") or [])]
     if failures:
         return "Failures:\n" + "\n".join(failures[:20])
+
+    # Frame fallback (SA-0MWDLPC3F005S9S2): a classified test failure with no
+    # structured failure record still reports the frame as the failing
+    # location — it must never fall through to the "no structured failures
+    # were parsed" prose.
+    if _gate_failure_kind(test_result) == GATE_FAILURE_TESTS:
+        frame = _gate_vitest_frame(test_result)
+        if frame is not None:
+            return "Failing location:\n" + frame
 
     state_changed_flags = test_result.get("state_changed_during_run") or []
     if isinstance(state_changed_flags, dict):
@@ -10617,6 +11279,114 @@ def _phase_start_locked(
             print(f"\n\u26d4 {msg}\n")
         return report
 
+    # ── Step 2.7: Main-checkout pre-check (before the claim) ─────────
+    # AH-0MWFH7P4D0058L0A: detect a foreign tracked-file mutation of the main
+    # checkout *before* the item is claimed. Two concurrent sessions on one
+    # repository can otherwise leave writes in the main checkout that only the
+    # finish gate notices — by which point an unrelated item's finish is
+    # blocked. Refusing here leaves the item open with no assignee and creates
+    # no worktree (AC1/AC2/AC3); the check is strictly read-only (AC6).
+    #
+    # This is an *addition* to the existing Key-Files-aware dirty-tree gate
+    # (Step 6.05, which still runs after the claim): a decisive foreign
+    # mutation short-circuits the start here, while a fetch/extension failure or
+    # unrelated dirt keeps the historical flow unchanged.
+    repo_root = _get_repo_root() or str(Path.cwd().resolve())
+    pre_item: dict[str, Any] | None = None
+    if _current_checkout_is_linked_worktree():
+        report["main_checkout_pre_check"] = {
+            "verdict": "skipped",
+            "reason": "inside a linked worktree",
+        }
+        report["dirty_worktree"] = False
+        report["dirty_worktree_left_behind"] = []
+    else:
+        LOG.info("Checking the main checkout before claiming %s...", work_item_id)
+        # Read-only fetch: when the item cannot be fetched, defer to the
+        # post-claim fetch below, which releases the claim it then holds.
+        pre_item = wl_show(work_item_id) or None
+        pre_expected_dirty: tuple[str, ...] = ()
+        extension_error = False
+        try:
+            pre_extension = load_implement_extension(repo_root)
+            pre_expected_dirty = _parse_expected_dirty(pre_extension)
+        except SkillExtensionError as exc:
+            # A malformed extension is handled (and the claim released) by the
+            # post-claim Step 4 load; do not pre-empt it here.
+            LOG.warning(
+                "Skipping pre-claim main-checkout check: %s", exc
+            )
+            extension_error = True
+
+        if pre_item is None or extension_error:
+            report["main_checkout_pre_check"] = {
+                "verdict": "skipped",
+                "reason": (
+                    "work item unavailable"
+                    if pre_item is None
+                    else "extension error"
+                ),
+            }
+        else:
+            pre_check = _main_checkout_pre_check(
+                repo_root,
+                pre_item.get("description", ""),
+                expected_dirty=pre_expected_dirty,
+            )
+            report["main_checkout_pre_check"] = {
+                "verdict": pre_check["verdict"],
+                "snapshot_taken_at": pre_check["snapshot"]["taken_at"],
+                "snapshot_status": pre_check["snapshot"]["status"],
+                "offending": pre_check["offending"],
+                "reason": pre_check["reason"],
+            }
+            if pre_check["verdict"] == "fail":
+                offending = pre_check["offending"]
+                listing = "\n".join(
+                    f"  - {path}" for path in offending[:20]
+                ) or "  (see git status below)"
+                status_output = git_status(cwd=repo_root)
+                msg = (
+                    f"Main-checkout mutation detected before the claim. "
+                    f"Uncommitted changes exist in the main checkout at "
+                    f"{repo_root} that are foreign to {work_item_id}: another "
+                    f"session may be writing there, or the changes overlap "
+                    f"this item's Key Files.\n"
+                    f"Do NOT stash, commit, or revert the user's uncommitted "
+                    f"changes.\n"
+                    f"STOP and ask the operator how to proceed (commit, stash, "
+                    f"revert, or abort) — never touch the user's working tree "
+                    f"without explicit permission.\n"
+                    f"Reason: {pre_check['reason']}.\n"
+                    f"Offending paths:\n{listing}\n"
+                    f"The work item was NOT claimed (status left open, no "
+                    f"assignee) and no worktree was created.\n"
+                    f"\nGit status:\n{status_output}"
+                )
+                LOG.warning("Main-checkout pre-check failed:\n%s", status_output)
+                if not json_output:
+                    print(
+                        "\n⚠  Main-checkout mutation detected before the claim"
+                    )
+                    print("=" * 60)
+                    print(status_output)
+                    print("=" * 60)
+                    print(
+                        "Ask the operator how to proceed — do not stash, "
+                        "commit, or revert user changes without permission.\n"
+                    )
+                report["success"] = False
+                report["message"] = msg
+                report["dirty_worktree"] = True
+                report["dirty_decision"] = pre_check["decision"]
+                if json_output:
+                    print(format_json_output(report))
+                return report
+            report["dirty_worktree"] = False
+            report["dirty_worktree_left_behind"] = list(
+                pre_check["decision"]["dirty_files"]
+            )
+
     # ── Step 3: Claim the work item via shared helper ─────────────
     # Status-only claim: the workflow stage must NOT be advanced here.
     # `in_progress` is a status, not a stage; passing it as a stage made `wl`
@@ -11172,7 +11942,18 @@ def _recover_non_fast_forward_push(
     if not git_push_to_dev(
         worktree_path, branch, new_commit, evidence_out=evidence_out
     ):
-        # Retry failed — preserve state for manual recovery.
+        # Retry failed — preserve state for manual recovery. A gate refusal
+        # keeps its distinct exception so the bounded leaf loop (and the
+        # report taxonomy, AC4/AC7) still sees ``gate_reason`` rather than a
+        # generic "after rebase" failure.
+        gate_reason = evidence_out.get("gate_reason") if evidence_out else None
+        if gate_reason:
+            raise PushGateFailureError(
+                str(gate_reason),
+                str(evidence_out.get("stderr_tail") or ""),
+                new_commit,
+                branch,
+            ) from exc
         wl_add_comment(
             work_item_id,
             f"Push to dev failed after rebase.\n"
@@ -11267,8 +12048,13 @@ def phase_finish(
     item (``open``, empty assignee) and records the retained state once per
     commit: the published (or local) commit, the branch, whether the worktree
     survives and the resume command. Re-running ``finish`` then converges to
-    ``completed`` / ``in_review`` through the ordinary no-diff/no-op-push
-    path, and the completion comment (Step 9) is deduplicated on the marker
+    ``completed`` / ``in_review``: because the worktree is clean and its
+    commit already exists, the re-run creates no new commit, so it
+    **attributes the prior run's commit** — a commit ahead of
+    ``origin/<parent_branch>`` whose message references the work-item id — and
+    proceeds through the ordinary fast-forward/push path
+    (SA-0MW98UNVB0085LFA AC1). A genuinely work-less worktree is still
+    refused. The completion comment (Step 9) is deduplicated on the marker
     plus commit hash — so a recovered interruption never leaves a duplicate
     completion comment or a second terminal transition in one run.
 
@@ -11755,24 +12541,58 @@ def phase_finish(
         for note in excluded_churn:
             LOG.info("Live-repo guard note: %s", note)
 
-    # ── Step 3b: Full-suite coverage moved to the dev-push gate ─────
-    # (SA-0MVECQUGF0064U81 — defer full-suite testing to integration.) No
-    # full suite runs here: the changed-scope validation above is the
-    # development-time (pre-commit) gate, kept fast so finish holds a
-    # host-wide "test" slot only for the affected tests. The FULL suite
-    # first runs at the dev-push integration gate — the pre-push hook
-    # (`.githooks/pre-push`) executes `run_tests.py --scope full
+    # ── Step 3a: Full-suite coverage stays at the dev-push gate ─────
+    # (SA-0MVECQUGF0064U81 — defer full-suite testing to integration.) The
+    # changed-scope validation above is the development-time (pre-commit)
+    # gate, kept fast so finish holds a host-wide fast-lane slot only for the
+    # affected tests. The FULL suite is the dev-push integration gate's — the
+    # pre-push hook (`.githooks/pre-push`) executes `run_tests.py --scope full
     # --strict-git-env` on pushes to dev/main, and the ship release gate
     # re-runs it on the merged dev→main tree — and that run populates the
     # main-checkout `.worklog/cache` that post-push verification and the
-    # audit skill consume read-only. Running the full suite here instead
-    # would (a) burn a slot for the whole suite duration per work item,
-    # (b) record a verdict no later consumer could safely reuse — before the
-    # gate was tree-bound it was cached under a pre-commit dirty git-state
-    # fingerprint (the verdict is now keyed by the would-be-commit tree SHA,
-    # SA-0MVQHVHXI007PQAB, but the dev-push gate still runs the full suite on
-    # the pushed commit), and (c) duplicate the push gate.
-    LOG.info("Changed-scope validation passed — full suite deferred to the dev-push gate")
+    # audit skill consume read-only. Two things make that safe to resolve
+    # here rather than in the hook (next step): the verdict is tree-bound
+    # (`fingerprint_kind="tree"`, SA-0MVQHVHXI007PQAB) and the hook re-binds
+    # it to the pushed commit, so a verdict about any other tree is never
+    # reused.
+    LOG.info(
+        "Changed-scope validation passed — the dev-push full suite is "
+        "resolved outside the main-checkout lock"
+    )
+
+    # ── Step 3b: Resolve the dev-push full-suite verdict WITHOUT the lock ──
+    # (SA-0MWFJS3820032YB4.) The dev-push hook runs `run_tests.py --scope full
+    # --gate-commit <sha>` while this run holds the exclusive main-checkout
+    # lock, so executing the suite there serialised every concurrent finish
+    # behind a single ~5 min window. The verdict is tree-keyed, so it is
+    # resolved here — against the would-be-commit tree the commit will
+    # produce, which `stage_tested_tree` proves below — and the hook's run is
+    # then served from the cache instead of executing the suite. The lock
+    # still covers only commit → fast-forward → push → ancestry assertion.
+    # A red verdict aborts here, before the lock: nothing is committed or
+    # pushed, and the hook's own tree binding remains the authority on what
+    # the pushed commit is allowed to be.
+    prelock_verdict = resolve_prelock_full_suite_verdict(
+        worktree_path, gate_tree, parent_branch=parent_branch
+    )
+    report["steps"]["full_suite_prelock"] = prelock_verdict
+    if prelock_verdict["attempted"] and not prelock_verdict["success"]:
+        msg = _prelock_full_suite_failure_message(work_item_id, prelock_verdict)
+        report["success"] = False
+        report["message"] = msg
+        wl_add_comment(work_item_id, msg)
+        # Failure-path guard verify after the pre-existing abort comment
+        # (SA-0MVXVBYXI000QMXM).
+        _record_main_checkout_verify("gate_failure", aborting=True)
+        try:
+            StatusLifecycle.update_status(work_item_id, "open", assignee="")
+        except RuntimeError:
+            LOG.error("Failed to reset work item %s status to open", work_item_id)
+        if json_output:
+            print(format_json_output(report))
+        else:
+            LOG.error(msg)
+        return report
 
     # ── Step 3c: Single-owner main-checkout lock (WL-0MVPADZ1Z000FOSG AC5) ─
     # Everything from the commit onwards operates on the main checkout, so
@@ -11781,10 +12601,14 @@ def phase_finish(
     # kernel-released when the holder dies, and recorded in the report for
     # observability. The wait is bounded by ``IMPLEMENT_FINISH_LOCK_TIMEOUT``
     # (default 0 = fail fast), so a concurrent finish never hangs this one.
+    # The window deliberately excludes the full-suite run above: the lock is
+    # held only for the mutations (SA-0MWFJS3820032YB4).
     lock_timeout = _finish_lock_timeout()
+    lock_wait_started = time.monotonic()
     lock_fd, lock_refusal = acquire_main_checkout_lock(
         repo_root, work_item_id, timeout=lock_timeout
     )
+    lock_wait_seconds = round(time.monotonic() - lock_wait_started, 3)
     report["steps"]["main_checkout_lock"] = {
         "lock_path": str(_main_checkout_lock_path(repo_root)),
         "acquired": lock_fd is not None,
@@ -11792,6 +12616,7 @@ def phase_finish(
             datetime.now(timezone.utc).isoformat() if lock_fd is not None else None
         ),
         "timeout_seconds": lock_timeout,
+        "waited_seconds": lock_wait_seconds,
         "holder": lock_refusal if lock_fd is None else None,
     }
     if lock_fd is None:
@@ -11881,6 +12706,23 @@ def phase_finish(
                 commit_created = True
                 created_hash = ""
 
+            # AC1 (SA-0MW98UNVB0085LFA): a finish interrupted during its push
+            # leaves a **clean** worktree whose commit already exists on the
+            # branch. Re-running finish therefore creates no new commit — but
+            # the commit is attributable to a **prior run of this worktree**
+            # and must be used, not refused as a no-op. The base is
+            # ``origin/<parent_branch>``: after an interrupted push the commit
+            # is already on local ``dev``, so a local-dev base would report
+            # "0 ahead" and re-refuse. Attribution stays strict — only a
+            # commit whose message references this item counts, so ambient
+            # HEAD from another item is never claimed (parent epic AC2).
+            attributed_prior_hash = ""
+            if not commit_created and not verification_only:
+                attribution = _commit_attribution(
+                    worktree_path, work_item_id, f"origin/{parent_branch}"
+                )
+                attributed_prior_hash = attribution.hash
+
             if commit_created:
                 commit_hash = created_hash or git_get_commit_hash(worktree_path)
                 report["steps"]["commit"] = {
@@ -11891,11 +12733,32 @@ def phase_finish(
                     "message": commit_msg,
                 }
                 LOG.info("Committed at %s", commit_hash)
+            elif attributed_prior_hash:
+                # The commit exists but this run did not create it: reuse it
+                # for the report, the fast-forward/push and the terminal path
+                # exactly as the ordinary commit path does (AC1).
+                commit_hash = attributed_prior_hash
+                report["steps"]["commit"] = {
+                    "success": True,
+                    "committed": True,
+                    "created": False,
+                    "hash": commit_hash,
+                    "message": commit_msg,
+                    "attributed": "prior_run",
+                }
+                LOG.info(
+                    "No new commit; attributing prior-run commit %s "
+                    "(ahead of origin/%s) to %s.",
+                    commit_hash,
+                    parent_branch,
+                    work_item_id,
+                )
             else:
-                # No commit was created. Never surface the ambient HEAD (which
-                # may be another item's published commit) as this item's
-                # commit (AC2): the hash stays empty and the machinery below
-                # uses the worktree HEAD only to fast-forward/push a no-op.
+                # No commit attributable to this item. Never surface the
+                # ambient HEAD (which may be another item's published commit)
+                # as this item's commit (AC2): the hash stays empty and the
+                # machinery below uses the worktree HEAD only to
+                # fast-forward/push a no-op.
                 commit_hash = git_get_commit_hash(worktree_path)
                 report["steps"]["commit"] = {
                     "success": verification_only,
@@ -11915,13 +12778,20 @@ def phase_finish(
                     # published and no completion comment is posted; the
                     # outer handler releases the item to open. The report
                     # names the retained worktree and the exact opt-in.
+                    # AC3 (SA-0MW98UNVB0085LFA): the wording states that no
+                    # commit is attributable to this item — never the false
+                    # "nothing was committed or pushed" (an unattributable
+                    # commit may exist here).
                     msg = (
-                        f"Finish refused: no commit was created for "
-                        f"{work_item_id} (the worktree has no change set), and "
-                        f"no --verification-only signal is present.\n"
+                        f"Finish refused: no commit attributable to "
+                        f"{work_item_id} exists (the worktree is clean and "
+                        f"HEAD carries no commit ahead of origin/"
+                        f"{parent_branch} whose message references this item), "
+                        f"and no --verification-only signal is present.\n"
                         f"- Worktree: {worktree_path} (retained, branch "
                         f"{branch})\n"
-                        f"- Commit: none — nothing was committed or pushed.\n"
+                        f"- Commit: none attributable to this item — nothing "
+                        f"was pushed by this run.\n"
                         f"- No terminal transition was written; the item stays "
                         f"in its prior state (released to open).\n"
                         f"If this item genuinely needs no code change (evidence "
@@ -11938,10 +12808,10 @@ def phase_finish(
                     wl_add_comment(
                         work_item_id,
                         "Finish refused (no_commit_no_signal): no commit "
-                        "was created for this item.\n"
+                        "attributable to this item exists.\n"
                         f"- Worktree: {worktree_path} (retained)\n"
-                        "- Commit: none — nothing was committed or "
-                        "pushed.\n"
+                        "- Commit: none attributable to this item — "
+                        "nothing was pushed by this run.\n"
                         "- No terminal transition was written; the item "
                         "is released to open.\n"
                         "If the item genuinely needs no code change, "
@@ -11955,18 +12825,25 @@ def phase_finish(
                     "proceeds without a commit (worktree %s).",
                     worktree_path,
                 )
+
+            # A commit attributable to this item exists when this run created
+            # one or when a prior run of the worktree did (interrupted-push
+            # recovery, AC1). Everything that names "the item's commit" keys
+            # off this, never off ``commit_created`` alone.
+            has_item_commit = commit_created or bool(attributed_prior_hash)
+
             # Interruption context (SA-0MVXUSJJY009HMQ0 AC2): a signal from
             # here on names the committed (and, after Step 6, published) work
             # in its retained-state record instead of releasing the item
-            # unexplained. On the no-commit path there is no item commit to
-            # name — ``commit`` stays empty so the record never misattributes
-            # the ambient HEAD. ``pushed`` is set once Step 6 confirms the
-            # push.
+            # unexplained. On a genuinely no-commit path there is no item
+            # commit to name — ``commit`` stays empty so the record never
+            # misattributes the ambient HEAD. ``pushed`` is set once Step 6
+            # confirms the push.
             _set_finish_progress(
                 work_item_id=work_item_id,
                 worktree_path=worktree_path,
                 branch=branch,
-                commit=commit_hash if commit_created else "",
+                commit=commit_hash if has_item_commit else "",
                 pushed=False,
             )
 
@@ -12023,249 +12900,521 @@ def phase_finish(
             # Evidence captured by the push (AC3/AC5): the gate's resolved
             # tree and executed-vs-cached verdict, exposed in --json output.
             push_evidence: dict[str, Any] = {}
-            try:
-                # AC1/AC2: the dev push runs from the checkout that holds the
-                # pushed commit (the worktree), so ``.githooks/pre-push``
-                # resolves its ``--project-root`` to the pushed tree. The
-                # guard refuses before any push when that checkout cannot be
-                # the subject, instead of silently gating a different tree.
-                _assert_push_subject(
-                    worktree_path, commit_hash, branch, worktree_path
-                )
-                if not git_push_to_dev(
-                    worktree_path,
-                    branch,
-                    commit_hash,
-                    evidence_out=push_evidence,
-                ):
-                    gate_reason = push_evidence.get("gate_reason")
-                    if gate_reason:
-                        # AC2: the hook named *why* (slot contention, timeout,
-                        # killed, red suite, ...); report that reason rather
-                        # than a generic push failure.
-                        raise PushGateFailureError(
-                            str(gate_reason),
-                            str(push_evidence.get("stderr_tail") or ""),
-                            commit_hash,
-                            branch,
-                        )
-                    raise RuntimeError("git push to dev failed.")
-            except PushSubjectMismatchError as exc:
-                # Fail closed (AC2): nothing was pushed. Restore local dev off
-                # the unpushed commit and preserve recovery state in a comment
-                # so a human can materialise the pushed tree and retry.
-                report["steps"]["push"] = {
-                    "success": False,
-                    "reason": "subject_mismatch",
-                    "hash": commit_hash,
-                    "worktree_path": worktree_path,
-                    "actual_head": exc.actual_head,
-                }
-                report["steps"]["local_dev_restore"] = (
-                    _restore_local_dev_after_failed_push(
-                        repo_root, local_dev_fast_forward, parent_branch
-                    )
-                )
-                wl_add_comment(
-                    work_item_id,
-                    f"Dev push refused (push-subject mismatch): {exc}\n"
-                    f"Commit: {commit_hash}\nBranch: {branch}\n"
-                    f"Worktree: {worktree_path}\n"
-                    f"Actual HEAD: {exc.actual_head or 'unresolved'}\n"
-                    f"Local dev was restored to origin/dev. The commit stays "
-                    f"on its feature branch {branch}.",
-                )
-                raise RuntimeError(
-                    f"git push to dev failed (push-subject mismatch): {exc}"
-                ) from exc
-            except PushTimeoutError as exc:
-                # AC3: recoverable state — commit is safe, branch info retained.
-                # Restore local dev off the unpushed commit (AC1) so the next
-                # finish/sibling does not fork from a base origin/dev lacks,
-                # post a manual-push comment, and re-raise so the outer
-                # handler resets status to open.
-                report["steps"]["push"] = {
-                    "success": False,
-                    "reason": "timeout",
-                    "hash": commit_hash,
-                }
-                report["steps"]["local_dev_restore"] = (
-                    _restore_local_dev_after_failed_push(
-                        repo_root, local_dev_fast_forward, parent_branch
-                    )
-                )
-                wl_add_comment(
-                    work_item_id,
-                    f"Push to dev timed out after {exc.timeout}s (pre-push hook "
-                    f"still running, likely the full test suite). Commit "
-                    f"{exc.commit_hash} is local on branch {exc.branch}.\n"
-                    f"Local dev was restored to origin/dev (the commit stays "
-                    f"on its feature branch).\n"
-                    f"Push manually: git push origin {exc.branch}:refs/heads/dev",
-                )
-                raise RuntimeError(f"git push to dev timed out: {exc}") from exc
-            except PushNonFastForwardError as exc:
-                # AC1/AC2/AC3: dev advanced concurrently — restore local dev
-                # (it must never point at the unpushed commit), then rebase
-                # and retry inside the (still-present) worktree instead of
-                # losing the completed implementation. The ancestry assertion
-                # below re-checks the rebased replacement hash.
-                report["steps"]["push"] = {
-                    "success": False,
-                    "reason": "non_fast_forward",
-                    "hash": commit_hash,
-                }
-                report["steps"]["local_dev_restore"] = (
-                    _restore_local_dev_after_failed_push(
-                        repo_root, local_dev_fast_forward, parent_branch
-                    )
-                )
+
+            # AC3/AC5 (SA-0MW22SEMV00230O5): remote-verified already-landed
+            # short-circuit. When the commit is already an ancestor of
+            # origin/dev (verified against the remote via a fetch — never a
+            # stale remote-tracking ref), the push is satisfied: ``finish``
+            # skips the re-push entirely, so a transient auth/transport flake
+            # can never fail (or reset to ``open``) an item whose commit has
+            # landed — the exact lifecycle dead-end observed on
+            # WL-0MW1VINII003IL7R. The remote-verified result doubles as the
+            # post-push ancestry assertion, so Step 6a is not re-run (it would
+            # only repeat the fetch).
+            already_landed = _commit_is_on_origin_dev(
+                repo_root, commit_hash, parent_branch
+            )
+            # AC7: a load-flake gate refusal is retried exactly once on the
+            # identical tree; when the retry passes the first attempt is
+            # labelled "infrastructure/load flake" instead of a code failure.
+            load_flake_recovered: dict[str, Any] | None = None
+            if already_landed["verified"]:
                 LOG.info(
-                    "Push failed (non-fast-forward); attempting rebase and retry "
-                    "...",
+                    "Commit %s already on origin/%s (remote-verified): the "
+                    "push is satisfied — skipping the re-push "
+                    "(push outcome: already_pushed).",
+                    commit_hash,
+                    parent_branch,
                 )
-                ff_retry: dict[str, Any] = {}
-                commit_hash = _recover_non_fast_forward_push(
-                    worktree_path=worktree_path,
-                    repo_root=repo_root,
-                    branch=branch,
-                    commit_hash=commit_hash,
-                    exc=exc,
-                    work_item_id=work_item_id,
-                    evidence_out=push_evidence,
-                    parent_branch=parent_branch,
-                    ff_retry_out=ff_retry,
-                )
-                # AC1 (SA-0MW3H07A8004Q54C): record the post-rebase
-                # fast-forward retry, and treat its own churn as finish's
-                # (never as a foreign mutation).
-                if ff_retry:
-                    local_dev_fast_forward["retry"] = ff_retry
-                    report["steps"]["local_dev_fast_forward"] = (
-                        local_dev_fast_forward
-                    )
-                    main_checkout_guard["own_churn"] = list(
-                        main_checkout_guard.get("own_churn") or []
-                    ) + list(ff_retry.get("own_churn") or [])
-                # The rebase rewrote HEAD; keep the reported commit in sync.
-                report["steps"]["commit"]["hash"] = commit_hash
                 report["steps"]["push"] = {
                     "success": True,
-                    "recovered": "non_fast_forward",
+                    "outcome": "already_pushed",
                     "hash": commit_hash,
-                    "gate_evidence": push_evidence,
+                    "origin_tip": already_landed["origin_tip"],
+                    "fetched": already_landed["fetched"],
                 }
-                report["steps"]["push"].update(
-                    _push_retry_trail_fields(push_evidence)
-                )
-                # An interruption from here on names the rebased replacement
-                # hash, which is the commit that actually landed.
+                report["steps"]["ancestry_assertion"] = already_landed
+                # The commit is on dev: the interruption record must say so
+                # (AC2), so a released item is never mistaken for unpublished
+                # work — and no push can fail, so nothing below can regress
+                # the item to open by a transport failure (AC5).
                 _set_finish_progress(commit=commit_hash, pushed=True)
-            except PushTransportLostError as exc:
-                # AC3 (SA-0MVWNHLQQ002TFZR): the SSH transport closed before
-                # the ref update. The suite may have been green, but the ref
-                # never reached origin, so the verdict was discarded. Report
-                # this *distinctly* from a red suite: `reason:
-                # connection_closed` is already an infrastructure failure for
-                # the drive retry classifier, and the comment/error say
-                # "transport lost", never "full suite green".
-                push_step = {
-                    "success": False,
-                    "reason": "connection_closed",
-                    "hash": commit_hash,
-                    "transport_lost": True,
-                    "attempts": exc.attempts,
-                    "gate_stderr_tail": exc.stderr,
-                }
-                push_step.update(_push_retry_trail_fields(push_evidence))
-                report["steps"]["push"] = push_step
-                report["steps"]["local_dev_restore"] = (
-                    _restore_local_dev_after_failed_push(
-                        repo_root, local_dev_fast_forward, parent_branch
-                    )
-                )
-                wl_add_comment(
-                    work_item_id,
-                    _transport_lost_comment(
-                        exc, commit_hash, branch, worktree_path
-                    ),
-                )
-                raise RuntimeError(
-                    f"git push to dev transport lost: the SSH connection "
-                    f"closed before the ref update after {exc.attempts} "
-                    f"attempt(s), so a green suite verdict (if any) was "
-                    f"discarded. This is NOT a test failure. Commit "
-                    f"{commit_hash} stays local on branch {branch}. "
-                    f"Remedy: retry finish (the SSH keepalive is now applied "
-                    f"automatically)."
-                ) from exc
-            except PushGateFailureError as exc:
-                # AC2: the pre-push gate said *why* the push failed. Report the
-                # machine-readable reason in the finish report and post it on
-                # the work item with the matching remediation, instead of the
-                # generic "git push to dev failed".
-                push_step: dict[str, Any] = {
-                    "success": False,
-                    "reason": exc.gate_reason,
-                    "hash": commit_hash,
-                    "gate_stderr_tail": exc.stderr_tail,
-                }
-                guard_details = push_evidence.get("pushed_commit_guard")
-                if guard_details:
-                    push_step["refused_by_pushed_commit_guard"] = guard_details
-                # AC3: expose the transport retry trail (attempt count, the
-                # backoff slept and the reason) on the push step, not only in
-                # the log.
-                push_step.update(_push_retry_trail_fields(push_evidence))
-                report["steps"]["push"] = push_step
-                report["steps"]["local_dev_restore"] = (
-                    _restore_local_dev_after_failed_push(
-                        repo_root, local_dev_fast_forward, parent_branch
-                    )
-                )
-                wl_add_comment(
-                    work_item_id,
-                    _dev_push_gate_failure_comment(
-                        exc.gate_reason,
-                        exc.stderr_tail,
-                        commit_hash,
-                        branch,
-                        worktree_path,
-                    ),
-                )
-                raise RuntimeError(
-                    f"git push to dev failed (gate reason: {exc.gate_reason}). "
-                    f"{_push_gate_remediation(exc.gate_reason)}"
-                ) from exc
-            except RuntimeError:
-                # A generic push failure: nothing reached origin. Undo our own
-                # fast-forward so local dev never stays on the unpushed commit
-                # (the exact orphan that made the next finish fork from a base
-                # origin/dev did not have).
-                report["steps"]["push"] = {
-                    "success": False,
-                    "reason": "push_failed",
-                    "hash": commit_hash,
-                }
-                report["steps"]["local_dev_restore"] = (
-                    _restore_local_dev_after_failed_push(
-                        repo_root, local_dev_fast_forward, parent_branch
-                    )
-                )
-                raise
             else:
-                report["steps"]["push"] = {
-                    "success": True,
-                    "hash": commit_hash,
-                    "gate_evidence": push_evidence,
-                }
-                report["steps"]["push"].update(
-                    _push_retry_trail_fields(push_evidence)
-                )
-                # The commit is now on dev: the interruption record must say
-                # so (AC2), so a released item is never mistaken for
-                # unpublished work.
-                _set_finish_progress(commit=commit_hash, pushed=True)
+                # ── Bounded leaf push loop (AC1/AC2/AC5/AC7) ─────────────
+                # A leaf ``finish`` now absorbs the transient failures that
+                # used to kill it outright, on the same bounded budget the
+                # drive path applies to driven children
+                # (``DEFAULT_INFRA_RETRY_LIMIT``, LP-0MVWEP292000ODBS):
+                #
+                # * non-fast-forward — rebase onto origin/dev and re-attempt
+                #   within the budget (AC2); a rebase conflict is a genuine
+                #   stop with an actionable message, never a forced retry;
+                # * auth/connect/remote-5xx transport failures are already
+                #   retried inside ``git_push_to_dev`` on its own bounded
+                #   budget; when that budget is spent the failure is reported
+                #   as *transport* infrastructure — never a bare "push
+                #   failed" (AC1);
+                # * a transport failure with the commit *concurrently* landed
+                #   converges instead of resetting a landed item to ``open``
+                #   (AC5);
+                # * a gate refusal with suite *load* errors is retried once
+                #   on the identical tree to distinguish an environment load
+                #   flake from a real failure (AC7, labelled, still blocked
+                #   when it reproduces).
+                nff_retries = 0
+                push_attempt = 0
+                while True:
+                    push_attempt += 1
+                    try:
+                        # AC1/AC2: the dev push runs from the checkout that
+                        # holds the pushed commit (the worktree), so
+                        # ``.githooks/pre-push`` resolves its
+                        # ``--project-root`` to the pushed tree. The guard
+                        # refuses before any push when that checkout cannot be
+                        # the subject, instead of silently gating a different
+                        # tree.
+                        _assert_push_subject(
+                            worktree_path, commit_hash, branch, worktree_path
+                        )
+                        if not git_push_to_dev(
+                            worktree_path,
+                            branch,
+                            commit_hash,
+                            evidence_out=push_evidence,
+                        ):
+                            gate_reason = push_evidence.get("gate_reason")
+                            if gate_reason:
+                                # AC2: the hook named *why* (slot contention,
+                                # timeout, killed, red suite, ...); report
+                                # that reason rather than a generic push
+                                # failure.
+                                raise PushGateFailureError(
+                                    str(gate_reason),
+                                    str(push_evidence.get("stderr_tail") or ""),
+                                    commit_hash,
+                                    branch,
+                                )
+                            if (
+                                push_evidence.get("reason")
+                                == PUSH_FAILURE_TRANSPORT
+                            ):
+                                # AC1: the transient auth/connect/5xx retries
+                                # inside ``git_push_to_dev`` were exhausted —
+                                # an infrastructure condition, reported as
+                                # *transport*, never a bare "push failed" or
+                                # the misleading "push manually" hint.
+                                raise PushTransportExhaustedError(
+                                    commit_hash,
+                                    branch,
+                                    str(
+                                        push_evidence.get("stderr_tail") or ""
+                                    ),
+                                    int(push_evidence.get("attempts") or 1),
+                                )
+                            raise RuntimeError("git push to dev failed.")
+                    except PushSubjectMismatchError as exc:
+                        # Fail closed (AC2): nothing was pushed. Restore local
+                        # dev off the unpushed commit and preserve recovery
+                        # state in a comment so a human can materialise the
+                        # pushed tree and retry.
+                        report["steps"]["push"] = {
+                            "success": False,
+                            "outcome": "push_failed",
+                            "reason": "subject_mismatch",
+                            "hash": commit_hash,
+                            "worktree_path": worktree_path,
+                            "actual_head": exc.actual_head,
+                        }
+                        report["steps"]["local_dev_restore"] = (
+                            _restore_local_dev_after_failed_push(
+                                repo_root, local_dev_fast_forward, parent_branch
+                            )
+                        )
+                        wl_add_comment(
+                            work_item_id,
+                            f"Dev push refused (push-subject mismatch): {exc}\n"
+                            f"Commit: {commit_hash}\nBranch: {branch}\n"
+                            f"Worktree: {worktree_path}\n"
+                            f"Actual HEAD: {exc.actual_head or 'unresolved'}\n"
+                            f"Local dev was restored to origin/dev. The commit "
+                            f"stays on its feature branch {branch}.",
+                        )
+                        raise RuntimeError(
+                            f"git push to dev failed (push-subject mismatch): {exc}"
+                        ) from exc
+                    except PushTimeoutError as exc:
+                        # AC3: recoverable state — commit is safe, branch info
+                        # retained. Restore local dev off the unpushed commit
+                        # (AC1) so the next finish/sibling does not fork from
+                        # a base origin/dev lacks, post a manual-push comment,
+                        # and re-raise so the outer handler resets status to
+                        # open.
+                        report["steps"]["push"] = {
+                            "success": False,
+                            "outcome": "push_failed",
+                            "reason": "timeout",
+                            "hash": commit_hash,
+                        }
+                        report["steps"]["local_dev_restore"] = (
+                            _restore_local_dev_after_failed_push(
+                                repo_root, local_dev_fast_forward, parent_branch
+                            )
+                        )
+                        wl_add_comment(
+                            work_item_id,
+                            f"Push to dev timed out after {exc.timeout}s "
+                            f"(pre-push hook still running, likely the full "
+                            f"test suite). Commit {exc.commit_hash} is local "
+                            f"on branch {exc.branch}.\n"
+                            f"Local dev was restored to origin/dev (the commit "
+                            f"stays on its feature branch).\n"
+                            f"Push manually: git push origin "
+                            f"{exc.branch}:refs/heads/dev",
+                        )
+                        raise RuntimeError(
+                            f"git push to dev timed out: {exc}"
+                        ) from exc
+                    except PushNonFastForwardError as exc:
+                        # AC1/AC2/AC3 (SA-0MW22SEMV00230O5): dev advanced
+                        # concurrently — restore local dev (it must never
+                        # point at the unpushed commit), then rebase and retry
+                        # inside the (still-present) worktree. Unlike the old
+                        # single-shot recovery, the retry is bounded: a
+                        # *second* concurrent advance (the observed failure
+                        # mode — origin/dev advanced three times during one
+                        # item's lifecycle) is rebased and re-attempted again
+                        # within ``DEFAULT_INFRA_RETRY_LIMIT`` rounds instead
+                        # of failing the item. The ancestry assertion below
+                        # re-checks the rebased replacement hash. A rebase
+                        # conflict is a genuine stop: ``_recover_non_fast_forward_push``
+                        # raises with an actionable message and never forces
+                        # or mutates silently.
+                        nff_retries += 1
+                        if nff_retries > DEFAULT_INFRA_RETRY_LIMIT:
+                            report["steps"]["push"] = {
+                                "success": False,
+                                "outcome": "push_failed",
+                                "reason": "non_fast_forward",
+                                "hash": commit_hash,
+                                "retries": nff_retries,
+                                "budget": DEFAULT_INFRA_RETRY_LIMIT,
+                            }
+                            report["steps"]["local_dev_restore"] = (
+                                _restore_local_dev_after_failed_push(
+                                    repo_root,
+                                    local_dev_fast_forward,
+                                    parent_branch,
+                                )
+                            )
+                            wl_add_comment(
+                                work_item_id,
+                                f"Push to dev failed (non-fast-forward) after "
+                                f"{nff_retries} rebase-and-retry rounds (dev "
+                                f"kept advancing concurrently); the bounded "
+                                f"budget of {DEFAULT_INFRA_RETRY_LIMIT} is "
+                                f"spent.\n"
+                                f"Commit: {commit_hash}\nBranch: {branch}\n"
+                                f"Worktree: {worktree_path} (retained)\n"
+                                f"Local dev was restored to origin/dev. Rebase "
+                                f"the feature branch and re-run finish once the "
+                                f"concurrent runs settle:\n"
+                                f"  cd {worktree_path} && git rebase origin/dev && "
+                                f"git push origin {branch}:refs/heads/dev",
+                            )
+                            raise RuntimeError(
+                                f"git push to dev failed (non-fast-forward) "
+                                f"after {nff_retries} rebase-and-retry rounds: "
+                                f"{exc.stderr}"
+                            ) from exc
+                        report["steps"]["push"] = {
+                            "success": False,
+                            "reason": "non_fast_forward",
+                            "hash": commit_hash,
+                        }
+                        report["steps"]["local_dev_restore"] = (
+                            _restore_local_dev_after_failed_push(
+                                repo_root, local_dev_fast_forward, parent_branch
+                            )
+                        )
+                        LOG.info(
+                            "Push failed (non-fast-forward, rebase round %d/%d); "
+                            "attempting rebase and retry ...",
+                            nff_retries,
+                            DEFAULT_INFRA_RETRY_LIMIT,
+                        )
+                        ff_retry: dict[str, Any] = {}
+                        try:
+                            commit_hash = _recover_non_fast_forward_push(
+                                worktree_path=worktree_path,
+                                repo_root=repo_root,
+                                branch=branch,
+                                commit_hash=commit_hash,
+                                exc=exc,
+                                work_item_id=work_item_id,
+                                evidence_out=push_evidence,
+                                parent_branch=parent_branch,
+                                ff_retry_out=ff_retry,
+                            )
+                        except PushNonFastForwardError:
+                            # AC2: dev advanced *again* during the recovery
+                            # push — bounded rebase-and-retry rather than a
+                            # hard failure (the work landed; the remote keeps
+                            # racing).
+                            LOG.warning(
+                                "Rebase-and-retry round %d/%d: dev advanced "
+                                "again during recovery; retrying within the "
+                                "bounded budget.",
+                                nff_retries,
+                                DEFAULT_INFRA_RETRY_LIMIT,
+                            )
+                            _push_retry_sleep(
+                                _drive_infra_backoff_delay(nff_retries)
+                            )
+                            continue
+                        # AC1 (SA-0MW3H07A8004Q54C): record the post-rebase
+                        # fast-forward retry, and treat its own churn as
+                        # finish's (never as a foreign mutation).
+                        if ff_retry:
+                            local_dev_fast_forward["retry"] = ff_retry
+                            report["steps"]["local_dev_fast_forward"] = (
+                                local_dev_fast_forward
+                            )
+                            main_checkout_guard["own_churn"] = list(
+                                main_checkout_guard.get("own_churn") or []
+                            ) + list(ff_retry.get("own_churn") or [])
+                        # The rebase rewrote HEAD; keep the reported commit in
+                        # sync.
+                        report["steps"]["commit"]["hash"] = commit_hash
+                        report["steps"]["push"] = {
+                            "success": True,
+                            "outcome": "pushed",
+                            "recovered": "non_fast_forward",
+                            "hash": commit_hash,
+                            "gate_evidence": push_evidence,
+                        }
+                        report["steps"]["push"].update(
+                            _push_retry_trail_fields(push_evidence)
+                        )
+                        # An interruption from here on names the rebased
+                        # replacement hash, which is the commit that actually
+                        # landed.
+                        _set_finish_progress(commit=commit_hash, pushed=True)
+                        break
+                    except (PushTransportLostError, PushTransportExhaustedError) as exc:
+                        # AC3/AC5 (SA-0MWWNHLQQ002TFZR,
+                        # SA-0MW22SEMV00230O5): the transport never completed
+                        # the ref update. A connection close may have discarded
+                        # a green suite verdict; an auth/connect/5xx failure
+                        # never reached the ref. Report distinctly —
+                        # ``reason: connection_closed`` / ``reason: transport``
+                        # are both on the infrastructure allow-list — but
+                        # *before* failing, re-verify remote ancestry: a
+                        # concurrently-landed commit (another run pushed the
+                        # same work) must converge, and an item whose commit is
+                        # on origin/dev is never reset to ``open`` by a
+                        # transport failure (AC5).
+                        if isinstance(exc, PushTransportLostError):
+                            push_step: dict[str, Any] = {
+                                "success": False,
+                                "reason": "connection_closed",
+                                "hash": commit_hash,
+                                "transport_lost": True,
+                                "attempts": exc.attempts,
+                                "gate_stderr_tail": exc.stderr,
+                            }
+                        else:
+                            push_step = {
+                                "success": False,
+                                "reason": PUSH_FAILURE_TRANSPORT,
+                                "hash": commit_hash,
+                                "transport_lost": True,
+                                "attempts": exc.attempts,
+                                "stderr_tail": exc.stderr,
+                            }
+                        push_step.update(_push_retry_trail_fields(push_evidence))
+                        landed_now = _commit_is_on_origin_dev(
+                            repo_root, commit_hash, parent_branch
+                        )
+                        if landed_now["verified"]:
+                            # AC5: the commit verifiably landed (maybe a
+                            # concurrent run pushed it) despite the transport
+                            # failure — converge, never strand a landed item.
+                            LOG.warning(
+                                "Push transport failed but the commit %s is "
+                                "verifiably on origin/%s — treating the push "
+                                "as satisfied (already_pushed) instead of "
+                                "resetting the item to open.",
+                                commit_hash,
+                                parent_branch,
+                            )
+                            push_step["success"] = True
+                            push_step["outcome"] = "already_pushed"
+                            report["steps"]["push"] = push_step
+                            report["steps"]["ancestry_assertion"] = landed_now
+                            _set_finish_progress(commit=commit_hash, pushed=True)
+                            break
+                        push_step["outcome"] = "push_failed"
+                        report["steps"]["push"] = push_step
+                        report["steps"]["local_dev_restore"] = (
+                            _restore_local_dev_after_failed_push(
+                                repo_root, local_dev_fast_forward, parent_branch
+                            )
+                        )
+                        if isinstance(exc, PushTransportLostError):
+                            wl_add_comment(
+                                work_item_id,
+                                _transport_lost_comment(
+                                    exc, commit_hash, branch, worktree_path
+                                ),
+                            )
+                            raise RuntimeError(
+                                f"git push to dev transport lost: the SSH "
+                                f"connection closed before the ref update "
+                                f"after {exc.attempts} attempt(s), so a green "
+                                f"suite verdict (if any) was discarded. This "
+                                f"is NOT a test failure. Commit {commit_hash} "
+                                f"stays local on branch {branch}. Remedy: "
+                                f"retry finish (the SSH keepalive is now "
+                                f"applied automatically)."
+                            ) from exc
+                        wl_add_comment(
+                            work_item_id,
+                            f"Dev push failed (transient transport): "
+                            f"auth/connect/remote failure repeated "
+                            f"{exc.attempts} time(s) despite the bounded "
+                            f"backoff retry. This is an infrastructure "
+                            f"condition, NOT a content rejection — the remote "
+                            f"never completed the connection, so nothing was "
+                            f"rejected.\n"
+                            f"Commit: {commit_hash}\nBranch: {branch}\n"
+                            f"Worktree: {worktree_path}\n"
+                            f"Local dev was restored to origin/dev (the commit "
+                            f"stays on its feature branch). Re-running finish "
+                            f"retries automatically.",
+                        )
+                        raise RuntimeError(
+                            f"git push to dev failed (transient transport) "
+                            f"after {exc.attempts} attempt(s): {exc.stderr} "
+                            f"Commit {commit_hash} stays local on branch "
+                            f"{branch}. Infrastructure condition — re-run "
+                            f"finish to retry."
+                        ) from exc
+                    except PushGateFailureError as exc:
+                        # AC7 (SA-0MW22SEMV00230O5): a gate failure whose
+                        # output names suite *load* errors (a missing shared
+                        # build, an import failure) is retried exactly once on
+                        # the identical tree. When the retry passes, the first
+                        # attempt is labelled an infrastructure/load flake (the
+                        # report names it); when it reproduces, the push stays
+                        # blocked — the gate is never weakened.
+                        if (
+                            _is_gate_load_flake(exc.stderr_tail)
+                            and load_flake_recovered is None
+                        ):
+                            load_flake_recovered = {
+                                "failed_on_attempt": push_attempt,
+                                "reason": "load_flake",
+                            }
+                            LOG.warning(
+                                "Dev-push gate failed on attempt %d with suite "
+                                "*load* errors (not test failures) — retrying "
+                                "once on the identical tree to distinguish an "
+                                "infrastructure/load flake from a real failure "
+                                "(gate is not weakened: a reproducible failure "
+                                "still blocks).",
+                                push_attempt,
+                            )
+                            _push_retry_sleep(_drive_infra_backoff_delay(1))
+                            continue
+                        # AC2: the pre-push gate said *why* the push failed.
+                        # Report the machine-readable reason in the finish
+                        # report and post it on the work item with the
+                        # matching remediation, instead of the generic "git
+                        # push to dev failed".
+                        push_step = {
+                            "success": False,
+                            "outcome": "push_failed",
+                            "reason": exc.gate_reason,
+                            "hash": commit_hash,
+                            "gate_stderr_tail": exc.stderr_tail,
+                        }
+                        guard_details = push_evidence.get("pushed_commit_guard")
+                        if guard_details:
+                            push_step["refused_by_pushed_commit_guard"] = (
+                                guard_details
+                            )
+                        # AC3: expose the transport retry trail (attempt count,
+                        # the backoff slept and the reason) on the push step,
+                        # not only in the log.
+                        push_step.update(_push_retry_trail_fields(push_evidence))
+                        report["steps"]["push"] = push_step
+                        report["steps"]["local_dev_restore"] = (
+                            _restore_local_dev_after_failed_push(
+                                repo_root, local_dev_fast_forward, parent_branch
+                            )
+                        )
+                        wl_add_comment(
+                            work_item_id,
+                            _dev_push_gate_failure_comment(
+                                exc.gate_reason,
+                                exc.stderr_tail,
+                                commit_hash,
+                                branch,
+                                worktree_path,
+                            ),
+                        )
+                        raise RuntimeError(
+                            f"git push to dev failed (gate reason: "
+                            f"{exc.gate_reason}). "
+                            f"{_push_gate_remediation(exc.gate_reason)}"
+                        ) from exc
+                    except RuntimeError:
+                        # A generic push failure: nothing reached origin. Undo
+                        # our own fast-forward so local dev never stays on the
+                        # unpushed commit (the exact orphan that made the next
+                        # finish fork from a base origin/dev did not have).
+                        report["steps"]["push"] = {
+                            "success": False,
+                            "outcome": "push_failed",
+                            "reason": "push_failed",
+                            "hash": commit_hash,
+                        }
+                        report["steps"]["local_dev_restore"] = (
+                            _restore_local_dev_after_failed_push(
+                                repo_root, local_dev_fast_forward, parent_branch
+                            )
+                        )
+                        raise
+                    else:
+                        report["steps"]["push"] = {
+                            "success": True,
+                            "outcome": "pushed",
+                            "hash": commit_hash,
+                            "gate_evidence": push_evidence,
+                        }
+                        # AC7: name the recovered load flake so a later reader
+                        # sees "suite failed to load on attempt N, passed
+                        # unmodified on attempt N+1" instead of a code failure.
+                        if load_flake_recovered is not None:
+                            report["steps"]["push"]["load_flake"] = (
+                                load_flake_recovered
+                            )
+                            LOG.warning(
+                                "Infrastructure/load flake: the full-suite "
+                                "gate failed to load on attempt "
+                                "%s and passed unmodified on attempt %d "
+                                "(labelled in report[steps][push][load_flake]).",
+                                load_flake_recovered["failed_on_attempt"],
+                                push_attempt,
+                            )
+                        report["steps"]["push"].update(
+                            _push_retry_trail_fields(push_evidence)
+                        )
+                        # The commit is now on dev: the interruption record
+                        # must say so (AC2), so a released item is never
+                        # mistaken for unpublished work.
+                        _set_finish_progress(commit=commit_hash, pushed=True)
+                        break
             LOG.info("Push to dev succeeded")
 
             # ── Step 6a: Post-push ancestry assertion (AC2) ───────────────
@@ -12276,13 +13425,21 @@ def phase_finish(
             # `AncestryAssertionError` here keeps the worktree and the feature
             # branch, leaves the work item un-advanced, and is reported by the
             # outer handler with the commit hash.
-            report["steps"]["ancestry_assertion"] = _assert_commit_on_origin_dev(
-                repo_root,
-                commit_hash,
-                parent_branch=parent_branch,
-                branch=branch,
-                worktree_path=worktree_path,
-            )
+            #
+            # On the already-landed path (SA-0MW22SEMV00230O5 AC3) the
+            # remote-verified check that short-circuited the push already ran
+            # the fetch + ancestry assertion, so it is *recorded* as the
+            # assertion (already in ``report[steps][ancestry_assertion]``);
+            # re-running it here would only repeat the fetch.
+            push_outcome = (report["steps"]["push"] or {}).get("outcome")
+            if push_outcome != "already_pushed":
+                report["steps"]["ancestry_assertion"] = _assert_commit_on_origin_dev(
+                    repo_root,
+                    commit_hash,
+                    parent_branch=parent_branch,
+                    branch=branch,
+                    worktree_path=worktree_path,
+                )
 
             # ── Step 6a.5: Post-push full-suite verification (read-only) ──
             # Design A (SA-0MVXUSED6008J04R): after a successful push the run
@@ -12305,10 +13462,34 @@ def phase_finish(
                 worktree_path, repo_root, commit_hash
             )
             report["steps"]["post_push_verification"] = post_push_verification
-            if post_push_verification["verdict"] not in (
+            # AC3 relief (SA-0MW22SEMV00230O5): on the already-landed path the
+            # tree was full-suite gated by the dev-push hook when it landed
+            # (every dev push is gated), so a *missing* read-only cache verdict
+            # must not strand a remote-verified-published item — it is
+            # recorded as a notice and the audit re-verifies (F3). A **red**
+            # verdict still refuses on both paths: a demonstrable failure is
+            # never hidden, so the gate is not weakened.
+            already_landed_path = push_outcome == "already_pushed"
+            if (
+                already_landed_path
+                and post_push_verification["verdict"] == POST_PUSH_VERDICT_MISSING
+            ):
+                LOG.warning(
+                    "Post-push verification: %s for an already-landed commit "
+                    "— the dev-push gate ran when it landed; proceeding with "
+                    "a recorded notice (a red verdict would still refuse).",
+                    POST_PUSH_VERDICT_MISSING,
+                )
+                post_push_verification["already_landed_missing_relaxed"] = True
+            elif post_push_verification["verdict"] not in (
                 POST_PUSH_VERDICT_GREEN,
                 POST_PUSH_VERDICT_NOT_APPLICABLE,
             ):
+                # AC4 (SA-0MW22SEMV00230O5): the push (or an earlier run's
+                # push) landed, so a verification refusal is the
+                # *push_landed_but_unverified* outcome — distinct from
+                # push_failed (nothing landed) and from already_pushed.
+                report["steps"]["push"]["outcome"] = "push_landed_but_unverified"
                 refusal_message, refusal_comment = (
                     _post_push_verification_refusal(
                         post_push_verification,
@@ -12317,6 +13498,16 @@ def phase_finish(
                         branch,
                         worktree_path,
                     )
+                )
+                # AC4: the refusal names the outcome so a post-hoc reader can
+                # tell "the push landed but verification could not be proven"
+                # from "the push failed" without re-running anything.
+                refusal_comment = (
+                    "Push outcome: push_landed_but_unverified — the commit "
+                    "was pushed (or already landed), but the full-suite "
+                    "verification could not be proven from the read-only "
+                    "cache. Run the full suite once to populate the cache, "
+                    "then re-run finish.\n\n" + refusal_comment
                 )
                 # AC4: the refusal is routed through the triage helper for
                 # BOTH unprovable verdicts — a red entry files the real
@@ -12464,7 +13655,7 @@ def phase_finish(
             # it after the terminal write would bump ``updatedAt`` on an
             # already audit-ready item (and race the dispatcher).
             verdict_lines = "\n".join(_verdict_provenance_lines(report))
-            if commit_created:
+            if has_item_commit:
                 commit_line = f"- Commit: {commit_hash}\n"
             else:
                 # AC2: never name the ambient HEAD as this item's commit. A
@@ -12521,21 +13712,21 @@ def phase_finish(
                 COMPLETION_COMMENT_MARKER,
                 (
                     f"Commit: {commit_hash}"
-                    if commit_created
+                    if has_item_commit
                     else "No changes: no commit was created"
                 ),
             )
             report["steps"]["completion_comment"] = {
                 "posted": not completion_already_recorded,
                 "deduplicated": completion_already_recorded,
-                "commit": commit_hash if commit_created else "",
+                "commit": commit_hash if has_item_commit else "",
             }
             if completion_already_recorded:
                 LOG.info(
                     "Completion comment for %s (%s) is already "
                     "recorded; skipping the duplicate on the re-run.",
                     work_item_id,
-                    f"commit {commit_hash}" if commit_created else "no commit",
+                    f"commit {commit_hash}" if has_item_commit else "no commit",
                 )
             else:
                 wl_add_comment(work_item_id, completion_comment)
@@ -12587,15 +13778,53 @@ def phase_finish(
         except RuntimeError:
             LOG.error("Failed to reset work item %s status to open", work_item_id)
         if "git push to dev failed" in msg or "git push to dev timed out" in msg:
-            # Already posted a manual-push comment from the push handler;
-            # the commit hash and branch are in the comment already.
-            LOG.warning(
-                "Push %s. Commit %s on branch %s is local and can be "
-                "pushed manually.",
-                "timed out" if "timed out" in msg else "failed",
-                commit_hash,
-                branch,
+            # AC4/AC5 (SA-0MW22SEMV00230O5): the failure taxonomy must say
+            # whether anything landed. The push handlers above already re-check
+            # remote ancestry and converge on an already-landed commit, so this
+            # residual guard re-verifies once more (a concurrent run may have
+            # landed the commit between the handler's check and here): an item
+            # whose commit is verifiably on origin/dev is reported as
+            # *push_landed_but_unverified*, never as a stranded push, and
+            # never with the misleading "push it manually" hint.
+            landed_now = _commit_is_on_origin_dev(
+                repo_root, commit_hash, parent_branch
             )
+            if landed_now["verified"]:
+                push_entry = report["steps"].get("push") or {}
+                LOG.warning(
+                    "Push failed but the commit %s is verifiably on "
+                    "origin/%s (push outcome: push_landed_but_unverified) — "
+                    "re-running finish converges without re-pushing.",
+                    commit_hash,
+                    parent_branch,
+                )
+                if isinstance(push_entry, dict):
+                    push_entry["outcome"] = "push_landed_but_unverified"
+                report["steps"]["push"] = push_entry
+                report["steps"]["ancestry_assertion"] = landed_now
+            elif "transport" in msg or "transport lost" in msg:
+                # AC1: an exhausted auth/connect/transport failure is an
+                # infrastructure condition — never the misleading "push it
+                # manually" hint (nothing was rejected; the connection never
+                # completed).
+                LOG.warning(
+                    "Push %s (transient transport — infrastructure, not a "
+                    "content rejection). Commit %s on branch %s is local; "
+                    "re-running finish retries automatically.",
+                    "timed out" if "timed out" in msg else "failed",
+                    commit_hash,
+                    branch,
+                )
+            else:
+                # Already posted a manual-push comment from the push handler;
+                # the commit hash and branch are in the comment already.
+                LOG.warning(
+                    "Push %s. Commit %s on branch %s is local and can be "
+                    "pushed manually.",
+                    "timed out" if "timed out" in msg else "failed",
+                    commit_hash,
+                    branch,
+                )
         elif "git commit failed" in msg:
             wl_add_comment(work_item_id, "Commit failed during finish phase.")
         elif isinstance(e, AncestryAssertionError):
@@ -12606,6 +13835,13 @@ def phase_finish(
             # structured steps entry now records one under
             # ``ancestry_assertion`` (classifies as ``infrastructure``,
             # matching the parent epic's allow-list).
+            # AC4 (SA-0MW22SEMV00230O5): a push whose ancestry cannot be
+            # proven is *push_landed_but_unverified* — distinguishable from a
+            # push_failed (nothing landed) in the report taxonomy.
+            push_entry = report["steps"].get("push") or {}
+            if isinstance(push_entry, dict):
+                push_entry["outcome"] = "push_landed_but_unverified"
+            report["steps"]["push"] = push_entry
             report["steps"]["ancestry_assertion"] = {
                 "success": False,
                 "reason": "ancestry_failed",
@@ -12722,7 +13958,7 @@ def phase_finish(
     removal_step = report["steps"].get("worktree_removal") or {}
 
     report["success"] = True
-    if commit_created:
+    if has_item_commit:
         report["hash"] = commit_hash
         report["message"] = (
             f"Implementation complete. Commit {commit_hash} pushed to dev."
@@ -12743,7 +13979,7 @@ def phase_finish(
         print("=" * 60)
         print(f"  ✅ Implementation complete for {work_item_id}")
         print("=" * 60)
-        if commit_created:
+        if has_item_commit:
             print(f"  Commit: {commit_hash}")
         else:
             print("  No changes — no commit was created (verification-only).")
@@ -13726,12 +14962,13 @@ def phase_parent(
         return report
 
     def _fail_placement(cid: str, violation: str) -> dict[str, Any]:
-        """Fail closed when a child's work landed in the main checkout.
+        """Fail closed when a child's work landed outside its worktree.
 
         A non-terminal child whose worktree is clean at the parent HEAD while
-        the main checkout is dirty means the child wrote outside its worktree
-        (``cwd`` is not sufficient). Report the offending paths and stop
-        instead of silently proceeding or advancing the parent.
+        the main checkout — or another item's linked worktree — holds changes
+        means the child wrote outside its worktree (``cwd`` is not
+        sufficient). Report the offending surface(s) and stop instead of
+        silently proceeding or advancing the parent.
         """
         LOG.error(violation)
         report["success"] = False
@@ -13741,8 +14978,9 @@ def phase_parent(
         report["children_processed"] = child_results
         wl_add_comment(
             work_item_id,
-            "Parent phase refused: a child session wrote to the main "
-            f"checkout instead of its worktree.\n```\n{violation}\n```",
+            "Parent phase refused: a child session wrote outside its "
+            "worktree (the main checkout or another item's linked "
+            f"worktree).\n```\n{violation}\n```",
         )
         if json_output:
             print(format_json_output(report))
@@ -14544,7 +15782,11 @@ def _pane_session_spawner(
         verbose: Accepted for signature parity with the headless spawner.
         focus: Whether the new pane takes focus (default: do not steal focus).
         client: Injectable herdr session client (tests); defaults to a
-            :class:`shared.herdr_session.HerdrSessionClient` over *env*.
+            :class:`shared.herdr_session.HerdrSessionClient` over *env* whose
+            per-call subprocess timeout is scaled above the child budget
+            (budget + :data:`PANE_CLIENT_TIMEOUT_SLACK`), so a multi-minute
+            turn is stopped by the herdr CLI's own ``--timeout`` verdict,
+            never killed by the client's 60 s default (SA-0MW7PAKSF008H8OH).
 
     Returns:
         ``{"success", "returncode", "reason", "pane_id", "transport"}`` —
@@ -14562,7 +15804,10 @@ def _pane_session_spawner(
         "transport": "pane",
     }
 
-    herdr = client or HerdrSessionClient(env=env)
+    herdr = client or HerdrSessionClient(
+        env=env,
+        timeout=max(int(timeout), 1) + PANE_CLIENT_TIMEOUT_SLACK,
+    )
 
     split = herdr.split_pane(worktree_path, env=_pane_child_env(env), focus=focus)
     if not split.get("success"):
@@ -17755,6 +19000,96 @@ def _is_worktree(path: Path) -> bool:
     return git_path.is_file()
 
 
+def _printable_path_listing(paths: list[str], limit: int = 20) -> str:
+    """Render offending paths as a bulleted list with an overflow marker."""
+    listing = "\n".join(f"  - {p}" for p in paths[:limit])
+    if len(paths) > limit:
+        listing += f"\n  … and {len(paths) - limit} more"
+    return listing
+
+
+def _placement_path_listing(paths: list[str], parent_branch: str) -> str:
+    """Render the evidence for one placement-violation change surface.
+
+    Dirty paths are listed; a surface flagged only because it holds commits
+    ahead of *parent_branch* (no dirty working-tree files) is described as
+    such, so a sibling that was strayed into and committed to is still named
+    even though it has no dirty paths to list.
+    """
+    if paths:
+        return f"Offending paths:\n{_printable_path_listing(paths)}"
+    return (
+        f"The surface holds commits ahead of {parent_branch} (no dirty "
+        f"working-tree files were observed)."
+    )
+
+
+def _registered_sibling_worktree_paths(
+    worktree_path: str | Path,
+    repo_root: str | Path,
+) -> list[Path]:
+    """Return the registered linked worktrees of *repo_root* other than the child's own.
+
+    A sibling worktree is any path git registers as a worktree of the same
+    repository, excluding the main checkout root and the child's own
+    worktree. It is the foreign write surface a driven child must never
+    touch — it belongs to another work item's session, so writing there
+    races that session and silently widens the epic (SA-0MW5FIJNQ002Z24I).
+    A foreign repository checkout — even one reachable by path — is never
+    listed, because the registry is scoped to *repo_root* itself
+    (cross-checkout attribution, SA-0MVXVBZF2009HRRN).
+
+    Args:
+        worktree_path: The child's own worktree root.
+        repo_root: The main checkout root.
+
+    Returns:
+        Existing, resolved sibling worktree paths (sorted for deterministic
+        ordering). Empty when the registry cannot be read or no siblings
+        exist — callers treat that as "no sibling write surface", never as
+        a violation.
+    """
+    root = Path(repo_root).resolve()
+    wt = Path(worktree_path).resolve()
+    registered = _registered_worktree_paths(str(root))
+    if not registered:
+        return []
+    siblings: list[Path] = []
+    for candidate in sorted(registered):
+        path = Path(candidate)
+        if path == root or path == wt:
+            continue
+        if not path.exists():
+            continue
+        siblings.append(path)
+    return siblings
+
+
+def _sibling_worktree_containing(
+    cur: Path, repo_root: str | Path, worktree_path: str | Path
+) -> Path | None:
+    """Return the registered sibling worktree that contains *cur*, if any.
+
+    The finish-phase placement gate is cwd-sensitive: a driven child that
+    ``cd``'s into another item's linked worktree and runs ``finish`` from
+    there is invisible to the main-checkout scan, so a cwd that resolves
+    into a registered sibling is checked as its own write surface
+    (SA-0MW5FIJNQ002Z24I).
+
+    Args:
+        cur: The resolved current directory.
+        repo_root: The main checkout root.
+        worktree_path: The child's own worktree root.
+
+    Returns:
+        The resolved sibling worktree root containing *cur*, else ``None``.
+    """
+    for sibling in _registered_sibling_worktree_paths(worktree_path, repo_root):
+        if cur == sibling or sibling in cur.parents:
+            return sibling
+    return None
+
+
 def _worktree_placement_violation(
     worktree_path: str,
     cwd: str | None = None,
@@ -17767,14 +19102,17 @@ def _worktree_placement_violation(
     ``implement.py start``. A violation exists only when ALL of:
 
     1. the current directory is not the worktree (or a subdirectory of it),
-    2. the main checkout holds uncommitted changes outside ``.worklog/``, and
+    2. another change surface holds the work — the main checkout holds
+       uncommitted changes outside ``.worklog/``, or the cwd resolves into a
+       **registered sibling worktree** of the same repository that holds
+       changes (SA-0MW5FIJNQ002Z24I), and
     3. the worktree itself holds NO changes (no dirty files and no commits
        ahead of the parent branch) — i.e. the work was done in the main
-       checkout, not the worktree.
+       checkout or a sibling worktree, not the worktree.
 
     Condition 3 keeps the gate precise: pre-existing/unrelated dirt in the
-    main checkout does not block a legitimate finish when the work actually
-    lives in the worktree.
+    main checkout (or in a sibling item's tree) does not block a legitimate
+    finish when the work actually lives in the worktree.
 
     Args:
         worktree_path: Absolute path to the worktree.
@@ -17784,8 +19122,9 @@ def _worktree_placement_violation(
         parent_branch: Branch the worktree forked from (default: ``dev``).
 
     Returns:
-        An actionable error message string if placement is violated,
-        otherwise ``None``.
+        An actionable error message string (naming both roots when the work
+        landed in a sibling worktree) if placement is violated, otherwise
+        ``None``.
     """
     wt = Path(worktree_path).resolve()
     cur = Path(cwd or os.getcwd()).resolve()
@@ -17794,6 +19133,38 @@ def _worktree_placement_violation(
 
     root = Path(repo_root or _get_repo_root(cur) or cur).resolve()
     root_expected = expected_dirty_paths(str(root))
+
+    # A cwd inside a *sibling* worktree is a foreign write surface: the main
+    # checkout scan below would miss changes written into another item's
+    # linked worktree entirely, so a registered sibling that contains cwd is
+    # checked explicitly as its own surface (SA-0MW5FIJNQ002Z24I).
+    sibling = _sibling_worktree_containing(cur, root, wt)
+    if sibling is not None:
+        if _git_path_has_changes(
+            wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
+        ):
+            return None  # work lives in the worktree; sibling dirt is unrelated
+        if _git_path_has_changes(
+            sibling, parent_branch, expected_dirty=root_expected
+        ):
+            offending = _main_checkout_offending_paths(
+                str(sibling), expected_dirty=root_expected
+            )
+            evidence = _placement_path_listing(offending, parent_branch)
+            return (
+                f"Work done outside the worktree: uncommitted changes were "
+                f"found in the sibling worktree {sibling} while this "
+                f"worktree {wt} contains no changes. A driven child MUST "
+                f"write only inside its own worktree ({wt} — the "
+                f"IMPLEMENT_WORKTREE_PATH); a sibling worktree belongs to "
+                f"another work item and racing its session is forbidden. "
+                f"{evidence}\n"
+                f"Move these changes into {wt} (or discard them), then "
+                f"re-run `implement.py finish`."
+            )
+        # A clean sibling is not evidence; fall through to the main-checkout
+        # scan, which still applies when the work landed there instead.
+
     if not git_has_dirty_files(
         git_status(cwd=str(root)), expected_dirty=root_expected
     ):
@@ -17860,24 +19231,28 @@ def _child_main_checkout_violation(
     parent_branch: str = DEFAULT_PARENT_BRANCH,
     repo_root: str | None = None,
 ) -> str | None:
-    """Detect a child session that wrote to the main checkout, not its worktree.
+    """Detect a child session that wrote outside its worktree.
 
     A driven child session receives ``cwd=<worktree>`` (and
     ``IMPLEMENT_WORKTREE_PATH``), but ``cwd`` is only a hint: an agent can
-    prefix commands with ``cd <main-checkout> && ...`` and write there. This
-    guard detects that failure after the fact so ``phase_parent``/``phase_drive``
-    fail closed instead of silently proceeding. A violation exists only when
-    ALL of:
+    prefix commands with ``cd <main-checkout> && ...`` and write there, or
+    even ``cd`` into **another item's linked worktree** and write there
+    (SA-0MW5FIJNQ002Z24I). This guard detects that failure after the fact so
+    ``phase_parent``/``phase_drive`` fail closed instead of silently
+    proceeding. A violation exists only when ALL of:
 
     1. the child is non-terminal (the caller enforces this),
-    2. the main checkout holds uncommitted changes outside ``.worklog/``, and
+    2. another change surface holds the work — the main checkout holds
+       uncommitted changes outside ``.worklog/``, or a **registered sibling
+       worktree** of the same repository holds changes, and
     3. the child's worktree holds NO changes (no dirty files and no commits
        ahead of the parent branch) — so the work did not land in the worktree.
 
     Condition 3 keeps the guard precise: pre-existing/unrelated dirt in the
-    main checkout does not block a child whose work legitimately lives in its
-    worktree. This mirrors :func:`_worktree_placement_violation`, minus the
-    cwd-sensitive check that only applies to ``phase_finish``.
+    main checkout (or in a sibling item's tree) does not block a child whose
+    work legitimately lives in its worktree. This mirrors
+    :func:`_worktree_placement_violation`, minus the cwd-sensitive check that
+    only applies to ``phase_finish``.
 
     Args:
         child_id: The child work item ID (named in the message).
@@ -17887,7 +19262,8 @@ def _child_main_checkout_violation(
             worktree).
 
     Returns:
-        An actionable error message naming the offending main-checkout paths,
+        An actionable error message naming every offending surface (the
+        main-checkout paths and/or the sibling worktrees with their paths),
         or ``None`` when there is no violation.
     """
     wt = Path(worktree_path)
@@ -17898,31 +19274,55 @@ def _child_main_checkout_violation(
     if not repo_root_str:
         return None
     root = Path(repo_root_str).resolve()
+    root_expected = expected_dirty_paths(str(root))
 
-    offending = _main_checkout_offending_paths(
-        str(root), expected_dirty=expected_dirty_paths(str(root))
-    )
-    if not offending:
-        return None  # main checkout clean (or only expected-dirty paths)
-
+    # The worktree holding the child's own work makes every other change
+    # surface unrelated (precise-guard rule) — check it first so a
+    # legitimate child never pays for the foreign-surface scans below.
     if _git_path_has_changes(
         wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
     ):
-        return None  # work lives in the worktree; main-checkout dirt is unrelated
+        return None
 
-    listing = "\n".join(f"  - {p}" for p in offending[:20])
-    if len(offending) > 20:
-        listing += f"\n  … and {len(offending) - 20} more"
+    offending = _main_checkout_offending_paths(str(root), expected_dirty=root_expected)
+    sibling_offending = [
+        (
+            sibling,
+            _main_checkout_offending_paths(
+                str(sibling), expected_dirty=root_expected
+            ),
+        )
+        for sibling in _registered_sibling_worktree_paths(wt, root)
+        if _git_path_has_changes(sibling, parent_branch, expected_dirty=root_expected)
+    ]
+    if not offending and not sibling_offending:
+        return None  # no foreign change surface
+
+    parts: list[str] = []
+    if offending:
+        parts.append(
+            f"Child {child_id} produced changes in the main checkout at "
+            f"{root} instead of its worktree {wt}. The worktree has no "
+            f"changes (no dirty files and no commits ahead of "
+            f"{parent_branch}), so the child's work did not land in its own "
+            f"worktree — `cwd` is not sufficient. Offending main-checkout "
+            f"paths:\n{_printable_path_listing(offending)}"
+        )
+    for sibling, sibling_paths in sibling_offending:
+        parts.append(
+            f"Child {child_id} produced changes in the sibling worktree "
+            f"{sibling} instead of its worktree {wt}. The worktree has no "
+            f"changes (no dirty files and no commits ahead of "
+            f"{parent_branch}), so the child's work did not land in its own "
+            f"worktree — `cwd` is not sufficient and a sibling worktree "
+            f"belongs to another work item. "
+            f"{_placement_path_listing(sibling_paths, parent_branch)}"
+        )
     return (
-        f"Child {child_id} produced changes in the main checkout at {root} "
-        f"instead of its worktree {wt}. The worktree has no changes (no "
-        f"dirty files and no commits ahead of {parent_branch}), so the "
-        f"child's work did not land in its own "
-        f"worktree — `cwd` is not sufficient. Offending main-checkout paths:\n"
-        f"{listing}\n"
-        f"Move these changes into {wt} (or discard them), then re-run. A "
-        f"driven child MUST run every write/edit with a path that resolves "
-        f"inside its worktree."
+        "\n\n".join(parts)
+        + "\nMove these changes into "
+        + f"{wt} (or discard them), then re-run. A driven child MUST run "
+        f"every write/edit with a path that resolves inside its worktree."
     )
 
 

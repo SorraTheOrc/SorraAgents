@@ -163,6 +163,10 @@ def _build_wl_create_cmd(title: str, description: str, priority: str) -> str:
     )
 
 
+# The single exact-identity lookup command (SA-0MWE1E4GQ004E1JG AC3).
+FINDING_KEY_LIST_CMD = "wl list Refactor-Finding-Key: --json"
+
+
 # ---------------------------------------------------------------------------
 # Tests: Priority Mapping
 # ---------------------------------------------------------------------------
@@ -339,7 +343,7 @@ class TestWorklogCLIIntegration:
         description = build_smell_description(referent_critical)
         priority = severity_to_priority(referent_critical["severity"])
 
-        expected_list_cmd = "wl list --tags Refactor --json"
+        expected_list_cmd = FINDING_KEY_LIST_CMD
         expected_create_cmd = _build_wl_create_cmd(title, description, priority)
 
         responses = {
@@ -368,7 +372,7 @@ class TestWorklogCLIIntegration:
         description = build_smell_description(referent_medium)
         priority = severity_to_priority(referent_medium["severity"])
 
-        expected_list_cmd = "wl list --tags Refactor --json"
+        expected_list_cmd = FINDING_KEY_LIST_CMD
         expected_create_cmd = _build_wl_create_cmd(title, description, priority)
 
         responses = {
@@ -398,7 +402,7 @@ class TestWorklogCLIIntegration:
         description = build_smell_description(referent_high)
         priority = severity_to_priority(referent_high["severity"])
 
-        expected_list_cmd = "wl list --tags Refactor --json"
+        expected_list_cmd = FINDING_KEY_LIST_CMD
         expected_create_cmd = _build_wl_create_cmd(title, description, priority)
 
         responses = {
@@ -532,7 +536,7 @@ class TestWorklogCLIIntegration:
 
         empty_list = '{"success":true,"workItems":[]}'
         responses = {
-            "wl list --tags Refactor --json": _cp(stdout=empty_list),
+            FINDING_KEY_LIST_CMD: _cp(stdout=empty_list),
             cmd1: _cp(stdout=mock_wl_create_json),
         }
         monkeypatch.setattr(
@@ -797,8 +801,11 @@ class TestWorklogDuplicatePrevention:
         sample_smell_critical,
     ):
         """Work item creation is skipped when worklog has an existing Refactor item
-        for the same (file, line, code) combination."""
-        from refactor.workitem_creation import create_smell_work_item
+        for the same finding identity."""
+        from refactor.workitem_creation import (
+            build_finding_key,
+            create_smell_work_item,
+        )
 
         # Create the actual file on disk so the file existence check passes
         file_path = temp_dir / "src" / "main.py"
@@ -808,13 +815,19 @@ class TestWorklogDuplicatePrevention:
         smell = dict(sample_smell_critical)
         smell["file"] = str(file_path)
 
-        # Mock subprocess to simulate wl list returning an existing item
+        # The existing item carries the exact identity marker, computed the
+        # same way production does (repo-relative, no line number).
+        identity = build_finding_key(smell, repo_root=str(temp_dir))
         mock_list_output = json.dumps({
             "success": True,
             "workItems": [
                 {
                     "id": "SA-0MOCK9999X000EXIST",
                     "title": "Refactor: Security issue in src/main.py",
+                    "description": (
+                        f"Refactor-Finding-Key: {identity}\n"
+                        "Refactor-Affected-Lines: 42\n"
+                    ),
                     "tags": ["Refactor"],
                     "status": "open",
                     "priority": "high",
@@ -823,7 +836,7 @@ class TestWorklogDuplicatePrevention:
         })
 
         # Build expected wl list command
-        expected_list_cmd = "wl list --tags Refactor --json"
+        expected_list_cmd = FINDING_KEY_LIST_CMD
 
         responses = {}
         # Set up mock response for wl list
@@ -842,8 +855,9 @@ class TestWorklogDuplicatePrevention:
             )
 
         monkeypatch.setattr(subprocess, "run", _fake_run)
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/wl")
 
-        result = create_smell_work_item(smell)
+        result = create_smell_work_item(smell, repo_root=str(temp_dir))
         assert result is None, (
             f"Expected None when worklog has existing item, got {result!r}"
         )
@@ -870,7 +884,7 @@ class TestWorklogDuplicatePrevention:
             "workItems": [],
         })
 
-        expected_list_cmd = "wl list --tags Refactor --json"
+        expected_list_cmd = FINDING_KEY_LIST_CMD
 
         # Build expected wl create command
         from refactor.workitem_creation import (
@@ -878,8 +892,8 @@ class TestWorklogDuplicatePrevention:
             build_smell_title,
             severity_to_priority,
         )
-        title = build_smell_title(smell)
-        description = build_smell_description(smell)
+        title = build_smell_title(smell, repo_root=str(temp_dir))
+        description = build_smell_description(smell, repo_root=str(temp_dir))
         priority = severity_to_priority(smell["severity"])
         expected_create_cmd = f"wl create --title {title} --description {description} --priority {priority} --tags Refactor --json"
 
@@ -899,10 +913,11 @@ class TestWorklogDuplicatePrevention:
             raise FileNotFoundError(f"Unexpected command: {key}")
 
         monkeypatch.setattr(subprocess, "run", _fake_run)
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/wl")
 
         from refactor.workitem_creation import create_smell_work_item
 
-        result = create_smell_work_item(smell)
+        result = create_smell_work_item(smell, repo_root=str(temp_dir))
         assert result == "SA-0MOCK1234X000WORK"
 
 
@@ -972,7 +987,7 @@ class TestBatchWorkItemCreation:
 
         # Each smell gets its own response; also mock wl list
         responses = {
-            "wl list --tags Refactor --json": _cp(stdout=empty_list),
+            FINDING_KEY_LIST_CMD: _cp(stdout=empty_list),
             cmd1: _cp(stdout=mock_wl_create_json),
             cmd2: _cp(stdout=mock_json2),
         }
@@ -1046,7 +1061,7 @@ class TestBatchWorkItemCreation:
 
         empty_list = '{"success":true,"workItems":[]}'
         responses = {
-            "wl list --tags Refactor --json": _cp(stdout=empty_list),
+            FINDING_KEY_LIST_CMD: _cp(stdout=empty_list),
             expected_create_cmd: _cp(stdout=mock_json),
         }
         monkeypatch.setattr(subprocess, "run", _make_fake_subprocess_run(responses))
@@ -1433,3 +1448,158 @@ class TestDocHygiene:
         assert "in_progress" in content, "SKILL.md must reference setting status to in_progress"
         assert "open --json" not in content, "SKILL.md must NOT contain ad-hoc wl update --status commands"
         assert "wl update <id> --status" not in content, "SKILL.md must NOT contain ad-hoc wl update --status commands"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Identity dedupe — cross-family twin suppression (AC5)
+# ---------------------------------------------------------------------------
+
+
+def _twin_capable_workitem_creation():
+    """Import the module; skip unless cross-family twin support has landed.
+
+    The refactor producer learns to consult the audit false-positive-chore
+    family in SA-0MWE1EAR30045VHO (F3), which introduces the
+    ``AUDIT_FP_TITLE_MARKER`` constant. Guarding on that constant keeps this
+    test dormant until its sibling item implements the contract.
+    """
+    from refactor import workitem_creation as wic
+
+    if not hasattr(wic, "AUDIT_FP_TITLE_MARKER"):
+        pytest.skip(
+            "cross-family twin suppression not yet implemented "
+            "(SA-0MWE1EAR30045VHO)"
+        )
+    return wic
+
+
+class TestIdentityDedupeScenarios:
+    """End-to-end identity dedupe scenarios that exercise the wl seam.
+
+    Related acceptance criteria (SA-0MWE1DXPW00846UV):
+    - AC5: the refactor producer suppresses creation when an audit-created
+      open item of the form ``ruff <RULE> in <path> — candidate false
+      positive`` already exists (twin suppression).
+    """
+
+    @staticmethod
+    def _fake_run(tmp_path, list_items, created, commands):
+        """Fake git + wl runner returning *list_items* for every ``wl list``."""
+
+        def fake_run(cmd, *args, **kwargs):
+            argv = (
+                list(cmd)
+                if isinstance(cmd, (list, tuple))
+                else str(cmd).split()
+            )
+            commands.append(argv)
+            prog = argv[0] if argv else ""
+            if prog == "git" and "rev-parse" in argv:
+                return _cp(stdout=str(tmp_path))
+            if prog == "wl" and len(argv) > 1:
+                sub = argv[1]
+                if sub == "list":
+                    return _cp(
+                        stdout=json.dumps(
+                            {"success": True, "workItems": list_items}
+                        )
+                    )
+                if sub == "create":
+                    created.append(argv)
+                    return _cp(
+                        stdout=json.dumps(
+                            {
+                                "success": True,
+                                "workItem": {"id": "SA-0NEWXX"},
+                            }
+                        )
+                    )
+                return _cp(stdout='{"success":true}')
+            return _cp(stdout='{"success":true,"workItems":[]}')
+
+        return fake_run
+
+    @staticmethod
+    def _audit_twin(status: str) -> dict[str, Any]:
+        return {
+            "id": "SA-0AUDITX",
+            "title": (
+                "ruff S112 in skill/x.py:99 — candidate false positive "
+                "— producer decision required"
+            ),
+            "description": "CFP-Chore-Key: ruff:S112:skill/x.py:99\n",
+            "status": status,
+            "issueType": "chore",
+            "tags": [],
+        }
+
+    @staticmethod
+    def _smell(file_path: Path) -> dict[str, Any]:
+        return {
+            "file": str(file_path),
+            "line": 42,
+            "severity": "medium",
+            "message": "S112 finding",
+            "source": "linter",
+            "smell_type": "lint",
+            "code": "S112",
+        }
+
+    def test_audit_twin_suppresses_refactor_creation(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """An open audit twin suppresses creation and is never auto-closed."""
+        wic = _twin_capable_workitem_creation()
+        file_path = tmp_path / "skill" / "x.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("a = 1\n")
+
+        created: list[list[str]] = []
+        commands: list[list[str]] = []
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            self._fake_run(
+                tmp_path, [self._audit_twin("open")], created, commands
+            ),
+        )
+        monkeypatch.setattr(wic.shutil, "which", lambda _name: "/usr/bin/wl")
+
+        result = wic.create_smell_work_item(self._smell(file_path))
+
+        assert result is None, f"an audit twin must suppress creation, got {result!r}"
+        assert not created, f"no item may be created for a twin: {created}"
+        # The audit chore carries needsProducerReview by design: the refactor
+        # producer must never close it.
+        assert not any(
+            cmd[:2] in (["wl", "close"], ["wl", "update"])
+            and "SA-0AUDITX" in cmd
+            for cmd in commands
+        ), f"audit chore was mutated: {commands}"
+
+    def test_terminal_audit_twin_does_not_suppress(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """A completed audit chore no longer tracks the finding."""
+        wic = _twin_capable_workitem_creation()
+        file_path = tmp_path / "skill" / "x.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("a = 1\n")
+
+        created: list[list[str]] = []
+        commands: list[list[str]] = []
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            self._fake_run(
+                tmp_path, [self._audit_twin("completed")], created, commands
+            ),
+        )
+        monkeypatch.setattr(wic.shutil, "which", lambda _name: "/usr/bin/wl")
+
+        result = wic.create_smell_work_item(self._smell(file_path))
+
+        assert result == "SA-0NEWXX", (
+            f"a terminal audit chore must not suppress, got {result!r}"
+        )
+        assert len(created) == 1

@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.1.28 (2026-11-15)
+> **Release focus:** This release focuses on making the audit, finish, and release pipeline more reliable and much faster, with smarter test scoping, automatic temp cleanup, and fixes for stuck or looping audits. It also resolves numerous finish and reporting edge cases—such as flaky git retries, interrupted runs, and inaccurate session status—while adding automatic installation of paid DeepSeek models.
+### Features
+- Stale test and build temp files are now cleaned up automatically, preventing crashes from a full temp directory. (SA-0MW2QEZBG009I3AI)
+- Audits now ignore unrelated failing tests, while releases still require a fully green suite. (SA-0MW0JJ36Z000AF57)
+- Finish gates now run only the tests affected by your change, so builds finish in seconds instead of hours. (SA-0MW0LNT970057DM9)
+- Audits now run against the latest merged code, so verdicts are never skewed by un-pushed local changes. (SA-0MW4ZRLSI005PHL6)
+- Paid DeepSeek models now install automatically on every machine and are selectable in-game. (SA-0MW0GL4590046BTK)
+- Driven tasks now stop safely instead of editing another task's workspace. (SA-0MW5FIJNQ002Z24I)
+- Reports now correctly show completed skill sessions as ready instead of incomplete. (SA-0MUUI6ZCX001RO8V)
+### Bug Fixes
+- Finishing work now retries flaky git failures and won't strand completed items. (SA-0MW22SEMV00230O5)
+- Large audits now complete reliably and save readable results, so releases no longer get stuck. (SA-0MW0LR0D70034DGE)
+- Vitest test failures now show the actual failing test instead of a misleading infrastructure error. (SA-0MW0NL3EW0009R4G)
+- Parent audits now finish instead of looping forever and no longer erase completed child results. (SA-0MVZ3SMK6007431I)
+- Large tasks are no longer silently skipped and given a fake 0-hour estimate. (SA-0MW0LPXXY0002CQ0)
+- Changed-scope test runs now always include the tests you just wrote, so a green run truly means your new tests passed. (SA-0MWA7OD8O001945I)
+- Releases now always include a complete changelog, even with large backlogs. (SA-0MWE4BT63005N8OE)
+- Pane-driven child sessions can now run their full multi-minute budget without being cut off at 60 seconds. (SA-0MW7PAKSF008H8OH)
+- Re-running finish on already-pushed work now completes reliably instead of failing. (SA-0MW0V9PEP004EJYV)
+- Interrupted finishes can now be re-run to completion instead of failing. (SA-0MW98UNVB0085LFA)
+- Duplicate code smells are now tracked once instead of piling up dozens of copies. (SA-0MW7Z1AU1006UT9C)
+- Finish now reliably syncs your local dev branch after a recovery rebase and clearly reports when a push is blocked by the commit guard. (SA-0MW3H07A8004Q54C)
+- End-of-session reports now correctly show whether your work passed its audit. (SA-0MUBW2FO5006H12Y)
+- Planning no longer stalls with false "uncovered" errors when criteria are genuinely covered. (SA-0MUG36DQ2008DH3L)
+
 ## v0.1.27 (2026-11-11)
 > **Release focus:** This release focuses on making audits and task tracking more reliable, with clearer ready-to-ship verdicts, correct reading of acceptance criteria and verification evidence, and fewer false blocks or duplicate chores. It also speeds up runs through reduced context loading, reused passing test results, and better test slot allocation, while fixing hangs, dropped connections, and stuck or prematurely started tasks.
 ### Features

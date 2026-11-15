@@ -250,7 +250,15 @@ export function getTopLevelCandidateItems() {
 // these markers, the gate treats the item as transient (warning, not blocking)
 // so a release is not spuriously blocked by a merely timed-out audit.
 const TIMEOUT_TRANSIENT_PATTERNS = [
-  /\btime(?:d)?\s*outs?\b/i, // "timed out", "time out", "timeout(s)"
+  // SA-0MWDPX9HM005V0WX: the zero-whitespace `\s*` used to match the literal
+  // `timeouts` inside the persisted reliability-summary counters
+  // (`AUDIT_RELIABILITY_SUMMARY … timeouts=0 child_screen_timeouts=0
+  // parent_screen_timeouts=0 …`), so a genuine `Ready to close: No` verdict
+  // carrying that line was misclassified as transient. The negative lookahead
+  // `(?!\s*=)` refuses a `timeout(s)` token that is a `key=value` counter —
+  // the counters are run metadata, never a transient marker — while the real
+  // prose markers ("timed out", "time out", "timeout(s)") still match.
+  /\btime(?:d)?\s*outs?\b(?!\s*=)/i, // "timed out", "time out", "timeout(s)"
   /provider\s+(?:error|stop\s+reason)/i, // "Pi provider error: ..."
   /script\s+execution\s+failure/i, // FailureNotice banner
   // WL-0MW2F2T1I001ZNH7 (C2): the machine-readable transient classification
@@ -393,7 +401,7 @@ export function buildRemediationCommand(workItemId) {
   return [
     `  # Re-run audit for ${workItemId}:`,
     `  wl audit-show ${workItemId} --json`,
-    `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId}`,
+    `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId} --strict`,
   ].join('\n');
 }
 
@@ -525,7 +533,7 @@ export function buildProducerReviewRemediationCommand(workItemId) {
     `  # Clear the producer-review flag for ${workItemId}:`,
     `  wl update ${workItemId} --needs-producer-review false --json`,
     `  # Or re-run audit to auto-resolve:`,
-    `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId}`,
+    `  python3 skill/audit/scripts/audit_runner.py issue ${workItemId} --strict`,
   ].join('\n');
 }
 
@@ -645,7 +653,7 @@ export function checkProducerReviewStatus(items) {
 export function stalePassingBlockReason(workItemId, freshness = null) {
   const detail = freshness && freshness.reason ? ` — ${freshness.reason}` : '';
   return `Audit is time-stale but content changed (or could not be confirmed unchanged)${detail}; `
-    + `re-audit with: python3 skill/audit/scripts/audit_runner.py issue ${workItemId} --force`;
+    + `re-audit with: python3 skill/audit/scripts/audit_runner.py issue ${workItemId} --strict --force`;
 }
 
 // ── attemptAuditRemediation ──────────────────────────────────────────────────
@@ -849,7 +857,7 @@ export async function checkAuditReadyToClose(options = {}) {
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
     runAuditCommand = (runnerPath, workItemId, timeoutMs) => execSync(
-      `python3 "${runnerPath}" issue ${workItemId}`,
+      `python3 "${runnerPath}" issue ${workItemId} --strict`,
       // Per-item timeout guard (SA-0MSUT8GQP004WSYN AC6 / R1): a hung audit
       // runner must not stall the whole release gate. The default audit
       // runner hard-times-out internally, so this is a belt-and-braces cap.

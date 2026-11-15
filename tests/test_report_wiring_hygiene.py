@@ -223,6 +223,90 @@ class TestPlanSkillPassesPlanningPhaseAcs:
         assert "incomplete" not in report.lower()
 
 
+# ─── Every report-rendering skill: concrete skill-session ACs + note ───────
+#
+# Regression guard for the epic SA-0MUUI6ZCX001RO8V: all report-rendering
+# skills must pass concrete skill-session deliverables to `--ac` (not the
+# work item's feature ACs, and not a generic placeholder), and each final
+# step must carry a note distinguishing the two.
+
+# Generic placeholders that let an agent pass the work item's feature ACs.
+_PLACEHOLDER_AC_MARKERS = (
+    "<AC# description>",
+    "<...>",
+    "<ac#",
+    "<description>",
+)
+_SEMANTICS_NOTE_MARKERS = (
+    "skill session",
+    "own deliverable",
+    "feature acceptance criteria",
+    "feature acs",
+)
+
+
+def _ac_lines(section: str) -> list[str]:
+    """Return the raw `--ac "..."` values in a final-step section."""
+    return [m.group(1) for m in _AC_LINE_RE.finditer(section)]
+
+
+def _is_placeholder(value: str) -> bool:
+    lowered = value.lower()
+    return any(marker in lowered for marker in _PLACEHOLDER_AC_MARKERS)
+
+
+class TestReportACConcreteness:
+    """Guard against placeholder `--ac` values returning to any skill.
+
+    The report's Acceptance Criteria table records the *skill session's* own
+    deliverables; work-item feature ACs belong in the Use Cases section
+    (SA-0MTQY7YM5009J6QR). A placeholder or a work-item feature AC renders a
+    successfully completed session as "Not ready to ship".
+    """
+
+    def test_all_final_step_acs_are_concrete(self):
+        """Every work-item skill must document at least one concrete
+        skill-session AC with a literal `met` verdict, and no placeholder."""
+        for skill_name in WORK_ITEM_SKILLS:
+            section = _final_step_section(skill_name)
+            acs = _ac_lines(section)
+            assert acs, f"{skill_name}: final step documents no --ac values"
+
+            concrete = []
+            for value in acs:
+                assert not _is_placeholder(value), (
+                    f"{skill_name}: placeholder --ac value {value!r}; pass a "
+                    "concrete skill-session deliverable instead"
+                )
+                parts = [p.strip() for p in value.split("|")]
+                assert len(parts) == 3, (
+                    f"{skill_name}: malformed --ac value (expected "
+                    f"desc|metric|verdict): {value!r}"
+                )
+                desc, metric, verdict = parts
+                assert desc and metric and verdict, (
+                    f"{skill_name}: empty --ac field in {value!r}"
+                )
+                if verdict.lower() == "met":
+                    concrete.append((desc, metric, verdict))
+
+            assert concrete, (
+                f"{skill_name}: final step has no concrete `--ac \"...|met\"` "
+                "example; a completed session must render as ready to ship"
+            )
+
+    def test_all_final_steps_have_semantics_note(self):
+        """Every work-item skill's final step must explain that `--ac`
+        records the skill session's own deliverables, not the work item's
+        feature ACs."""
+        for skill_name in WORK_ITEM_SKILLS:
+            section = _final_step_section(skill_name).lower()
+            assert any(marker in section for marker in _SEMANTICS_NOTE_MARKERS), (
+                f"{skill_name}: final step lacks a note distinguishing "
+                "skill-session ACs from the work item's feature ACs"
+            )
+
+
 class TestNonWorkItemSkillsUnwired:
     def test_speak_is_not_wired(self):
         for skill_name in NON_WORK_ITEM_SKILLS:

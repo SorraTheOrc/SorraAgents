@@ -83,6 +83,25 @@ removed manually by deleting `.worklog/code-freeze.json`.
 `check-audit-gate.js` provides the two readiness gates evaluated during a
 release (before the dev→main merge):
 
+### Strict audit mode (SA-0MW0JJ36Z000AF57)
+
+The release gate must never accept a **permissive** audit pass (one that
+excused unrelated unit failures). Every audit the gate runs passes
+**`--strict`**, and the manual remediation commands it surfaces include
+`--strict`:
+
+- `check-audit-gate.js` — `runAuditCommand` default and the surfaced
+  remediation commands (`buildRemediationCommand`, producer-review
+  remediation, the time-stale `--strict --force` re-audit hint).
+- `check-final-validation.js` — `runAuditCommand` default.
+- `refresh-audits.js` — pre-flight `runAuditCommand` default.
+- `audit-remediation.js` — the `OFFLINE_AUDIT_REFRESH_HINT` batch command
+  (`batch --strict`).
+
+Because the audit freshness gate records the mode that produced a stored
+pass, a strict ship run never reuses a permissive “Yes” — it re-runs. See the
+audit reference's [Test-failure modes](audit-skill-reference.md#test-failure-modes--strict-and-permissive-sa-0mw0jj36z000af57).
+
 ### Candidate scoping (top-level only)
 
 Both gates operate on **top-level** `in_review` items (`parentId == null`),
@@ -97,6 +116,9 @@ parent's, so a child-level gap must never spuriously block a release.
   items (no parent) are top-level and remain gated.
 
 ### Audit readiness gate (exit 6)
+
+> Release runs always audit **strictly** (`--strict`, see above): a permissive
+> pass with excused failures never satisfies the gate.
 
 `checkAuditReadyToClose()` checks each top-level item via
 `wl audit-show <id> --json` and classifies it:

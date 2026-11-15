@@ -211,8 +211,150 @@ class TestTrackingChores:
 
 
 # ---------------------------------------------------------------------------
-# AC5: fail-safe chore creation failure
+# SA-0MWE1EAR30045VHO: cross-family twin consultation
 # ---------------------------------------------------------------------------
+
+
+class TestRefactorTwinConsultation:
+    """CFP chore creation cross-references an open Refactor-family item.
+
+    The audit producer must not mint a blind twin of a smell the refactor
+    producer already tracks: before creating a NEW chore the loop consults
+    open ``Refactor-Finding-Key`` items once per run and embeds a visible
+    ``Refactor-Twin: <id>`` cross-reference in the chore description. The
+    chore is never suppressed or closed (it carries needsProducerReview by
+    design) — only the cross-reference is added.
+    """
+
+    def test_chore_embeds_refactor_twin_when_refactor_item_exists(self, tmp_path):
+        """A matching Refactor item adds Refactor-Twin to the chore description."""
+        finding = _finding(severity="medium", code="F841", file="src/bad.py")
+        entry = _screen_entry(finding, classification="confident-false-positive",
+                              remediable=False, justification="misfires")
+        refactor_item = {
+            "id": "SA-0REFACTOR",
+            "title": "Refactor: Unused Variable in src/bad.py",
+            "description": (
+                "Refactor-Finding-Key: F841:src/bad.py\n"
+                "Refactor-Fingerprint: " + "0" * 64 + "\n"
+            ),
+            "status": "open",
+            "issueType": "task",
+            "tags": ["Refactor"],
+        }
+
+        def _side(cmd, **kwargs):
+            cmd_str = " ".join(cmd)
+            if cmd_str.startswith("git rev-parse"):
+                return SimpleNamespace(returncode=0, stdout="abc1234\n", stderr="")
+            if "Refactor-Finding-Key:" in cmd_str:
+                return SimpleNamespace(returncode=0, stdout=json.dumps({
+                    "success": True, "workItems": [refactor_item],
+                }), stderr="")
+            if " create " in cmd_str or cmd_str.endswith(" create"):
+                return SimpleNamespace(returncode=0, stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "CHORE-1", "status": "open"},
+                }), stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        runner = mock.MagicMock()
+        runner.side_effect = _side
+        results = _run_loop(tmp_path, [finding], [entry], runner=runner)
+
+        assert results["chore_items"] == [{"id": "CHORE-1"}]
+        dispatched = " ".join(_create_commands(runner)[0])
+        assert "Refactor-Twin: SA-0REFACTOR" in dispatched, dispatched
+
+    def test_chore_without_refactor_twin_has_no_marker(self, tmp_path):
+        """No matching Refactor item → no Refactor-Twin marker (still created)."""
+        finding = _finding(severity="medium", code="F841", file="src/bad.py")
+        entry = _screen_entry(finding, classification="confident-false-positive",
+                              remediable=False, justification="misfires")
+        runner = _runner()  # wl list returns unparseable output → empty family
+        results = _run_loop(tmp_path, [finding], [entry], runner=runner)
+
+        assert results["chore_items"] == [{"id": "CHORE-1"}]
+        dispatched = " ".join(_create_commands(runner)[0])
+        assert "Refactor-Twin:" not in dispatched, dispatched
+
+    def test_line_drift_does_not_break_twin_match(self, tmp_path):
+        """The Refactor identity ignores lines; the audit finding's line may
+        differ from the item's and the match still holds."""
+        finding = _finding(severity="medium", code="F841", file="src/bad.py")
+        finding["line"] = 40  # refactor item was filed for line 1
+        entry = _screen_entry(finding, classification="confident-false-positive",
+                              remediable=False, justification="misfires")
+        refactor_item = {
+            "id": "SA-0REFACTOR",
+            "title": "Refactor: Unused Variable in src/bad.py",
+            "description": "Refactor-Finding-Key: F841:src/bad.py\n",
+            "status": "open",
+            "issueType": "task",
+            "tags": ["Refactor"],
+        }
+
+        def _side(cmd, **kwargs):
+            cmd_str = " ".join(cmd)
+            if cmd_str.startswith("git rev-parse"):
+                return SimpleNamespace(returncode=0, stdout="abc1234\n", stderr="")
+            if "Refactor-Finding-Key:" in cmd_str:
+                return SimpleNamespace(returncode=0, stdout=json.dumps({
+                    "success": True, "workItems": [refactor_item],
+                }), stderr="")
+            if " create " in cmd_str or cmd_str.endswith(" create"):
+                return SimpleNamespace(returncode=0, stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "CHORE-1", "status": "open"},
+                }), stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        runner = mock.MagicMock()
+        runner.side_effect = _side
+        results = _run_loop(tmp_path, [finding], [entry], runner=runner)
+
+        assert results["chore_items"] == [{"id": "CHORE-1"}]
+        dispatched = " ".join(_create_commands(runner)[0])
+        assert "Refactor-Twin: SA-0REFACTOR" in dispatched, dispatched
+
+    def test_terminal_refactor_item_does_not_link_twin(self, tmp_path):
+        """A completed Refactor item no longer tracks the finding; the chore is
+        created without a twin marker."""
+        finding = _finding(severity="medium", code="F841", file="src/bad.py")
+        entry = _screen_entry(finding, classification="confident-false-positive",
+                              remediable=False, justification="misfires")
+        refactor_item = {
+            "id": "SA-0REFACTOR",
+            "title": "Refactor: Unused Variable in src/bad.py",
+            "description": "Refactor-Finding-Key: F841:src/bad.py\n",
+            "status": "completed",
+            "issueType": "task",
+            "tags": ["Refactor"],
+        }
+
+        def _side(cmd, **kwargs):
+            cmd_str = " ".join(cmd)
+            if cmd_str.startswith("git rev-parse"):
+                return SimpleNamespace(returncode=0, stdout="abc1234\n", stderr="")
+            if "Refactor-Finding-Key:" in cmd_str:
+                return SimpleNamespace(returncode=0, stdout=json.dumps({
+                    "success": True, "workItems": [refactor_item],
+                }), stderr="")
+            if " create " in cmd_str or cmd_str.endswith(" create"):
+                return SimpleNamespace(returncode=0, stdout=json.dumps({
+                    "success": True,
+                    "workItem": {"id": "CHORE-1", "status": "open"},
+                }), stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        runner = mock.MagicMock()
+        runner.side_effect = _side
+        results = _run_loop(tmp_path, [finding], [entry], runner=runner)
+
+        assert results["chore_items"] == [{"id": "CHORE-1"}]
+        dispatched = " ".join(_create_commands(runner)[0])
+        assert "Refactor-Twin:" not in dispatched, dispatched
+
 
 
 class TestFailSafe:

@@ -1,10 +1,13 @@
 /**
  * Unit tests for skill/ship/scripts/release/generate-changelog.js
  *
- * Verifies getCompletedOrInReviewItems() query/projection contract:
- * exactly ONE `wl list --stage in_review --json`
- * invocation piped through jq (SA-0MSLW5P7J0068UFZ, SA-0MSPPHTYA002212R), so large worklogs
- * cannot overflow execSync's default 1 MB buffer (ENOBUFS).
+ * Verifies the getCompletedOrInReviewItems() query/projection contract:
+ * exactly ONE `wl list --stage in_review --json` invocation piped through jq
+ * (SA-0MSLW5P7J0068UFZ, SA-0MSPPHTYA002212R), with a SKINNY projection
+ * ({id, title, issueType, parentId}) and an explicit maxBuffer so a large
+ * worklog can never overflow execSync's default 1 MB buffer (ENOBUFS).
+ * Also covers the lazy, bounded description fetch that replaces the old
+ * full-description projection (SA-0MWE4BT63005N8OE).
  */
 
 import { test, describe } from 'node:test';
@@ -90,24 +93,25 @@ describe('getCompletedOrInReviewItems - single stage query + jq projection', () 
       id: 'SA-1',
       title: 'One',
       issueType: 'feature',
-      description: 'desc one',
       parentId: null,
-    }], 'projection should expose exactly id/title/issueType/description/parentId');
+    }], 'projection should expose exactly id/title/issueType/parentId (description is fetched lazily)');
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test('does not overflow execSync buffer with >1MB wl output', async () => {
+  test('does not overflow execSync buffer when the projected output exceeds 1MB (AC1/AC4)', async () => {
     const mod = await import(MODULE_PATH);
     const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
     const argsLogPath = join(tmpDir, 'args.log');
-    // ~200 items x ~6KB of audit enrichment (NOT projected) ≈ 1.2MB raw
-    // output — over execSync's default 1MB maxBuffer. jq drops the
-    // enrichment so only the 5 projected fields enter Node's buffer.
+    // The PROJECTED JSON itself is >1MB: 200 items with ~6KB titles. Titles
+    // ARE projected, so even the skinny projection overflows execSync's
+    // default 1MB maxBuffer — only the explicit 64MB maxBuffer (AC1) keeps
+    // it alive. A large non-projected description/enrichment is included too,
+    // so the test also covers the original full-description overflow shape.
     const workItems = Array.from({ length: 200 }, (_, i) => ({
       id: `SA-LARGE-${i}`,
-      title: `Large item ${i}`,
+      title: `Large item ${i} ${'z'.repeat(6000)}`,
       issueType: 'bug',
-      description: `description of item ${i}`,
+      description: 'd'.repeat(6000),
       enrichment: 'z'.repeat(6000),
       tags: ['a', 'b', 'c'],
     }));
@@ -117,21 +121,36 @@ describe('getCompletedOrInReviewItems - single stage query + jq projection', () 
 
     assert.equal(items.length, 200, 'all items should be returned without ENOBUFS');
     for (const item of items) {
-      assert.ok('id' in item && 'title' in item && 'issueType' in item && 'description' in item);
-      assert.ok(!('enrichment' in item) && !('tags' in item), 'non-projected fields dropped');
+      assert.deepEqual(
+        Object.keys(item).sort(),
+        ['id', 'issueType', 'parentId', 'title'],
+        'projection is skinny — description/enrichment/tags never enter the buffer',
+      );
     }
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test('returns [] and logs a warning when wl query fails', async () => {
+  test('returns [] and surfaces the real error (not a misleading "wl not available?")', async () => {
     const mod = await import(MODULE_PATH);
     const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
     const argsLogPath = join(tmpDir, 'args.log');
     const binDir = createWlMock({ workItems: [], argsLogPath, fail: true });
 
-    const items = withWlMock(binDir, () => mod.getCompletedOrInReviewItems());
+    const messages = [];
+    const original = console.error;
+    console.error = (...args) => messages.push(args.join(' '));
+    let items;
+    try {
+      items = withWlMock(binDir, () => mod.getCompletedOrInReviewItems());
+    } finally {
+      console.error = original;
+    }
 
     assert.deepEqual(items, [], 'failed query should yield no items');
+    const logged = messages.join('\n');
+    assert.ok(/could not query in_review work items/i.test(logged), `should log an actionable query warning, got: ${logged}`);
+    assert.ok(/Command failed|exit|code|ENOBUFS|ETIMEDOUT/i.test(logged), `should surface the underlying error detail, got: ${logged}`);
+    assert.ok(!/wl not available\?/i.test(logged), 'should not emit the old misleading message');
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -164,8 +183,121 @@ describe('getCompletedOrInReviewItems - single stage query + jq projection', () 
 
     assert.deepEqual(items, [{
       id: 'SA-1', title: 'Dash-safe', issueType: 'task',
-      description: 'desc', parentId: null,
+      parentId: null,
     }], 'query must run under bash so set -o pipefail works on dash');
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Lazy description fetch — bounded, per-item, degrades gracefully (AC2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a fake `wl` that answers `wl show <id> --json` from a map of
+ * descriptions, recording each invocation.
+ *
+ * @param {object} opts
+ * @param {Record<string,string>} opts.descriptions - id → description.
+ * @param {string} opts.argsLogPath - File where the fake wl appends its args.
+ * @param {string[]} [opts.failIds] - ids whose `wl show` exits 1.
+ * @returns {string} The temp bin dir to prepend to PATH.
+ */
+function createWlShowMock({ descriptions, argsLogPath, failIds = [] }) {
+  const binDir = mkdtempSync(join(tmpdir(), 'fakeshow-'));
+  for (const [id, description] of Object.entries(descriptions)) {
+    writeFileSync(
+      join(binDir, `${id}.json`),
+      JSON.stringify({ success: true, workItem: { id, description } }),
+      'utf-8',
+    );
+  }
+  const wlPath = join(binDir, 'wl');
+  const failPattern = failIds.length ? failIds.join('|') : '___never___';
+  const script = `#!/usr/bin/env bash\n`
+    + `echo "$@" >> "${argsLogPath}"\n`
+    + `id="$2"\n`
+    + `case "$id" in\n`
+    + `  ${failPattern}) echo "boom" >&2; exit 1 ;;\n`
+    + `  *) if [ -f "${binDir}/$id.json" ]; then cat "${binDir}/$id.json"; else echo '{"success":false}'; fi ;;\n`
+    + `esac\n`;
+  writeFileSync(wlPath, script, { mode: 0o755 });
+  return binDir;
+}
+
+describe('lazy description fetch (AC2)', () => {
+  test('fetchItemDescription returns the description via a single bounded wl show', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const argsLogPath = join(tmpDir, 'args.log');
+    const binDir = createWlShowMock({
+      descriptions: { 'SA-DESC-1': 'Fetched description' },
+      argsLogPath,
+    });
+
+    const desc = withWlMock(binDir, () => mod.fetchItemDescription('SA-DESC-1'));
+
+    assert.equal(desc, 'Fetched description');
+    const calls = readFileSync(argsLogPath, 'utf-8').trim().split('\n').filter(Boolean);
+    assert.deepEqual(calls, ['show SA-DESC-1 --json'], 'should query a single item via wl show');
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('fetchItemDescription degrades to "" and logs on failure', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const argsLogPath = join(tmpDir, 'args.log');
+    const binDir = createWlShowMock({ descriptions: {}, argsLogPath, failIds: ['SA-BOOM'] });
+
+    const messages = [];
+    const original = console.error;
+    console.error = (...args) => messages.push(args.join(' '));
+    let desc;
+    try {
+      desc = withWlMock(binDir, () => mod.fetchItemDescription('SA-BOOM'));
+    } finally {
+      console.error = original;
+    }
+
+    assert.equal(desc, '', 'failed fetch should degrade to an empty description');
+    assert.ok(/could not fetch description for SA-BOOM/i.test(messages.join('\n')), 'failure should be logged');
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test('fetchItemDescription rejects non-work-item-shaped ids without a subprocess', async () => {
+    const mod = await import(MODULE_PATH);
+    const messages = [];
+    const original = console.error;
+    console.error = (...args) => messages.push(args.join(' '));
+    let desc;
+    try {
+      desc = mod.fetchItemDescription('bad; rm -rf /');
+    } finally {
+      console.error = original;
+    }
+    assert.equal(desc, '');
+    assert.ok(/invalid work item id/i.test(messages.join('\n')), 'invalid id should be rejected and logged');
+  });
+
+  test('enrichWithDescriptions fetches only when a description is missing', async () => {
+    const mod = await import(MODULE_PATH);
+    const tmpDir = mkdtempSync(join(tmpdir(), 'wlargs-'));
+    const argsLogPath = join(tmpDir, 'args.log');
+    const binDir = createWlShowMock({
+      descriptions: { 'SA-NEED': 'Fetched' },
+      argsLogPath,
+    });
+    const items = [
+      { id: 'SA-HAVE', title: 'Has', issueType: 'task', description: 'existing', parentId: null },
+      { id: 'SA-NEED', title: 'Needs', issueType: 'task', parentId: null },
+    ];
+
+    const enriched = withWlMock(binDir, () => mod.enrichWithDescriptions(items));
+
+    assert.equal(enriched[0].description, 'existing', 'pre-enriched items are untouched');
+    assert.equal(enriched[1].description, 'Fetched', 'missing descriptions are fetched');
+    const calls = readFileSync(argsLogPath, 'utf-8').trim().split('\n').filter(Boolean);
+    assert.deepEqual(calls, ['show SA-NEED --json'], 'only the item missing a description should be fetched');
     rmSync(tmpDir, { recursive: true, force: true });
   });
 });

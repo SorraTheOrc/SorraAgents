@@ -18,7 +18,22 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import pytest
 from audit.scripts import audit_runner
+
+# Capture the real ahead/divergent guard before the conftest autouse fixture
+# neutralises it, so the audit-base-freshness tests can exercise the real
+# behaviour against an offline fixture (SA-0MW4ZRLSI005PHL6).
+_REAL_DIVERGENCE = audit_runner._launch_checkout_divergence
+
+
+@pytest.fixture(autouse=True)
+def _use_real_divergence_guard():
+    """Re-enable the real ahead/divergent guard for this module's tests."""
+    with mock.patch.object(
+        audit_runner, "_launch_checkout_divergence", _REAL_DIVERGENCE,
+    ):
+        yield
 
 # An explicit worklog dir short-circuits prefix-to-sibling resolution so the
 # mocked runner is the only thing invoked.
@@ -178,3 +193,71 @@ def test_check_freshness_fails_open_on_lookup_error(capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["fresh"] is False
     assert "freshness check failed" in out["reason"]
+
+
+# ── Audit-base freshness on a contaminated launch checkout (SA-0MW4ZRLSI005PHL6) ──
+#
+# ``_audit_base_freshness`` (SA-0MT9EK1UU000DT1R) historically flagged only the
+# *behind* case (delivered on origin/dev, absent from HEAD). AC2 extends it to
+# also flag an *ahead/divergent* main checkout (un-pushed in-flight work). This
+# is the freshness-layer assertion; the end-to-end F3-isolation and _phase_gate
+# abort coverage lives in ``test_audit_runner_contaminated_launch.py``.
+
+
+def test_audit_base_freshness_clean_checkout_is_fresh(tmp_path):
+    """A checkout at origin/dev contains the delivered commits → fresh."""
+    from audit.tests.fixtures.contaminated_launch import (
+        build_contaminated_launch_scenario,
+    )
+
+    scenario = build_contaminated_launch_scenario(tmp_path / "clean-scenario")
+    ctx = _freshness_ctx(scenario.clean)
+    fresh, _evidence, missing, _head = audit_runner._audit_base_freshness(
+        ctx, scenario.delivered_commits, "",
+    )
+    assert fresh is True
+    assert missing == []
+
+
+def test_audit_base_freshness_dirty_ahead_checkout_is_stale(tmp_path):
+    """An ahead/divergent main checkout is stale even if a caller passes no
+    delivered-commit candidates — the un-pushed commit alone disqualifies it."""
+    from audit.tests.fixtures.contaminated_launch import (
+        build_contaminated_launch_scenario,
+    )
+
+    scenario = build_contaminated_launch_scenario(tmp_path / "dirty-scenario")
+    ctx = _freshness_ctx(scenario.dirty)
+    fresh, evidence, missing, _head = audit_runner._audit_base_freshness(
+        ctx, [], "",
+    )
+    assert fresh is False
+    assert scenario.dirty_head in missing
+    assert "divergence" in evidence.lower()
+
+
+def _freshness_ctx(owning_root):
+    """Minimal context whose real-git runner targets *owning_root*."""
+    import subprocess as _subprocess
+    from types import SimpleNamespace as _NS
+
+    from shared.git_sandbox import fixture_git_env
+
+    def _run(cmd):
+        proc = _subprocess.run(
+            list(cmd), cwd=str(owning_root), check=False, text=True,
+            capture_output=True, env=fixture_git_env(),
+        )
+        return _NS(returncode=proc.returncode, stdout=proc.stdout,
+                   stderr=proc.stderr)
+
+    ctx = audit_runner._AuditContext(
+        issue_id="WL-CONTAM", persist=False, timeout=None, parent_timeout=None,
+        pi_bin="pi", model=None, model_source="local", runner=_run,
+        json_mode=False, debug_log=None, force=True, worklog_dir=None,
+        batch_phase2=False, green_run=None, audit_children=False,
+        max_child_audits=None, run_tests=False, owning_root=str(owning_root),
+        description="", work_item={},
+    )
+    ctx.per_audit_project_root = str(owning_root)
+    return ctx

@@ -451,6 +451,48 @@ def test_vitest_command_does_not_mask_infrastructure_failure(tmp_path) -> None:
     assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
 
 
+#: Runner-level twin of the parser contract pin (SA-0MWDLP4SW0099MZM): a
+#: run whose captured output is only a ``❯ <file>:<line>:<col>`` frame tail
+#: must produce one structured failure and no infrastructure notice. The
+#: strict-xfail marker pinned test-first by SA-0MWDLP4SW0099MZM was removed
+#: here — the parser slice SA-0MWDLPF320060T0H lands the frame tail parsing.
+def test_frame_only_vitest_failure_is_a_code_failure_not_a_notice(tmp_path) -> None:
+    """A 1200-char frame-only vitest tail carries a record and no notice.
+
+    Regression pin (RISE-0MW5JFQCU001YYQK / RISE-0MW4XICXH006AEVS): the gate's
+    tail window trimmed the ``FAIL`` header, ``AssertionError:`` line and
+    ``|project|`` pipes from a genuine docs-assertion failure, so the runner
+    parsed no record and reported ``unparsed_failure`` — the operator was told
+    the command or configuration was wrong when the *code* was at fault.
+    """
+    result = _run_suite_with_fixture(
+        tmp_path, fx.VITEST_FRAME_ONLY_COMMAND, fx.vitest_frame_only_failure()
+    )
+
+    assert len(result["failures"]) == 1, (
+        "the failing file and frame must be named, never 'unparsed'"
+    )
+    assert result["notice_code"] == ""
+    assert "no parsable failures" not in result["notice"]
+    assert result["success"] is False
+
+
+def test_frame_less_vitest_output_stays_unparsed_failure(tmp_path) -> None:
+    """Control: marker-less non-zero vitest output keeps the unparsed notice.
+
+    The frame parser must never turn a genuinely unparsable non-zero run into
+    a ``test_failure`` (AC5, SA-0MWDLP4SW0099MZM): output with an arrow plus
+    prose but no ``❯ <path>:<line>:<col>`` frame stays ``unparsed_failure``.
+    """
+    result = _run_suite_with_fixture(
+        tmp_path, fx.VITEST_FRAME_ONLY_COMMAND, fx.vitest_frame_less_failure()
+    )
+
+    assert result["failures"] == []
+    assert result["notice_code"] == NOTICE_UNPARSED_FAILURE
+    assert result["success"] is False
+
+
 def test_published_notice_codes_match_the_runner_constants() -> None:
     """The fixture vocabulary *is* the runner's contract, not a copy of it."""
     assert fx.NOTICE_SUITE_TIMEOUT == run_tests.NOTICE_SUITE_TIMEOUT
@@ -758,3 +800,119 @@ class TestStateChangedDuringRunNotice:
             == test_cache.STATE_CHANGED_NOTICE_CODE
         )
         assert run_tests.STATE_CHANGED_EXIT_CODE == test_cache.STATE_CHANGED_EXIT_CODE
+
+
+class TestRetryDiscardedDiagnostics:
+    """A retry-accepted stage stays green and its failures surface as diagnostics.
+
+    CG-0MWEHG69O005VM17: failures harvested from a stage the retry runner
+    accepted (``status=0`` + ``retry-clean``/``accepted-transient``) are
+    ADDITIVE diagnostics — a structured ``discarded_failures`` field plus a
+    stable ``notice``/``notice_code`` — never suite failures, so a recovered
+    contention flake cannot turn the release gate red.
+    """
+
+    def test_retry_clean_run_reports_success_with_discarded_field(
+        self, tmp_path
+    ) -> None:
+        """The suite is green and the discarded record is visible, not lost."""
+        proc = SimpleNamespace(
+            stdout=fx.VITEST_RETRY_CLEAN_OUTPUT,
+            stderr="",
+            returncode=0,
+        )
+        with mock.patch.object(run_tests, "_run_cmd", return_value=proc), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite(
+                "all",
+                cwd=_repo(tmp_path, fx.VITEST_RETRY_CLEAN_COMMAND),
+                use_cache=False,
+            )
+
+        assert result["success"] is True
+        assert result["failures"] == []
+        assert result["returncode"] == 0
+        assert len(result["discarded_failures"]) == 1
+        assert (
+            "tf-runtime-integration.browser.test.ts"
+            in result["discarded_failures"][0]["test_name"]
+        )
+        assert result["notice_code"] == run_tests.NOTICE_RETRY_DISCARDED
+        assert (
+            "tf-runtime-integration.browser.test.ts" in result["notice"]
+        ), "the operator must see which file flaked"
+
+    def test_run_all_aggregates_discarded_with_suite_attribution(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The aggregate carries discarded failures alongside the green verdict."""
+        monkeypatch.setenv("TEST_SCOPE_SKIP", "1")
+        proc = SimpleNamespace(
+            stdout=fx.VITEST_RETRY_CLEAN_OUTPUT,
+            stderr="",
+            returncode=0,
+        )
+        with mock.patch.object(run_tests, "_run_cmd", return_value=proc), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            aggregate = run_all(
+                ("all",),
+                cwd=_repo(tmp_path, fx.VITEST_RETRY_CLEAN_COMMAND),
+                use_cache=False,
+            )
+
+        assert aggregate["success"] is True
+        assert aggregate["failures"] == []
+        assert len(aggregate["discarded_failures"]) == 1
+        assert aggregate["discarded_failures"][0]["suite"] == "all"
+        assert run_tests.NOTICE_RETRY_DISCARDED in aggregate["notice_codes"]
+        assert any(
+            run_tests.NOTICE_RETRY_DISCARDED in n for n in aggregate["notices"]
+        )
+
+    def test_mixed_output_is_red_with_only_the_genuine_failure(
+        self, tmp_path
+    ) -> None:
+        """AC2: a green-verdict stage never masks a genuine failure elsewhere."""
+        proc = SimpleNamespace(
+            stdout=fx.VITEST_RETRY_MIXED_OUTPUT,
+            stderr="",
+            returncode=1,
+        )
+        with mock.patch.object(run_tests, "_run_cmd", return_value=proc), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite(
+                "all",
+                cwd=_repo(tmp_path, fx.VITEST_RETRY_CLEAN_COMMAND),
+                use_cache=False,
+            )
+
+        assert result["success"] is False
+        assert [f["test_name"] for f in result["failures"]] == [
+            "tests/e2e/tutorial-1.browser.test.ts > main-street tutorial part 1 "
+            "> step 3"
+        ], "only the tutorial failure is a suite failure"
+        assert len(result["discarded_failures"]) == 1
+        assert (
+            "tf-runtime-integration.browser.test.ts"
+            in result["discarded_failures"][0]["test_name"]
+        )
+
+    def test_retry_failed_is_red_and_never_discards(self, tmp_path) -> None:
+        """A non-green verdict keeps every failure; nothing is discarded."""
+        proc = SimpleNamespace(
+            stdout=fx.VITEST_RETRY_FAILED_OUTPUT,
+            stderr="",
+            returncode=1,
+        )
+        with mock.patch.object(run_tests, "_run_cmd", return_value=proc), \
+             mock.patch.object(run_tests, "_test_concurrency_slot"):
+            result = run_suite(
+                "all",
+                cwd=_repo(tmp_path, fx.VITEST_RETRY_CLEAN_COMMAND),
+                use_cache=False,
+            )
+
+        assert result["success"] is False
+        assert result["failures"], "retry-failed must list the failures"
+        assert result["discarded_failures"] == []
+        assert result["notice_code"] != run_tests.NOTICE_RETRY_DISCARDED
