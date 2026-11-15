@@ -606,3 +606,159 @@ class TestDevPushGateReasonReported:
 
     def test_unknown_reason_still_gets_an_actionable_remediation(self) -> None:
         assert implement._push_gate_remediation(None).strip()
+
+
+# ---------------------------------------------------------------------------
+# Vitest frame fallback at the finish boundary (SA-0MWDLPC3F005S9S2)
+#
+# A non-zero vitest run whose bounded output tail carries a
+# ``❯ <file>:<line>:<col>`` frame is never classified ``unparsed``/
+# infrastructure: the gate reports ``test_failure`` with the frame as the
+# failing location even when the runner built no structured failure record
+# (empty ``failures`` list). The frame fallback replaces ONLY the
+# ``unparsed`` outcome.
+# ---------------------------------------------------------------------------
+
+
+class TestVitestFrameFallbackAtTheFinishBoundary:
+    """``_adapt_guarded_result`` → ``_gate_failure_kind`` → message."""
+
+    _FRAME_LOC = "tests/the-rising/the-rising-docs.test.ts:2129:20"
+
+    def _framed(self, **overrides) -> dict:
+        base = {
+            "success": False,
+            "stdout": fx.VITEST_FRAME_ONLY_TAIL,
+            "suites": {"all": {"returncode": 1, "failures": []}},
+        }
+        base.update(overrides)
+        return _adapt(**base)
+
+    def test_frame_regex_mirrors_the_shared_classifier(self) -> None:
+        from skill.test.scripts import gate_reason
+
+        assert implement._VITEST_FRAME_RE.pattern == (
+            gate_reason._VITEST_FRAME_RE.pattern
+        ), (
+            "implement.py's compatibility fallback and the shared classifier "
+            "must agree on what a vitest frame is"
+        )
+
+    def test_framed_run_without_structured_failures_is_test_failure(self) -> None:
+        adapted = self._framed()
+
+        assert adapted["failures"] == [], (
+            "the fixture deliberately carries no structured record"
+        )
+        assert implement._gate_vitest_frame(adapted) == self._FRAME_LOC
+        assert implement._gate_failure_kind(adapted) == (
+            implement.GATE_FAILURE_TESTS
+        ), (
+            "a framed non-zero run must never be reported unparsed"
+        )
+
+    def test_frame_in_stderr_is_found_too(self) -> None:
+        adapted = self._framed(
+            stderr=fx.VITEST_FRAME_ONLY_TAIL, stdout="",
+        )
+
+        assert implement._gate_failure_kind(adapted) == (
+            implement.GATE_FAILURE_TESTS
+        )
+
+    def test_message_reports_the_frame_as_the_failing_location(self) -> None:
+        message = _message(self._framed())
+
+        assert "Failing location:" in message
+        assert self._FRAME_LOC in message
+        assert "No structured test failures were parsed" not in message, (
+            "a classified test failure must not claim the failures were "
+            "unparsable"
+        )
+
+    def test_detail_reports_the_frame_and_only_the_frame(self) -> None:
+        detail = implement._gate_failure_detail(self._framed())
+
+        assert detail == f"Failing location:\n{self._FRAME_LOC}"
+        assert "Command output (tail)" not in detail, (
+            "the frame is the deciding signal; the generic tail must not "
+            "bury it"
+        )
+
+    def test_killed_run_with_a_frame_stays_killed(self) -> None:
+        adapted = _adapt(
+            success=False,
+            suites={"node": {"returncode": -9, "failures": []}},
+            notice_codes=[implement._NOTICE_KILLED],
+            notices=["suite killed by signal 9: npm test"],
+            stderr=fx.VITEST_FRAME_ONLY_TAIL,
+        )
+
+        assert implement._gate_failure_kind(adapted) == (
+            implement.GATE_FAILURE_KILLED
+        ), (
+            "the frame fallback replaces only the unparsed outcome"
+        )
+
+    def test_negative_exit_code_with_a_frame_stays_killed(self) -> None:
+        adapted = _adapt(
+            success=False,
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"node": {"returncode": -9, "failures": []}},
+        )
+
+        assert implement._gate_failure_kind(adapted) == (
+            implement.GATE_FAILURE_KILLED
+        )
+
+    def test_timeout_with_a_frame_stays_timeout(self) -> None:
+        adapted = _adapt(
+            success=False,
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"all": {"returncode": 124, "failures": []}},
+            notice_codes=[implement._NOTICE_SUITE_TIMEOUT],
+            notices=["suite timed out after 600s: all"],
+        )
+
+        assert implement._gate_failure_kind(adapted) == (
+            implement.GATE_FAILURE_TIMEOUT
+        )
+
+    def test_frame_less_run_stays_unparsed(self) -> None:
+        """The frame-less control (arrow + prose) keeps its unparsed verdict."""
+        adapted = _adapt(
+            success=False,
+            stdout=fx.VITEST_FRAME_LESS_OUTPUT,
+            suites={"all": {"returncode": 3, "failures": []}},
+        )
+
+        assert implement._gate_failure_kind(adapted) == (
+            implement.GATE_FAILURE_UNPARSED
+        )
+
+    def test_enospc_control_stays_unparsed(self) -> None:
+        adapted = _adapt(
+            success=False,
+            stderr=fx.ENOSPC_IN_PLAYWRIGHT_STDERR,
+            suites={"all": {"returncode": 1, "failures": []}},
+        )
+
+        assert implement._gate_failure_kind(adapted) == (
+            implement.GATE_FAILURE_UNPARSED
+        )
+
+    def test_killed_message_never_reports_a_frame_location(self) -> None:
+        """The frame is a failing location only for a genuine code failure —
+        a killed run's detail keeps the killed narrative (AC4)."""
+        adapted = _adapt(
+            success=False,
+            suites={"node": {"returncode": -9, "failures": []}},
+            notice_codes=[implement._NOTICE_KILLED],
+            notices=["suite killed by signal 9: npm test"],
+            stderr=fx.VITEST_FRAME_ONLY_TAIL,
+        )
+
+        detail = implement._gate_failure_detail(adapted)
+        assert "Failing location" not in detail
+        assert "was killed" in _message(adapted).lower()
+

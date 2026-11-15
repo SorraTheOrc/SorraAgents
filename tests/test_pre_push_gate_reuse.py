@@ -305,3 +305,121 @@ def test_different_tree_verdict_is_never_served_to_the_gate(
         cwd=str(gate_repo),
         fingerprint_kind=tc.FINGERPRINT_KIND_TREE,
     ) is not None
+
+
+# ── SA-0MWFJS3820032YB4: the finish lock window excludes the suite ───────────
+#
+# ``implement.py finish`` used to reach this gate only through the push — while
+# holding the exclusive main-checkout lock — so concurrent finishes serialised
+# their suite runs. It now resolves the gate's verdict for the would-be-commit
+# tree *before* taking the lock (``resolve_prelock_full_suite_verdict`` →
+# ``run_tests(worktree, scope="full", fingerprint=<tree>)``). These tests prove
+# the two halves that make that a speed-up rather than a second suite run: the
+# verdict the *finish* entry point records is the tree-keyed entry this gate
+# serves, and a push with no pre-lock verdict still executes the suite.
+
+
+def _declare_pytest_suite(repo: Path) -> str:
+    """Give *repo* a declared pytest suite and return the new HEAD (clean).
+
+    ``implement.run_tests`` resolves the full suite through the test skill (a
+    declared ``pytest.ini`` or pytest-style ``tests/test_*.py``); without one
+    there is no suite to run and no cache entry to serve. The commit keeps the
+    working tree clean so the gate can still bind the pushed commit in place.
+    """
+    (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (repo / "tests").mkdir(exist_ok=True)
+    (repo / "tests" / "test_sample.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8"
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "declare a pytest suite")
+    return gs.run_git(repo, ["rev-parse", "HEAD"], check=True).stdout.strip()
+
+
+def test_finish_entry_point_verdict_is_served_to_the_gate(
+    gate_repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A verdict recorded by ``implement.run_tests`` IS served to the gate.
+
+    This goes through the real finish-side entry point (suite resolution, guard
+    delegation, cache write) rather than the cache layer directly, so it pins
+    what the lock-window change actually relies on: the pre-lock run and the
+    push's ``--gate-commit`` run agree on the cache key for the same tree. If
+    they diverged, a finish push would re-execute the full suite inside the
+    lock — the serialisation this item removes.
+    """
+    from skill.implement.scripts import implement
+
+    repo = gate_repo
+    pushed_sha = _declare_pytest_suite(repo)
+    pushed_tree = tree_of(repo, pushed_sha)
+    monkeypatch.delenv("IMPLEMENT_TEST_COMMAND", raising=False)
+
+    executions: list[dict[str, str]] = []
+
+    def fake_run_cmd(cmd, **kwargs):
+        executions.append({"cmd": " ".join(cmd), "cwd": str(kwargs.get("cwd"))})
+        return SimpleNamespace(returncode=0, stdout=SUMMARY_OUTPUT, stderr="")
+
+    monkeypatch.setattr(rt, "_run_cmd", fake_run_cmd)
+
+    # Exactly what ``phase_finish`` does before it takes the lock.
+    verdict = implement.run_tests(str(repo), scope="full", fingerprint=pushed_tree)
+
+    assert verdict["success"] is True, verdict
+    assert verdict["skipped"] is False, verdict
+    assert verdict["cached"] is False
+    assert tc.lookup(
+        rt.pytest_command(),
+        pushed_tree,
+        cwd=str(repo),
+        fingerprint_kind=tc.FINGERPRINT_KIND_TREE,
+    ) is not None, "the pre-lock run must record a tree-keyed verdict"
+    assert len(executions) == 1, executions
+
+    # The push that follows serves it: no second execution, and the runner's
+    # own provenance line says so.
+    code, payload, stderr = run_gate(capsys, repo, pushed_sha)
+
+    assert code == 0, stderr
+    assert len(executions) == 1, (
+        "the gate must serve the pre-lock verdict for the same tree instead of "
+        f"executing the suite again (executions: {executions})"
+    )
+    assert payload.get("cached") is True, payload
+    assert payload["gate"]["cache_hit"] is True
+    assert payload["gate"]["tree"] == pushed_tree
+    assert "verdict=cached" in stderr
+    assert "cache_hit=true" in stderr
+
+
+def test_gate_executes_when_no_prelock_verdict_exists(
+    gate_repo: Path,
+    pushed_sha: str,
+    executed: list[dict[str, str]],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Without the pre-lock verdict the gate still executes (fail closed).
+
+    The speed-up is an optimisation, never a bypass: a push whose tree has no
+    recorded verdict pays for the suite at the gate, exactly as before. This is
+    also the degraded path when no would-be-commit tree exists to bind the
+    pre-lock verdict to.
+    """
+    pushed_tree = tree_of(gate_repo, pushed_sha)
+    assert tc.lookup(
+        rt.pytest_command(),
+        pushed_tree,
+        cwd=str(gate_repo),
+        fingerprint_kind=tc.FINGERPRINT_KIND_TREE,
+    ) is None
+
+    code, payload, stderr = run_gate(capsys, gate_repo, pushed_sha)
+
+    assert code == 0, stderr
+    assert executed, "the gate must execute the suite when no verdict exists"
+    assert payload.get("cached") is False
+    assert payload["gate"]["cache_hit"] is False

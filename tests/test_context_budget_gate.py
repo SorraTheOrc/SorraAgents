@@ -71,9 +71,12 @@ def test_context_budget_thresholds_file_is_valid() -> None:
 #: Committed cap for the implement SKILL.md body. Originally 20,000 B
 #: (SA-0MVYDCUWA001Z8K0 AC1, the >=80% cut from 99,749 B); raised to 22,000 B
 #: by SA-0MW74IL6B001AMQN so the mandatory no-op finish / --verification-only
-#: contract can live in the brief the agent reads. The cap still ratchets:
-#: a further increase is a conscious budget revision, not a silent regrowth.
-SKILL_IMPLEMENT_MD_CAP = 22000
+#: contract can live in the brief the agent reads; raised to 22,500 B by
+#: SA-0MUUI6ZCX001RO8V to carry the mandatory skill-session vs work-item AC
+#: semantics note required on every report-rendering skill. The cap still
+#: ratchets: a further increase is a conscious budget revision, not a silent
+#: regrowth.
+SKILL_IMPLEMENT_MD_CAP = 22500
 
 
 def test_skill_implement_md_is_gated_at_or_below_cap() -> None:

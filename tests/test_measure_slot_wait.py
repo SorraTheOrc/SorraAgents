@@ -85,8 +85,7 @@ def _tool_result(call_id: str, text: str, timestamp: str) -> dict:
 def _write_session(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record) + "\n")
+        handle.writelines(json.dumps(record) + "\n" for record in records)
 
 
 def _bare_run_tests_block(

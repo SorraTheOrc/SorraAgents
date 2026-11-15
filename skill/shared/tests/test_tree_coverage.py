@@ -714,6 +714,50 @@ wl next --json
         assert "unrelated prose" not in " ".join(acs)
         assert [len(ac.split()) for ac in acs] == [26, 21, 15, 14, 18]
 
+    def test_wrapped_ac_bullet_reported_shape_extracted_whole(self):
+        """Regression SA-0MUG36DQ2008DH3L: the reported bullet shape (bold
+        label, inline code, wrapped continuation) yields the whole criterion,
+        not its first physical line."""
+        desc = """## Acceptance Criteria
+- **AC1 — Hermetic git usage:** every test helper that runs real `git` commands
+  uses a temporary repository, not the project checkout.
+- **AC2 — Deterministic:** the helper returns the same result on every run.
+"""
+        acs = extract_acceptance_criteria(desc)
+        assert acs == [
+            (
+                "**AC1 — Hermetic git usage:** every test helper that runs "
+                "real `git` commands uses a temporary repository, not the "
+                "project checkout."
+            ),
+            "**AC2 — Deterministic:** the helper returns the same result on every run.",
+        ]
+        # The criterion is strictly longer than its first physical line: a
+        # first-line-only extractor would have dropped the continuation.
+        first_line = (
+            "**AC1 — Hermetic git usage:** every test helper that runs real "
+            "`git` commands"
+        )
+        assert len(acs[0].split()) > len(first_line.split())
+
+    def test_wrapped_and_single_line_ac_text_extract_equivalently(self):
+        """AC3: hard-wrapping an AC does not change its extracted text, so
+        single-line descriptions keep their pre-existing results."""
+        single_line = """## Acceptance Criteria
+- The helper uses a temporary repository, not the project checkout.
+- The helper returns the same result on every run.
+"""
+        wrapped = """## Acceptance Criteria
+- The helper uses a temporary
+  repository, not the project
+  checkout.
+- The helper returns the same
+  result on every run.
+"""
+        assert extract_acceptance_criteria(wrapped) == extract_acceptance_criteria(
+            single_line
+        )
+
 
 # =========================================================================
 # 4. Coverage computation
@@ -1225,6 +1269,116 @@ class TestRunCoverageReview:
         result = run_coverage_review("SA-01", runner=_custom_runner)
         assert result["recommendation"] == "proceed"
         assert result["warnings"] == []
+
+
+class TestWrappedAcCoverageRegression:
+    """Regression for SA-0MUG36DQ2008DH3L: wrapped AC bullets are compared
+    whole, so a child that maps to the full criterion covers it.
+
+    Under the pre-fix first-line-only extraction both sides were truncated to
+    fragments, the Jaccard scores fell below the 0.4 coverage threshold, and
+    the review reported a false ``stop``. These tests assert the fix: the
+    whole criteria are extracted and compared, so coverage is ``proceed``.
+    """
+
+    _PARENT_DESCRIPTION = (
+        "## Acceptance Criteria\n"
+        "- **AC1 — Hermetic git usage:** every test helper that runs real "
+        "`git` commands\n"
+        "  uses a temporary repository, not the project checkout.\n"
+        "- **AC2 — Clean tree:** the helper leaves the working tree untouched\n"
+        "  after every run.\n"
+    )
+
+    _CHILD_DESCRIPTION = (
+        "## Acceptance Criteria\n"
+        "- Covers parent criterion AC1: every test helper that\n"
+        "  runs real `git` commands uses a temporary repository, not the "
+        "project checkout;\n"
+        "  hermetic git usage.\n"
+        "- Covers parent criterion AC2: the helper\n"
+        "  leaves the working tree untouched after every run; clean tree.\n"
+    )
+
+    @staticmethod
+    def _make_runner(parent_description: str, child_description: str):
+        """Serve one parent and one child description to the review."""
+
+        def runner(cmd):
+            if "--parent" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItems": [{"id": "SA-02", "title": "Child"}],
+                        }
+                    )
+                )
+            if "dep" in cmd and "list" in cmd:
+                return _FakeResult(
+                    json.dumps(
+                        {"success": True, "inbound": [], "outbound": []}
+                    )
+                )
+            target = next((c for c in cmd if c.startswith("SA-")), None)
+            if target == "SA-01":
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {"description": parent_description},
+                        }
+                    )
+                )
+            if target == "SA-02":
+                return _FakeResult(
+                    json.dumps(
+                        {
+                            "success": True,
+                            "workItem": {"description": child_description},
+                        }
+                    )
+                )
+            return _FakeResult("{}", returncode=1)
+
+        return runner
+
+    def test_wrapped_parent_acs_covered_by_full_child_mapping(self):
+        """A wrapped parent AC and a child bullet restating the full criterion
+        yield ``fully_covered: True`` and ``proceed`` (AC2)."""
+        result = run_coverage_review(
+            "SA-01",
+            runner=self._make_runner(
+                self._PARENT_DESCRIPTION, self._CHILD_DESCRIPTION
+            ),
+        )
+        assert result["coverage"]["fully_covered"] is True
+        assert result["coverage"]["uncovered"] == []
+        assert result["coverage"]["coverage_pct"] == 100.0
+        assert result["recommendation"] == "proceed"
+
+    def test_first_line_fragments_fall_below_threshold_but_whole_acs_cover(self):
+        """AC2: assert the fix, not the bug — the first-line fragments would
+        score below the 0.4 coverage threshold, while the whole criteria
+        (which the extractor now returns) comfortably clear it."""
+        parent_first_line = (
+            "**AC1 — Hermetic git usage:** every test helper that runs real "
+            "`git` commands"
+        )
+        child_first_line = "Covers parent criterion AC1: every test helper that"
+        assert jaccard_similarity(parent_first_line, child_first_line) < 0.4
+
+        parent_full = (
+            "**AC1 — Hermetic git usage:** every test helper that runs real "
+            "`git` commands uses a temporary repository, not the project "
+            "checkout."
+        )
+        child_full = (
+            "Covers parent criterion AC1: every test helper that runs real "
+            "`git` commands uses a temporary repository, not the project "
+            "checkout; hermetic git usage."
+        )
+        assert jaccard_similarity(parent_full, child_full) >= 0.4
 
 
 class TestTriageGeneratedChildExemption:

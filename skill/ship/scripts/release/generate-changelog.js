@@ -41,6 +41,37 @@ const CHANGELOG_PATH = resolve(REPO_ROOT, 'CHANGELOG.md');
 // ── Worklog helpers ────────────────────────────────────────────────────────
 
 /**
+ * Explicit `maxBuffer` for the bulk `wl list` projection (64 MB).
+ *
+ * The projection is skinny (see `getCompletedOrInReviewItems`), but the
+ * buffer must still comfortably hold the projected JSON for a very large
+ * in_review backlog. Left at Node's default (1 MB) an oversized projection
+ * trips `ENOBUFS`; the historical bug then swallowed the error and emitted an
+ * empty changelog section (SA-0MWE4BT63005N8OE AC1).
+ */
+export const WL_QUERY_MAX_BUFFER = 64 * 1024 * 1024;
+
+/**
+ * Explicit `maxBuffer` for a single-item `wl show` description fetch (1 MB).
+ * A single work item description is never legitimately larger than this, and
+ * keeping it small bounds the lazy-fetch path independently of the bulk query
+ * (SA-0MWE4BT63005N8OE AC2 constraint).
+ */
+export const DESCRIPTION_FETCH_MAX_BUFFER = 1024 * 1024;
+
+/**
+ * Render an execSync error as `CODE: message` for an actionable warning.
+ *
+ * @param {unknown} err
+ * @returns {string}
+ */
+function describeExecError(err) {
+  if (!err) return String(err);
+  const code = err.code ? `${err.code}: ` : '';
+  return `${code}${err.message || String(err)}`;
+}
+
+/**
  * Fetch all work items that should appear in the changelog:
  * those with stage=in_review (status=completed — the release candidate
  * set per the stage/status model).
@@ -58,22 +89,32 @@ const CHANGELOG_PATH = resolve(REPO_ROOT, 'CHANGELOG.md');
  * `set -o pipefail` ensures a `wl` failure still surfaces as an execSync
  * error so the warning path below fires.
  *
- * @returns {Array<{id:string, title:string, issueType:string, description:string, parentId?:string|null}>}
+ * The projection is deliberately **skinny**: `description` is omitted and
+ * fetched lazily (via `enrichWithDescriptions`) for the small subset of
+ * parent items that survive `getParentsOnly`. This bounds the projected
+ * output regardless of backlog size, so a huge in_review set can never
+ * overflow the buffer (SA-0MWE4BT63005N8OE AC2). `maxBuffer` is still set
+ * explicitly as a safety net (AC1).
+ *
+ * @returns {Array<{id:string, title:string, issueType:string, parentId?:string|null}>}
  */
 export function getCompletedOrInReviewItems() {
   try {
     // Single query (stage=in_review implies status=completed), piped through
-    // jq so only {id, title, issueType, description, parentId} enters the buffer.
-    // parentId is needed to filter parent-only work items for the changelog.
+    // jq so only {id, title, issueType, parentId} enters the buffer. parentId
+    // is needed to filter parent-only work items for the changelog.
     const output = execSync(
       `bash -c 'set -o pipefail; wl list --stage in_review --json ` +
-      `| jq -c \"[.workItems[] | {id, title, issueType, description, parentId}]\"'`,
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      `| jq -c \"[.workItems[] | {id, title, issueType, parentId}]\"'`,
+      { encoding: 'utf-8', maxBuffer: WL_QUERY_MAX_BUFFER, stdio: ['pipe', 'pipe', 'pipe'] },
     );
     return JSON.parse(output) || [];
-  } catch {
-    // wl may not be available; caller handles this gracefully
-    console.error('Warning: could not query completed/in_review work items (wl not available?)');
+  } catch (err) {
+    // Surface the real failure (e.g. ENOBUFS, wl missing, jq error) instead
+    // of a misleading "wl not available?" warning (SA-0MWE4BT63005N8OE AC3).
+    console.error(
+      `Warning: could not query in_review work items: ${describeExecError(err)}`,
+    );
     return [];
   }
 }
@@ -84,13 +125,72 @@ export function getCompletedOrInReviewItems() {
  * Filter work items to only parent items (those with no parentId).
  * This excludes child/subtask items that would create redundant changelog entries.
  *
- * @param {Array<{id:string, title:string, issueType:string, description:string, parentId?:string|null}>} items
- * @returns {Array<{id:string, title:string, issueType:string, description:string}>}
+ * @param {Array<{id:string, title:string, issueType:string, parentId?:string|null}>} items
+ * @returns {Array<{id:string, title:string, issueType:string, parentId?:string|null}>}
  */
 export function getParentsOnly(items) {
   return items.filter(
     (item) => item.parentId === null || item.parentId === undefined,
   );
+}
+
+/**
+ * Fetch a single work item's full description by id.
+ *
+ * Uses a single-item `wl show <id> --json` wrapped in `bash -c` (dash-safe
+ * `set -o pipefail`) with its own explicit `maxBuffer`. Returns '' and logs a
+ * warning when the id is invalid or the fetch fails, so a bad lookup degrades
+ * to a title-only changelog entry instead of aborting the release
+ * (SA-0MWE4BT63005N8OE AC2 constraint).
+ *
+ * @param {string} id
+ * @returns {string}
+ */
+export function fetchItemDescription(id) {
+  // Defence in depth: ids are shell-substituted, so reject anything that is
+  // not a work-item-shaped token before it reaches the command string.
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(String(id))) {
+    console.error(`Warning: could not fetch description for invalid work item id: ${String(id)}`);
+    return '';
+  }
+  try {
+    const output = execSync(
+      `bash -c 'set -o pipefail; wl show ${id} --json'`,
+      { encoding: 'utf-8', maxBuffer: DESCRIPTION_FETCH_MAX_BUFFER, stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    const data = JSON.parse(output);
+    return (data && data.workItem && data.workItem.description) || '';
+  } catch (err) {
+    console.error(
+      `Warning: could not fetch description for ${id}: ${describeExecError(err)}`,
+    );
+    return '';
+  }
+}
+
+/**
+ * Fill in missing `description` fields by fetching each item's description
+ * lazily with a single bounded `wl show <id> --json` call.
+ *
+ * Defence in depth (SA-0MWE4BT63005N8OE AC2): the bulk query projects skinny
+ * fields only, so descriptions are fetched here for just the (small) set of
+ * parent items that reach the changelog. Each fetch has its own explicit
+ * `maxBuffer`, so a huge description can never re-introduce `ENOBUFS` on the
+ * bulk query; a single failed fetch degrades to a title-only entry.
+ *
+ * Items that already carry a non-empty description are returned unchanged, so
+ * callers with pre-enriched items trigger no subprocesses.
+ *
+ * @param {Array<{id:string, title:string, issueType:string, description?:string, parentId?:string|null}>} items
+ * @returns {Array<{id:string, title:string, issueType:string, description:string, parentId?:string|null}>}
+ */
+export function enrichWithDescriptions(items) {
+  return items.map((item) => {
+    if (typeof item.description === 'string' && item.description.length > 0) {
+      return item;
+    }
+    return { ...item, description: fetchItemDescription(item.id) };
+  });
 }
 
 // ── LLM-based player description generation ─────────────────────────────────
@@ -341,7 +441,7 @@ export async function categorizeItems(items) {
   const bugFixes = [];
   const other = [];
 
-  const parents = getParentsOnly(items);
+  const parents = enrichWithDescriptions(getParentsOnly(items));
   const processed = await mapWithConcurrency(parents, 4, async (item) => {
     const description = await generatePlayerDescription(item);
     const review = await reviewClassification(item);
@@ -570,6 +670,14 @@ async function main() {
   console.error(`Generating CHANGELOG.md for v${version} (${date}) ...`);
 
   const allItems = getCompletedOrInReviewItems();
+  if (allItems.length === 0) {
+    // Loud, actionable warning: an empty set silently produced a header-only
+    // changelog section in v1.0.29 (SA-0MWE4BT63005N8OE AC5).
+    console.error(
+      'WARNING: no work items in stage=in_review — the generated changelog ' +
+      'section will be EMPTY. Check that the release candidate set is staged.',
+    );
+  }
   console.error(`Found ${allItems.length} work item(s) (completed + in_review)`);
 
   const parentItems = getParentsOnly(allItems);

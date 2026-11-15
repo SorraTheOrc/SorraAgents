@@ -38,7 +38,8 @@ passes and the test gate is green. `implement.py finish` validates with
 **changed scope only**; the **full suite first runs at the dev-push
 integration gate** (`run_tests.py --scope full` in the pre-push hook), and the
 ship release gate re-runs it on the merged dev→main tree
-(SA-0MVECQUGF0064U81, SA-0MT6BYQHB008DOGC).
+(SA-0MVECQUGF0064U81, SA-0MT6BYQHB008DOGC). `finish` resolves that verdict
+before taking the main-checkout lock (SA-0MWFJS3820032YB4).
 
 Privacy note: avoid secrets/tokens/PII in comments or PR bodies; mask/redact
 sensitive values.
@@ -66,11 +67,16 @@ Deep detail:
 
 ## No-op finish: refusal by default, `--verification-only` opt-in
 
-`finish` refuses a worktree that produced no commit: no push, no terminal
-write, no completion comment, `success: false` with
-`steps.commit.reason = "no_commit_no_signal"`, item released to `open`. It
-never attributes the ambient `dev` HEAD as this item's commit.
+`finish` refuses a worktree with no commit **attributable to the item**: no
+push, no terminal write, no completion comment, `success: false` with
+`steps.commit.reason = "no_commit_no_signal"`, item released to `open`; the
+ambient `dev` HEAD is never named as this item's commit.
 
+- **Interrupted-push re-run.** A finish interrupted during its push leaves a
+  clean worktree whose commit already exists; re-running `finish` attributes
+  that **prior-run commit** (ahead of `origin/<parent_branch>`, message
+  references the item) and finalises normally. A genuinely work-less worktree
+  is still refused.
 - **Produce work (default).** A clean, commit-less worktree is unfinished work:
   re-enter it, produce what the acceptance criteria require, re-run `finish`.
 - **Verification-only (opt-in).** `start <id> --verification-only` records the
@@ -112,19 +118,14 @@ See [docs/dev/skill-extensions.md](../../docs/dev/skill-extensions.md).
 
 ## Background Job Etiquette
 
-Long-running jobs follow the shared
-[background-job etiquette](../shared/background-job-etiquette.md) pattern:
-**launch → prepare other work → one completion-driven wait → collect**. Launch
-with a tailable log, then wait **once** with `../shared/wait_for_job.py --pid
-$PID --log /tmp/job.log --pattern "<done>" --timeout 3600`. Fixed `sleep N`
-polling is deprecated:
-[reference — background job etiquette](../../docs/dev/implement-skill-reference.md#relocated-background-job-etiquette).
+Follow the shared
+[background-job etiquette](../shared/background-job-etiquette.md): launch with
+a tailable log, then **one** completion-driven wait
+(`../shared/wait_for_job.py`); never poll with `sleep N`.
 
 ## Gate failure diagnosis
 
-A red finish gate reports a machine-readable `reason` and its deciding fact
-fields on `test_phase` in the `--json` report; read `reason` first. Full
-reason table and fact-field meanings:
+A red finish gate reports a machine-readable `reason`; read it first:
 [reference — reading a gate failure](../../docs/dev/implement-skill-reference.md#relocated-reading-a-gate-failure--reason-and-its-facts-sa-0mvtet8kq0031r6z).
 
 ## Status Safety & Abort Handling
@@ -169,8 +170,6 @@ abort); act only after the operator explicitly chooses.
   asks the operator. Project-declared expected-dirty paths (`ignoreDirtyPaths`)
   do not stop the gate. The gate protects the **main checkout** only; inside a
   linked worktree it is skipped (those dirty files are the agent's own work).
-
-On abort: `StatusLifecycle.update_status(<work-item-id>, "open", assignee="")`.
 
 3. Stash hygiene gate (warn on orphaned stashes)
 
@@ -218,9 +217,16 @@ linked PRDs/plans/docs.
 > ```
 >
 > Never edit through an absolute path under the main checkout — `phase_parent`/
-> `drive` detect a driven child whose work landed there and fail closed. Run
-> `wl` worktree-safely with `wl --worklog-dir <main-checkout>/.worklog …`. See
+> `drive` fail closed on a driven child whose work landed there, and a
+> **sibling worktree** (another item's linked worktree) is equally forbidden —
+> refuse any write whose path resolves into one. Run `wl` worktree-safely with
+> `wl --worklog-dir <main-checkout>/.worklog …`. See
 > [docs/dev/worktree-isolation.md](../../docs/dev/worktree-isolation.md).
+>
+> **Driven red-gate rule:** a driven session (`IMPLEMENT_DRIVE_ACTIVE=1`)
+> whose first `finish` gate is red for a failure it did not introduce triages
+> (creates the work item, records the block) and **stops** — never
+> `implement.py start` that item, never edit its (or any) worktree.
 
 ```bash
 git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-id>-<short-slug> dev
@@ -228,11 +234,10 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 ```
 
 > **`node_modules` is a worktree-local link farm:** `implement.py start`
-> materialises it as per-package symlinks (nested `node_modules` symlinked
-> too; workspace packages resolve to the worktree's own `packages/*`;
-> supersedes the whole-directory symlink, SA-0MSGS763C006SM1B).
-> **Do NOT run `npm install` inside a worktree** — writes corrupt the shared
-> install. Deep detail:
+> materialises it as per-package symlinks (nested and workspace packages
+> resolve to the worktree itself; supersedes the whole-directory symlink,
+> SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** —
+> writes corrupt the shared install. Deep detail:
 > [reference — worktree creation](../../docs/dev/implement-skill-reference.md#relocated-step-5--create-a-worktree-from-dev-and-branch-inside-it).
 
 > **Git submodules are auto-initialised:** `implement.py start` runs
@@ -257,7 +262,7 @@ and the stale-shared-resolution fail-closed gate.
   `wl create "<title>" --deps discovered-from:<work-item-id> --json`.
 - Once all ACs are met: **build** (no errors), then validate via `/skill:test`
   ([test skill](../test/SKILL.md)). `implement.py finish` runs a **changed-scope**
-  validation; the **full suite** is deferred to the dev-push gate.
+  validation; the **full suite** is the dev-push gate's, resolved pre-lock.
   `run_tests.py` must go through the test-skill runner — only it records the
   per-repo cache the audit reads. Update docs (except `CHANGELOG.md`).
 
@@ -335,6 +340,8 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   `--keep-worktree` (or
   `IMPLEMENT_KEEP_WORKTREE=1`) defers worktree removal; driven children never
   pass it (`IMPLEMENT_DRIVE_ACTIVE=1` defers).
+
+  **Retry taxonomy (SA-0MW22SEMV00230O5):** § Bounded push loop.
 - Follow the mandatory **build → test → commit** order.
 - **Add the `## Impact` sentence before finishing.** A newly completed item's
   description must carry an `## Impact` section: one sentence describing the user-experience impact — not a technical summary.
@@ -360,11 +367,10 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   [reference — worktree removal ownership](../../docs/dev/implement-skill-reference.md#worktree-removal-ownership-sa-0mvte8xaj002iudr).
 
   **Why rebuild?** `dist/` is gitignored; `git pull` does not update it.
-- **Close your response with:**
-  `<work-item-id>: <concise-summary>\n\nWork committed to dev`. **Manual
-  (only when `finish` was not used):** mark `in_review` via
+- **Close your response with:** `<work-item-id>: <concise-summary>` then
+  `Work committed to dev`. Without `finish`, mark `in_review` via
   `StatusLifecycle.update_status(<work-item-id>, "completed", stage="in_review")`
-  — never after `finish` returns; the item stays `in_review` until release.
+  — never after `finish` returns.
 
 Full finish contract (finish lock, verified sync, refusal recovery, push
 timeout, gate reasons, terminal read-back):
@@ -372,10 +378,9 @@ timeout, gate reasons, terminal read-back):
 
 ## Status Transition Matrix
 
-Claim → `in_progress`; epic/parent done and Step 9 → `completed` + stage
-`in_review` (assignee released); every abort/failure → `open` with
-`assignee=""`. Full matrix:
-[reference — status transition matrix](../../docs/dev/implement-skill-reference.md#relocated-status-transition-matrix).
+Claim → `in_progress`; Step 9 → `completed`/`in_review` (assignee released);
+every abort/failure → `open` with `assignee=""`.
+[Full matrix → reference](../../docs/dev/implement-skill-reference.md#relocated-status-transition-matrix).
 
 ## Scripts (canonical runner & modules)
 
@@ -385,10 +390,7 @@ build/test and linters
 
 ## Final cleanup (belt-and-suspenders)
 
-Before exiting, `wl show <work-item-id> --json`; if still `in_progress` and
-the work is incomplete, reset to `open` with `assignee=""` so the item never
-blocks another agent
-([reference](../../docs/dev/implement-skill-reference.md)).
+See [relocated detail](../../docs/dev/implement-skill-reference.md#relocated-final-cleanup-belt-and-suspenders).
 
 ## Final step: standardized end-of-session report
 
@@ -397,10 +399,16 @@ Render the canonical report ([../report/SKILL.md](../report/SKILL.md)) as the
 
 ```bash
 python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
-  --skill-name <skill_name> --headline "<1-3 sentence summary>" \
-  --ac "<AC# description>|<verification metric>|met" \
+  --skill-name implement \
+  --headline "<1-3 sentence summary>" \
+  --ac "Worktree created | implement.py start | met" \
+  --ac "Build and tests green | build/test output | met" \
+  --ac "Commit pushed to dev | git log | met" \
   [--producer-actions "<...>"] [--notes "<...>"] [--next-action <review|plan|implement|...>]
 ```
+
+> **Note:** `--ac` records this skill session's own success criteria, not the
+> work item's feature ACs (shown in Use Cases; SA-0MTQY7YM5009J6QR).
 
 Then paste it verbatim into your final response and close with
 `<work-item-id>: <one-line summary>`. End with `</end_session>` on its own line

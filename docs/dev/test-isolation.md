@@ -851,6 +851,14 @@ The repo-root `conftest.py` arms `skill/shared/inherited_index_guard.py`
 - the stat signature is only a *trigger*: a rewrite that stages the same
   entries (a git stat-cache refresh) is not a violation, so there are no false
   positives;
+- **an index that can no longer be read is a violation, never silent.** The
+  stat-churn short-circuit applies only when **both** digests are readable —
+  `None == None` would otherwise treat an unreadable-at-session-start index
+  (captured `digest=None`) that a test then deletes or tampers with as benign
+  stat churn, leaving the offender anonymous and reproducing the unattributed
+  `gate evidence invalid` failure (SA-0MW0V9PEP004EJYV AC2). A deleted index
+  is caught by the empty-tree-vs-captured-tree comparison, an unreadable one
+  by the `git write-tree` failure fallback; both fall through to the report;
 - after reporting, the watch re-baselines on the current state, so only the
   first offending test is named instead of every later test in the session;
 - it is bound to the index inherited at **session start**, so a test that
@@ -884,12 +892,13 @@ layer, not a substitute for the rule above:
 - `skill/shared/tests/test_inherited_index_guard.py` — `IndexWatch` unit
   behaviour (no inherited index → inert; hermetic fixture stays silent; raw
   fixture staging into the inherited index is reported once and re-baselined;
-  a same-tree rewrite is not a violation) plus an end-to-end **simulated gate
-  run**: the real `conftest.py` and guard modules are copied, unchanged, into a
-  throwaway project whose suite contains one hermetic and one poisoning test.
-  The hermetic run stays green and leaves the index byte-identical; the
-  poisoning run fails and the output names the offending test and the
-  remediation.
+  a same-tree rewrite is not a violation; a corrupt, deleted, or
+  unreadable-at-capture-and-deleted index is still reported — never silent)
+  plus an end-to-end **simulated gate run**: the real `conftest.py` and guard
+  modules are copied, unchanged, into a throwaway project whose suite contains
+  one hermetic and one poisoning test. The hermetic run stays green and leaves
+  the index byte-identical; the poisoning run fails and the output names the
+  offending test and the remediation.
 - `tests/test_finish_gate_temp_index.py` — the gate's own post-suite integrity
   check (the last line of defence when a nested suite has no conftest).
 - The fixture sweep itself — `tests/` and `skill/*/tests/` helpers now route

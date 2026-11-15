@@ -241,14 +241,19 @@ Render the canonical end-of-session report (helper: [`../report/SKILL.md`](../re
 
 ```bash
 python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
-  --skill-name <skill_name> \
+  --skill-name machine-hygiene \
   --headline "<1-3 sentence headline summary>" \
-  --ac "<AC# description>|<verification metric>|met" \
-  --ac "<...>|<...>|unmet" \
+  --ac "Machine pressure assessed (CPU/memory/disk) | hygiene report | met" \
+  --ac "Safe remediations proposed | remediation list | met" \
+  --ac "Actions logged and approval requested where needed | wl comment | met" \
   [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>]
 ```
+
+> **Note:** ACs record the *skill session's* own deliverables — not the work item's feature
+> acceptance criteria (surfaced in the Use Cases section). Passing feature ACs would render
+> the session as "Not ready to ship" even though it completed successfully.
 
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, so the operator sees the report itself (not just the

@@ -262,6 +262,15 @@ NOTICE_KILLED = "killed"
 #: is empty (SA-0MVU8XRBQ000DG9D).
 NOTICE_UNPARSED_FAILURE = "unparsed_failure"
 
+#: Stable code for the **non-fatal** notice that a retry-runner stage was
+#: accepted (``status=0`` + ``retry-clean``/``accepted-transient``) and its
+#: superseded-attempt failures were discarded as diagnostics
+#: (CG-0MWEHG69O005VM17). A notice, never a failure: ``success`` stays green
+#: and the exit status is unchanged — the release gate must not need a re-run
+#: after an accepted retry. The discarded records also live on the structured
+#: ``discarded_failures`` field of the suite result.
+NOTICE_RETRY_DISCARDED = "retry_discarded_failures"
+
 #: Prefix of the no-free-slot notice produced by :func:`_test_concurrency_slot`.
 #: Exposed as a stable constant so a consumer handling a legacy result that
 #: predates ``notice_code`` can classify slot contention without duplicating
@@ -833,6 +842,12 @@ CHANGED_SCOPE_NO_SOURCE = "no changed source or test files"
 CHANGED_SCOPE_NO_GROUP = "no matching group and no convention-matched test files"
 CHANGED_SCOPE_NO_TESTS = "no convention-matched test files"
 CHANGED_SCOPE_NO_TOOLING = "selected test files have no runnable suite tooling"
+#: A group matched, but the change set also touches files its ``paths`` spec
+#: does not cover and no file-level command could be resolved for them, so a
+#: group-only command set would silently skip them (SA-0MWA7OD8O001945I).
+CHANGED_SCOPE_GROUP_INCOMPLETE = (
+    "matched group leaves changed files with no runnable test selection"
+)
 
 
 class ChangedScopeSelection(NamedTuple):
@@ -846,6 +861,53 @@ class ChangedScopeSelection(NamedTuple):
     commands: list[str] | None
     reason: str
     group: str | None = None
+
+
+def _changed_outside_group_paths(
+    changed: set[str], group_name: str, project_root: Path
+) -> set[str]:
+    """Return the changed paths the named group's ``paths`` spec does not cover.
+
+    A matched group runs a *coarse* command set (e.g. one directory), so any
+    changed file outside its ``paths`` patterns is invisible to that command
+    and needs its own file-level selection
+    (SA-0MWA7OD8O001945I).
+
+    Args:
+        changed: The changed-file set.
+        group_name: The group selected by :func:`select_group_from_changed_files`.
+        project_root: Project root holding ``.pi/test-config.json``.
+
+    Returns:
+        Changed paths not matched by any pattern in the group's ``paths``.
+        Empty when the group spec is unavailable (nothing to subtract, so the
+        caller keeps the historical group-only behaviour).
+    """
+    groups = _read_groups(project_root) or {}
+    spec = groups.get(group_name)
+    if spec is None:
+        return set()
+    paths_spec = spec.get("paths", [])
+    return {p for p in changed if not _paths_match_spec(p, paths_spec)}
+
+
+def _union_commands(*command_lists: list[str]) -> list[str]:
+    """Union command lists in argument order, de-duplicated.
+
+    Order is deterministic: the declared group commands first, then each
+    file-level command, with later duplicates dropped. A list that already
+    appears earlier is never repeated, so a group whose command happens to
+    equal the file-level command runs once.
+    """
+    merged: list[str] = []
+    seen: set[str] = set()
+    for commands in command_lists:
+        for command in commands:
+            if command in seen:
+                continue
+            seen.add(command)
+            merged.append(command)
+    return merged
 
 
 def _selectable_changed(changed: set[str]) -> set[str]:
@@ -967,8 +1029,16 @@ def changed_scope_selection(
 
     1. **Declared ``groups``** in ``.pi/test-config.json`` — the smallest
        group whose ``paths`` match a changed file wins and its ``commands``
-       run. ``suiteCommands`` no longer disables selection: it defines the
-       *full* suite only, never the changed-scope subset.
+       run. Any changed file outside that group's ``paths`` is then unioned
+       in from the file-level selection below (group commands first, then
+       sorted file-level commands, de-duplicated), so a matched group can
+       never silently drop an edit-authored test file
+       (SA-0MWA7OD8O001945I). When nothing lies outside the group the result
+       is the group's commands alone, unchanged. When the outside files are
+       test/source files with no runnable file-level command, the selection
+       fails closed (``commands is None``) so the caller runs the full suite.
+       ``suiteCommands`` no longer disables selection: it defines the *full*
+       suite only, never the changed-scope subset.
     2. **Convention mapping** — a changed test file itself, or a source whose
        stem maps to a test file (pytest, node ``.mjs``, vitest
        ``.test.ts``/``.spec.ts``).
@@ -987,13 +1057,41 @@ def changed_scope_selection(
         return ChangedScopeSelection(None, CHANGED_SCOPE_NO_CHANGES)
 
     # 1. Declared named groups (coarser than file-level, but still targeted).
+    # A group's commands cover only its ``paths``; any changed file outside
+    # them is unioned in from the file-level selection rather than dropped
+    # (SA-0MWA7OD8O001945I). A group-only match keeps the historical result
+    # byte for byte.
     group_name = select_group_from_changed_files(changed, root)
     if group_name is not None:
         group_cmds = group_commands(group_name, root)
         if group_cmds:
-            return ChangedScopeSelection(
-                list(group_cmds), f"matched group '{group_name}'", group_name
-            )
+            uncovered = _changed_outside_group_paths(changed, group_name, root)
+            extra_cmds: list[str] = []
+            uncovered_selected: set[str] = set()
+            if uncovered:
+                uncovered_selected = {
+                    f
+                    for f in map_changed_to_tests(root, uncovered)
+                    if (root / f).exists()
+                }
+                extra_cmds = _commands_for_selected_tests(root, uncovered_selected)
+                if not extra_cmds and _selectable_changed(uncovered):
+                    # The group cannot prove coverage of those files and no
+                    # file-level command exists for them: fail closed to the
+                    # full suite instead of silently dropping a changed test
+                    # file (AC1). Non-selectable changes (docs, config) are
+                    # not tests and never force the fallback.
+                    return ChangedScopeSelection(
+                        None, CHANGED_SCOPE_GROUP_INCOMPLETE, group_name
+                    )
+            commands = _union_commands(list(group_cmds), extra_cmds)
+            reason = f"matched group '{group_name}'"
+            if extra_cmds:
+                reason += (
+                    f" + {len(uncovered_selected)} changed test file(s) "
+                    "outside the group"
+                )
+            return ChangedScopeSelection(commands, reason, group_name)
 
     groups_declared = _read_groups(root) is not None
     if not _selectable_changed(changed):
@@ -1037,9 +1135,10 @@ def changed_scope_commands(
 
     Returns None (meaning "fall back to the full suite") when no changed
     files exist, only non-source changes were made, no group matches, no
-    test file maps to the change, or the selected tests have no runnable
-    tooling. Call :func:`changed_scope_selection` when the specific fallback
-    reason is needed.
+    test file maps to the change, the selected tests have no runnable
+    tooling, or a matched group leaves changed source/test files with no
+    runnable selection of their own. Call :func:`changed_scope_selection`
+    when the specific fallback reason is needed.
     """
     return changed_scope_selection(
         project_root=project_root,
@@ -1991,16 +2090,35 @@ def _extract_yaml_block(block: str, key: str) -> str:
 # (``❯``→``>``, ``×``→``x``) are accepted so a captured or Windows-rendered log
 # still parses.
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-#: `` FAIL  |<project>| <file> > <suite> > <test>`` — the Failed Tests header.
+#: `` FAIL  [|<project>|] <file> > <suite> > <test>`` — the Failed Tests
+#: header. The ``|<project>|`` pipe is **optional**: project-mode runs print
+#: it, plain node-mode runs print ``FAIL  <file> > <suite> > <test>``
+#: (SA-0MWDLPF320060T0H).
 _VITEST_FAIL_HEADER_RE = re.compile(
-    r"^\s*FAIL\s+\|(?P<project>[^|\n]*)\|\s*(?P<name>\S[^\n]*?)\s*$",
+    r"^\s*FAIL\s+(?:\|(?P<project>[^|\n]*)\|\s*)?(?P<name>\S[^\n]*?)\s*$",
     re.MULTILINE,
 )
-#: `` ❯ |<project>| <file> (N tests | M failed) 1234ms`` — the per-file header.
+#: `` ❯ [|<project>|] <file> (N tests | M failed) 1234ms`` — the per-file
+#: tree header. The ``|<project>|`` pipe is optional (node-mode); the
+#: ``(N tests`` parenthetical is required so a ``❯ <file>:<line>:<col>``
+#: stack frame is never read as a file header.
 _VITEST_FILE_HEADER_RE = re.compile(
-    r"^\s*(?:❯|>)\s+\|(?P<project>[^|\n]*)\|\s*(?P<file>[^\s()]+)",
+    r"^\s*(?:❯|>)\s+(?:\|(?P<project>[^|\n]*)\|\s*)?"
+    r"(?P<file>[^\s()]+)\s*\(\s*\d+\s*test",
     re.MULTILINE,
 )
+#: `` ❯ [<fn>] <file>:<line>:<col>`` — a Vitest stack frame. When the gate's
+#: 1200-char output tail has stripped the FAIL header and error line (their
+#: message embeds a long diff), the surviving frame plus its source excerpt
+#: is the failure's remaining signal — the frame is reported as the failing
+#: location (RISE-0MW5JFQCU001YYQK, SA-0MWDLPF320060T0H).
+_VITEST_FRAME_RE = re.compile(
+    r"^\s*(?:❯|>)\s+(?:\S+\s+)?(?P<loc>\S+:\d+:\d+)\s*$",
+    re.MULTILINE,
+)
+#: The source-window lines printed under a Vitest frame: ``  104|   }``
+#: (line + code) and ``      |        ^`` (the caret marker).
+_VITEST_EXCERPT_LINE_RE = re.compile(r"^\s*(?:\d+\||\|\s*\^)")
 #: ``   × <suite> > <test> 29146ms`` — a failed test inside a file's tree.
 _VITEST_TREE_FAIL_RE = re.compile(
     r"^\s*(?P<marker>[×✗x])\s+(?P<name>\S[^\n]*?)"
@@ -2015,13 +2133,106 @@ _VITEST_BLOCK_END_RE = re.compile(
     r"^\s*(?:⎯{3,}|─{3,}|Test Files\s|Tests\s|Start at\s|Duration\s|\[vitest-runner\])"
 )
 
+#: The retry runner's final machine-readable verdict line
+#: (``vitest-run-with-retry.ts::runSummary``):
+#: ``[vitest-runner] attempts=N status=S outcome=O args="..." expected=N ran=M``
+#: (or ``expected=unset`` when no expectation was supplied). Emitted via
+#: ``warn`` to stderr after every attempt sequence; a stage's combined output
+#: runs up to and including its own verdict line. ``status`` is the numeric
+#: attempt-sequence exit code (0/1/124 for a hang); the ``[retry] … Retrying
+#: once...`` banner is NOT a verdict line (CG-0MWEHG69O005VM17).
+_VITEST_RUNNER_VERDICT_RE = re.compile(
+    r"^\[vitest-runner\] attempts=\d+ status=(?P<status>\S+) "
+    r"outcome=(?P<outcome>[a-z-]+)",
+    re.MULTILINE,
+)
+
+#: The retry-runner outcomes that mean the stage's final verdict is GREEN
+#: after the retry mechanism ran: ``retry-clean`` (attempt 2 passed) and
+#: ``accepted-transient`` (every error block was attributable to an acceptable
+#: transient signature). Both require ``status=0`` to accompany them — the
+#: verdict line is only trusted when the runner itself reports zero.
+_VITEST_GREEN_RETRY_OUTCOMES = frozenset({"retry-clean", "accepted-transient"})
+
+
+def _split_vitest_runner_segments(
+    text: str,
+) -> list[tuple[str, tuple[str, str] | None]]:
+    """Split *text* into per-stage segments at the retry-runner verdict lines.
+
+    Each ``[vitest-runner]`` line ends the stage it summarises, so a segment
+    runs from the end of the previous verdict line (or the start of the
+    output) through the end of its own verdict line and carries that verdict
+    as ``(status, outcome)``. Text after the LAST verdict line (e.g. a
+    tutorial E2E section run by a different script that never emits a verdict
+    line) forms a trailing segment with verdict ``None`` — never discarded.
+
+    Returns a list of ``(segment_text, verdict)`` pairs, always non-empty
+    (output without any verdict line is one segment with verdict ``None``).
+    """
+    segments: list[tuple[str, tuple[str, str] | None]] = []
+    cursor = 0
+    for match in _VITEST_RUNNER_VERDICT_RE.finditer(text):
+        segment = text[cursor : match.end()]
+        verdict = (match.group("status"), match.group("outcome"))
+        segments.append((segment, verdict))
+        cursor = match.end()
+    tail = text[cursor:]
+    if tail:
+        segments.append((tail, None))
+    if not segments:
+        segments.append((text, None))
+    return segments
+
+
+def _is_green_retry_verdict(status: str, outcome: str) -> bool:
+    """Whether a runner verdict is the retry-accepted green outcome.
+
+    Only ``status=0`` accompanied by ``retry-clean`` or ``accepted-transient``
+    discards a stage's failures. Every other outcome (``clean``, ``failed``,
+    ``retry-failed``, ``coverage-failed``, ``hang``) or a non-zero status
+    keeps them — a mis-parsed verdict only ever *keeps* failures (fail-safe
+    direction, CG-0MWEHG69O005VM17).
+    """
+    return status == "0" and outcome in _VITEST_GREEN_RETRY_OUTCOMES
+
+
+def _parse_vitest_with_retry_verdict(
+    output: str,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Parse vitest output honouring the retry runner's per-stage verdicts.
+
+    Segments the combined output at each ``[vitest-runner]`` verdict line and
+    parses each stage independently. A stage whose verdict is green
+    (``status=0`` + ``retry-clean``/``accepted-transient``) contributes its
+    failures to the *discarded* list — the runner already proved the retry
+    recovered, so those records are diagnostics, not suite failures. Every
+    other stage (non-green verdict, or no verdict at all) contributes its
+    failures untouched, so a genuine failure in the same command's output is
+    never masked (per-stage segmentation, AC2).
+
+    Returns ``(failures, discarded)`` — the two lists share the record shape
+    of :func:`parse_vitest_failures`.
+    """
+    text = _ANSI_ESCAPE_RE.sub("", output)
+    failures: list[dict[str, str]] = []
+    discarded: list[dict[str, str]] = []
+    for segment, verdict in _split_vitest_runner_segments(text):
+        records = parse_vitest_failures(segment)
+        if verdict is not None and _is_green_retry_verdict(*verdict):
+            discarded.extend(records)
+        else:
+            failures.extend(records)
+    return failures, discarded
+
 
 def parse_vitest_failures(output: str) -> list[dict[str, str]]:
     """Parse Vitest's default-reporter output into structured failure records.
 
-    Vitest names a failing test after its file and suite — ``FAIL  |<project>|
-    <file> > <suite> > <test>`` in the ``Failed Tests`` block and ``× <suite> >
-    <test>`` under the ``❯ |<project>| <file>`` tree header. Before
+    Vitest names a failing test after its file and suite — ``FAIL  [|<project>|]
+    <file> > <suite> > <test>`` in the ``Failed Tests`` block (the ``|<project>|``
+    pipe is optional: node-mode runs omit it) and ``× <suite> > <test>`` under
+    the ``❯ [|<project>|] <file>`` tree header. Before
     MS-0MW3UR8SX009YZWS the runner understood only TAP, so every Vitest
     failure produced ``failures: []`` and was classified ``unparsed_failure``
     (gate ``reason: unparsed``): the operator was told the *command or
@@ -2030,10 +2241,14 @@ def parse_vitest_failures(output: str) -> list[dict[str, str]]:
 
     The ``Failed Tests`` block is parsed first (it carries the error, code
     frame and stack), then the per-file tree; a test reported in both places
-    yields **one** record. Summary lines (``Test Files …``/``Tests …``) never
-    produce a record, and output without these markers yields none — an
-    infrastructure failure (``ENOSPC`` in the browser provider) therefore keeps
-    its ``unparsed_failure`` classification.
+    yields **one** record. When neither pass finds anything — the gate's
+    1200-char output tail (``GATE_OUTPUT_TAIL_CHARS``) can strip the FAIL
+    header and tree markers, leaving only the ``❯ <file>:<line>:<col>``
+    frames plus their source excerpts — the frames themselves become the
+    failing locations. Summary lines (``Test Files …``/``Tests …``) never
+    produce a record, and output without any of these markers yields none —
+    an infrastructure failure (``ENOSPC`` in the browser provider) therefore
+    keeps its ``unparsed_failure`` classification.
 
     Args:
         output: The command's combined stdout/stderr.
@@ -2083,6 +2298,28 @@ def parse_vitest_failures(output: str) -> list[dict[str, str]]:
         detail = _vitest_tree_detail(lines, index + 1)
         add(f"{current_file} > {fail_match.group('name')}", detail)
 
+    # 3) Frame-only fallback (SA-0MWDLPF320060T0H): when the gate's 1200-char
+    #    output tail has stripped both the FAIL headers and the tree markers,
+    #    the ``❯ <file>:<line>:<col>`` frames (plus source excerpts) are the
+    #    surviving failure signal — e.g. an assertion whose message embeds a
+    #    long README diff. Each frame (or the excerpt under it) becomes a
+    #    structured record whose failing location is the frame. Only reached
+    #    when the richer passes found nothing, so a full output never
+    #    double-reports a failure's stack frames as extra records.
+    if not records:
+        for index, line in enumerate(lines):
+            frame = _VITEST_FRAME_RE.match(line)
+            if not frame:
+                continue
+            loc = frame.group("loc")
+            # The frame line itself heads the record's detail so the failing
+            # location is visible in both test_name and stack_trace, followed
+            # by the source excerpt when one is printed (SA-0MWDLP4SW0099MZM
+            # contract: the captured frame must appear in stack_trace).
+            excerpt = _vitest_frame_detail(lines, index + 1)
+            detail = line.strip() + ("\n" + excerpt if excerpt else "")
+            add(loc, detail)
+
     return records
 
 
@@ -2110,6 +2347,23 @@ def _vitest_tree_detail(lines: list[str], start: int) -> str:
     return "\n".join(detail).strip()
 
 
+def _vitest_frame_detail(lines: list[str], start: int) -> str:
+    """Return the source-excerpt lines printed under a Vitest frame line.
+
+    Vitest prints the failing source window as ``N| code`` lines followed by a
+    `` | ^`` caret marker; collection stops at the first non-excerpt line (the
+    next frame, a blank line or a block/summary marker). The frame location
+    itself is not repeated — it is already the record's ``test_name``.
+    """
+    detail: list[str] = []
+    for line in lines[start:]:
+        if _VITEST_EXCERPT_LINE_RE.match(line):
+            detail.append(line.strip())
+            continue
+        break
+    return "\n".join(detail).strip()
+
+
 def parse_failures(command: str, output: str) -> list[dict[str, str]]:
     """Parse *output* with the failure parser matching *command*'s reporter.
 
@@ -2117,19 +2371,48 @@ def parse_failures(command: str, output: str) -> list[dict[str, str]]:
     loop) so the two can never drift apart:
 
     * ``pytest`` commands → :func:`parse_pytest_failures` (unchanged);
-    * Vitest commands → :func:`parse_vitest_failures`;
+    * Vitest commands → :func:`parse_vitest_failures`, with the retry
+      runner's per-stage verdicts honoured (see
+      :func:`_parse_vitest_with_retry_verdict`);
     * anything else → :func:`parse_node_failures` (TAP, unchanged), falling
-      back to the Vitest parser when TAP yields nothing. The fallback covers
-      wrapper commands (``npm --silent test``) whose output shape cannot be
-      inferred from the command line; the Vitest markers are specific enough
-      that non-Vitest output still yields no records.
+      back to the retry-aware Vitest parser when TAP yields nothing. The
+      fallback covers wrapper commands (``npm --silent test``) whose output
+      shape cannot be inferred from the command line; the Vitest markers are
+      specific enough that non-Vitest output still yields no records.
     """
     if "pytest" in command:
         return parse_pytest_failures(output)
     if is_vitest_command(command):
-        return parse_vitest_failures(output)
+        return _parse_vitest_with_retry_verdict(output)[0]
     records = parse_node_failures(output)
-    return records or parse_vitest_failures(output)
+    return records or _parse_vitest_with_retry_verdict(output)[0]
+
+
+def parse_failures_with_retry_verdict(
+    command: str, output: str
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Shared :func:`parse_failures` plus the discarded retry-recovered records.
+
+    ``run_suite`` uses this so a green-verdict stage's discarded failures can
+    be reported as diagnostics (a stable notice / ``discarded_failures`` field)
+    without becoming suite failures; ``parse_failures`` delegates to it and
+    returns only the genuine failures. Both lists share the record shape of
+    :func:`parse_vitest_failures`.
+
+    Routing is identical to :func:`parse_failures`:
+
+    * ``pytest`` commands → :func:`parse_pytest_failures` (no discarded list);
+    * Vitest commands → :func:`_parse_vitest_with_retry_verdict`;
+    * anything else → TAP, falling back to the retry-aware Vitest parser.
+    """
+    if "pytest" in command:
+        return parse_pytest_failures(output), []
+    if is_vitest_command(command):
+        return _parse_vitest_with_retry_verdict(output)
+    records = parse_node_failures(output)
+    if records:
+        return records, []
+    return _parse_vitest_with_retry_verdict(output)
 
 
 # ---------------------------------------------------------------------------
@@ -2653,7 +2936,12 @@ def run_suite(
     single source of truth — instead of the hardcoded pytest+node pair. The
     failure parser is chosen per command (pytest commands → pytest parser,
     everything else → node parser), mirroring the audit's
-    ``_run_tests_via_test_skill``.
+    ``_run_tests_via_test_skill``. Parsing is retry-verdict aware
+    (CG-0MWEHG69O005VM17): failures from a stage the retry runner accepted
+    (``status=0`` + ``retry-clean``/``accepted-transient``) are carried on the
+    result's additive ``discarded_failures`` field plus a stable
+    ``notice``/``notice_code`` (``retry_discarded_failures``) — never in
+    ``failures`` and never changing ``success``/the exit status.
 
     *scope* ("full" or "changed") selects which tests run: ``full`` resolves
     the repo's full suite (existing behavior); ``changed`` resolves only
@@ -2823,6 +3111,12 @@ def run_suite(
     slot_lane = slot_lane_for(resolvable_scope, test_type)
 
     all_failures: list[dict[str, str]] = []
+    #: Failures harvested from stages the retry runner accepted
+    #: (``status=0`` + ``retry-clean``/``accepted-transient``): reported as
+    #: diagnostics (``discarded_failures`` + a stable notice), never as suite
+    #: failures, so a recovered contention flake does not turn a green tree red
+    #: (CG-0MWEHG69O005VM17).
+    all_discarded: list[dict[str, str]] = []
     overall_returncode = 0
     cached_flags: list[bool] = []
     cache_entries: list[dict[str, Any]] = []
@@ -2848,6 +3142,12 @@ def run_suite(
             "returncode": None,
             "command": command,
             "failures": [],
+            # Retry-recovered failures (CG-0MWEHG69O005VM17): records from
+            # stages the retry runner accepted (status=0 +
+            # retry-clean/accepted-transient), reported as diagnostics — never
+            # in ``failures`` and never affecting ``success``. Additive field;
+            # consumers that predate it simply never see it populated.
+            "discarded_failures": [],
             "notice": "",
             "notice_code": "",
             "stdout": _output_tail("\n".join(stdout_parts)),
@@ -2971,8 +3271,9 @@ def run_suite(
             # commands would run against the same unstable checkout and
             # contribute nothing usable.
             break
-        failures = parse_failures(cmd, output)
+        failures, discarded = parse_failures_with_retry_verdict(cmd, output)
         all_failures.extend(failures)
+        all_discarded.extend(discarded)
         if proc.returncode != 0:
             overall_returncode = proc.returncode
 
@@ -2993,14 +3294,33 @@ def run_suite(
             f"discarded — re-run the suite from a stable checkout."
         )
 
+    # Retry-recovered discard notice (CG-0MWEHG69O005VM17): informational,
+    # never a failure. A stage the retry runner accepted stays green; the
+    # notice names the flaked file(s) so an operator can still see what the
+    # retry recovered. Carried on ``discarded_failures`` (structured) and as a
+    # stable notice combination for per-suite printing.
+    discarded_notice = ""
+    discarded_notice_code = ""
+    if all_discarded:
+        discarded_notice_code = NOTICE_RETRY_DISCARDED
+        flaked = ", ".join(
+            sorted({f.get("test_name", "<unknown>") for f in all_discarded})
+        )
+        discarded_notice = (
+            f"[{NOTICE_RETRY_DISCARDED}] {len(all_discarded)} failure(s) on "
+            f"superseded attempt(s) were accepted as transient by the retry "
+            f"runner and discarded (not suite failures): {flaked}"
+        )
+
     result = _result(
         success=overall_returncode == 0 and not all_failures,
         returncode=overall_returncode,
         exit_code=overall_returncode,
         command=command,
         failures=all_failures,
-        notice=flagged_notice,
-        notice_code=flagged_notice_code,
+        discarded_failures=all_discarded,
+        notice=flagged_notice or discarded_notice,
+        notice_code=flagged_notice_code or discarded_notice_code,
         cached=use_cache and all(cached_flags) if cached_flags else False,
         state_changed_during_run=state_changed_detail,
     )
@@ -3108,6 +3428,10 @@ def run_all(
     """
     results: dict[str, Any] = {}
     all_failures: list[dict[str, str]] = []
+    # Retry-recovered failures aggregated alongside ``failures``
+    # (CG-0MWEHG69O005VM17): each record gains the suite attribution, exactly
+    # as ``failures`` does, so a consumer sees which suite discarded what.
+    all_discarded: list[dict[str, str]] = []
 
     # Full-scope runs are the churn-heavy path behind the /tmp-inode defect
     # (SA-0MW2QED9M005FWOK): prune stale pytest roots once before executing so
@@ -3171,6 +3495,8 @@ def run_all(
             slot_wait_total += result.get("slot_wait_seconds") or 0.0
             for failure in result["failures"]:
                 all_failures.append({**failure, "suite": name})
+            for discarded in result.get("discarded_failures") or []:
+                all_discarded.append({**discarded, "suite": name})
             if result.get("notice"):
                 notices.append(result["notice"])
             if result.get("notice_code"):
@@ -3183,6 +3509,10 @@ def run_all(
         "success": all(r["success"] for r in results.values()),
         "suites": results,
         "failures": all_failures,
+        # Retry-recovered diagnostics (CG-0MWEHG69O005VM17): additive, never
+        # counted in ``success``/``failures`` — a stage the retry runner
+        # accepted stays green.
+        "discarded_failures": all_discarded,
         "notices": notices,
         "notice_codes": notice_codes,
         # Moved-checkout flags (SA-0MW3FF18I003KGZE): the detail behind each

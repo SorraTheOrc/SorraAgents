@@ -4,10 +4,17 @@ Covers SA-0MVECQUGF0064U81: during implementation only changed-scope tests
 run; the full suite first runs at the dev-push integration gate (pre-push
 hook) and again at the ship release gate.
 
+Covers SA-0MWFJS3820032YB4: the dev-push gate's verdict is resolved by
+``implement.py finish`` **before** it takes the exclusive main-checkout lock,
+so the ~5 min suite never runs inside that window. The one full-scope run in
+``finish`` is therefore the *gate's* run — tree-keyed and pre-lock — never a
+second, independent finish gate.
+
 Static greps guard the deliberate removals/insertions (matching the repo's
 policy-sentinel style, cf. test_install_pi_hook_wiring.py); behaviour is
-covered end-to-end by test_pre_push_test_gate.py (dev/main pushes) and
-test_release_full_suite_gate.py (release gate).
+covered end-to-end by test_pre_push_test_gate.py (dev/main pushes),
+test_release_full_suite_gate.py (release gate) and
+skill/implement/tests/test_finish_main_checkout_lock.py (lock ordering).
 """
 from __future__ import annotations
 
@@ -41,14 +48,41 @@ _STALE_DOC_PHRASES = (
 
 class TestFinishFullGateRemoved:
     def test_no_full_gate_marker_in_implement_py(self) -> None:
-        """implement.py must not run a full-suite gate during finish."""
+        """implement.py must not run an independent full-suite finish gate."""
         source = IMPLEMENT_PY.read_text(encoding="utf-8")
         for marker in _REMOVED_MARKERS:
             assert marker not in source, f"removed marker still present: {marker!r}"
         # The precise finish-gate invocation must be gone (comments may still
         # reference `--scope full`, the deferred push/release gate).
         assert 'run_tests(worktree_path, scope="full")' not in source, (
-            "finish must not invoke a full-scope suite"
+            "finish must not invoke an unbound full-scope suite"
+        )
+
+    def test_full_scope_run_is_the_dev_push_gate_bound_to_the_would_be_tree(
+        self,
+    ) -> None:
+        """SA-0MWFJS3820032YB4: the one full-scope run is tree-bound and pre-lock.
+
+        A full-suite run in ``finish`` is only legitimate as the *dev-push
+        gate's* verdict, resolved for the would-be-commit tree before the
+        main-checkout lock. Anything else re-introduces the serialised suite
+        (or a second, unbound finish gate).
+        """
+        source = IMPLEMENT_PY.read_text(encoding="utf-8")
+        assert "def resolve_prelock_full_suite_verdict(" in source
+        assert 'run_tests(worktree_path, scope="full", fingerprint=tree)' in source, (
+            "the pre-lock full-suite run must be keyed on the would-be-commit "
+            "tree so the pre-push hook can serve it"
+        )
+        prelock_call = source.index(
+            "prelock_verdict = resolve_prelock_full_suite_verdict("
+        )
+        lock_call = source.index(
+            "lock_fd, lock_refusal = acquire_main_checkout_lock("
+        )
+        assert prelock_call < lock_call, (
+            "the full-suite verdict must be resolved before the main-checkout "
+            "lock is acquired"
         )
 
     def test_stale_doc_phrasing_removed(self) -> None:

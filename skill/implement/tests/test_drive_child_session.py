@@ -34,6 +34,7 @@ import functools
 import json
 import os
 import signal
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -484,6 +485,55 @@ class TestPaneSessionSpawner:
         assert result["success"] is True
         assert result["agent_status"] == "blocked"
         assert result["pane_id"] == "w1:p9"
+
+    # SA-0MW7PAKSF008H8OH — a real (multi-minute) child turn must outlive the
+    # client's 60 s default subprocess timeout. The default client is built
+    # with a subprocess timeout scaled *above* the child budget, so a turn that
+    # runs its full budget is stopped by the herdr CLI's own ``--timeout``
+    # verdict, never killed by the client. An injected client is left alone —
+    # tests own its timeout.
+    def test_default_client_subprocess_timeout_scales_with_child_budget(self, monkeypatch):
+        """AC2: the client's subprocess timeout exceeds the child budget."""
+        runner = fake.FakeHerdrRunner(_pane_script())
+        monkeypatch.setattr(subprocess, "run", runner)
+        child_budget = 600
+
+        result = impl_mod._pane_session_spawner(
+            PANE_CHILD, PANE_WORKTREE, child_budget, _pane_env(),
+        )
+
+        assert result["success"] is True
+        assert len(runner.kwargs) == 3
+        # Every herdr subprocess call (split, start, prompt) runs under the
+        # scaled timeout — the prompt wait (the long turn) above all.
+        assert all(
+            kwargs["timeout"] > child_budget for kwargs in runner.kwargs
+        )
+
+    def test_long_turn_records_the_cli_timeout_verdict_never_a_client_kill(self, monkeypatch):
+        """AC1: a >60 s turn surfaces the herdr CLI's ``--timeout`` verdict,
+        not the client's ``herdr call timed out`` kill message."""
+        runner = fake.FakeHerdrRunner([
+            {"stdout": fake.pane_info_response("w1:p9")},
+            {"stdout": fake.agent_started_response(PANE_AGENT_NAME, "w1:p9")},
+            {
+                "stdout": fake.error_response("timeout", "wait expired"),
+                "exit_code": 1,
+            },
+        ])
+        monkeypatch.setattr(subprocess, "run", runner)
+        child_budget = 120
+
+        result = impl_mod._pane_session_spawner(
+            PANE_CHILD, PANE_WORKTREE, child_budget, _pane_env(),
+        )
+
+        assert result["success"] is False
+        assert "timed out after 120s" in result["reason"]
+        assert "herdr call timed out" not in result["reason"]
+        # The client did not kill the subprocess: the budget-scale timeout was
+        # in place for the wait that produced the CLI verdict.
+        assert runner.kwargs[2]["timeout"] > child_budget
 
 
 class TestPaneEnvironmentIsolation:

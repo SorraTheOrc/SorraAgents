@@ -281,12 +281,31 @@ Render the canonical report before returning control to the operator:
 python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   --skill-name <skill_name> \
   --headline "<1-3 sentence headline summary>" \
-  --ac "<AC# description>|<verification metric>|met" \
-  --ac "<...>|<...>|unmet" \
+  --ac "<skill-session deliverable 1 description>|<verification metric>|met" \
+  --ac "<skill-session deliverable 2 description>|<verification metric>|met" \
   [--producer-actions "<producer actions needed to complete the CURRENT stage; blocking only — omit for 'None needed'>"] \
   [--notes "<freeform context/caveats/assumptions>"] \
   [--next-action <review|plan|implement|...>] \
   [--use-case "<use-case string>"]
+```
+
+> **Note:** The `--ac` values record the **skill session's** own deliverables
+> — not the work item's feature acceptance criteria. Pass the concrete
+> outcomes the skill itself produces (e.g. "brief drafted", "children
+> created", "build green"); the work item's feature ACs belong in the
+> **Use Cases** section (SA-0MTQY7YM5009J6QR).
+
+```bash
+# Example: intake skill passes its own skill-session deliverables
+python3 $(skill_path report)/scripts/render_report.py SA-0EXAMPLE0000 \
+  --skill-name intake \
+  --headline "Interviewed the producer, captured requirements, and drafted the brief." \
+  --ac "Producer interview completed — requirements captured | interview notes | met" \
+  --ac "Feature brief drafted and linked to work item | wl show --json | met" \
+  --ac "Open questions identified and recorded | appendix entries | met" \
+  [--producer-actions "Answer the OPEN QUESTION in comment SA-C0EXAMPLE before proceeding."] \
+  [--notes "Interview took 15 minutes; producer confirmed budget constraints."] \
+  [--next-action plan]
 ```
 
 The script prints the rendered report to stdout — **paste it verbatim into
@@ -299,19 +318,27 @@ Rules for callers:
 
 1. **AC verdicts come from the calling skill's own evaluation** — the
    renderer never guesses them; pass one `--ac` per criterion.
-2. **Meta-Data is rendered by the script** from live `wl show --json` —
+2. **Skill-session ACs, not work-item ACs.** The `--ac` table records the
+   **skill session's** own success criteria (e.g. brief drafted, children
+   created, build green, audit performed). **Work-item feature ACs** are
+   surfaced in the **Use Cases** section (SA-0MTQY7YM5009J6QR), not in
+   the `--ac` table. Passing the work item's feature ACs (which are
+   unmet until the feature is built) would incorrectly render the report
+   as "Not ready to ship" even though the skill session completed
+   successfully.
+3. **Meta-Data is rendered by the script** from live `wl show --json` —
    the caller supplies only prose (headline, Producer Actions, Notes,
    next action).
    `--producer-actions` carries **blocking, current-stage** actions only;
    omit it (or pass `None needed`) when the next step is just the next
    phase of the workflow.
-3. Run it as the **final step**, after all status/stage transitions, so the
+4. Run it as the **final step**, after all status/stage transitions, so the
    Meta-Data reflects the end-of-session state.
-4. Output is stdout markdown; the calling skill **pastes it verbatim into
+5. Output is stdout markdown; the calling skill **pastes it verbatim into
    its final response** — tool output alone does not put the report in front
    of the operator. (Persisting the report to the work item is a follow-up;
    v1 is stdout only.)
-5. The rendered report ends with `</end_session>` on its own line as its final line for terminal sessions; question-ended sessions do not render the report or the marker.
+6. The rendered report ends with `</end_session>` on its own line as its final line for terminal sessions; question-ended sessions do not render the report or the marker.
 
 ## Pane-title status indicator
 
@@ -423,6 +450,57 @@ Plan deferred until the report-helper tests land (dependency: tests → impl →
 
 ✅ Ready to ship
 This completes the plan process for SA-0MSJ082OY003IQ8S (Standardize skill session end-of-session reporting via helper report skill).
+```
+
+### Non-plan example: audit
+
+The audit skill's AC table records **audit session** deliverables (audit was
+performed, verdict determined), not the work item's feature ACs — which are
+displayed in the Use Cases section instead.
+
+```markdown
+# Completed audit
+
+**Add unit tests for the payment processing module** (SA-0EXAMPLEAUDIT0)
+
+## Use Cases
+
+- As a developer, I want my payment module to be tested for edge cases.
+- As a reviewer, I want confidence that the ACs are fully covered.
+
+Performed a comprehensive audit of the work item's implementation against
+its acceptance criteria.
+
+## Acceptance Criteria
+
+| AC# | Description | Metric | Verdict |
+|---|---|---|---|
+| 1 | Audit performed — work item assessed against ACs | audit report generated | met |
+| 2 | Audit verdict determined and recorded | verdict stated | met |
+
+## Meta-Data
+
+- Type: feature
+- Priority: ⭐ high
+- Status: 🔄 in-progress
+- Stage: 🔍 in_review
+- Risk: ⚠️ Medium
+- Effort: 🐇 Small
+- Children: 2
+- Audit: ✅ passed
+
+## Producer Actions
+
+None needed
+
+## Notes
+
+All feature ACs are covered by tests; implementation follows the design docs.
+
+## Conclusion
+
+✅ Ready to ship
+This completes the audit process for SA-0EXAMPLEAUDIT0 (Add unit tests for the payment processing module).
 ```
 
 ## Related

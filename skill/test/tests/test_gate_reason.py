@@ -227,3 +227,228 @@ class TestDiagnostics:
         )
         assert "TEST_LOCK_TIMEOUT" in message
         assert "infrastructure" in message
+
+
+class TestVitestFrameFallback:
+    """Framed vitest tails are never classified ``unparsed``
+    (SA-0MW0NL3EW0009R4G AC6 / SA-0MWDLPC3F005S9S2).
+
+    A non-zero vitest run whose bounded output tail carries a
+    ``❯ <file>:<line>:<col>`` frame is a genuine code failure even when the
+    runner built no structured failure record (empty ``failures`` list — the
+    gate's output window may have stripped the ``FAIL`` header and error
+    line). The frame is reported as the failing location. The fallback
+    replaces ONLY the ``unparsed`` outcome: signal kill, timeout,
+    slot contention and infrastructure reasons still win.
+    """
+
+    FRAME_UNIT = "tests/unit/score.test.ts:14:20"
+    FRAME_ONLY_RESULT = _result(
+        stdout=f" ❯ {FRAME_UNIT}\n"
+        "    13|     const total = score(4, 2);\n"
+        "    14|   expect(total).toBe(3);\n",
+        suites={"all": {"returncode": 1}},
+    )
+
+    def test_frame_regex_mirrors_the_runner(self) -> None:
+        assert gate_reason._VITEST_FRAME_RE.pattern == (
+            run_tests._VITEST_FRAME_RE.pattern
+        ), (
+            "the shared classifier's frame regex must match the runner's -- "
+            "a drift would let the gate and the pre-parse disagree"
+        )
+
+    def test_framed_non_zero_result_without_structured_failures_is_test_failure(
+        self,
+    ) -> None:
+        result = _result(
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"all": {"returncode": 1}},
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_TEST_FAILURE
+        )
+
+    def test_captured_tail_reports_the_frame_as_the_location(self) -> None:
+        result = self.FRAME_ONLY_RESULT
+        assert (
+            gate_reason.vitest_frame_location(result) == self.FRAME_UNIT
+        ), "the operator must be told WHERE the failure is"
+
+    def test_captured_tail_with_test_name_prefix_parses(self) -> None:
+        """Vitest frames may carry a function name before the location:
+        `` ❯ waitForCondition core/tests/helpers/waitForCondition.ts:165:8``."""
+        result = _result(
+            stdout=(
+                " ❯ waitForCondition core/tests/helpers/waitForCondition.ts:165:8\n"
+                "    163|   if (predicate()) return;\n"
+            ),
+            suites={"all": {"returncode": 1}},
+        )
+        assert gate_reason.vitest_frame_location(result) == (
+            "core/tests/helpers/waitForCondition.ts:165:8"
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_TEST_FAILURE
+        )
+
+    def test_frame_in_stderr_is_found(self) -> None:
+        result = _result(
+            stderr=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"all": {"returncode": 1}},
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_TEST_FAILURE
+        )
+
+    def test_unparsed_failure_notice_with_a_frame_is_still_test_failure(
+        self,
+    ) -> None:
+        """A cache-served/older-runner shape carries the notice while the
+        tail still holds the frame — the fallback must beat ``unparsed``."""
+        result = _result(
+            notice_codes=[run_tests.NOTICE_UNPARSED_FAILURE],
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"all": {"returncode": 1}},
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_TEST_FAILURE
+        )
+
+    def test_resolved_exit_code_shape_is_honoured_with_a_frame(self) -> None:
+        result = _result(
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            exit_code=1,
+            exit_code_reported=True,
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_TEST_FAILURE
+        )
+
+    def test_frame_less_non_zero_result_stays_unparsed(self) -> None:
+        """The frame-less control (arrow + prose, no ``path:line:col``) keeps
+        today's ``unparsed`` classification — the regex must not over-match."""
+        result = _result(
+            stdout=fx.VITEST_FRAME_LESS_OUTPUT,
+            suites={"all": {"returncode": 1}},
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_UNPARSED
+        )
+
+    def test_enospc_control_stays_unparsed(self) -> None:
+        """The inode-exhaustion signature carries no frame and must keep its
+        infrastructure-class ``unparsed`` verdict (SA-0MW3ENVLU0097JRD)."""
+        result = _result(
+            stderr=fx.ENOSPC_IN_PLAYWRIGHT_STDERR,
+            suites={"all": {"returncode": 1}},
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_UNPARSED
+        )
+
+    def test_signal_killed_run_with_a_frame_stays_killed(self) -> None:
+        result = _result(
+            notice_codes=[run_tests.NOTICE_KILLED],
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"node": {"returncode": -9}},
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_KILLED
+        )
+
+    def test_negative_exit_code_with_a_frame_stays_killed(self) -> None:
+        """Without the notice the shape alone (negative exit) still wins."""
+        result = _result(
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"node": {"returncode": -9}},
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_KILLED
+        )
+
+    def test_timeout_with_a_frame_stays_timeout(self) -> None:
+        result = _result(
+            notice_codes=[run_tests.NOTICE_SUITE_TIMEOUT],
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"all": {"returncode": 124}},
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_TIMEOUT
+        )
+
+    def test_slot_contention_with_a_frame_stays_slot_contention(self) -> None:
+        result = _result(
+            notice_codes=[run_tests.NOTICE_SLOT_BUSY],
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_SLOT_CONTENTION
+        )
+
+    def test_command_not_found_with_a_frame_stays_infrastructure(self) -> None:
+        result = _result(
+            notice_codes=[run_tests.NOTICE_COMMAND_NOT_FOUND],
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"all": {"returncode": 127}},
+        )
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_INFRASTRUCTURE
+        )
+
+    def test_frame_without_an_executed_command_is_not_fabricated(self) -> None:
+        """No exit code, no notice: a leftover frame in the tail must not turn
+        a run that never executed into a code failure (no command attributed)."""
+        result = _result(stdout=fx.VITEST_FRAME_ONLY_TAIL)
+        assert (
+            gate_reason.classify_gate_result(result)
+            == gate_reason.GATE_REASON_UNKNOWN
+        )
+
+
+class TestVitestFrameFallbackDiagnostics:
+    """The operator-facing diagnostic names the frame as the failing location
+    (SA-0MWDLPC3F005S9S2 AC2)."""
+
+    def test_render_gate_diagnostic_names_the_frame_for_test_failure(
+        self,
+    ) -> None:
+        result = _result(
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"all": {"returncode": 1}},
+        )
+        diagnostic = gate_reason.render_gate_diagnostic(
+            gate_reason.GATE_REASON_TEST_FAILURE, result
+        )
+        assert "Failing location:" in diagnostic
+        assert "tests/the-rising/the-rising-docs.test.ts:2129:20" in diagnostic
+        assert diagnostic.startswith("gate_reason=test_failure\n")
+
+    def test_diagnostic_without_a_frame_is_unchanged(self) -> None:
+        diagnostic = gate_reason.render_gate_diagnostic(
+            gate_reason.GATE_REASON_TEST_FAILURE, _result()
+        )
+        assert "Failing location" not in diagnostic
+
+    def test_diagnostic_never_names_a_frame_for_other_reasons(self) -> None:
+        result = _result(
+            stdout=fx.VITEST_FRAME_ONLY_TAIL,
+            suites={"node": {"returncode": -9}},
+        )
+        diagnostic = gate_reason.render_gate_diagnostic(
+            gate_reason.GATE_REASON_KILLED, result
+        )
+        assert "Failing location" not in diagnostic
+

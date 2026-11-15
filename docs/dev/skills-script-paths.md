@@ -341,6 +341,51 @@ copied into the project:
    cd ~/.pi/agent/skills/<skill-name> && python3 ./scripts/<script>.py ...
    ```
 
+### Global pi agent config merge
+
+`scripts/install_pi.sh` applies the repository's tracked pi agent config
+(`.pi-config/agent/models.json` + `settings.json`) to the global install at
+`~/.pi/agent` **by merge, not by overwrite** (SA-0MW0GL4590046BTK). Running
+the installer on a machine that already has a `models.json`/`settings.json`
+adds/refreshes the tracked providers and unions the tracked `enabledModels`
+instead of skipping the files (the old behaviour) or clobbering local values:
+
+- **Non-destructive and idempotent** — every local-only provider, model,
+  `modelOverrides` entry, and `enabledModels` pattern is preserved; a second
+  run changes nothing.
+- **Single timestamped backup** (`models.json.bak.<ts>` /
+  `settings.json.bak.<ts>`) is written before the first modification, and
+  writes are atomic (temp file + `os.replace`).
+- **Fail-open** on an unparseable existing file: it is reported and left
+  byte-for-byte intact, and the install continues with a warning.
+- **Non-interactive-safe** (works under `stdin=/dev/null`); a completely
+  missing destination file is installed whole from the tracked config.
+- Each run prints a per-provider summary (`Added …` / `OK: already present …`).
+
+The merge is implemented by the dependency-free (stdlib-only) script
+`scripts/merge_pi_agent_config.py`, invoked by `install_pi.sh` as:
+
+```bash
+python3 scripts/merge_pi_agent_config.py .pi-config/agent ~/.pi/agent
+```
+
+**Post-install verification** — after installing, confirm the paid MunitoAI
+DeepSeek models are selectable and callable (requires a valid MunitoAI
+credential in `~/.pi/agent/auth.json` or `$MUNITOAI_API_KEY`):
+
+```bash
+pi --list-models munito
+pi -p --no-tools --model MunitoAI/deepseek-ai/deepseek-v4.1-flash-1017 "reply with ok"
+```
+
+The first command lists both MunitoAI DeepSeek models
+(`deepseek-ai/deepseek-v4-flash` and `deepseek-ai/deepseek-v4.1-flash-1017`);
+the second returns a response from the newer paid model. MunitoAI publishes
+no context/pricing metadata (`GET /inference/v1/models` returns ids only), so
+the `contextWindow`/`maxTokens` values for the `…v4.1-flash-1017` entry are
+**unverified** — they mirror the `…v4-flash` entry (400000 / 16384) and are
+flagged as such in `scripts/merge_pi_agent_config.py`'s module docstring.
+
 ### Project-local AGENTS.md
 
 The global install provides the full agent workflow. Each project then gets a

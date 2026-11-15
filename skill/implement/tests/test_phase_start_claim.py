@@ -59,6 +59,15 @@ def _mocked_phase_start(*, update_status, git_dirty: bool = False, worktree_add:
             patch.object(implement, "is_code_freeze_active", return_value=False)
         )
         stack.enter_context(patch.object(implement, "git_status", return_value=status))
+        # Force the main-checkout pre-check to run regardless of the test
+        # runner's own cwd (a linked worktree during `implement.py finish`).
+        stack.enter_context(
+            patch.object(
+                implement,
+                "_current_checkout_is_linked_worktree",
+                return_value=False,
+            )
+        )
         stack.enter_context(
             patch.object(implement, "git_has_dirty_files", return_value=git_dirty)
         )
@@ -147,11 +156,13 @@ def test_claim_is_status_only_and_leaves_stage_untouched(caplog):
     assert "Failed to update stage" not in caplog.text
 
 
-def test_claim_happens_before_dirty_gate_without_stage(caplog):
-    """The claim precedes the dirty-tree gate and stays status-only.
+def test_dirty_gate_precedes_claim_and_leaves_item_unclaimed(caplog):
+    """The main-checkout pre-check runs BEFORE the claim and is read-only.
 
-    Even when the safety gate aborts the phase, the item must have been
-    claimed (status-only) first, then reset to ``open`` (SA-0MUY9PMB7001ENMP).
+    A dirty/foreign main checkout must stop the start *before* the item is
+    claimed, so it stays ``open`` with no assignee and no scheduling hold
+    (AH-0MWFH7P4D0058L0A AC3). The guard must not write a claim or a reset
+    (AC6).
     """
     lifecycle = MagicMock()
     with (
@@ -162,13 +173,13 @@ def test_claim_happens_before_dirty_gate_without_stage(caplog):
 
     assert report["success"] is False
     assert report.get("dirty_worktree") is True
-
-    calls = lifecycle.update_status.call_args_list
-    assert calls[0].args == ("SA-TEST", "in_progress")
-    assert "stage" not in calls[0].kwargs
-    assert calls[1].args == ("SA-TEST", "open")
-    # The dirty-gate reset releases the assignee hold too.
-    assert calls[1].kwargs.get("assignee") == ""
+    assert "ask the operator" in report["message"]
+    # The guard refuses before the claim: nothing was claimed, so nothing is
+    # reset either (the item is left open, unassigned).
+    assert lifecycle.update_status.call_count == 0, (
+        "the pre-claim guard must not claim or reset the item: "
+        f"{lifecycle.update_status.call_args_list}"
+    )
     assert "Failed to update stage" not in caplog.text
 
 

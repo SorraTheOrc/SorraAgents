@@ -129,7 +129,7 @@ export async function refreshAudits(options = {}) {
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
     runAuditCommand = (runnerPath, workItemId, timeoutMs) => execSync(
-      `python3 "${runnerPath}" issue ${workItemId}`,
+      `python3 "${runnerPath}" issue ${workItemId} --strict`,
       // Per-item timeout, clamped to the remaining budget by the caller
       // (WL-0MW32YZP7005LZ5B).
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], timeout: timeoutMs ?? resolveRemediationTimeoutMs() },

@@ -13,6 +13,28 @@ The module is designed to be called from both the plan and intake skills,
 allowing them to verify that a parent's acceptance criteria are collectively
 covered by its children.
 
+AC-coverage similarity semantics
+--------------------------------
+Acceptance criteria are extracted **whole**. A hard-wrapped ``- `` bullet's
+continuation lines are joined (with a single space, re-joining a word broken
+by a trailing hyphen) until the next blank line, the next top-level list
+marker or the next ``##`` heading, so a criterion is never truncated to its
+first physical line (SA-0MUG36DQ2008DH3L).
+
+``jaccard_similarity`` tokenises each criterion as the set of ``\\b\\w+\\b``
+matches of its lowercased text: punctuation, markdown markers and inline-code
+backticks are therefore stripped, and word order and repetition do not
+matter. Similarity is the Jaccard index ``|A ∩ B| / |A ∪ B|``.
+
+Parent and child ACs are always compared as **whole criteria**. A parent AC
+is *covered* when its best similarity to any child AC is at least the coverage
+threshold (default ``0.4`` in ``compute_coverage``). An uncovered AC whose
+best match reaches the lower auto-close floor (``0.2``,
+``AUTO_CLOSE_SIMILARITY_THRESHOLD``) has a clear mapping and can be
+auto-closed; below that the review stops. Because the comparison uses whole
+criteria, a child that restates the complete parent criterion (wrapping is
+irrelevant) covers it.
+
 Related work item: SA-0MSLRVQIF0040GAM
 """
 
@@ -695,7 +717,9 @@ def compute_coverage(
 def jaccard_similarity(a: str, b: str) -> float:
     """Compute Jaccard similarity between two strings using word tokens.
 
-    Tokens are lowercased and stripped of punctuation.
+    Tokens are the ``\\b\\w+\\b`` matches of the lowercased strings, so
+    punctuation and markdown markers are stripped and word order/repetition
+    are ignored. Similarity is ``|A ∩ B| / |A ∪ B|``.
 
     Arguments:
         a: First string.

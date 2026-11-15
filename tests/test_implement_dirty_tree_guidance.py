@@ -288,7 +288,7 @@ def test_start_gate_aborts_without_stashing_user_changes(tmp_path: Path) -> None
     - report guidance to ask the operator and forbid stashing,
     - never invoke `git stash`,
     - leave the user's uncommitted file byte-for-byte untouched, and
-    - reset the work item status back to `open`.
+    - leave the item unclaimed (the guard is read-only, so there is no reset).
     """
     # -- Build a fake git repo with the user's uncommitted work --
     repo = tmp_path / "repo"
@@ -364,11 +364,14 @@ def test_start_gate_aborts_without_stashing_user_changes(tmp_path: Path) -> None
         "the user's uncommitted file must not be modified"
     )
 
-    # -- The work item must be released back to open after the abort --
+    # -- The pre-claim guard is read-only: the item is never claimed, so there
+    #    is no reset to `open` either (AH-0MWFH7P4D0058L0A AC3/AC6). --
     wl_log = (bin_dir / "wl_calls.log").read_text(encoding="utf-8")
-    last_call = wl_log.strip().splitlines()[-1]
-    assert "--status open" in last_call, (
-        f"work item must be reset to open after the dirty-tree abort, last wl call: {last_call!r}"
+    assert "--status in_progress" not in wl_log, (
+        f"the pre-claim guard must not claim the item, calls:\n{wl_log}"
+    )
+    assert "--status open" not in wl_log, (
+        f"the pre-claim guard must not write a reset, calls:\n{wl_log}"
     )
 
 

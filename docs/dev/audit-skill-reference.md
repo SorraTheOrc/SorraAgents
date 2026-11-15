@@ -189,6 +189,23 @@ whole audit:
   audit verdict or the exit code. Checkpointing applies to `issue` audits
   only; `audit project` runs are out of scope.
 
+## Abort-recovery state file is write-only for the runner (SA-0MTRH8C5O005URGR)
+
+When an audit begins, the runner writes the captured pre-audit
+`{issue_id, original_status, original_stage}` to a state file
+(`.audit_state_<id>.json` in `$AUDIT_ABSTATE_FILE`, else the explicit
+`--worklog-dir`, else `/tmp`) immediately **before** the `in_progress`
+claim, and removes it on normal exit and in its SIGTERM/SIGINT handlers.
+The runner **never reads this file back** — it only writes
+(`_write_audit_state_file`) and removes (`_remove_audit_state_file`) it.
+The file exists solely for the **parent** process:
+`skill/ship/scripts/check-audit-gate.js` (and `refresh-audits.js` via
+`attemptAuditRemediation`) reads a leftover state file after the child exits
+and restores the pre-audit status itself. A stale state file therefore
+cannot short-circuit or distort a retry: the runner's verdict, counters and
+retry path are unaffected by whatever the file contains, and a leftover file
+only triggers a parent-side restore after an uncatchable kill (`SIGKILL`).
+
 ## Pre-flight affirmation guard
 
 Entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY) preventing two audits of the same work item from racing. The SKILL.md long documented a "pre-flight affirmation" with no code behind it; this guard makes docs and code agree.
@@ -239,6 +256,19 @@ The gate verifies integration against `origin/dev` (`git fetch origin dev` + `me
 - **Fail-open:** a candidate that is NOT an ancestor of `origin/dev` (unrelated/context citation, unresolvable sha) is skipped; a git error while verifying presence in `HEAD` treats the commit as present; items with no resolvable evidence never reach the guard.
 
 Evidence surfaces in the report under `## Merge Gate Evidence (Phase 1)` (before the Code Quality section) and in JSON payloads as `{merge_gate: {merged, blocker, reason}}`.
+
+### Fresh origin/dev execution worktree + ahead/divergent guard (SA-0MW4ZRLSI005PHL6)
+
+The stale-audit-base guard above only flags the **behind** case (delivered on `origin/dev`, absent from local `HEAD`). It does not flag a main checkout that carries **un-pushed in-flight commits** (ahead of / divergent from `origin/dev`) and it does not move execution out of the launch checkout. The 2026-11-06 RISE-0MW19AROF0035FRH incident was exactly that shape: the main checkout's `dev` held one un-pushed commit touching `risingMatchHarness.ts`/`src/TheRisingAdversary.ts` and was six commits *behind* `origin/dev`; the F3 full-suite gate ran `npm test` in that contaminated checkout, failed four integration suites, and emitted a spurious AC8 `partial` / `Ready to close: No` for an item whose own scope was green at its tip.
+
+Two complementary mechanisms (both in `audit_runner.py`) close the gap:
+
+1. **Fresh origin/dev execution worktree (AC1)** — before F3 suite execution, `_phase_gate` calls `_create_execution_worktree(owning_root, runner, issue_id)`: it fetches `origin/dev`, creates a **detached** worktree at the latest `origin/dev` (`<owning>/.worklog/worktrees/audit-exec-<id>`), initialises git submodules *before* symlinking the shared `node_modules` (ordering hazard SA-0MVTOR53E003IIEQ; conventions SA-0MSN52GGN002B0AZ / SA-0MSGS763C006SM1B), and sets `ctx.execution_worktree`. Both F3 `_run_tests_via_test_skill` calls use `ctx.execution_root` (the worktree, else `per_audit_root`), so **the suite never executes from the launch checkout**. The worktree is removed by `cmd_issue`'s finally block (`_remove_execution_worktree`). The green-cache query (`_auto_green_run_outcome`) stays at `per_audit_root`, so a clean launch with a populated cache still skips execution (AC5); a cache miss executes fresh at the clean base — a cold worktree cache is **expected**, not a regression (cache keys are cwd-scoped, `test_cache.py`; SA-0MVCTZRZD004CE3L). A mocked/garbage runner that answers git with a JSON blob is rejected: `_looks_like_sha` validates `origin/dev` and ahead-commit output, and the worktree path must exist with a `.git` file, so unit-test fakes fail open rather than fabricating a worktree.
+2. **Ahead/divergent guard (AC2)** — `_launch_checkout_divergence(owning_root, runner, launch_root)` returns divergent when `git rev-list origin/dev..HEAD` is non-empty, i.e. local `HEAD` contains commits absent from `origin/dev`. `_phase_gate` evaluates it **right after owning-root resolution and before F3 auto-execution**, so a contaminated suite never runs (and never triages spurious `test-failure` children). It is also applied belt-and-braces inside `_audit_base_freshness` (the merge-gate evidence), marking the base stale. **Scope (AC5):** only fires when the launch checkout IS the owning repo's main checkout (`launch_root.resolve() == owning_root.resolve()`); a feature-worktree launch legitimately sits ahead of `origin/dev` and is unaffected. Fail-open on any git error or an unresolvable `origin/dev`.
+
+**File-scope base (AC3).** The Phase 1/2 file-scope manifest's repository index resolves against `ctx.execution_root` (the fresh worktree) so evidence never reflects a stale/dirty layout; changed-file and touched-file resolution retain the guard-protected owning runner (after AC2, an ahead/divergent main checkout is refused, and a clean launch's tree is identical).
+
+**Tests (AC4).** `skill/audit/tests/fixtures/contaminated_launch.py` builds an offline, `tmp_path`-only bare-remote fixture: a clean clone at `origin/dev`, and a **dirty** clone carrying one un-pushed commit touching a harness file and six commits behind `origin/dev`, with a tracked git submodule and no `node_modules`. `skill/audit/tests/test_audit_runner_contaminated_launch.py` exercises the production helpers and the `_phase_gate` F3 path: clean is fresh/proceeds, the dirty main checkout is refused before F3, and F3 runs in the execution worktree on a cache miss.
 
 ## Freshness Gate
 
@@ -316,6 +346,98 @@ effect on the output. It exists because the ship gates
 callers instead of failing with ``unrecognized arguments: --json``.
 
 **Child verdict reuse uses the same content gate (primary):** the content-based fingerprint gate is the PRIMARY freshness test for child verdict reuse in parent audits, not just item-level audits (LP-0MSQ32MF200675AR). Children use the **same simplified item-data-only fingerprint**: a child whose stored audit carries an unchanged v2 fingerprint AND a parseable verdict is reused — its persisted AC verdict table appears in the parent report (with a ``Child verdict reused from <auditedAt> — content unchanged, no fresh audit performed.`` marker) and NO pi calls are issued for that child — no child Phase 1 screening, no child Phase 2 deep/batch entry. The time gate remains the legacy floor for fingerprint-less child reports. ``--force`` bypasses child reuse exactly as it bypasses the item-level gate.
+
+## Test-failure modes — strict and permissive (SA-0MW0JJ36Z000AF57)
+
+Full contract for the `--strict` / `AUDIT_STRICT` audit mode. Summary in
+[`skill/audit/SKILL.md`](../../skill/audit/SKILL.md#test-failure-modes-sa-0mw0jj36z000af57).
+
+### Mode resolution and default (AC1)
+
+Precedence **`--strict`/`--no-strict` flag > `AUDIT_STRICT` env > permissive
+default**, resolved once in `cmd_issue` into `_AuditContext.strict` /
+`.strict_source` (`"flag"`/`"env"`/`"default"`). Truthy env values are
+`1`/`true`/`yes`/`on`; any other non-empty value forces permissive. Both
+`issue` and `batch` accept the flags.
+
+### Verdict: `_evaluate_red_suite` (AC2/AC3)
+
+A single helper consumes a red suite in both the F3 auto-execution path
+(`_run_tests_via_test_skill`) and the Phase 1 merge gate (`_integrate_into_dev`):
+
+- **strict** → every failure blocks; the verdict matches today byte-for-byte.
+- **permissive** → only *unrelated unit* failures are excused; integration,
+  affected and unresolved-inconclusive failures block (fail closed). The
+  merge gate uses the pre-integration `origin/dev` sha as the baseline, so a
+  failure that reproduces there is pre-existing and unrelated.
+
+An excused red run injects the `EXCUSED-RED SUITE` prompt block analogous to
+the GREEN-RUN blocks so execution-dependent ACs may be marked `met`.
+
+### Classification (AC4)
+
+`_classify_test_failure_scope(failure)` → `unit` / `integration` by path
+convention, matched case-insensitively against the POSIX failure path:
+
+| Pattern | Class |
+|---|---|
+| `tests/integration/**`, `tests/e2e/**`, `tests/manual/**` | integration |
+| `**/*_e2e*`, `**/*integration*` | integration |
+| everything else | unit |
+| unclassifiable path | **integration** (fail closed) |
+
+### Relatedness (AC4)
+
+`_failure_relatedness(failure, touched_files, key_files, project_root)` →
+`affected` / `unrelated` / `inconclusive`. Deterministic mapping first:
+
+1. a changed **shared test-infrastructure** file (`conftest.py`,
+   `tests/helpers/**`, `tests/fixtures/**`, `tests/support/**`) → *affected*;
+2. the failing test file is itself a changed file → *affected*;
+3. a changed source module the test imports → *affected*;
+4. otherwise *inconclusive*.
+
+Only inconclusive failures reach `_baseline_unrelated`, which re-runs **just
+those failures** in a scratch worktree (`git worktree add --detach`) at the
+pre-change commit (`_resolve_baseline_commit` = `git merge-base HEAD
+origin/dev`):
+
+- fails identically at baseline → **unrelated** (excused);
+- passes at baseline → **affected** (the change broke it);
+- baseline cannot run → **affected** (fail closed).
+
+Execution goes through `paced_runner()` and stands down under
+`LIVE_REPO_GUARD_ACTIVE`, so nested suite runs cannot recurse. Any git/exec
+error degrades to *affected* — never a crash (Never-block F4).
+
+### Persistence (AC5/AC7)
+
+The report gains a `Test failure mode: <mode> (source: <src>)` metadata line
+and a `## Test Failure Mode` section (table of scope/relatedness/blocking +
+evidence, plus the baseline commit used). The `--json` payload carries
+`test_failure_mode: {mode, strict, source, evaluation}`. The freshness gate
+compares mode strength: strict never reuses a permissive pass; permissive may
+reuse a strict pass (legacy/mode-less reports are treated as permissive).
+
+### Cached-red handling
+
+In permissive mode a `red` cached full-suite entry is classified from the
+cached output rather than accepted as blocking-by-default; if the cached
+output yields no parseable failure records the runner executes the suite as on
+a miss. Strict mode keeps today's cached-red behaviour unchanged.
+
+### Excused failures are still triaged (AC5)
+
+Triage into critical `test-failure` work items is unchanged and runs for
+excused failures exactly as for blocking ones (same dedup + cap semantics).
+
+### Caller matrix (AC6)
+
+| Caller | Mode |
+|---|---|
+| `ship` — `check-audit-gate.js`, `check-final-validation.js`, `refresh-audits.js`, surfaced manual commands | `--strict` |
+| interactive/agent `/skill:audit`, `batch` | permissive (default) unless `--strict`/`AUDIT_STRICT` |
+| dev-push pre-push full-suite gate | unchanged (permissive never weakens it) |
 
 ## Producer-review flag lifecycle (SA-0MVR9B1UH002BUST, Option B+)
 
@@ -526,6 +648,14 @@ flag (`--batch-drain` forces it on); drained items always run with
   is separate from the per-launch admission queue (`audit`), so draining
   never steals a live launch's admission ticket and never perturbs queue
   positions of contending audits (SA-0MTG5RYH8005RQNM).
+- **Cross-project entries** (LP-0MW96A9GW009KVF7, parent
+  LP-0MW0KZUJP0019SLS AC2): every entry carries an owning **project root**
+  (the checkout root whose `.worklog` holds the item). The queue is
+  physically host-wide, so a repo-A drain can dequeue an item enqueued by
+  repo B; the per-entry root makes that safe — each item drains against its
+  own worklog. Legacy entries (written before the field, or by a producer
+  that cannot resolve ownership) carry no root and keep today's
+  single-root routing (AC5).
 - A producer (operator/herdr dispatch) enqueues items, or the `batch`
   subcommand **primes** the queue from `wl list --stage in_review --json`
   when it is below the depth threshold: candidates are ordered by queue
@@ -541,10 +671,16 @@ duplicates; audits via the FULL single-item pipeline (`cmd_issue`:
 claim, freshness gate, phase gates, persist, verified lifecycle); every
 item's pi calls acquire/release host-wide slots, so the **concurrency
 slot is released between items** — another process can use the slot
-before the next item is dequeued. The loop stops when the queue is
-empty, `--max-items N` is reached, or the wall-clock budget elapses —
-whichever comes first; remaining items stay queued for the next window.
-A single item's audit failure is logged and does not abort the window.
+before the next item is dequeued. **Cross-project routing** (AC3): the
+item's stored project root is passed through to the audit, so each item
+is audited against ITS OWN `.worklog` (`<root>/.worklog`) rather than the
+drainer's default; a `None` root (legacy entry / undeterminable
+ownership) falls back to the drainer's own worklog dir — the documented
+fail-open, preserving single-host behaviour (AC5). The loop stops when
+the queue is empty, `--max-items N` is reached, or the wall-clock budget
+elapses — whichever comes first; remaining items stay queued for the next
+window. A single item's audit failure is logged and does not abort the
+window.
 
 ### Configuration
 
@@ -563,7 +699,44 @@ window; `--json` emits a machine-readable summary), and
 
 Every window emits exactly one stderr line with
 `batch_start`, `batch_end`, `items_processed`, `queue_remaining`,
-`items_included` (ISO timestamps; including zero-item windows).
+`items_included` (ISO timestamps; including zero-item windows). For
+cross-project windows the additive per-project map
+`projects_included={project_root: [item_ids...]}` is appended, so the
+report shows which repositories contributed to the window (AC4); a
+single-project window emits an empty map (backward compatible).
+
+## Cross-host audit lease (LP-0MW96A9GW009KVF7)
+
+The audit skill holds a **cross-host audit-tier lease** on the proxy for
+the lifetime of each run (parent epic LP-0MW0KZUJP0019SLS AC1): at most
+`audit_admission.max_audits` (default 1) audits hold a lease across ALL
+client hosts, so a second host's audit WAITS instead of competing for the
+one local `llama-server` GPU. The proxy owns the cap and the lease
+registry (`llm` repo, LP-0MW95FYMH006XYNK); this repo ships the client:
+
+- **Acquire** at run start (`audit_lease_begin`): `POST
+  /llama/local/audit/lease {session_id}` where the session id is
+  `audit-<issue>-lease-<uuid8>` (the proxy identifies audit-tier sessions
+  by the `audit-` prefix).
+- **Renew** between phases and **release** in the finally block, so every
+  exit path (success, scope error, abort, crash) frees the slot; a
+  crashed holder's lease expires via the proxy's TTL backstop regardless.
+- **Nested runs reuse** the outer lease (children, batch drains) — one
+  identity per process, never a double acquire.
+- **Fail-safe by construction**: a proxy error, timeout or a saturated
+  `audit-budget-saturated` refusal after bounded retries
+  (`AUDIT_LEASE_ACQUIRE_RETRIES`, default 3, honouring the hinted
+  `retry_after_s`) proceeds WITHOUT a lease under the legacy per-host
+  guards — a second audit never hangs indefinitely behind the running
+  holder (documented fallback).
+
+### Lease configuration
+
+| Setting | Env var | Default |
+|---|---|---|
+| Enable lease client | `AUDIT_LEASE_ENABLED=0` disables | enabled |
+| Per-request HTTP timeout | `AUDIT_LEASE_TIMEOUT` (seconds) | 5 |
+| Saturation retries | `AUDIT_LEASE_ACQUIRE_RETRIES` | 3 |
 
 ## Descendant cascade on a passing parent audit (SA-0MUR7Y3BJ004FGPP)
 
@@ -856,7 +1029,15 @@ python3 ./scripts/audit_runner.py issue SA-123 --run-tests
 
 **Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide. Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > live proxy slot status > 6 static default. When no explicit request is present the ceiling is **derived from the live proxy slot capacity** (`/llama/local/status` → `max(1, min(available_slots, total_slots))`) so a 2-slot proxy never queues six pi sessions behind two slots (SA-0MVF1NKZQ009P3ZG AC3): six concurrent pi sessions used to queue behind two slots and the queue wait was charged against each call's own timeout budget, inflating p90 and pushing calls onto their 600 s/1,800 s caps. The derivation is fail-open and logged once per run (`Audit ceiling: ceiling=<N> source=<cli|env|slots|static> available_slots=<N> total_slots=<N>`) so the decision is observable in the audit log. An explicit `--max-concurrency` or `AUDIT_MAX_CONCURRENCY` is authoritative and is never silently overridden by slot discovery; an invalid env value warns and falls back to the static ceiling. The host-wide `issue` ingress cap (`AUDIT_MAX_HOST_AUDITS`, default 6) separately bounds independently launched `audit_runner.py issue` processes. Both defaults were right-sized to the host's measured audit-slot capacity (SA-0MUSZJRB9006ZCHE): the F7 harness (`skill/shared/validate_fanout.py`) showed the old ingress cap of 3 was the binding constraint on concurrent audits, and 6 (= 2x the 3-slot local LLM proxy pool) drains bursts with a batch-attributable load delta <= 1.63 and no swap growth on the 16-core host. Each pi launch holds one audit slot; when the ceiling is saturated the launch **waits on a shared bounded priority queue** (SA-0MTG5RYH8005RQNM) instead of failing fast: it enqueues a ticket at its work item's priority (critical > high > medium > low; missing/unknown priority defaults to medium), and is admitted in priority order (FIFO within a tier) as slots free up. The total wait for admission + slot is bounded by `AUDIT_QUEUE_TIMEOUT` (default 90s); `AUDIT_LOCK_TIMEOUT` now bounds only each individual semaphore attempt inside the admission poll (default 0s = immediate retry). Log lines (`Audit slot acquired: queued_at=<ts> priority=<level> queue_position=<N> dequeued_at=<ts> wait_seconds=<N> ticket=<id>`) make queue behaviour observable from stderr (AC4). If the bound is exhausted the audit still completes gracefully with the `unmet` evidence "Audit concurrency limit reached" (bounded, never fail-fast). Queue/admission and downtime-gate metrics are collected read-only by [`skill/shared/audit_gate_metrics.py`](../../skill/shared/audit_gate_metrics.py) (a pure-Python metrics collector); its host measurements and the keep-the-gate recommendation are recorded in [`downtime-idle-gate-evaluation.md`](downtime-idle-gate-evaluation.md) (SA-0MTG5UPBR0028K50).
 
-**Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS`). Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
+**Provider-error retry:** Pi calls that end in a provider error (`stopReason: "error"` / `errorMessage` on the last assistant message of `agent_end`, e.g. Local Proxy `finish_reason: error`) are retried automatically up to `_PI_MAX_RETRIES` (2) times with linear backoff (`_PI_RETRY_BACKOFF_SECONDS` = 2 s, growing 1x, 2x per retry attempt). The backoff is **slot-aware** (SA-0MW0LROWQ000JVTM): the concurrency slot is released before the backoff sleep and re-acquired through the priority queue afterwards, so parallel audits never retry-storm a saturated proxy pool while one item backs off. Timeouts and unparseable-but-otherwise-healthy responses are NOT retried. If a provider error persists after retries, ACs fall back to `partial` with evidence like "Pi provider error: <errorMessage> — criterion could not be evaluated." rather than the misleading "Pi model output could not be parsed" message, so operators can distinguish a transient model outage from a genuine parse failure.
+
+**Actionable provider-error evidence (SA-0MW0LROWQ000JVTM AC2):** an exhausted provider-error path never surfaces as a bare `Connection error.` line. `_provider_error_evidence` assembles a stable, greppable diagnostic naming every field an operator needs to act:
+
+```text
+Pi provider error: <message>. Provider: <model>. Phase: <phase>. Attempts: <n>. Elapsed: <x>s. Manual review required. Remediation: re-run when the proxy pool has capacity, or set AUDIT_MAX_CONCURRENCY=1 to serialize concurrent audits, or re-run with --force.
+```
+
+The `Pi provider error: <message>` prefix is preserved for downstream consumers (the JSON payload's provider-error count greps it), `<phase>` is the `_phase_label(context)` name (`Phase 1 parent screening`, `Phase 1 child screening (<id>)`, `Phase 2 deep analysis`, `Phase 2 child deep analysis`, `Phase 2 batched deep analysis`), and `Attempts`/`Elapsed` reflect the retries actually made and the wall-clock duration including them.
 
 **Bounded JSON re-ask (SA-0MU32TCFM003B78I / SA-0MVI6VNDF001VE1S):** the Phase 1 parent/child screens and Phase 2 parent/child deep-analysis prompts are JSON-first — a strict **JSON contract** instruction is carried on the **first** call of every JSON-expecting phase: ``Return ONLY a single valid JSON array and nothing else: no prose before or after it, no Markdown code fences, and no trailing comma before a closing ']' or '}'``, with the ``index``/``verdict``/``evidence`` schema restated. Historically the strict schema was only on the re-ask, so a first response that used a fence or a trailing comma paid for a second full-length call (p50 461 s). The extractor tolerates leading/trailing prose, complete Markdown code fences, and — new — **trailing commas outside string literals** (a common model formatting slip; repaired in-place without reinterpreting values). When a response still cannot be parsed into an index-bearing verdict array, the runner issues **exactly one** bounded "[JSON RE-ASK] return only the JSON array" call, observable under the `verdict_reask` context, counted in the reliability summary as `verdict_reasks`, and bounded by the per-call timeout, before falling back to the conservative `partial` verdict. A persistent failure therefore never becomes `met`/`Yes`; the re-ask only recovers a usable array when the model can re-emit it. Genuine parse failures in the 48-day SorraAgents corpus were 7/272 (2.6%), dominated by empty/narrative/truncated responses that the re-ask targets.
 
@@ -1000,7 +1181,7 @@ issue` run emits **exactly one** machine-greppable summary line to stderr and
 appends it to the persisted report:
 
 ```
-AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n> parent_screen_timeouts=<n> elapsed_seconds=<x>
+AUDIT_RELIABILITY_SUMMARY calls=<n> parse_ok=<n> parse_failed=<n> timeouts=<n> child_skips=<n> provider_errors=<n> concurrency_waits=<n> verdict_reasks=<n> child_screen_timeouts=<n> parent_screen_timeouts=<n> elapsed_seconds=<x> run_id=<hex> started_at=<epoch>
 ```
 
 The keys (and their order) are the stable contract `RELIABILITY_SUMMARY_KEYS`;
@@ -1016,7 +1197,7 @@ SA-0MVI6VNDF001VE1S), `child_screen_timeouts` (child Phase-1 screens
 that hit their budget and were quarantined as `partial` —
 SA-0MVI3608M0080QLW), and `parent_screen_timeouts` (parent Phase-1 screens
 that hit their right-sized budget and were quarantined as `partial` —
-SA-0MVJ3Q662006RDJR). The line is emitted once per run via
+SA-0MVJ3Q662006RDJR). A **per-attempt identity** (SA-0MW0LROWQ000JVTM AC3) is appended AFTER the stable key set plus `elapsed_seconds`: `run_id=<hex>` (a fresh UUID4 hex regenerated by `_rel_reset()` at the top of every `cmd_issue` run) and `started_at=<epoch>` (the wall-clock start timestamp, seconds with millisecond precision). Because both are regenerated per attempt, an operator can always tell whether the numbers they are reading came from the attempt they just ran — a stale stored report (e.g. a previous run's summary kept because its report was never re-persisted) can never be mistaken for the current attempt, and existing dashboards keep their column positions (the two identity keys are appended, never interleaved). The line is emitted once per run via
 `emit_reliability_summary()` — from the
 normal report path and, where possible, from an early-exit `finally` (timeout
 or abort before report assembly) so partial runs are still measurable. It
@@ -1113,6 +1294,7 @@ Notes:
 
 - **Persistence + readback verification is an invariant of the runner.** Unless `--do-not-persist` is given, the runner ALWAYS persists the audit and then performs a readback verification via `wl audit-show --json` to confirm the stored audit is retrievable. If either step fails, the runner exits non-zero. Use `--do-not-persist` for dry runs. The `--require-persist` flag has been removed — persist+verify is now unconditional.
 - **Resilient audit persistence (P8):** the final `wl update <id> --audit-text <report>` step is the last write of the run. If it rejects the assembled verdict content (malformed JSON / validation error), `persist_audit()` never leaves the audit text field as the 43-char stub (`Audit result persisted via persist_audit.py`). It (1) runs a repair pass that salvages broken JSON fragments (valid JSON prefixes extracted; per-AC rows preserved; zero model calls) and retries once; (2) if the retry fails, persists a compact markdown fallback notice (with a clear failure notice naming the work item, so the identity/readback guards pass) and returns `PERSIST_CONTENT_INVALID` (4); (3) the runner then performs a *bounded* re-ask — at most **one** additional model call to re-emit the verdict array in valid JSON — reassembles the report and retries persistence. The repair never re-runs the full audit pipeline. If every attempt fails, `persist_audit()` returns non-zero and the run reports failure.
+- **Failure-notice reports persist header-first (SA-0MW0LRBJM008Q2MC):** `wl update --audit-text` accepts only a first non-empty line of exactly `Ready to close: Yes`/`No` (otherwise `audit-invalid-first-line`). A report wrapped by `FailureNotice.wrap()` (script-failure banner on line 1) is submitted with the verdict header relocated to the top while the banner stays fully visible in the body; `wl audit-set --raw-output` keeps the original report, so `rawOutput` preservation is unchanged. When the audit-text step is rejected for a non-JSON reason (e.g. E2BIG, first-line validation), the compact fallback notice names the actual captured wl error and its remediation instead of a generic "malformed JSON" claim, and returns `1` rather than `PERSIST_CONTENT_INVALID` — `PERSIST_CONTENT_INVALID` is reserved for a genuine malformed-JSON rejection.
 - **Transient classification contract (WL-0MW2F2T1I001ZNH7):** a verdict-assembly or verdict-persistence failure is **never** stored as a bare `readyToClose: false` implying a model assessment. The persisted report always keeps the wl-required `Ready to close: <Yes|No>` first line and adds a machine-readable `Audit classification: transient (<cause>)` line, where `<cause>` is one of `verdict_persistence_failure` (the compact fallback notice persisted when the full report was rejected) or `verdict_assembly_failure: <cause>` with `cause` ∈ `timeout` \| `provider_error` \| `unparseable_output` \| `concurrency_cap` (a run whose verdicts came from an infrastructure fallback marker — Phase-2 timeout, provider error, unparseable output, concurrency cap). A clean run emits **no** classification line. `persist_audit()` mirrors the report's classification line into the `wl audit-set --summary` (`Audit result persisted; transient (…)`) so a summary-only consumer can distinguish the case. No new `wl` schema/CLI field is introduced — the classification is content in the existing `rawOutput`/`summary` fields.
 - **Priority normalization on 'Ready to close: Yes':** when the persisted report says `Ready to close: Yes` and the work item currently carries `critical` priority, `persist_audit.py` lowers it to `high` (via `wl update <id> --priority high`) before calling `wl audit-set`, so resolved items leave the critical queue. This is best-effort: a failed priority fetch/update logs a warning and never blocks persistence. It applies to both parent and child audit persistence (single `persist_audit()` entry point).
 - The persister (and the runner when persisting) call: `wl audit-set <issue-id> --ready-to-close <yes|no> --summary <text> --raw-output "<report>" --json` and return a non-zero exit code on failure. Every `wl` command built by `persist_audit` resolves the worklog store exactly like the runner's READ path (explicit `--worklog-dir` > prefix-to-sibling scan > cwd-chain > no flag) via the shared `skill.shared.status_lifecycle` helpers — the PERSIST path is cwd-independent by construction (SA-0MSKQERKH002IBLG), covering the runner parent/child path, the re-ask path, and the standalone CLI. After a successful return code, the runner calls `wl audit-show <issue-id> --json` and exits non-zero if the stored audit is null, has empty `rawOutput`/`summary`, **or the stored content does not reference the target work-item ID** (content identity check — catches a stale report persisted to the wrong item). The readback runs through the same resolved store, so it verifies against the store the audit was persisted to.
@@ -1237,6 +1419,14 @@ The ONLY relaxation of the audit's no-create rule, for tracking false positives:
   `_collect_audit_waivers` also honours a `findings` list on `auditWaiver` should
   a future store persist one.
 - **Never tracked**: `uncertain` and `genuine` findings get no work item.
+- **Cross-family twin cross-reference** (SA-0MWE1EAR30045VHO AC2): before
+  minting a NEW tracking chore the runner consults open Refactor-family items
+  once per run (`wl list "Refactor-Finding-Key:" --json`) and matches on
+  (rule, repository-relative path) — the line number is ignored so line drift
+  cannot break the match. On a match the chore description embeds
+  `Refactor-Twin: <refactor-item-id>` so the twin is visible and linked. The
+  chore is still created (it carries `needsProducerReview` by design) — it is
+  never auto-suppressed or auto-closed; only the cross-reference is added.
 - **Fail-safe** (`chore_failures`): a `wl create` failure never reverts the
   remediation commit; the affected finding stays blocking `genuine` (demoted with
   `chore_failed`) and the failure is recorded in the report.

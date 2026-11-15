@@ -72,10 +72,10 @@ def _commit(
     gs.commit_all(root, message or f"add {name}")
 
 
-def _add_worktree(root: Path, worktree: Path) -> Path:
+def _add_worktree(root: Path, worktree: Path, branch: str = "wl-child") -> Path:
     """Create a linked worktree on its own branch forked from the parent."""
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    return gs.add_worktree(root, worktree, "wl-child", base=PARENT_BRANCH)
+    return gs.add_worktree(root, worktree, branch, base=PARENT_BRANCH)
 
 
 @pytest.fixture()
@@ -90,6 +90,14 @@ def repo(tmp_path: Path) -> Path:
 def worktree(repo: Path, tmp_path: Path) -> Path:
     """A clean child worktree forked from ``dev`` at the fork base."""
     return _add_worktree(repo, tmp_path / "wt" / "wl-child")
+
+
+@pytest.fixture()
+def sibling(repo: Path, tmp_path: Path) -> Path:
+    """A second linked worktree of the same repo (another item's tree)."""
+    return _add_worktree(
+        repo, tmp_path / "wt2" / "wl-sibling", branch="wl-sibling"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +324,150 @@ class TestPlacementGuardContract:
         assert (
             implement._child_main_checkout_violation(
                 CHILD_ID, str(worktree), PARENT_BRANCH
+            )
+            is None
+        )
+
+    # -- sibling-worktree surface (SA-0MW5FIJNQ002Z24I) --
+
+    def test_dirty_sibling_worktree_with_clean_own_worktree_fails_closed(
+        self, worktree: Path, sibling: Path
+    ) -> None:
+        # The driven child cd'd into another item's linked worktree and wrote
+        # there: its own worktree holds no work while the sibling holds
+        # changes. The main checkout itself is clean — the exact gap the
+        # sibling extension closes.
+        (sibling / "stray.txt").write_text(
+            "written by the child\n", encoding="utf-8"
+        )
+
+        violation = implement._child_main_checkout_violation(
+            CHILD_ID, str(worktree), PARENT_BRANCH
+        )
+
+        assert violation is not None
+        assert CHILD_ID in violation
+        assert str(sibling) in violation
+        assert "stray.txt" in violation
+
+    def test_sibling_with_commits_ahead_fails_closed(
+        self, worktree: Path, sibling: Path
+    ) -> None:
+        # The stray child committed into the sibling worktree — commits ahead
+        # of the parent branch count as changes there (the silently-widened
+        # epic scenario).
+        _commit(
+            sibling, "stray-commit.txt",
+            message="SA-SIBLING000NAME: stray work",
+        )
+
+        violation = implement._child_main_checkout_violation(
+            CHILD_ID, str(worktree), PARENT_BRANCH
+        )
+
+        assert violation is not None
+        assert str(sibling) in violation
+
+    def test_clean_sibling_worktree_never_triggers_the_guard(
+        self, worktree: Path, sibling: Path
+    ) -> None:
+        assert (
+            implement._child_main_checkout_violation(
+                CHILD_ID, str(worktree), PARENT_BRANCH
+            )
+            is None
+        )
+
+    def test_own_worktree_holding_the_work_exempts_a_dirty_sibling(
+        self, worktree: Path, sibling: Path
+    ) -> None:
+        # A sibling's in-progress work is unrelated once the child's own
+        # worktree holds the child's work (precise-guard rule: unrelated dirt
+        # never blocks).
+        (sibling / "unrelated.txt").write_text(
+            "sibling wip\n", encoding="utf-8"
+        )
+        _commit(worktree, "child-work.txt")
+
+        assert (
+            implement._child_main_checkout_violation(
+                CHILD_ID, str(worktree), PARENT_BRANCH
+            )
+            is None
+        )
+
+    def test_dirty_main_checkout_plus_dirty_sibling_names_both_surfaces(
+        self, repo: Path, worktree: Path, sibling: Path
+    ) -> None:
+        (repo / "leaked.txt").write_text("child wrote main\n", encoding="utf-8")
+        (sibling / "stray.txt").write_text(
+            "child wrote sibling\n", encoding="utf-8"
+        )
+
+        violation = implement._child_main_checkout_violation(
+            CHILD_ID, str(worktree), PARENT_BRANCH
+        )
+
+        assert violation is not None
+        assert "leaked.txt" in violation
+        assert "stray.txt" in violation
+        assert str(sibling) in violation
+
+    def test_foreign_repo_checkout_is_never_the_write_surface(
+        self, repo: Path, worktree: Path, tmp_path: Path
+    ) -> None:
+        # A completely different repository reachable by path is NOT a
+        # sibling worktree (cross-checkout attribution, SA-0MVXVBZF2009HRRN):
+        # the guard never attributes a foreign checkout to the child.
+        foreign = gs.init_repo(tmp_path / "foreign")
+        (foreign / "foreign.txt").write_text(
+            "other repo\n", encoding="utf-8"
+        )
+
+        assert (
+            implement._child_main_checkout_violation(
+                CHILD_ID, str(worktree), PARENT_BRANCH
+            )
+            is None
+        )
+
+    def test_finish_gate_flags_cwd_inside_a_dirty_sibling_worktree(
+        self, repo: Path, worktree: Path, sibling: Path
+    ) -> None:
+        (sibling / "stray.txt").write_text(
+            "written by the child\n", encoding="utf-8"
+        )
+
+        violation = implement._worktree_placement_violation(
+            str(worktree), cwd=str(sibling), repo_root=str(repo)
+        )
+
+        assert violation is not None
+        assert str(sibling) in violation
+        assert str(worktree) in violation
+        assert "stray.txt" in violation
+
+    def test_finish_gate_clean_sibling_worktree_is_not_a_violation(
+        self, repo: Path, worktree: Path, sibling: Path
+    ) -> None:
+        assert (
+            implement._worktree_placement_violation(
+                str(worktree), cwd=str(sibling), repo_root=str(repo)
+            )
+            is None
+        )
+
+    def test_finish_gate_own_worktree_holding_work_exempts_a_dirty_sibling(
+        self, repo: Path, worktree: Path, sibling: Path
+    ) -> None:
+        (sibling / "unrelated.txt").write_text(
+            "sibling wip\n", encoding="utf-8"
+        )
+        _commit(worktree, "child-work.txt")
+
+        assert (
+            implement._worktree_placement_violation(
+                str(worktree), cwd=str(sibling), repo_root=str(repo)
             )
             is None
         )

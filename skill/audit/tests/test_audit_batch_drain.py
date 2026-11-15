@@ -62,8 +62,8 @@ def _recording_audit_one():
     """Return (records, audit_one) where audit_one records item/priority."""
     records = []
 
-    def _audit_one(item_id, priority):
-        records.append((item_id, priority))
+    def _audit_one(item_id, priority, worklog_root=None):
+        records.append((item_id, priority, worklog_root))
         return 0
 
     return records, _audit_one
@@ -83,7 +83,7 @@ def test_batch_drain_processes_multiple_items_in_one_window():
     records, audit_one = _recording_audit_one()
     metrics = audit_runner._batch_drain_cycle(audit_one, max_items=5, timeout=60)
 
-    assert [i for i, _ in records] == ["SA-A", "SA-B", "SA-C"]
+    assert [i for i, _, _ in records] == ["SA-A", "SA-B", "SA-C"]
     assert metrics["items_processed"] == 3
     assert metrics["queue_remaining"] == 0
     assert metrics["items_included"] == ["SA-A", "SA-B", "SA-C"]
@@ -142,12 +142,13 @@ def test_batch_drain_priority_order_fifo_within_tier():
     records, audit_one = _recording_audit_one()
     audit_runner._batch_drain_cycle(audit_one, max_items=10, timeout=60)
 
-    assert [i for i, _ in records] == [
+    assert [i for i, _, _ in records] == [
         "SA-CRIT", "SA-HI1", "SA-HI2", "SA-MED", "SA-LO",
     ]
     # Each drained item carried the priority it was queued at (AC2).
-    assert dict(records)["SA-CRIT"] == Priority.CRITICAL
-    assert dict(records)["SA-LO"] == Priority.LOW
+    by_id = {item_id: (prio, root) for item_id, prio, root in records}
+    assert by_id["SA-CRIT"][0] == Priority.CRITICAL
+    assert by_id["SA-LO"][0] == Priority.LOW
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +180,7 @@ def test_batch_drain_stops_at_budget():
 
     records = []
 
-    def _slow_audit_one(item_id, priority):
+    def _slow_audit_one(item_id, priority, worklog_root=None):
         records.append(item_id)
         time.sleep(0.4)  # each item burns most of the budget
         return 0
@@ -211,7 +212,7 @@ def test_batch_drain_releases_slot_between_items(monkeypatch):
 
     acquisitions = []
 
-    def _slot_audit_one(item_id, priority):
+    def _slot_audit_one(item_id, priority, worklog_root=None):
         sem = Semaphore("audit", max_workers=1, timeout=5)
         acquired = sem.acquire(timeout=5)
         acquisitions.append(acquired)
@@ -283,7 +284,7 @@ def test_batch_drain_skips_admission_tickets_and_primary():
         skip_ids=frozenset({"SA-PRIMARY"}),
     )
 
-    assert records == [("SA-REAL", Priority.MEDIUM)]
+    assert records == [("SA-REAL", Priority.MEDIUM, None)]
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +414,7 @@ def test_maybe_run_batch_drain_runs_when_backlogged(monkeypatch, capsys):
 
     records = []
 
-    def _audit_one(item_id, priority):
+    def _audit_one(item_id, priority, worklog_root=None):
         records.append(item_id)
         return 0
 
@@ -469,3 +470,113 @@ def test_batch_audit_one_never_recurses(monkeypatch):
     assert kwargs["no_checkpoint"] is True
     assert kwargs["runner"] is sentinel_runner  # inherits origin runner
     assert kwargs["persist"] is True  # inherits origin persistence
+
+# ---------------------------------------------------------------------------
+# Cross-project batch queue (LP-0MW96A9GW009KVF7, parent LP-0MW0KZUJP0019SLS
+# AC2/AC3/AC4)
+# ---------------------------------------------------------------------------
+
+
+def _enqueue_with_root(item_id, priority, project_root, timestamp=None):
+    _batch_queue().enqueue(
+        item_id, priority, project_root=project_root, timestamp=timestamp
+    )
+
+
+def test_drain_routes_each_item_to_its_own_project_root():
+    """AC3: a drain from repo A audits a repo-B item against repo B's root.
+
+    The callback receives the entry's project_root so it can route the item's
+    worklog operations to the owning project, never a shared default.
+    """
+    _enqueue_with_root("SA-A", Priority.MEDIUM, "/home/rgardler/projects/SorraAgents")
+    _enqueue_with_root("LP-B", Priority.MEDIUM, "/home/rgardler/projects/llm")
+    _enqueue_with_root("WL-C", Priority.MEDIUM, "/home/rgardler/projects/ContextHub")
+
+    records, audit_one = _recording_audit_one()
+    metrics = audit_runner._batch_drain_cycle(audit_one, max_items=5, timeout=60)
+
+    by_id = {item_id: (prio, root) for item_id, prio, root in records}
+    assert by_id["SA-A"][1] == "/home/rgardler/projects/SorraAgents"
+    assert by_id["LP-B"][1] == "/home/rgardler/projects/llm"
+    assert by_id["WL-C"][1] == "/home/rgardler/projects/ContextHub"
+    assert metrics["items_processed"] == 3
+
+
+def test_drain_legacy_entry_without_root_keeps_none_routing():
+    """AC5: an entry with no project_root keeps today's single-root path."""
+    _enqueue("SA-LEGACY", Priority.MEDIUM)
+    records, audit_one = _recording_audit_one()
+    audit_runner._batch_drain_cycle(audit_one, max_items=5, timeout=60)
+    assert records == [("SA-LEGACY", Priority.MEDIUM, None)]
+
+
+def test_batch_metrics_report_projects_included_per_project():
+    """AC4: the drain reports which projects contributed (per-project map)."""
+    _enqueue_with_root("SA-A", Priority.MEDIUM, "/home/rgardler/projects/SorraAgents")
+    _enqueue_with_root("SA-B", Priority.MEDIUM, "/home/rgardler/projects/SorraAgents")
+    _enqueue_with_root("LP-C", Priority.MEDIUM, "/home/rgardler/projects/llm")
+
+    _records, audit_one = _recording_audit_one()
+    metrics = audit_runner._batch_drain_cycle(audit_one, max_items=5, timeout=60)
+
+    assert metrics["items_included"] == ["SA-A", "SA-B", "LP-C"]
+    assert metrics["projects_included"] == {
+        "/home/rgardler/projects/SorraAgents": ["SA-A", "SA-B"],
+        "/home/rgardler/projects/llm": ["LP-C"],
+    }
+
+
+def test_batch_metrics_line_includes_project_contributions(capsys):
+    """AC4: the stderr metrics line names each contributing project."""
+    _enqueue_with_root("SA-A", Priority.HIGH, "/home/rgardler/projects/SorraAgents")
+    _enqueue_with_root("LP-B", Priority.MEDIUM, "/home/rgardler/projects/llm")
+
+    _records, audit_one = _recording_audit_one()
+    audit_runner._batch_drain_cycle(audit_one, max_items=5, timeout=60)
+
+    err = capsys.readouterr().err
+    line = next(ln for ln in err.splitlines() if "Audit batch drain:" in ln)
+    assert "items_included=['SA-A', 'LP-B']" in line
+    assert "projects_included={'/home/rgardler/projects/SorraAgents': ['SA-A'], '/home/rgardler/projects/llm': ['LP-B']}" in line
+
+
+def test_enqueue_pending_audit_items_stamps_owning_project_root():
+    """AC1/AC3: priming stamps each entry with its owning project root."""
+    runner = _wl_runner_returning([{
+        "workItems": [{"id": "SA-P1", "priority": "high",
+                        "createdAt": "2026-11-01T00:00:00Z"}],
+    }])
+
+    def _fake_owning(item_id, worklog_dir=None):
+        return Path("/home/rgardler/projects/SorraAgents")
+
+    monkeypatch = __import__("pytest").MonkeyPatch()
+    monkeypatch.setattr(audit_runner, "_resolve_owning_project_root", _fake_owning)
+    try:
+        enqueued = audit_runner._enqueue_pending_audit_items(
+            max_items=5, runner=runner, worklog_dir="/tmp/whatever/.worklog"
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert enqueued == ["SA-P1"]
+    entry = _batch_queue().dequeue(timeout=1.0)
+    assert entry is not None
+    assert entry.item_id == "SA-P1"
+    assert entry.project_root == "/home/rgardler/projects/SorraAgents"
+
+
+def _wl_runner_returning(stdout_payloads):
+    """Build a Runner whose stdout returns *stdout_payloads* in sequence."""
+    import subprocess
+
+    iterator = iter(stdout_payloads)
+
+    def _runner(cmd):
+        payload = next(iterator, {})
+        return subprocess.CompletedProcess(
+            list(cmd), 0, stdout=json.dumps(payload), stderr=""
+        )
+
+    return _runner
