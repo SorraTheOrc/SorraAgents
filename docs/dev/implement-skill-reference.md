@@ -1854,7 +1854,7 @@ checkout**, so the main checkout's own churn is never a failure:
 
 - refs checked out in a registered worktree other than *that* checkout's root,
   plus the `branch.<name>.*` config those worktrees own (ownership-based,
-  SA-0MV8311B3005DNG8) — so `implement.py finish`'s own Step-5 fast-forward in
+  SA-0MV8311B3005DNG8) — so `implement.py finish`'s own **post-push** fast-forward in
   the main checkout, and worktrees registered/removed mid-run, are churn;
 - `refs/heads/dev` and the whole `refs/remotes/origin/*` namespace
   (WL-0MV5MYBKJ0033P8U);
@@ -1907,7 +1907,7 @@ Regression pins: `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`,
 ## Finish main-checkout guard (WL-0MVPADZ1Z000FOSG AC3)
 
 The test guards above protect a **test run**. But `implement.py finish`
-itself operates on the main checkout — Step-5 fast-forward, Step-6b worktree
+itself operates on the main checkout — post-push fast-forward, Step-6b worktree
 removal and the post-push ancestry assertion (the Step-6 dev push now runs from
 the worktree that holds the pushed commit, SA-0MVTFMB7K002Y1F3) — so a foreign
 actor mutating the main checkout mid-finish (the 2026-10-26 `packages/shared`
@@ -1934,10 +1934,11 @@ window on the success path **and** on every pre-push abort path
   verify. They are worktree-local refusals outside the guard's failure-path
   set; an operator reading a report from one of them sees the refusal message
   itself, never `verifies`.
-- **Verify before the push** (Step 5b, `pre_push`): after the fast-forward,
-  `own_churn` (the fast-forward's own file list, `git diff --name-only` of
-  the pre-fast-forward HEAD → the merged commit) is attributed to finish and
-  excluded; everything else that changed aborts.
+- **Verify before the push** (Step 5b, `pre_push`): the local-`dev`
+  fast-forward is **deferred until after the push reports success**
+  (WL-0MWFKDH78002T2CR AC1), so the pre-push verify expects a checkout
+  finish itself has not yet touched: `own_churn` is empty here and anything
+  that changed since the baseline aborts.
 - **Verify before worktree removal** (Step 6c, `pre_worktree_removal`): a
   mutation that appeared while the push ran (e.g. a concurrent actor) must
   still abort loudly.
@@ -1957,8 +1958,8 @@ this table and the constant drift apart.
 | `build_failure` | the Step-2 build fails | yes (the run is already failing) |
 | `gate_failure` | the Step-3 gate fails in `--json` mode, or every fix-and-re-run retry is exhausted | yes (already failing) |
 | `user_abort` | the interactive fix loop's `abort` choice (or EOF/`KeyboardInterrupt`) | yes (already failing) |
-| `pre_push` | after the Step-5 fast-forward, immediately before the push | yes — `_abort_on_main_checkout_violation` |
-| `pre_worktree_removal` | after the push, before the worktree is removed | yes — `_abort_on_main_checkout_violation` |
+| `pre_push` | before the push (the local-`dev` fast-forward is deferred until after push success, so there is no own churn yet) | yes — `_abort_on_main_checkout_violation` |
+| `pre_worktree_removal` | after the push and the post-push local-`dev` fast-forward (its churn is attributed via `own_churn`), before the worktree is removed | yes — `_abort_on_main_checkout_violation` |
 
 A verify that passes still records a `pass` entry, so a green main checkout is
 observable on every path (e.g.
@@ -2009,7 +2010,7 @@ expected-dirty paths are never a failure.
 | `guard["repo_root"]` | The main checkout the guard snapshots and verifies (`_resolve_main_repo_root`, below) |
 | `guard["snapshot_at"]` | ISO timestamp of the baseline snapshot |
 | `guard["baseline_paths"]` | Number of dirty/untracked entries in the baseline snapshot |
-| `guard["own_churn"]` | The attribution allow-list: checkout-relative paths from finish's own fast-forward that were observed dirty in this checkout (never a deletion) |
+| `guard["own_churn"]` | The attribution allow-list: checkout-relative paths from finish's **post-push** fast-forward that were observed dirty in this checkout (never a deletion). Empty for every pre-push verify — the advance is deferred until after the push succeeds (WL-0MWFKDH78002T2CR AC1) |
 | `guard["verifies"]` | Ordered list of verify entries, one per verify point reached |
 | `guard["verdict"]` | Verdict of the most recent verify (`pass` or `fail`) |
 | `verifies[].stage` | The stage label from the table above (`VERIFY_STAGES`) |
@@ -2174,7 +2175,8 @@ symlink (fails), and the unmodified main checkout (fails).
 ## Single-owner per-repository lock (WL-0MVPADZ1Z000FOSG AC5, SA-0MVPZG3IQ009IJMO)
 
 `implement.py finish` serialises its main-checkout critical section (commit →
-fast-forward → push → worktree removal → post-push parent-branch sync) with a
+push → post-push fast-forward → worktree removal → post-push parent-branch
+sync) with a
 **per-repository exclusive advisory lock**:
 `<main-checkout>/.worklog/locks/main-checkout.lock`. The mechanics live in the
 shared helper `skill/shared/repo_lock.py` (`RepoLock`, beside
@@ -2301,64 +2303,75 @@ run). Without it, pushing from the worktree would lose the pushed commit's
 green `scope: full` tree-kind entry as far as the main checkout's post-push
 verification and the audit skill (F3) are concerned.
 
-The pre-push fast-forward of the main checkout's local parent branch is
+The post-push fast-forward of the main checkout's local parent branch is
 **main-checkout hygiene only** (it keeps the next worktree's base up to date),
 never the gate subject, and may be skipped safely while the push and the
-ancestry assertion remain authoritative. That advance is inherently
-unverified — the commit is by definition not on `origin/dev` yet — so
-`phase_finish` decomposes it into three cooperating guarantees, all inside
-the per-repository lock above:
+ancestry assertion remain authoritative. Crucially (WL-0MWFKDH78002T2CR
+AC1/AC2) it runs **only after ``git push`` reports success**: advancing local
+``dev`` to an about-to-be-pushed commit opened a write-then-restore window in
+which a concurrent ``start`` resolved ``dev`` to the unpushed tip and
+permanently grafted another item's commit onto its branch. The advance is
+deferred until the commit is a known ``refs/remotes/origin/dev`` tip, so a
+failed/refused push leaves local ``dev`` **provably unchanged** from its
+pre-finish value (``restore` reasons report ``no_advance_to_undo``), and
+``phase_start`` independently refuses to branch from a ``dev`` that is not a
+pushed tip (`_resolve_start_base`). The three cooperating guarantees, all
+inside the per-repository lock where the push runs:
 
 | Step | Helper | Report key | Guarantee |
 |---|---|---|---|
-| Pre-push advance | `_fast_forward_local_dev_for_push` | `report["steps"]["local_dev_fast_forward"]` | `git merge --ff-only` only (never a rewrite); records `pre_advance_tip`; refuses loudly when the advance would be unsafe |
-| Push-failure restore | `_restore_local_dev_after_failed_push` | `report["steps"]["local_dev_restore"]` | Local `dev` returns to `refs/remotes/origin/dev`; uncommitted work survives (no `reset --hard`) |
+| Pre-push deferral | *(no git call)* | `report["steps"]["local_dev_fast_forward"]` = `method: deferred`, `advanced: False` | Local `dev` is never touched while a push is in flight; the restore paths find nothing to undo (`no_advance_to_undo`) |
+| Post-push advance | `_fast_forward_local_dev_for_push` | `report["steps"]["local_dev_fast_forward"]` | `git merge --ff-only` only (never a rewrite), after push success; records `pre_advance_tip`; refuses loudly when the advance would be unsafe |
+| Push-failure state | `_restore_local_dev_after_failed_push` | `report["steps"]["local_dev_restore"]` | Reports `no_advance_to_undo` on every failed push — local `dev` never moved |
 | Post-push verification | `_assert_commit_on_origin_dev` | `report["steps"]["ancestry_assertion"]` | Finish succeeds only when the pushed commit is an ancestor of `refs/remotes/origin/dev` |
 
-### The advance is verified and reversible
+### The advance is verified and deferred
 
 - **Fast-forward only, never a rewrite.** Local `dev` is moved with `git merge
   --ff-only` (first onto `refs/remotes/origin/dev`, then onto the finish
   commit); no local commit is discarded and no history is rewritten.
-- **Refuse rather than silently skip.** The previous broad `except` could
-  disable the whole fast-forward without a trace. Every unsafe precondition
-  now returns `method="refused"`, a loud warning naming the refs and hashes,
-  and a machine-readable `reason`: `fetch_failed`,
+- **Deferred until after the push succeeds.** Step 5 of the run records a
+  deferral (`method: "deferred"`, `advanced: False`) instead of touching
+  local `dev`; the advance executes in the post-push step (Step 6a.5) — after
+  `git push` reported success, the ancestry assertion and the read-only
+  verification passed (WL-0MWFKDH78002T2CR AC1). A non-fast-forward recovery
+  records the same deferral on its `retry` entry rather than advancing
+  mid-push.
+- **Refuse rather than silently skip** (post-push). The previous broad
+  `except` could disable the whole fast-forward without a trace. Every unsafe
+  precondition now returns `method="refused"`, a loud warning naming the refs
+  and hashes, and a machine-readable `reason`: `fetch_failed`,
   `no_remote_tracking_ref`, `checkout_failed`, `local_dev_diverged` (local
   `dev` carries commits the remote does not have, or cannot fast-forward to
   the remote tip) and `commit_not_based_on_remote_tip` (a sibling landed
-  first). A refusal never fails the finish: the push (with its rebase-and-retry
-  recovery) and the post-push ancestry assertion remain authoritative.
-- **Retried after the recovery rebase (SA-0MW3H07A8004Q54C AC1).** When Step 5
-  refused (`local_dev_diverged` / `commit_not_based_on_remote_tip`) because a
-  sibling moved `dev`, the non-fast-forward recovery rebases the feature branch
-  onto `origin/dev` and then **retries** the fast-forward for the rebased
-  commit, recorded as `report["steps"]["local_dev_fast_forward"]["retry"]`.
-  The main checkout's `dev` (and its `HEAD` when `dev` is checked out)
-  therefore tracks the pushed commit before the retry push. A second refusal is
-  recorded and never fails the finish, and the retry's own file churn is added
-  to the main-checkout guard's `own_churn` so it is never misreported as a
-  foreign mutation.
-- **Reversal on a failed push.** Every push-failure path (`PushTimeoutError`,
-  `PushNonFastForwardError`, a plain push failure) calls
-  `_restore_local_dev_after_failed_push`, so the shared local `dev` is never
-  left pointing at an unpushed finish commit — the state that made the
-  2026-10-25 orphan possible. The restore is deliberately conservative:
-  - the target is `refs/remotes/origin/dev`, a commit known to be published;
-  - only finish's **own** advance is undone — when the branch moved since
-    (`branch_moved_since_advance`) another actor owns that move and nothing is
-    touched;
-  - checked out → `git reset --merge` (uncommitted work in the shared checkout
-    survives; an overlapping local modification is reported as
-    `reset_conflict` and never clobbered — `reset --hard` is never used);
-  - not checked out → atomic compare-and-swap `git update-ref`.
-- **Own churn is still attributed — narrowly.** The fast-forward's file churn
-  is recorded as `own_churn` so the main-checkout guard never aborts on it
+  first). A refusal never fails the finish: the post-push ancestry assertion
+  remains authoritative, and the Step-8 parent-branch sync is a safe-skip
+  backstop.
+- **Deferred after the recovery rebase (WL-0MWFKDH78002T2CR AC1).** When a
+  sibling moved `dev`, the non-fast-forward recovery rebases the feature
+  branch onto `origin/dev`; its fast-forward for the rebased commit is
+  **deferred** (recorded as `report["steps"]["local_dev_fast_forward"]["retry"]`
+  with `advanced: False`) — the retry push may still fail, so the single
+  post-push advance in `phase_finish` owns the movement. The deferral is
+  recorded and never fails the finish.
+- **Nothing to reverse on a failed push.** Every push-failure path
+  (`PushTimeoutError`, `PushNonFastForwardError`, a plain push failure)
+  calls `_restore_local_dev_after_failed_push`, which reports
+  `no_advance_to_undo`: local `dev` was never moved, so there is no
+  write-then-restore window for a concurrent `start` to observe — the 2026-10-25
+  orphan and the 2026-11-13 graft are both structurally impossible.
+  The restore helper is retained (and still reachable as the failure-path
+  record surface) for any future write that would need an undo.
+- **Own churn is still attributed — narrowly, and post-push.** The post-push
+  fast-forward's file churn is recorded as `own_churn` so the main-checkout
+  guard's pre-worktree-removal verify never aborts on it
   (WL-0MVPADZ1Z000FOSG AC3/AC4), but only paths *observed dirty in this
   checkout* qualify: unobserved diff paths are reported as `not_observed`
   diagnostics, a non-main-checkout root allow-lists nothing, and a deletion is
   never allow-listed (see
-  [the attribution contract](#attribution-contract-own_churn)).
+  [the attribution contract](#attribution-contract-own_churn)). The pre-push
+  verify sees an untouched checkout (own churn empty — the advance is
+  deferred), so a foreign mutation there still aborts.
 
 ### The post-push ancestry assertion fails closed
 
@@ -4192,17 +4205,31 @@ runs reported success.
   dies — `SIGKILL`, an exception or a hard crash included. The metadata in the
   lock file is for the refusal message only and never decides ownership, so a
   **stale lock file cannot block a later finish**.
-- **Verified fast-forward.** Local `dev` only ever advances with `git merge
+- **Verified fast-forward — deferred until after the push succeeds.**
+  Local `dev` only ever advances with `git merge
   --ff-only` (its history is never rewritten) and the pre-advance tip is
-  recorded. When local `dev` moved since the worktree base, the commit is not
-  based on the current `origin/dev`, the fetch fails or the checkout cannot
-  switch, the helper **refuses loudly** (`local_dev_diverged`,
-  `commit_not_based_on_remote_tip`, `fetch_failed`, `checkout_failed`) instead
-  of silently skipping — so an unsafe advance is never taken and the refusal
-  is reported rather than swallowed.
-- **Reversible on push failure.** A failed push restores local `dev` to
-  `refs/remotes/origin/dev`: `git reset --merge` when `dev` is checked out
-  (uncommitted work in the shared checkout survives; an overlapping local
+  recorded. The advance runs **only after** `git push` reports success
+  (WL-0MWFKDH78002T2CR AC1): while the push is in flight, finish's Step-5
+  record is a `method: deferred` marker and local `dev` is never touched, so
+  a concurrent `start` can never fork a worktree from an unpushed commit.
+  When, post-push, local `dev` moved since the worktree base, the commit is
+  not based on the current `origin/dev`, the fetch fails or the checkout
+  cannot switch, the helper **refuses loudly** (`local_dev_diverged`,
+  `commit_not_based_on_remote_tip`, `fetch_failed`, `checkout_failed`)
+  instead of silently skipping — so an unsafe advance is never taken and the
+  refusal is reported rather than swallowed. `start` independently refuses to
+  branch from a `dev` that is not a known pushed tip (`_resolve_start_base`,
+  `local_dev_not_a_pushed_tip`).
+- **Nothing to reverse on a failed push.** Because the advance is deferred
+  until after the push succeeds, a failed/refused push finds nothing to undo:
+  `_restore_local_dev_after_failed_push` reports `no_advance_to_undo` and
+  local `dev` is **provably unchanged** from its pre-finish value — there is
+  no write-then-restore window. The conservative restore machinery is
+  retained as the failure-path record surface and safety net: it targets
+  `refs/remotes/origin/dev`, undoes only finish's **own** advance (when the
+  branch moved since, `branch_moved_since_advance`, another actor owns that
+  move and nothing is touched), uses `git reset --merge` when `dev` is checked
+  out (uncommitted work in the shared checkout survives; an overlapping local
   modification is reported, never clobbered — `reset --hard` is never used),
   otherwise an atomic compare-and-swap `git update-ref`. An unpushed commit is
   therefore never left as the next worktree's base.
@@ -4282,20 +4309,24 @@ idempotent — it re-verifies commit → ancestry → status and marks the item
 
 **When a manual merge is needed.** Only in two cases. First, when the rebase
 conflicts: resolve them, commit, push, and re-run `finish`. Second, when the
-pre-push fast-forward reports `local_dev_diverged` because the **main
-checkout's local `dev` carries commits `origin/dev` does not have**:
+post-push fast-forward reports `local_dev_diverged` because the **main
+checkout's local `dev` carries commits `origin/dev` does not have** (the
+defect family of WL-0MWFKDH78002T2CR — a concurrent `start` now refuses to
+branch from such a `dev` via `_resolve_start_base`, and `finish` never
+advances an unpushed commit):
 
 ```bash
 git -C <main-checkout> log --oneline origin/dev..dev   # what is local-only
 ```
 
-Those commits are someone's unpublished work, so `finish` neither discards nor
+those commits are someone's unpublished work, so `finish` neither discards nor
 merges them for you. If they are intended, publish them (push `dev`, or merge
 them into `origin/dev`) and re-run `finish`; if they are stale, restore local
 `dev` deliberately with `git -C <main-checkout> reset --merge origin/dev` —
 `--merge`, never `--hard`, because the shared checkout may hold uncommitted
-work from another session. `finish` has already restored its **own** advance
-after the failed push, so this is the residual case of a pre-existing local
+work from another session. `finish` never advanced its **own** local `dev`
+before the push (the advance is deferred until after push success), so this is
+the residual case of a pre-existing local
 divergence.
 
 **Runtime copy.** These behaviours live in the installed skill copy

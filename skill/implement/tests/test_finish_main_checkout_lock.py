@@ -659,7 +659,15 @@ def test_concurrent_finishes_overlap_their_full_suite_runs(tmp_path, monkeypatch
     def _fake_run_tests(cwd, scope="changed", base_ref=None, fingerprint=None):
         if scope != "full":
             return _tests_result()
-        fd, _holder = implement.acquire_main_checkout_lock(repo, "WL-PROBE")
+        # The probe is fail-fast; retry briefly so a *sibling's momentary
+        # probe hold* (its own acquire/release) is never mistaken for a
+        # finish holding the lock during the suite. A real finish hold lasts
+        # the whole mutating window, so it is observed on every retry.
+        fd, _holder = None, None
+        for _attempt in range(5):
+            fd, _holder = implement.acquire_main_checkout_lock(repo, "WL-PROBE")
+            if fd is not None:
+                break
         with observed_lock:
             observed.append(("full_suite", fd is not None))
         if fd is not None:

@@ -1086,29 +1086,26 @@ def test_phase_finish_reports_refused_by_pushed_commit_guard(sandbox):
     ), f"the remedy must name the worktree push; got {comments}"
 
 
-def test_recover_retries_the_fast_forward_with_the_rebased_commit(sandbox):
-    """After the recovery rebase, the fast-forward is retried for the new tip."""
+def test_recovery_defers_the_fast_forward_until_the_retry_push(sandbox):
+    """The recovery never advances local dev; it records the deferral.
+
+    Pre-fix behaviour retried the fast-forward for the rebased commit *before*
+    the retry push — moving local dev to a still-unpushed commit. Under AC1
+    (WL-0MWFKDH78002T2CR) the advance belongs to the single post-push step in
+    ``phase_finish``; the recovery records a deferral and touches no ref.
+    """
     recorded: list[tuple] = []
-    advanced = {
-        "method": "advanced",
-        "success": True,
-        "advanced": True,
-        "commit": "rebased123",
-        "advanced_to": "rebased123",
-        "own_churn": ["feature.txt"],
-    }
-
-    def fake_ff(repo_root, commit_hash, parent_branch="dev"):
-        recorded.append((repo_root, commit_hash, parent_branch))
-        return dict(advanced)
-
     ff_retry: dict = {}
     run_ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     with (
         patch.object(implement, "run_cmd", return_value=run_ok),
         patch.object(implement, "git_get_commit_hash", return_value="rebased123"),
         patch.object(
-            implement, "_fast_forward_local_dev_for_push", side_effect=fake_ff
+            implement,
+            "_fast_forward_local_dev_for_push",
+            side_effect=AssertionError(
+                "the recovery must never advance local dev mid-push"
+            ),
         ),
         patch.object(implement, "_assert_push_subject"),
         patch.object(implement, "git_push_to_dev", return_value=True),
@@ -1131,19 +1128,21 @@ def test_recover_retries_the_fast_forward_with_the_rebased_commit(sandbox):
         )
 
     assert new_commit == "rebased123"
-    assert recorded == [(str(sandbox["main"]), "rebased123", "dev")], recorded
-    assert ff_retry == advanced, ff_retry
+    assert recorded == [], f"local dev must not be advanced pre-push: {recorded}"
+    assert ff_retry["method"] == "deferred", ff_retry
+    assert ff_retry["advanced"] is False, ff_retry
+    assert ff_retry["commit"] == "rebased123", ff_retry
 
 
 def test_phase_finish_records_the_fast_forward_retry(sandbox):
-    """The recovery retry is recorded in the finish report."""
-    advanced = {
-        "method": "advanced",
+    """The recovery's deferral is recorded in the finish report."""
+    deferred = {
+        "method": "deferred",
         "success": True,
-        "advanced": True,
+        "advanced": False,
         "commit": sandbox["feature_short"],
-        "advanced_to": sandbox["feature_short"],
-        "own_churn": ["feature.txt"],
+        "reason": "deferred_until_post_push",
+        "own_churn": [],
     }
     calls = {"n": 0}
 
@@ -1158,7 +1157,7 @@ def test_phase_finish_records_the_fast_forward_retry(sandbox):
     def fake_recover(**kwargs):
         out = kwargs.get("ff_retry_out")
         if out is not None:
-            out.update(advanced)
+            out.update(deferred)
         return kwargs["commit_hash"]
 
     pushes: list[tuple] = []
@@ -1173,7 +1172,7 @@ def test_phase_finish_records_the_fast_forward_retry(sandbox):
 
     assert report["success"] is True, report["message"]
     recorded = report["steps"]["local_dev_fast_forward"]
-    assert recorded.get("retry") == advanced, recorded
+    assert recorded.get("retry") == deferred, recorded
 
 
 def test_concurrent_move_recovery_pushes_the_clean_worktree_tree(sandbox):
@@ -1193,6 +1192,7 @@ def test_concurrent_move_recovery_pushes_the_clean_worktree_tree(sandbox):
     _install_recording_guard_hook(sandbox, marker)
 
     ff_retry: dict = {}
+    pre_recovery_dev = _rev(main, "dev")
     with patch.object(implement, "wl_add_comment", return_value=True):
         new_commit = implement._recover_non_fast_forward_push(
             worktree_path=str(wt),
@@ -1227,7 +1227,13 @@ def test_concurrent_move_recovery_pushes_the_clean_worktree_tree(sandbox):
     )
     assert Path(observed[2]).resolve() == wt.resolve(), observed
 
-    # AC1: the retried fast-forward advanced the main checkout's dev.
-    assert ff_retry.get("method") == "advanced", ff_retry
-    assert _names_commit(ff_retry.get("advanced_to") or "", new_commit), ff_retry
-    assert _names_commit(_rev(main), new_commit), new_commit
+    # AC1 (WL-0MWFKDH78002T2CR): the recovery deferred the advance — local
+    # dev was never moved to the (still-unpushed) rebased commit. Only the
+    # post-push step in phase_finish may advance it, after the retry push
+    # reports success.
+    assert ff_retry.get("method") == "deferred", ff_retry
+    assert ff_retry.get("advanced") is False, ff_retry
+    assert _rev(main, "dev") == pre_recovery_dev, (
+        "the recovery must not move local dev before the retry push succeeds; "
+        f"dev moved from {pre_recovery_dev} to {_rev(main, 'dev')}"
+    )
