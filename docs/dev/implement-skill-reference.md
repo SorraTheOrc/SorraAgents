@@ -260,6 +260,65 @@ fake, injected commit-evidence provider, recording mutation fake).
 - No fetch/network in the evidence path; a stale `origin/dev` ref is accepted
   evidence on the failure path.
 
+## Spawn-failure evidence: a child that produced nothing is startable again (SA-0MWGZ8NWP009QD8G)
+
+A child whose session died **before writing anything** (spawn error, provider
+failure, non-zero exit, timeout) is left `in-progress` with a worktree that
+holds no work: no dirty files and no commits ahead of `dev`. The placement
+guard cannot distinguish that child from one whose work landed in the main
+checkout or in a sibling worktree — both look identical on disk — so before
+SA-0MWGZ8NWP009QD8G the next `drive`/`parent` run attributed **pre-existing,
+unrelated** dirt to the failed child and failed the chain closed, naming paths
+it had never touched. Recovering needed a manual `implement.py abort`.
+
+### The record
+
+On its non-terminal spawn-failure path `phase_drive` records the failure as
+durable evidence: `record_spawn_failure()` writes
+`<worktree>/.worklog/spawn-failure.json` with the child id, a UTC timestamp and
+the spawner's reason, and marks the `children_driven` entry
+`spawn_failure_recorded: true`. The location matters:
+
+- **Under `.worklog/`** — the prefix every dirty-path helper excludes — so the
+  record can never be mistaken for work. The child stays *no work*
+  (`CHILD_CLEAN`), i.e. re-spawnable, never presentable as finishable.
+- **Worktree-local** — it describes *that* worktree's last session and
+disappears when the worktree is removed; a missing worktree is never
+re-created just to hold a record.
+
+It is written **only** for a child that produced no attributable work of its
+own (`_classify_child_worktree` ⇒ `CHILD_CLEAN` / `CHILD_NO_WORK`), so a
+session that did work never
+excuses a later stray. `phase_start` clears the record (`clear_spawn_failure`)
+when the next session begins, because the evidence describes the *previous*
+session; recording and clearing are both fail-open — the record is diagnostic
+evidence, never a gate.
+
+### How the guard reads it
+
+`_child_main_checkout_violation` returns **no violation** for a child carrying
+recorded spawn-failure evidence (matched by child id): a session that died
+before writing cannot have produced the foreign dirt, so those surfaces are
+pre-existing and unrelated. `phase_parent` then reports the child for
+implementation in both branches — the `skip-in-progress` path and the
+`implement` path — with `report["spawn_failure"]` carrying the evidence and a
+message saying it is **startable again**, so the next `drive` re-spawns it
+without manual intervention.
+
+Evidence-free children keep the full guard: a child that genuinely wrote into
+a sibling worktree still fails closed (SA-0MW5FIJNQ002Z24I), and an unreadable
+or foreign-child record is ignored so the guard applies unchanged. Residual
+limit: a session that wrote into a foreign surface *and* died before doing the
+work it owns is indistinguishable from a spawn failure once the driver has
+recorded the failure — the record is only written when the child's own
+worktree is genuinely empty.
+
+Regression coverage:
+`skill/implement/tests/test_drive_sibling_worktree_stray.py`
+(`TestSpawnFailureEvidence`, `TestSpawnFailedChildIsStartableAgain`,
+`TestDriveRecordsSpawnFailureEvidence`) — real git fixture repositories, both
+`phase_parent` call sites, and the end-to-end drive→parent hand-off.
+
 ## Assignee release when a kill cannot run an exit hook (SA-0MVVF75ZA007XNKB)
 
 A non-empty `assignee` is a **scheduling hold** (see the
@@ -836,7 +895,7 @@ values):
 | `reset-for-retry` | The child was non-terminal after the finish bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. Carries `reset: true`, `status`, `stage`, `evidence`, `finish_attempts` and `discarded_paths` (the uncommitted files the reset removed — never a commit). |
 | `completed-late` | Session timeout/exit after the child reached a terminal state (see the timeout section). |
 | `finalised` | A stranded child was finalised via `--finalise-stranded`. |
-| `failed` | The child is not terminal; the chain stops and `failed_child` is set. |
+| `failed` | The child is not terminal; the chain stops and `failed_child` is set. Carries `spawn_failure_recorded: true` when the driver recorded spawn-failure evidence in the child's worktree (see the spawn-failure section), so the next run recognises it as startable again. |
 
 Additional report fields:
 
@@ -3956,6 +4015,11 @@ Guards (deterministic, in `phase_parent`):
   of the same repository holds changes** (SA-0MW5FIJNQ002Z24I) — has written
   outside its own worktree; the phase fails closed with the offending
   surfaces (and does not advance the parent) instead of silently proceeding.
+  A child whose last session died before producing any work is exempt: the
+  driver's recorded spawn-failure evidence
+  (`<worktree>/.worklog/spawn-failure.json`) makes the foreign dirt
+  pre-existing and unrelated, so the child is reported startable again and
+  the next `drive` re-spawns it (SA-0MWGZ8NWP009QD8G).
 - A parent with no children or all-terminal children behaves as today.
 
 Worktree isolation per child is preserved: every child is implemented in

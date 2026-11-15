@@ -359,7 +359,12 @@ chain.
 The guard is deliberately precise: a legitimate child whose work is already in
 its worktree, a clean main checkout, `.worklog/`-only dirt, or a clean sibling
 tree never trigger it — the child's own worktree holding the work makes every
-other change surface unrelated (unrelated dirt never blocks). A **foreign
+other change surface unrelated (unrelated dirt never blocks). A child whose
+session died before writing anything is exempt too: `phase_drive` records the
+failure in `<worktree>/.worklog/spawn-failure.json`, so the foreign dirt is
+pre-existing and unrelated and the child is reported startable again (the next
+`drive` re-spawns it) rather than failing the chain closed
+(SA-0MWGZ8NWP009QD8G). A **foreign
 repository checkout** — even one reachable by path — is never a sibling: only
 paths `git worktree list` registers for the child's own repository count
 (cross-checkout attribution). The ahead-count (rather than a HEAD comparison)

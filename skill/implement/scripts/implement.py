@@ -497,6 +497,14 @@ def _resolve_test_timeout(cwd: str) -> int:
 # State file name stored inside the worktree
 STATE_FILE_NAME = ".implement_state.json"
 
+#: Worktree-local record of a driven child session that failed before doing any
+#: work (a spawn error, non-zero exit or timeout with the child left
+#: non-terminal). It lives under ``.worklog/`` — a prefix every dirty-path
+#: helper excludes — so the record can never be mistaken for the child's work.
+#: Read by the placement guard, cleared when the next session starts
+#: (SA-0MWGZ8NWP009QD8G / AH-0MWFHLDAS008YG0P).
+SPAWN_FAILURE_FILE = ".worklog/spawn-failure.json"
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -10996,6 +11004,130 @@ def remove_state(worktree_path: str) -> None:
         LOG.debug("State file removed: %s", state_path)
 
 
+def record_spawn_failure(
+    worktree_path: str,
+    child_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Record that a driven child session failed before producing any work.
+
+    The driver observes the failure directly (a spawn error, a non-zero exit
+    or a timeout with the child left non-terminal). ``phase_parent`` and
+    ``phase_drive`` **cannot** reconstruct it from the filesystem later: a
+    child that produced nothing looks exactly like a child whose work landed
+    somewhere else. Without this evidence the placement guard
+    (:func:`_child_main_checkout_violation`) attributes pre-existing dirt in
+    the main checkout or in a sibling worktree to the failed child and fails
+    the chain closed, naming paths the child never touched
+    (SA-0MWGZ8NWP009QD8G / AH-0MWFHLDAS008YG0P).
+
+    The record is written to :data:`SPAWN_FAILURE_FILE` inside the child's
+    worktree. ``.worklog/`` is excluded by every dirty-path helper, so the
+    record never counts as work: the child stays re-spawnable rather than
+    being presented as finishable. The record is cleared when the next session
+    starts (:func:`clear_spawn_failure` in ``phase_start``) and disappears with
+    the worktree.
+
+    Args:
+        worktree_path: The child's worktree root.
+        child_id: The child work item ID the record belongs to.
+        reason: Human-readable failure evidence (the spawner's reason).
+
+    Returns:
+        The recorded evidence dict, or ``None`` when the worktree is gone or
+        the write failed (fail-open: this record is diagnostic evidence, never
+        a gate).
+    """
+    wt = Path(worktree_path)
+    if not wt.is_dir():
+        LOG.warning(
+            "Not recording the spawn failure for %s: worktree %s is gone.",
+            child_id,
+            wt,
+        )
+        return None
+    evidence = {
+        "child_id": child_id,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "reason": reason,
+    }
+    path = wt / SPAWN_FAILURE_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+    except OSError as exc:
+        LOG.warning(
+            "Could not record the spawn failure for %s in %s: %s",
+            child_id,
+            wt,
+            exc,
+        )
+        return None
+    LOG.info("Recorded the spawn failure for %s in %s", child_id, path)
+    return evidence
+
+
+def read_spawn_failure(
+    worktree_path: str, child_id: str | None = None
+) -> dict[str, Any] | None:
+    """Read recorded spawn-failure evidence from a child's worktree.
+
+    Args:
+        worktree_path: The child's worktree root.
+        child_id: When given, evidence recorded for a *different* child is
+            ignored (a worktree belongs to one item; this keeps a stale record
+            from excusing another item).
+
+    Returns:
+        The evidence dict, or ``None`` when there is no record, it is
+        unreadable, or it belongs to another child. Unreadable evidence fails
+        open (the placement guard applies unchanged).
+    """
+    path = Path(worktree_path) / SPAWN_FAILURE_FILE
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        LOG.warning("Ignoring unreadable spawn-failure record %s: %s", path, exc)
+        return None
+    if not isinstance(data, dict):
+        LOG.warning("Ignoring malformed spawn-failure record %s: %r", path, data)
+        return None
+    recorded_child = str(data.get("child_id") or "")
+    if child_id and recorded_child and recorded_child != child_id:
+        LOG.debug(
+            "Ignoring spawn-failure record %s: it belongs to %s, not %s.",
+            path,
+            recorded_child,
+            child_id,
+        )
+        return None
+    return data
+
+
+def clear_spawn_failure(worktree_path: str) -> bool:
+    """Clear recorded spawn-failure evidence (a fresh session attempt).
+
+    Args:
+        worktree_path: The child's worktree root.
+
+    Returns:
+        True when a record was removed, False when there was none (or the
+        removal failed — fail-open, the record is diagnostic only).
+    """
+    path = Path(worktree_path) / SPAWN_FAILURE_FILE
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        LOG.warning("Could not clear the spawn-failure record %s: %s", path, exc)
+        return False
+    LOG.debug("Cleared spawn-failure record %s", path)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Stash hygiene helpers
 # ---------------------------------------------------------------------------
@@ -11977,6 +12109,10 @@ def _phase_start_locked(
         verification_only=bool(verification_only),
     )
     write_state(state, abs_wt_path)
+    # A fresh session attempt starts from a clean slate: any recorded
+    # spawn-failure evidence describes the *previous* session, which is why
+    # this child is startable again (SA-0MWGZ8NWP009QD8G).
+    clear_spawn_failure(abs_wt_path)
 
     report["worktree_path"] = abs_wt_path
     report["branch"] = branch
@@ -15159,6 +15295,25 @@ def phase_parent(
             "(lifecycle owner's decision).",
         )
 
+    def _startable_again_note(cid: str, worktree_path: str) -> str:
+        """Explain a spawn-failed child in the implement-next message.
+
+        A child whose last session died before producing any work carries
+        recorded evidence (SA-0MWGZ8NWP009QD8G). Its worktree is clean, so it
+        is startable again rather than a placement violation; saying so
+        explicitly stops the operator reading the bare "in progress" message
+        as a stuck child that needs a manual ``abort``.
+        """
+        evidence = read_spawn_failure(worktree_path, cid)
+        if not evidence:
+            return ""
+        report["spawn_failure"] = evidence
+        return (
+            f" Its previous session failed before producing any work "
+            f"({evidence.get('reason') or 'unknown failure'}), so it is "
+            f"startable again."
+        )
+
     def _report_implement_next(
         cid: str, worktree_path: str, branch: str, message: str,
         start_result: dict[str, Any] | None = None,
@@ -15402,7 +15557,8 @@ def phase_parent(
                     cid, worktree_path, "",
                     f"Child {cid} is in progress. Implement in "
                     f"{worktree_path}, then re-run "
-                    f"`implement.py parent {work_item_id}`.",
+                    f"`implement.py parent {work_item_id}`."
+                    + _startable_again_note(cid, worktree_path),
                 )
             else:
                 pending_ids.append(cid)
@@ -15462,7 +15618,8 @@ def phase_parent(
                 cid, worktree_path, "",
                 f"Child {cid} worktree exists at {worktree_path}. "
                 f"Implement, then re-run "
-                f"`implement.py parent {work_item_id}`.",
+                f"`implement.py parent {work_item_id}`."
+                + _startable_again_note(cid, worktree_path),
             )
 
         # No worktree — start the child in its own subprocess.
@@ -19064,6 +19221,27 @@ def phase_drive(
                 )
                 continue
 
+            # Not terminal: record durable evidence that the child produced
+            # nothing (SA-0MWGZ8NWP009QD8G). The placement guard cannot tell a
+            # failed session from one whose work landed in the main checkout
+            # or in a sibling worktree; without this record the next run
+            # attributes unrelated dirt to the child and fails the chain
+            # closed. Only a child with no attributable work of its own is
+            # recorded, so a session that did produce work never excuses a
+            # later stray.
+            spawn_failure = None
+            if (
+                _classify_child_worktree(child_id, worktree_path, parent_branch)
+                in (CHILD_CLEAN, CHILD_NO_WORK)
+            ):
+                spawn_failure = record_spawn_failure(
+                    worktree_path,
+                    child_id,
+                    reconciliation["reason"]
+                    or str(spawn_result.get("reason", "") or "session failed"),
+                )
+            entry["spawn_failure_recorded"] = spawn_failure is not None
+
             # Not terminal: dispose of the pane this session created. A
             # timeout means the wait expired and the session is gone, so its
             # pane is closed (AC4: the timeout bound closes the pane and stops
@@ -19492,6 +19670,14 @@ def _child_main_checkout_violation(
     :func:`_worktree_placement_violation`, minus the cwd-sensitive check that
     only applies to ``phase_finish``.
 
+    A child with recorded **spawn-failure evidence**
+    (:func:`record_spawn_failure`) is exempt: its session died before writing
+    anything, so the foreign dirt found here is pre-existing and cannot be
+    attributed to it. Such a child is reported startable again
+    (SA-0MWGZ8NWP009QD8G / AH-0MWFHLDAS008YG0P). Only the driver writes that
+    record, and only for a child that produced no work, so the genuine
+    cross-worktree-write detection (SA-0MW5FIJNQ002Z24I) is unchanged.
+
     Args:
         child_id: The child work item ID (named in the message).
         worktree_path: Absolute path to the child's worktree.
@@ -19520,6 +19706,21 @@ def _child_main_checkout_violation(
     if _git_path_has_changes(
         wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
     ):
+        return None
+
+    # A child whose session failed before producing any work cannot have
+    # written the surfaces scanned below: the driver recorded that evidence
+    # when the session died (SA-0MWGZ8NWP009QD8G). Whatever dirt is found is
+    # then pre-existing and unrelated, so the caller reports the child as
+    # startable again instead of failing the chain closed. Genuine
+    # cross-worktree writes carry no such record, so the SA-0MW5FIJNQ002Z24I
+    # detection is unaffected.
+    if read_spawn_failure(str(wt), child_id):
+        LOG.info(
+            "Child %s has a recorded session failure and no work of its own; "
+            "foreign change surfaces are not attributed to it.",
+            child_id,
+        )
         return None
 
     offending = _main_checkout_offending_paths(str(root), expected_dirty=root_expected)

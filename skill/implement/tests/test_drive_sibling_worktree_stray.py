@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MWFSGW52003YZA3
+# smell: ruff_specific
+# severity: medium
+# description: Unpacked variable `status_calls` is never used
+# -->
 """Regression tests: a driven child that strays into a sibling worktree.
 
 Incident (SA-0MW5FIJNQ002Z24I): a driven child whose first ``finish`` gate
@@ -92,6 +98,12 @@ def sibling_worktree(repo: Path, tmp_path: Path) -> Path:
     return gs.add_worktree(repo, wt, f"wl-{SIBLING_ID}", base=PARENT_BRANCH)
 
 
+SPAWN_FAILURE_REASON = (
+    f"Child session for {CHILD_ID} exited with code 1: Provider "
+    "finish_reason: error"
+)
+
+
 def _child(status: str = "open") -> dict:
     return {
         "id": CHILD_ID,
@@ -104,7 +116,9 @@ def _child(status: str = "open") -> dict:
     }
 
 
-def _run_phase_parent(worktree_path: Path, invoke_impl=None):
+def _run_phase_parent(
+    worktree_path: Path, invoke_impl=None, status: str = "open"
+):
     """Drive ``phase_parent`` against the child, recording wl writes.
 
     Returns the report plus the recorded ``update_status`` calls (empty = no
@@ -133,7 +147,7 @@ def _run_phase_parent(worktree_path: Path, invoke_impl=None):
             return_value={"id": PARENT_ID, "title": "Parent", "status": "plan_complete"},
         ),
         mock.patch.object(
-            implement, "wl_show_children", return_value=[_child()]
+            implement, "wl_show_children", return_value=[_child(status)]
         ),
         mock.patch.object(implement, "wl_dep_blockers", return_value=[]),
         mock.patch.object(
@@ -233,3 +247,279 @@ class TestDrivenChildStraysIntoSiblingWorktree:
         assert report.get("placement_violation") is not True
         # The child has work, so the phase handed it to finish (stubbed).
         assert invoked == [("finish", CHILD_ID)]
+
+
+# ---------------------------------------------------------------------------
+# Spawn-failure evidence: a child that wrote nothing is startable again
+# (SA-0MWGZ8NWP009QD8G / AH-0MWFHLDAS008YG0P)
+# ---------------------------------------------------------------------------
+#
+# Incident: ``implement.py drive`` spawned a child session that died before
+# writing anything (a transient provider error, ``Provider finish_reason:
+# error``). The child was left ``in-progress`` with a clean worktree (no dirty
+# files, no commits ahead), and the next ``drive``/``parent`` run then
+# attributed *pre-existing* dirt in the main checkout and in three sibling
+# worktrees to it — naming paths the child had never touched — and failed the
+# chain closed. Recovering needed a manual ``implement.py abort``.
+#
+# Contract (parent ACs):
+#
+# - The driver records durable evidence when a child's session fails and the
+#   child produced no work (``record_spawn_failure``). The record lives under
+#   the worktree's ``.worklog/`` — a prefix the dirty-path helpers always
+#   exclude — so it can never be mistaken for work, and it is cleared when the
+#   next session starts.
+# - ``_child_main_checkout_violation`` treats recorded spawn-failure evidence
+#   as proof the child wrote nothing: unrelated dirty surfaces are then
+#   pre-existing dirt, so the child is reported *startable again* (the next
+#   ``drive`` re-spawns it) instead of failing the chain.
+# - Evidence-free children keep the full guard (SA-0MW5FIJNQ002Z24I): a child
+#   that genuinely wrote into a sibling worktree still fails closed, at both
+#   ``phase_parent`` call sites.
+
+
+class TestSpawnFailureEvidence:
+    """The durable spawn-failure record itself."""
+
+    def test_recorded_evidence_round_trips_and_is_never_work(
+        self, child_worktree: Path
+    ) -> None:
+        evidence = implement.record_spawn_failure(
+            str(child_worktree), CHILD_ID, SPAWN_FAILURE_REASON
+        )
+
+        assert evidence is not None
+        assert evidence["child_id"] == CHILD_ID
+        assert evidence["reason"] == SPAWN_FAILURE_REASON
+        assert evidence["recorded_at"]
+        assert (
+            implement.read_spawn_failure(str(child_worktree), CHILD_ID)
+            == evidence
+        )
+        # AC1: recording the failure must not turn the child into "has work".
+        # The record sits under ``.worklog/``, which every dirty-path helper
+        # excludes, so the child stays re-spawnable (never finishable).
+        assert implement._has_worktree_changes(str(child_worktree)) is False
+        assert (
+            implement._classify_child_worktree(
+                CHILD_ID, str(child_worktree), PARENT_BRANCH
+            )
+            == implement.CHILD_CLEAN
+        )
+
+    def test_clear_removes_the_record_and_is_idempotent(
+        self, child_worktree: Path
+    ) -> None:
+        implement.record_spawn_failure(
+            str(child_worktree), CHILD_ID, SPAWN_FAILURE_REASON
+        )
+
+        assert implement.clear_spawn_failure(str(child_worktree)) is True
+        assert implement.read_spawn_failure(str(child_worktree), CHILD_ID) is None
+        assert implement.clear_spawn_failure(str(child_worktree)) is False
+
+    def test_evidence_naming_another_child_is_never_attributed(
+        self, child_worktree: Path
+    ) -> None:
+        implement.record_spawn_failure(
+            str(child_worktree), "SA-OTHERCHILD00001", SPAWN_FAILURE_REASON
+        )
+
+        assert implement.read_spawn_failure(str(child_worktree), CHILD_ID) is None
+        # Reading without a child id still yields the raw record (diagnostics).
+        assert implement.read_spawn_failure(str(child_worktree)) is not None
+
+    def test_unreadable_evidence_fails_open_to_the_guard(
+        self, child_worktree: Path
+    ) -> None:
+        marker = child_worktree / implement.SPAWN_FAILURE_FILE
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("{not json", encoding="utf-8")
+
+        assert implement.read_spawn_failure(str(child_worktree), CHILD_ID) is None
+
+    def test_a_missing_worktree_is_never_recreated(
+        self, tmp_path: Path
+    ) -> None:
+        gone = tmp_path / "removed-worktree"
+
+        assert implement.record_spawn_failure(str(gone), CHILD_ID, "boom") is None
+        assert not gone.exists()
+
+
+class TestSpawnFailedChildIsStartableAgain:
+    """A spawn-failed child is re-spawnable, not a placement violation."""
+
+    def test_dirty_main_and_sibling_are_not_attributed_to_it(
+        self, repo: Path, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        """The incident: unrelated dirt in both foreign surfaces."""
+        (repo / "dirty-main.txt").write_text("uncommitted\n", encoding="utf-8")
+        (sibling_worktree / "stray.py").write_text("x = 1\n", encoding="utf-8")
+        implement.record_spawn_failure(
+            str(child_worktree), CHILD_ID, SPAWN_FAILURE_REASON
+        )
+
+        report, status_calls, invoked = _run_phase_parent(child_worktree)
+
+        assert report["success"] is True
+        assert report.get("placement_violation") is not True
+        assert report["next_child"] == CHILD_ID
+        assert report["spawn_failure"]["child_id"] == CHILD_ID
+        assert "startable again" in report["message"]
+        # No status mutation: the child is reported, never reset behind the
+        # workflow's back, and no finish is attempted.
+        assert invoked == []
+        assert status_calls == []
+
+    def test_in_progress_child_with_evidence_is_startable_again(
+        self, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        """The ``skip-in-progress`` call site (the incident's shape)."""
+        (sibling_worktree / "stray.py").write_text("x = 1\n", encoding="utf-8")
+        implement.record_spawn_failure(
+            str(child_worktree), CHILD_ID, SPAWN_FAILURE_REASON
+        )
+
+        report, status_calls, invoked = _run_phase_parent(
+            child_worktree, status="in-progress"
+        )
+
+        assert report["success"] is True
+        assert report.get("placement_violation") is not True
+        assert report["next_child"] == CHILD_ID
+        assert "startable again" in report["message"]
+        assert invoked == []
+        assert status_calls == []
+
+    def test_clean_surfaces_with_evidence_still_report_implement_next(
+        self, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        """The happy path is unchanged: nothing dirty, nothing to attribute."""
+        implement.record_spawn_failure(
+            str(child_worktree), CHILD_ID, SPAWN_FAILURE_REASON
+        )
+
+        report, status_calls, invoked = _run_phase_parent(child_worktree)
+
+        assert report["success"] is True
+        assert report.get("placement_violation") is not True
+        assert report["next_child"] == CHILD_ID
+        assert invoked == []
+        assert status_calls == []
+
+    def test_genuine_stray_without_evidence_still_fails_closed(
+        self, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        """No weakening: the same dirt *without* evidence is a violation."""
+        (sibling_worktree / "stray.py").write_text("x = 1\n", encoding="utf-8")
+
+        report, status_calls, invoked = _run_phase_parent(
+            child_worktree, status="in-progress"
+        )
+
+        assert report["success"] is False
+        assert report["placement_violation"] is True
+        assert str(sibling_worktree) in report["message"]
+        assert "stray.py" in report["message"]
+        assert invoked == []
+        assert status_calls == []
+
+    def test_evidence_naming_another_child_keeps_the_guard(
+        self, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        (sibling_worktree / "stray.py").write_text("x = 1\n", encoding="utf-8")
+        implement.record_spawn_failure(
+            str(child_worktree), "SA-OTHERCHILD00001", SPAWN_FAILURE_REASON
+        )
+
+        report, _status_calls, _invoked = _run_phase_parent(child_worktree)
+
+        assert report["success"] is False
+        assert report["placement_violation"] is True
+
+
+class TestDriveRecordsSpawnFailureEvidence:
+    """``phase_drive`` records the evidence the guard later reads."""
+
+    def _drive(self, child_worktree: Path, child_status: str = "in-progress"):
+        parent_report = {
+            "success": True,
+            "next_child": CHILD_ID,
+            "worktree_path": str(child_worktree),
+        }
+        child_item = _child(child_status)
+
+        def _wl_show(work_item_id: str):
+            if work_item_id == PARENT_ID:
+                return {
+                    "id": PARENT_ID,
+                    "title": "Parent",
+                    "status": "plan_complete",
+                    "stage": "plan_complete",
+                }
+            return dict(child_item)
+
+        def _spawner(child_id, worktree_path, timeout, env, verbose=False):
+            assert child_id == CHILD_ID
+            assert worktree_path == str(child_worktree)
+            return {
+                "success": False,
+                "returncode": 1,
+                "reason": SPAWN_FAILURE_REASON,
+            }
+
+        with (
+            mock.patch.object(implement, "wl_show", side_effect=_wl_show),
+            mock.patch.object(
+                implement, "wl_show_children", return_value=[child_item]
+            ),
+            mock.patch.object(
+                implement, "_discover_worktree", return_value=str(child_worktree)
+            ),
+            mock.patch.object(implement, "wl_add_comment", return_value=True),
+        ):
+            return implement.phase_drive(
+                PARENT_ID,
+                parent_runner=lambda *a, **k: dict(parent_report),
+                spawn_session=_spawner,
+            )
+
+    def test_failed_session_on_a_child_with_no_work_records_evidence(
+        self, child_worktree: Path
+    ) -> None:
+        report = self._drive(child_worktree)
+
+        assert report["failed_child"] == CHILD_ID
+        entry = report["children_driven"][0]
+        assert entry["result"] == "failed"
+        assert entry["spawn_failure_recorded"] is True
+
+        evidence = implement.read_spawn_failure(str(child_worktree), CHILD_ID)
+        assert evidence is not None
+        assert "Provider finish_reason: error" in evidence["reason"]
+
+    def test_recorded_evidence_makes_the_next_parent_run_startable_again(
+        self, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        """End to end: drive's record defuses the next run's guard."""
+        self._drive(child_worktree)
+        (sibling_worktree / "stray.py").write_text("x = 1\n", encoding="utf-8")
+
+        report, _status_calls, _invoked = _run_phase_parent(
+            child_worktree, status="in-progress"
+        )
+
+        assert report["success"] is True
+        assert report.get("placement_violation") is not True
+        assert report["next_child"] == CHILD_ID
+
+    def test_a_child_that_already_holds_work_records_no_evidence(
+        self, child_worktree: Path
+    ) -> None:
+        """Evidence is only ever recorded for a child that produced nothing."""
+        _commit(child_worktree, "child-work.py", branch_tag=CHILD_ID)
+
+        self._drive(child_worktree)
+
+        assert implement.read_spawn_failure(str(child_worktree), CHILD_ID) is None
