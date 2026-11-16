@@ -1213,6 +1213,7 @@ class TestWorklogDirDetection:
         """cwd/.worklog is found first."""
         proj = tmp_path / "proj"
         (proj / ".worklog").mkdir(parents=True)
+        (proj / ".worklog" / "initialized").write_text("{}")
         monkeypatch.chdir(proj)
         assert status_lifecycle_module._detect_worklog_dir() == proj / ".worklog"
 
@@ -1220,6 +1221,7 @@ class TestWorklogDirDetection:
         """git rev-parse --show-toplevel/.worklog is used when cwd is a subdir."""
         root = tmp_path / "repo"
         (root / ".worklog").mkdir(parents=True)
+        (root / ".worklog" / "initialized").write_text("{}")
         (root / "sub").mkdir(parents=True)
         monkeypatch.chdir(root / "sub")
         fake = subprocess.CompletedProcess(
@@ -1235,6 +1237,7 @@ class TestWorklogDirDetection:
         """Ancestor .worklog is found when git resolution fails."""
         proj = tmp_path / "proj"
         (proj / ".worklog").mkdir(parents=True)
+        (proj / ".worklog" / "initialized").write_text("{}")
         deep = proj / "a" / "b"
         deep.mkdir(parents=True)
         monkeypatch.chdir(deep)

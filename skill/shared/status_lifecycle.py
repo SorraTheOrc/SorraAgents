@@ -80,7 +80,11 @@ which injects ``--worklog-dir`` flags with this precedence:
        resolves to its own project's store even when the harness cwd is the
        framework repo
     3. cwd chain (:func:`worklog_dir_flag`) — ``<cwd>/.worklog``, git root,
-       nearest initialized ancestor
+       nearest **initialised** ancestor. Only initialised ``.worklog``
+       directories are accepted, and an ancestor already named ``.worklog``
+       is its own candidate — the ``.worklog/.worklog`` nesting never
+       occurs, so a cwd inside ``<main>/.worklog/worktrees/…`` resolves the
+       main checkout's store (SA-0MW0JHMJE006GWQB)
     4. no flag (wl resolves from cwd; failures surface real error detail)
 
 Public helpers: :func:`resolve_worklog_dir` (resolve a store for an id),
@@ -291,20 +295,58 @@ def _is_initialized_worklog(path: Path) -> bool:
     )
 
 
+def _worklog_candidate(directory: Path) -> Path:
+    """Candidate ``.worklog`` path for *directory* on the resolution chain.
+
+    When *directory* is itself already named ``.worklog`` the candidate is
+    that directory itself — it is never extended to ``.worklog/.worklog``.
+    Any other directory's candidate is ``directory / ".worklog"``.
+
+    This is the **no double suffix** rule behind the implement-worktree
+    layout: a cwd inside ``<main>/.worklog/worktrees/wl-<id>-<slug>`` walks
+    its ancestors, one of which IS ``<main>/.worklog`` — the worklog
+    directory that is itself an ancestor is the candidate, so the walk must
+    consider ``<main>/.worklog``, never ``<main>/.worklog/.worklog``
+    (SA-0MW0JHMJE006GWQB).
+
+    Args:
+        directory: cwd, git root, or an ancestor on the resolution chain.
+
+    Returns:
+        The candidate ``.worklog`` path (accepted only when initialised).
+    """
+    if directory.name == ".worklog":
+        return directory
+    return directory / ".worklog"
+
+
 def _detect_worklog_dir() -> Path | None:
-    """Detect the target project's ``.worklog`` directory.
+    """Detect the target project's initialised ``.worklog`` directory.
 
     Resolution order (mirrors ``audit_runner.TARGET_PROJECT_ROOT``):
       1. ``<cwd>/.worklog``
       2. ``<git root>/.worklog`` via ``git rev-parse --show-toplevel``
       3. nearest ancestor directory containing ``.worklog``
 
+    **Initialised candidates only.** A candidate ``.worklog`` is accepted
+    only when :func:`_is_initialized_worklog` is true — a worktree's
+    committed ``config.yaml``-only ``.worklog/`` copy (uninitialised) is
+    never returned; resolution continues to the nearest initialised
+    ancestor, and returns ``None`` when nothing initialised exists.
+
+    **No double suffix.** Each ancestor's candidate comes from
+    :func:`_worklog_candidate`: an ancestor already named ``.worklog`` is
+    its own candidate, so a cwd inside
+    ``<main>/.worklog/worktrees/wl-<id>-<slug>`` resolves the main
+    checkout's initialised store (which is itself an ancestor) rather than
+    a nested ``<main>/.worklog/.worklog`` (SA-0MW0JHMJE006GWQB).
+
     Returns ``None`` when no worklog directory can be resolved (the caller
     should then run ``wl`` without ``--worklog-dir`` and surface the error).
     """
     cwd = Path.cwd()
-    cand = cwd / ".worklog"
-    if cand.is_dir():
+    cand = _worklog_candidate(cwd)
+    if _is_initialized_worklog(cand):
         return cand
     try:
         proc = subprocess.run(
@@ -315,14 +357,14 @@ def _detect_worklog_dir() -> Path | None:
             timeout=30,
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            cand = Path(proc.stdout.strip()) / ".worklog"
-            if cand.is_dir():
+            cand = _worklog_candidate(Path(proc.stdout.strip()))
+            if _is_initialized_worklog(cand):
                 return cand
     except OSError:
         pass
     for parent in cwd.parents:
-        cand = parent / ".worklog"
-        if cand.is_dir():
+        cand = _worklog_candidate(parent)
+        if _is_initialized_worklog(cand):
             return cand
     return None
 
@@ -432,27 +474,22 @@ def worklog_dir_flag() -> list[str]:
     project root (e.g. the skill install dir), pass the explicit
     ``--worklog-dir`` so the command succeeds regardless of cwd.
 
-    A git worktree's ``.worklog/`` contains only the committed
-    ``config.yaml`` and is NOT initialized, so ``wl`` fails from inside a
-    worktree. Since worktrees live under the main checkout's
-    ``.worklog/worktrees/``, the nearest ancestor with an initialized
-    ``.worklog`` is the main checkout — point ``wl`` at it.
+    **Initialised candidates only.** A git worktree's ``.worklog/`` contains
+    only the committed ``config.yaml`` and is NOT initialized, so ``wl``
+    fails from inside a worktree unless pointed at an initialised store.
+    Resolution accepts a candidate only when :func:`_is_initialized_worklog`
+    is true and never builds a nested ``.worklog/.worklog``
+    (:func:`_worklog_candidate`): since worktrees live under the main
+    checkout's ``.worklog/worktrees/``, the nearest initialised ancestor
+    of a worktree cwd is the main checkout's ``.worklog`` itself
+    (SA-0MW0JHMJE006GWQB).
 
-    Returns an empty list when no worklog directory is resolvable (the
-    command will run as-is and any failure will surface real error detail).
+    Returns an empty list when no initialised worklog directory is
+    resolvable (the command will run as-is and any failure will surface
+    real error detail).
     """
-    cwd_worklog = Path.cwd() / ".worklog"
-    if cwd_worklog.is_dir():
-        if _is_initialized_worklog(cwd_worklog):
-            return []
-        # cwd/.worklog exists but is not initialized (e.g. a git worktree
-        # with only the committed config.yaml): resolve the nearest
-        # ancestor project .worklog that IS initialized (the main checkout).
-        for parent in Path.cwd().parents:
-            cand = parent / ".worklog"
-            if _is_initialized_worklog(cand):
-                return ["--worklog-dir", str(cand)]
-        return []
+    if _is_initialized_worklog(_worklog_candidate(Path.cwd())):
+        return []  # cwd is itself an initialised worklog root
     wl_dir = _detect_worklog_dir()
     if wl_dir is None:
         return []

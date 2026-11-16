@@ -63,8 +63,11 @@ def test_persist_audit_returns_nonzero_on_wl_failure():
 
 
 def test_cli_reads_stdin_and_exits_zero(monkeypatch, capsys):
-    # Patch subprocess.run used in the module
-    def fake_runner(cmd, check=False, text=True, capture_output=True):
+    # Patch subprocess.run used in the module. The fake mirrors the real
+    # run() signature (**kwargs) because the shared worklog-dir resolution
+    # (status_lifecycle._detect_worklog_dir) invokes the patched attribute
+    # with timeout=30 for its git-root probe (SA-0MW0JHMJE006GWQB).
+    def fake_runner(cmd, **kwargs):
         return FakeProc(returncode=0, stdout=json.dumps({"success": True}), stderr="")
 
     monkeypatch.setattr("audit.scripts.persist_audit.subprocess.run", fake_runner)

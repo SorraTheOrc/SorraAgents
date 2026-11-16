@@ -84,8 +84,14 @@ wl --worklog-dir /abs/path/to/main-checkout/.worklog \
 ```
 
 `StatusLifecycle` resolves the same directory automatically (its
-`--worklog-dir` precedence: explicit > prefix-to-sibling scan > cwd chain), so
-workflow scripts that use it keep working from a worktree.
+`--worklog-dir` precedence: explicit > prefix-to-sibling scan > cwd chain),
+so workflow scripts that use it keep working from a worktree. The cwd-chain
+resolution accepts **initialised** `.worklog` directories only and never
+builds a nested `.worklog/.worklog`: an ancestor already named `.worklog` is
+its own candidate, so a cwd inside `<main>/.worklog/worktrees/wl-<id>-<slug>`
+resolves the main checkout's initialised store — never a worktree's
+committed `config.yaml`-only copy or a stale `<main>/.worklog/.worklog`
+(SA-0MW0JHMJE006GWQB).
 
 ### Wrong: leave the worktree to run `wl`, then edit there
 
