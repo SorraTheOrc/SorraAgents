@@ -2758,6 +2758,11 @@ def _resolve_producer_review_decision(ctx: _AuditContext,
       (SA-0MVZNECSD005XB42 AC2)
     - ``Yes`` on an audit-generated candidate-false-positive tracker chore →
       ``untouched`` (AC4)
+    - ship-triggered run (``--ship-triggered``) + top-level ``Yes`` or
+      ``No`` → ``untouched`` with reason "ship-triggered audit - flag
+      untouched" — the release's own verification re-audit never arms the
+      producer queue (SA-0MW92TODX00064XQ AC1/AC2/AC3); only ship-automated
+      invocations set the marker
     - ``No`` + independent (not cascade-demotion-suppressed) + top-level →
       ``required`` regardless of ``merge_gate_blocker`` (AC3)
     - ``No`` + cascade-demotion-suppressed → ``untouched`` (producer Q2)
@@ -2790,6 +2795,20 @@ def _resolve_producer_review_decision(ctx: _AuditContext,
             "reason": (
                 "infrastructure-failure fallback 'No' — flag untouched"
             ),
+            "fingerprint": fingerprint,
+        }
+
+    # Ship-triggered run (SA-0MW92TODX00064XQ AC1/AC2/AC3): a release-gate
+    # verification re-audit is NOT an independent review, so a top-level
+    # 'Yes' or 'No' leaves the producer-review flag untouched (neither set
+    # nor cleared). Only ship-automated invocations set the marker; every
+    # other lifecycle behaviour (the 'Yes' advance / 'No' demotion, the
+    # persisted report) is unchanged. Children remain covered by the child
+    # rule below.
+    if ctx.ship_triggered and top_level and verdict in ("yes", "no"):
+        return {
+            "action": PRODUCER_REVIEW_UNTOUCHED,
+            "reason": "ship-triggered audit - flag untouched",
             "fingerprint": fingerprint,
         }
 
@@ -11486,6 +11505,14 @@ class _AuditContext:
     max_child_audits: int | None
     run_tests: bool
     no_execute: bool = False
+    # Ship-automation marker (SA-0MW92TODX00064XQ): when True this run is a
+    # release-gate verification re-audit, NOT an independent review, so
+    # ``_resolve_producer_review_decision`` resolves ``untouched`` for a
+    # top-level 'Yes' or 'No' verdict and the ``--needs-producer-review``
+    # flag is never written (the write is suppressed, never cleared). Set
+    # from the ``--ship-triggered`` CLI flag by the ``issue`` command;
+    # only ship-automated invocations set it.
+    ship_triggered: bool = False
     # Audit test-failure mode (SA-0MW0JJ36Z000AF57). ``strict`` is resolved once
     # in cmd_issue from --strict/--no-strict > AUDIT_STRICT > permissive default;
     # ``strict_source`` records how it was resolved for the persisted report.
@@ -17502,7 +17529,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               no_checkpoint: bool = False,
               child_in_main_slot: bool | None = None,
               batch_drain: bool | None = None,
-              strict: bool | None = None) -> int:
+              strict: bool | None = None,
+              ship_triggered: bool = False) -> int:
     """Audit a single work item.
 
     *batch_drain* (SA-0MTG5TP5Z008QBL5) controls the post-audit batch
@@ -17521,6 +17549,15 @@ def cmd_issue(issue_id: str, persist: bool = True,
     ``False`` uses the unchanged separate-process path (a ``pi`` subprocess
     per child). Resolution precedence: explicit value (CLI flag, flag wins)
     > ``AUDIT_CHILD_IN_MAIN_SLOT`` env var > ``True`` (default).
+
+    *ship_triggered* (``--ship-triggered``, OFF by default) marks this run
+    as a ship-automated release-gate verification re-audit (SA-0MW92TODX00064XQ):
+    the producer-review flag is never written — a top-level 'Yes' or 'No'
+    verdict resolves ``untouched`` and leaves ``needsProducerReview`` as it
+    was (neither set nor cleared). All other lifecycle behaviour (the 'Yes'
+    advance / 'No' demotion, the persisted report) is unchanged. Only
+    ship-automated invocations set it; operator-invoked audits stay
+    marker-free and keep independent flagging.
 
     The resolved model name and source are included as a metadata line
     in the audit report output (issue-level and child reports).
@@ -17632,6 +17669,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         max_citations_per_ac=max_citations_per_ac,
         explicit_checkpoint_dir=checkpoint_dir,
         no_checkpoint=no_checkpoint,
+        ship_triggered=ship_triggered,
     )
     rc = _phase_gate(ctx)
     if rc is not None:
@@ -18312,6 +18350,17 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Append Pi debug output to this file (JSONL)")
     p_issue.add_argument("--force", action="store_true",
                          help="Bypass the freshness gate and force a full audit")
+    p_issue.add_argument("--ship-triggered", action="store_true",
+                         help=(
+                             "Ship-automation marker: this run is a release-gate "
+                             "verification re-audit, NOT an independent review. "
+                             "The producer-review flag is never written — a "
+                             "top-level 'Yes' or 'No' verdict leaves "
+                             "needsProducerReview untouched (neither set nor "
+                             "cleared). Only ship-automated invocations set this; "
+                             "operator-invoked audits stay marker-free and keep "
+                             "independent flagging (SA-0MW92TODX00064XQ)"
+                         ))
     p_issue.add_argument("--audit-children", action="store_true",
                          help=(
                              "Opt-in: auto-trigger a full audit for each active child "
@@ -18743,7 +18792,8 @@ def _run_issue_command(args) -> int:
                             args, "child_in_main_slot", None
                         ),
                         batch_drain=getattr(args, "batch_drain", None),
-                        strict=getattr(args, "strict", None))
+                        strict=getattr(args, "strict", None),
+                        ship_triggered=getattr(args, "ship_triggered", False))
         finally:
             # Ensure the reliability summary is emitted even on an early exit
             # (exception/timeout before _phase_report) — R7 AC4.
