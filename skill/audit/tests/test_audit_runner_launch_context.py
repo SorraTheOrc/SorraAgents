@@ -1589,3 +1589,219 @@ class TestCrossRepoCodeRoot:
             "issue", "OSL-1", "--code-root", str(repo_b),
         ])
         assert args.code_root == str(repo_b)
+
+
+# ===========================================================================
+# AC2 (LP-0MWDDRU1P0067SUV): cross-repo DETECTION — without an explicit code
+# root, a work item whose delivered files live only in a SIBLING project's
+# repository must fail CLOSED with a scope error that names the sibling
+# repo, before any Phase 1 model call (zero pi invocations), with a non-zero
+# exit and no persisted report.
+#
+# This is the sibling of the AC1 cross-repo ``--code-root`` test above: AC1
+# proves the explicit code root works; AC2 proves the *absence* of one is
+# refused loudly rather than silently mis-scoped.
+#
+# TEST-FIRST CONTRACT — expected red until the implementation item lands
+# (LP-0MWDDRWBG0013CS1 "Implement cross-repo detection: fail closed naming
+# sibling candidates"). Marked ``xfail(strict=False)`` so the suite stays
+# green while the contract is documented; the markers are removed when the
+# production change lands (precedent: LP-0MWDDRTHE00981PK).
+# ===========================================================================
+
+
+_CROSS_REPO_DETECTION_RED = pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "contract test (LP-0MWDDRU1P0067SUV): expected red until the "
+        "cross-repo detection lands (LP-0MWDDRWBG0013CS1 fail-closed "
+        "detection naming sibling candidates); xpasses when it lands and "
+        "the marker is removed"
+    ),
+)
+
+#: Item description for the detection fixture: the Key Files exist ONLY in
+#: the sibling code repo. An ``## Acceptance Criteria`` section keeps the
+#: Phase 1 parent screen live (so "zero pi invocations" is a real assertion —
+#: pre-fix the run *would* reach Phase 1 and call pi).
+_CROSS_REPO_DETECTION_DESCRIPTION = (
+    "## Acceptance Criteria\n"
+    "- AC1: the delivered feature behaves as specified.\n"
+    "\n"
+    "## Key Files (predicted)\n"
+    "- `src/codeb/feature.py`\n"
+)
+
+#: Same-repo control description: the Key File lives in the OWNING repo, so
+#: the cross-repo guard must not fire (no false abort).
+_SAME_REPO_DESCRIPTION = (
+    "## Acceptance Criteria\n"
+    "- AC1: the delivered feature behaves as specified.\n"
+    "\n"
+    "## Key Files (predicted)\n"
+    "- `src/app/main.py`\n"
+)
+
+
+def _make_cross_repo_detection_fixture(tmp_path: Path, prefix: str = "OSL"):
+    """Two real temp git repos plus a discoverable sibling scan root.
+
+    Layout::
+
+        <tmp>/projects/
+            llm/                               (repo A — worklog owner)
+                .worklog/config.yaml           (prefix: OSL)
+                .gitignore                     (ignores .worklog/)
+                src/app/main.py                (A's OWN marker; distinctive)
+            code/                              (repo B — sibling code repo)
+                .worklog/config.yaml           (prefix: CODE — scanable)
+                src/codeb/feature.py           (the item's Key File)
+
+    Both are real git repositories on ``main`` (no ``dev`` baseline ⇒ the
+    Phase 1 merge gate fails open, never attempting integration). Repo A
+    carries a ``src/`` marker so its FILE SCOPE manifest is *valid* — the
+    fail-closed assertion therefore cannot be satisfied by the pre-existing
+    manifest scope error; it must come from the new cross-repo detection.
+
+    Returns ``(worklog_a, repo_a, repo_b, patcher)``.
+    """
+    projects = tmp_path / "projects"
+
+    # Repo A — the worklog-owning project (real git repo).
+    repo_a = projects / "llm"
+    (repo_a / "src" / "app").mkdir(parents=True)
+    (repo_a / "src" / "app" / "main.py").write_text("app = 1\n")
+    (repo_a / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    worklog_a = repo_a / ".worklog"
+    worklog_a.mkdir()
+    (worklog_a / "config.yaml").write_text(
+        f"projectName: LLM\nprefix: {prefix}\n", encoding="utf-8"
+    )
+    init_repo(repo_a, default_branch="main", sandbox_root=tmp_path)
+    commit_all(repo_a, "worklog repo initial")
+
+    # Repo B — a SIBLING project whose repository holds the item's files.
+    # Its own .worklog/config.yaml makes it part of the scan population.
+    repo_b = projects / "code"
+    (repo_b / "src" / "codeb").mkdir(parents=True)
+    (repo_b / "src" / "codeb" / "feature.py").write_text("x = 1\n")
+    sibling_worklog = repo_b / ".worklog"
+    sibling_worklog.mkdir()
+    (sibling_worklog / "config.yaml").write_text(
+        "projectName: Code\nprefix: CODE\n", encoding="utf-8"
+    )
+    init_repo(repo_b, default_branch="main", sandbox_root=tmp_path)
+    commit_all(repo_b, "add codeb feature")
+
+    patcher = mock.patch(
+        "shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
+    )
+    return worklog_a, repo_a, repo_b, patcher
+
+
+def _fake_pi_met(issue_id, context, prompt, **kwargs):
+    """Canned Phase 1/2 pi response (met) so a pre-fix run completes."""
+    return {
+        "extracted_text": json.dumps([
+            {"index": 0, "verdict": "met", "evidence": "src/codeb/feature.py:1"},
+        ]),
+    }
+
+
+class TestCrossRepoDetectionFailsClosed:
+    """AC2 (LP-0MWDDRU1P0067SUV): absent an explicit code root, a cross-repo
+    item is refused loudly — naming the sibling repo — before any model call.
+    """
+
+    def _run(self, tmp_path, *, description, recorded=None):
+        worklog_a, repo_a, repo_b, patcher = (
+            _make_cross_repo_detection_fixture(tmp_path)
+        )
+        recorded = [] if recorded is None else recorded
+        pi_mock = mock.MagicMock(side_effect=_fake_pi_met)
+        persist_mock = mock.MagicMock(return_value=0)
+        with (
+            patcher,
+            # Launch from the owning project (repo A), no --code-root.
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", repo_a),
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", pi_mock,
+            ),
+            mock.patch.object(audit_runner, "persist_audit", persist_mock),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(
+                    recorded=recorded, description=description, git_cwd=repo_a,
+                ),
+                worklog_dir=str(worklog_a),
+            )
+        return rc, pi_mock, persist_mock, repo_b
+
+    @_CROSS_REPO_DETECTION_RED
+    def test_cross_repo_item_without_code_root_fails_closed(self, tmp_path,
+                                                            capsys):
+        """AC2/AC3/AC5: no ``--code-root`` on a cross-repo item aborts with a
+        non-zero exit and a scope error that NAMES the sibling repo holding
+        the item's touched files, and no report is emitted.
+        """
+        rc, _pi, persist_mock, repo_b = self._run(
+            tmp_path, description=_CROSS_REPO_DETECTION_DESCRIPTION,
+        )
+        captured = capsys.readouterr()
+        err = captured.err
+
+        assert rc == 1, "a cross-repo item without --code-root must fail closed"
+        # Same style as the existing "Audit scope error" paths.
+        assert "Audit scope error" in err, err
+        # The error names the SIBLING repository that holds the files — the
+        # discriminating signal that this is the cross-repo detection, not the
+        # pre-existing manifest scope error (which names the owning root).
+        assert str(repo_b) in err, (
+            f"scope error must name the sibling code repo {repo_b}: {err}"
+        )
+        # No persisted report, no report text at all (the abort happens
+        # before report assembly).
+        persist_mock.assert_not_called()
+        assert "Ready to close" not in captured.out + err, captured.out
+
+    @_CROSS_REPO_DETECTION_RED
+    def test_fail_closed_before_phase1_zero_pi_invocations(self, tmp_path):
+        """AC4: the abort happens BEFORE any Phase 1 model call — zero pi
+        invocations (fail closed, fail fast).
+        """
+        _rc, pi_mock, _persist, _repo_b = self._run(
+            tmp_path, description=_CROSS_REPO_DETECTION_DESCRIPTION,
+        )
+        pi_mock.assert_not_called()
+
+    # -- Controls (must stay green before AND after the change) -------------
+
+    def test_same_repo_item_is_not_rejected(self, tmp_path, capsys):
+        """Guard is not over-eager: an item whose Key Files live in the owning
+        repo proceeds to Phase 1 (pi is called) with no cross-repo abort.
+        """
+        rc, pi_mock, _persist, _repo_b = self._run(
+            tmp_path, description=_SAME_REPO_DESCRIPTION,
+        )
+        err = capsys.readouterr().err
+        assert rc == 0, err
+        assert pi_mock.called, "same-repo item must still reach Phase 1"
+        assert "cross-repo" not in err, err
+
+    def test_undeterminable_touched_set_fails_open(self, tmp_path, capsys):
+        """An undeterminable touched set (no Key Files, no item commits) skips
+        the detection (fail open) — never a false abort.
+        """
+        rc, pi_mock, _persist, _repo_b = self._run(
+            tmp_path,
+            description="## Acceptance Criteria\n- AC1: the thing works.\n",
+        )
+        err = capsys.readouterr().err
+        assert rc == 0, err
+        assert pi_mock.called, "undeterminable scope must not fail closed"
