@@ -2170,6 +2170,107 @@ def _verify_launch_context(issue_id: str,
     return None
 
 
+def _sibling_project_roots() -> list[Path]:
+    """Roots of sibling projects carrying a prefix-matching worklog config.
+
+    Same candidate population as the shared prefix-to-sibling scan
+    (``SIBLING_SCAN_ROOT/*/.worklog/config.yaml`` — AC4 of
+    LP-0MWDDRU1P0067SUV). The scan root is read from the SHARED
+    ``skill.shared.status_lifecycle`` module at call time so tests that
+    patch that attribute (the documented patching point) are honoured.
+    Returns project roots (the parent of each ``.worklog`` dir), ordered
+    and de-duplicated.
+    """
+    from shared import status_lifecycle as shared_status_life
+    try:
+        configs = sorted(
+            shared_status_life.SIBLING_SCAN_ROOT.glob("*/.worklog/config.yaml")
+        )
+    except OSError:
+        return []
+    roots: list[Path] = []
+    for config in configs:
+        root = config.parent.parent
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _sibling_repo_holds_path(candidate: Path, rel_path: str) -> bool:
+    """One bounded existence check: does *rel_path* exist in the sibling
+    candidate's checkout?
+
+    A single filesystem probe per touched file (never a whole-repo scan —
+    AC4), deliberately NOT a subprocess: the audit's injectable runner and
+    the subprocess module are both mocked across many flow tests, and a
+    probe through them would report every candidate as holding the file
+    (false abort). The sibling project's delivered files are committed and
+    checked out, so working-tree presence is a faithful proxy for presence
+    at HEAD (AC3); an unverifiable candidate never triggers a false abort.
+    """
+    try:
+        return (candidate / rel_path).exists()
+    except OSError:
+        return False
+
+
+def _detect_cross_repo_scope_error(
+    runner: Runner,
+    issue_id: str,
+    work_item: dict,
+    owning_root: Path,
+    comments: Sequence[dict] | None = None,
+) -> str | None:
+    """Cross-repo detection (AC2, LP-0MWDDRU1P0067SUV; implementation
+    LP-0MWDDRWBG0013CS1): an item whose resolved touched-file set is
+    ENTIRELY absent from the owning repo — while present at HEAD in a
+    sibling candidate project's repository — must fail closed.
+
+    Returns an ``Audit scope error``-style message naming the sibling
+    candidate(s), or ``None`` to fail open / skip:
+
+    - touched set empty/undeterminable (``_resolve_touched_files`` returned
+      nothing) — the detection is skipped entirely and the existing
+      ``_validate_file_scope_manifest`` coverage check stays the backstop;
+    - ANY touched path exists in the owning repo (same-repo launch — zero
+      cost, the check only runs when the touched set is entirely absent);
+    - git/IO failures (never a false abort).
+
+    Once the ``--code-root`` option lands (LP-0MWDDRVQ7005KOHN), callers
+    must skip this detection when an explicit code root is supplied — it is
+    only correct for the no-explicit-code-root case.
+    """
+    touched = _resolve_touched_files(
+        runner, issue_id, work_item=work_item, comments=comments,
+    )
+    if not touched:
+        return None
+    owning = Path(owning_root).resolve()
+    try:
+        if any((owning / p).exists() for p in touched):
+            return None
+    except OSError:
+        return None
+    holders: list[Path] = []
+    for candidate in _sibling_project_roots():
+        if candidate.resolve() == owning:
+            continue
+        if all(_sibling_repo_holds_path(candidate, p) for p in touched):
+            holders.append(candidate)
+    if not holders:
+        return None
+    return (
+        "Audit scope error: the work item's delivered files "
+        f"({', '.join(touched)}) are absent from the owning project "
+        f"({owning}) but present at HEAD in the sibling project "
+        "repository candidate(s): "
+        f"{', '.join(str(h) for h in holders)}. No explicit code root was "
+        "given, so the audit would resolve the wrong repository. Re-run "
+        "with an explicit code root naming the sibling repository, or "
+        "launch from the sibling project."
+    )
+
+
 def _project_top_levels(project_root: Path) -> list[str]:
     """Return the tracked top-level paths of *project_root* (git ls-files).
 
@@ -14485,6 +14586,22 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     work_item = ctx.work_item
     children = ctx.children
     description = ctx.description
+
+    # Cross-repo detection (AC2, LP-0MWDDRU1P0067SUV; implementation
+    # LP-0MWDDRWBG0013CS1): with NO explicit code root, an item whose
+    # delivered (touched) files live only in a SIBLING project's repository
+    # must fail closed with an ``Audit scope error`` naming the sibling
+    # candidate(s) — before the merge gate mutates anything in the wrong
+    # repo and before any Phase 1 model call. Fail open when the touched
+    # set is empty/undeterminable or any touched path exists in the owning
+    # repo (same-repo launch is zero-cost).
+    if ctx.owning_root:
+        cross_repo_error = _detect_cross_repo_scope_error(
+            runner, issue_id, work_item=work_item,
+            owning_root=Path(ctx.owning_root), comments=ctx.comments,
+        )
+        if cross_repo_error:
+            raise AuditScopeError(cross_repo_error)
 
     # Merge gate (SA-0MT456M27001LRTL) — very start of Phase 1, BEFORE the
     # code-quality scan, children-stage check, or surface AC assessment.

@@ -1602,23 +1602,11 @@ class TestCrossRepoCodeRoot:
 # proves the explicit code root works; AC2 proves the *absence* of one is
 # refused loudly rather than silently mis-scoped.
 #
-# TEST-FIRST CONTRACT — expected red until the implementation item lands
-# (LP-0MWDDRWBG0013CS1 "Implement cross-repo detection: fail closed naming
-# sibling candidates"). Marked ``xfail(strict=False)`` so the suite stays
-# green while the contract is documented; the markers are removed when the
-# production change lands (precedent: LP-0MWDDRTHE00981PK).
+# TEST-FIRST CONTRACT — implemented by LP-0MWDDRWBG0013CS1 "Implement
+# cross-repo detection: fail closed naming sibling candidates". The markers
+# were removed when the production change landed (precedent: LP-0MWDDRTHE00981PK).
 # ===========================================================================
 
-
-_CROSS_REPO_DETECTION_RED = pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "contract test (LP-0MWDDRU1P0067SUV): expected red until the "
-        "cross-repo detection lands (LP-0MWDDRWBG0013CS1 fail-closed "
-        "detection naming sibling candidates); xpasses when it lands and "
-        "the marker is removed"
-    ),
-)
 
 #: Item description for the detection fixture: the Key Files exist ONLY in
 #: the sibling code repo. An ``## Acceptance Criteria`` section keeps the
@@ -1743,7 +1731,6 @@ class TestCrossRepoDetectionFailsClosed:
             )
         return rc, pi_mock, persist_mock, repo_b
 
-    @_CROSS_REPO_DETECTION_RED
     def test_cross_repo_item_without_code_root_fails_closed(self, tmp_path,
                                                             capsys):
         """AC2/AC3/AC5: no ``--code-root`` on a cross-repo item aborts with a
@@ -1770,7 +1757,6 @@ class TestCrossRepoDetectionFailsClosed:
         persist_mock.assert_not_called()
         assert "Ready to close" not in captured.out + err, captured.out
 
-    @_CROSS_REPO_DETECTION_RED
     def test_fail_closed_before_phase1_zero_pi_invocations(self, tmp_path):
         """AC4: the abort happens BEFORE any Phase 1 model call — zero pi
         invocations (fail closed, fail fast).
