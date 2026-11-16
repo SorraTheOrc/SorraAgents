@@ -8205,7 +8205,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            merge_gate_evidence: str | None = None,
                            snapshot_exempt: set[str] | None = None,
                            stale_pending_ids: set[str] | None = None,
-                           classification: str | None = None) -> str:
+                           classification: str | None = None,
+                           audit_scope: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -8267,6 +8268,14 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       near the header so the persisted report carries the freshness gate data
       (SA-0MSKB6US1009CNHT, SA-0MVIDI8E00063OOP). The line is parsed back by
       ``_extract_content_fingerprint``.
+
+    *audit_scope* is an optional pre-formatted ``## Audit Scope`` section
+      (heading + body) stating the resolved code root and the worklog root.
+      When provided it is emitted near the header on **every** assembled
+      report — with or without an explicit ``--code-root`` — so the persisted
+      report always records which repository the evidence came from
+      (LP-0MVZ6R5H8007NYLR AC4 / child LP-0MWDDRWX6006YE0Z AC1). The caller
+      resolves the roots from ``_AuditContext`` before assembly.
 
     *classification* is the optional transient cause token (``timeout`` /
       ``provider_error`` / ``unparseable_output`` / ``concurrency_cap``) for
@@ -8463,6 +8472,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if content_fingerprint:
             lines.append("")
             lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
+        if audit_scope:
+            lines.extend(["", audit_scope])
         lines.extend(["", "## Summary", ""])
     else:
         lines = [
@@ -8496,6 +8507,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if content_fingerprint:
             lines.append("")
             lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
+        if audit_scope:
+            lines.extend(["", audit_scope])
         lines.extend(["", "## Summary", ""])
 
     # Count verdicts across parent criteria only (children have their own
@@ -16568,6 +16581,28 @@ def _phase_report(ctx: _AuditContext) -> int:
             issue_id, ctx.owning_root, ctx.checkpoint_dir,
         )
 
+        # Resolved audit scope (LP-0MVZ6R5H8007NYLR AC4): record which
+        # repository the evidence came from on every persisted report — the
+        # per-audit git evidence root (``--code-root`` override or the
+        # default owning-project root) and the worklog root are independent
+        # axes, and a cross-repo reader must be able to tell them apart
+        # without remembering which flags were passed (child
+        # LP-0MWDDRWX6006YE0Z AC1/AC2). Emitted at assembly so it lands in
+        # the persisted report before ``persist_audit()``.
+        code_root = (
+            ctx.per_audit_project_root
+            if ctx.per_audit_project_root else str(TARGET_PROJECT_ROOT)
+        )
+        try:
+            worklog_root = str(Path(worklog_dir).resolve().parent)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            worklog_root = "<unknown worklog root>"
+        audit_scope = (
+            "## Audit Scope\n\n"
+            f"Code root: {code_root}\n"
+            f"Worklog root: {worklog_root}"
+        )
+
         def _assemble_report() -> str:
             assembled = _assemble_issue_report(
                 work_item, ac_results, child_results,
@@ -16588,6 +16623,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 merge_gate_evidence=ctx.merge_gate_evidence,
                 snapshot_exempt=ctx.snapshot_exempt_children,
                 stale_pending_ids=stale_pending_ids,
+                audit_scope=audit_scope,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if ctx.script_failure:

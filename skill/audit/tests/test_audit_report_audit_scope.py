@@ -191,7 +191,10 @@ class TestPersistedReportAuditScope:
         assert "Ready to close:" in report
         assert "OSL-1" in report
 
-    @_AUDIT_SCOPE_RED
+    # The cross-repo test above keeps ``@_AUDIT_SCOPE_RED`` (it additionally
+    # needs LP-0MWDDRVQ7005KOHN's --code-root parameter); this default-root
+    # test turned green with the ## Audit Scope emission (LP-0MWDDRWX6006YE0Z)
+    # and its marker is removed.
     def test_default_report_records_owning_root_as_scope(self, tmp_path):
         """With **no** explicit code root the section is still emitted — the
         default owning-project root is recorded as the code root (AC4's
