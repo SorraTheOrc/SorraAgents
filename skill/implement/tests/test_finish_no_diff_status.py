@@ -48,7 +48,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -115,7 +115,7 @@ class FakeGitBoundary:
     # ------------------------------------------------------------------
     # Context-manager protocol
     # ------------------------------------------------------------------
-    def __enter__(self) -> FakeGitBoundary:
+    def __enter__(self) -> Self:
         self._patch = patch.object(implement, "run_cmd", side_effect=self._run_cmd)
         self._patch.start()
         return self
