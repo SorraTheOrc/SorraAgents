@@ -1805,3 +1805,202 @@ class TestCrossRepoDetectionFailsClosed:
         err = capsys.readouterr().err
         assert rc == 0, err
         assert pi_mock.called, "undeterminable scope must not fail closed"
+
+
+# ===========================================================================
+# AC3 (LP-0MWDDRUMH002LRZR): same-repo byte-for-byte contract — a same-repo
+# item (worklog owner IS the code repo) audited WITH an explicit
+# ``--code-root`` pointing at the owning repo must behave byte-for-byte
+# identically to one audited WITHOUT it (identical file-scope manifest, HEAD
+# attestation and verdict); with the flag absent, the resolved code root is
+# the owning project root (default unchanged).
+#
+# This is the control for the AC1/AC2 cross-repo contract: the new option
+# must be a strict no-op when its value equals the default resolution.
+#
+# TEST-FIRST CONTRACT — expected red until the implementation item lands
+# (LP-0MWDDRVQ7005KOHN ``--code-root``/per-audit-root wiring). Marked
+# ``xfail(strict=False)`` so the suite stays green while the contract is
+# documented; when the production change lands they xpass and the markers
+# are removed (precedent: LP-0MWDDRTHE00981PK).
+# ===========================================================================
+
+
+_SAME_REPO_RED = pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "contract test (LP-0MWDDRUMH002LRZR): expected red until the "
+        "same-repo --code-root wiring lands (LP-0MWDDRVQ7005KOHN "
+        "--code-root / AUDIT_CODE_ROOT); xpasses when it lands and the "
+        "marker is removed"
+    ),
+)
+
+
+def _make_same_repo_fixture(tmp_path: Path, prefix: str = "OSL"):
+    """One real git repo where the worklog owner IS the code repo.
+
+    Layout::
+
+        <tmp>/projects/llm/                  (repo — worklog owner + code)
+            .worklog/config.yaml             (prefix: OSL)
+            .gitignore                       (ignores .worklog/)
+            src/app/main.py                  (Key File; commit msg: OSL-1)
+            src/app/wip.py                   (uncommitted working-tree change)
+
+    Returns ``(worklog_dir, repo_root)``. ``main`` has no ``dev`` baseline,
+    so the merge gate fails open and never attempts an integration push.
+    """
+    projects = tmp_path / "projects"
+    repo = projects / "llm"
+    (repo / "src" / "app").mkdir(parents=True)
+    (repo / "src" / "app" / "main.py").write_text("app = 1\n")
+    (repo / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    worklog_dir = repo / ".worklog"
+    worklog_dir.mkdir()
+    (worklog_dir / "config.yaml").write_text(
+        f"projectName: LLM\nprefix: {prefix}\n", encoding="utf-8"
+    )
+    init_repo(repo, default_branch="main", sandbox_root=tmp_path)
+    commit_all(repo, "OSL-1: add app main")
+    # Merge-gate integration evidence lives in the owning repo itself.
+    run_git(repo, ["branch", "wl-OSL-1-feature"], check=True)
+    # Uncommitted working-tree change so changed-files + code-quality scope
+    # resolution are exercised (deterministic across both runs).
+    (repo / "src" / "app" / "wip.py").write_text("wip = 2\n")
+    return worklog_dir, repo
+
+
+class TestSameRepoCodeRootByteForByte:
+    """AC3 (LP-0MWDDRUMH002LRZR): a same-repo item's behaviour is
+    byte-for-byte unchanged with and without the new ``--code-root`` option.
+    """
+
+    def _capture_run(
+        self, worklog_dir: Path, repo: Path, *, code_root: str | None,
+    ) -> dict:
+        """Run the same-repo item once, capturing the run's artefacts.
+
+        Returns ``{"rc", "manifests", "heads", "pi_calls", "git_cmds"}``:
+        the exit code, every file-scope manifest built, every HEAD sha
+        resolved, every pi ``(context, prompt)`` pair sent (the deterministic
+        verdict inputs), and the git command stream the runner executed.
+        """
+        manifests: list[str] = []
+        heads: list[str] = []
+        pi_calls: list[tuple[str, str]] = []
+        recorded: list[list[str]] = []
+        real_build = audit_runner._build_file_scope_manifest
+        real_head = audit_runner._resolve_audited_head
+
+        def recording_build(*args, **kwargs):
+            manifest = real_build(*args, **kwargs)
+            manifests.append(manifest)
+            return manifest
+
+        def recording_head(runner):
+            head = real_head(runner)
+            heads.append(head)
+            return head
+
+        def recording_pi(issue_id, context, prompt, **kwargs):
+            pi_calls.append((context, prompt))
+            return _fake_pi_met(issue_id, context, prompt, **kwargs)
+
+        cmd_kwargs = {
+            "persist": False, "force": True,
+            "runner": _make_minimal_runner(
+                recorded, description=_SAME_REPO_DESCRIPTION,
+                git_cwd=repo,
+            ),
+            "worklog_dir": str(worklog_dir),
+        }
+        if code_root is not None:
+            cmd_kwargs["code_root"] = code_root
+        with (
+            # Launch from the owning project root; the item's Key Files live
+            # in this same repo (the same-repo case).
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", repo),
+            mock.patch.object(
+                audit_runner, "_build_file_scope_manifest",
+                side_effect=recording_build,
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head",
+                side_effect=recording_head,
+            ),
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log",
+                side_effect=recording_pi,
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue("OSL-1", **cmd_kwargs)
+        return {
+            "rc": rc,
+            "manifests": manifests,
+            "heads": heads,
+            "pi_calls": pi_calls,
+            "git_cmds": [c for c in recorded if c and c[0] == "git"],
+        }
+
+    @_SAME_REPO_RED
+    def test_same_repo_byte_for_byte_with_and_without_code_root(self, tmp_path):
+        """AC3: the SAME same-repo item run twice — once with an explicit
+        ``--code-root <owning-root>``, once without — yields byte-for-byte
+        identical file-scope manifests, HEAD attestations, verdict inputs
+        (the pi context/prompt stream) and git command streams.
+        """
+        worklog_dir, repo = _make_same_repo_fixture(tmp_path)
+        with_flag = self._capture_run(
+            worklog_dir, repo, code_root=str(repo),
+        )
+        without_flag = self._capture_run(worklog_dir, repo, code_root=None)
+
+        assert with_flag["rc"] == 0, (
+            "same-repo audit with --code-root must exit green"
+        )
+        assert without_flag["rc"] == 0, (
+            "same-repo audit without --code-root must exit green"
+        )
+        # Byte-for-byte: identical file-scope manifest(s), HEAD attestation(s)
+        # and pi (context, prompt) stream — identical verdict inputs produce
+        # the identical verdict.
+        assert with_flag["manifests"] == without_flag["manifests"], (
+            "file-scope manifest must be byte-for-byte identical"
+        )
+        assert with_flag["heads"] == without_flag["heads"], (
+            "HEAD attestation must be byte-for-byte identical"
+        )
+        assert with_flag["pi_calls"] == without_flag["pi_calls"], (
+            "verdict inputs (pi context/prompt stream) must be identical"
+        )
+        # The git command stream is unchanged too — the option is a strict
+        # no-op when it equals the default resolution.
+        assert with_flag["git_cmds"] == without_flag["git_cmds"], (
+            "git command stream must be byte-for-byte identical"
+        )
+
+    def test_default_code_root_is_owning_project_root(self, tmp_path):
+        """AC3: with the flag ABSENT the resolved code root is the owning
+        project root (default unchanged) — every HEAD resolved during the
+        run attests the owning repo, never a foreign repository.
+        """
+        worklog_dir, repo = _make_same_repo_fixture(tmp_path)
+        repo_head = run_git(
+            repo, ["rev-parse", "HEAD"], check=True
+        ).stdout.strip()
+        result = self._capture_run(worklog_dir, repo, code_root=None)
+
+        assert result["rc"] == 0
+        assert result["heads"], (
+            "expected at least one HEAD attestation during the run"
+        )
+        assert all(head == repo_head for head in result["heads"]), (
+            f"default code root must be the owning project root "
+            f"({repo_head}): {result['heads']}"
+        )
