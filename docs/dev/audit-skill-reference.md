@@ -455,6 +455,7 @@ reviewed?"*. This section defines exactly when the audit runner writes it.
 | `No` | top-level, independent | either | **`yes`** |
 | `No` | top-level, cascade-demotion-suppressed | either | **untouched** (producer decision Q2) |
 | `No` | child (has a parent) | either | **untouched** (SA-0MSSVKYEW008PJ9H) |
+| `Yes` / `No` | top-level, ship-triggered (`--ship-triggered`) | either | **untouched** — reason "ship-triggered audit - flag untouched" (SA-0MW92TODX00064XQ) |
 | any | any | infrastructure failure / unparseable verdict / tainted `No` | **untouched** (producer decision Q3) |
 
 The runner **never** writes `--needs-producer-review no` on any path: it may
@@ -509,6 +510,33 @@ prior non-passing audit, a legacy/fingerprint-less report, or a failed
 `wl audit-show`. A spurious review request is a nuisance; a silently discarded
 review gate is a release-safety defect.
 
+### Ship-triggered runs (SA-0MW92TODX00064XQ)
+
+A ship-triggered audit — the ship skill's Step-2 audit readiness gate, Step-6
+final-validation sweep, and pre-flight `--refresh-audits`, all of which invoke
+`audit_runner.py issue <id> --strict --ship-triggered` — is a release-gate
+**verification re-audit**, not an independent review. `_resolve_producer_review_decision`
+therefore resolves `PRODUCER_REVIEW_UNTOUCHED` with the reason
+`"ship-triggered audit - flag untouched"` for a top-level `Yes` *or* `No`
+verdict: the release's own verification never arms the producer queue and never
+clears a stored flag. Only the flag write is suppressed — `Yes` still advances
+to `completed`/`in_review`; `No` still demotes to `open`/`plan_complete`
+(subject to cascade-demotion suppression); the persisted report still records
+the verdict plus a `Producer review: untouched (ship-triggered audit - flag
+untouched)` metadata line (see *Recording the decision*). Marker-free
+(independent) runs are unchanged: an independent top-level `Yes` with a
+producer decision required still flags, and an independent top-level `No`
+still flags (parent AC2).
+
+The marker is set **only** by ship-automated invocations. Surfaced manual
+remediation commands (operator-invoked) — `buildRemediationCommand()`
+(`audit_runner.py issue <id> --strict`), the offline refresh hint
+(`audit_runner.py batch --strict`), and `check-freshness` probes — carry **no**
+`--ship-triggered`, so an operator-run audit keeps exactly the independent
+flagging behaviour above. It cannot leak: the flag is accepted only by the
+`issue` subcommand (never `batch` / `check-freshness`), and the runner never
+writes `--needs-producer-review no`.
+
 ### Cost
 
 No new `wl` invocation on the hot path: the non-forced path reuses the
@@ -527,6 +555,7 @@ persisted carries an explicit metadata line:
 Producer review: preserved (content fingerprint <sha256>)
 Producer review: required (<reason>; previous content fingerprint <sha256>)
 Producer review: untouched (<reason>)
+Producer review: untouched (ship-triggered audit - flag untouched)
 ```
 
 Inspect it with `wl audit-show <id> --json` (the line is inside the stored
@@ -819,7 +848,7 @@ release summary never claims blanket success. The step remains non-blocking.
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--code-root DIR] [--checkpoint-dir DIR] [--no-checkpoint]` — `--code-root` (env `AUDIT_CODE_ROOT`) supplies an explicit code-repository root for the git-derived evidence, independent of the worklog (LP-0MVZ6R5H8007NYLR; see *Explicit code-repository root for cross-repo items*)
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--ship-triggered] [--pi-bin] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--code-root DIR] [--checkpoint-dir DIR] [--no-checkpoint]` — `--code-root` (env `AUDIT_CODE_ROOT`) supplies an explicit code-repository root for the git-derived evidence, independent of the worklog (LP-0MVZ6R5H8007NYLR; see *Explicit code-repository root for cross-repo items*)
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
