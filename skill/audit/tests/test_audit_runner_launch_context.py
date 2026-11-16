@@ -1374,3 +1374,218 @@ class TestStaleSiblingIsolation:
             audit_runner._resolve_owning_project_root("TEST-1")
             == audit_runner.TARGET_PROJECT_ROOT
         )
+
+
+# ===========================================================================
+# AC1 (LP-0MWDDRTHE00981PK): cross-repo code-root — a work item tracked in
+# worklog repo A whose code lives in repo B is audited with the explicit
+# ``--code-root <repo-B>`` so every git-derived surface (merge gate,
+# file-scope manifest, changed files, green-run evidence, code-quality
+# scope) resolves against B while all wl reads/writes stay on A's worklog.
+#
+# TEST-FIRST CONTRACT — expected red until the implementation items land
+# (LP-0MWDDRVQ7005KOHN ``--code-root``/per-audit-root wiring, LP-0MWDDRWBG0013CS1
+# cross-repo detection). Marked ``xfail(strict=False)`` so the suite stays green
+# while the contract is documented; when the production change lands they xpass
+# and the markers are removed (precedent: SA-0MVUTD3IX004E03C).
+# ===========================================================================
+
+
+_CROSS_REPO_RED = pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "contract test (LP-0MWDDRTHE00981PK): expected red until the "
+        "cross-repo code-root implementation lands (LP-0MWDDRVQ7005KOHN "
+        "--code-root / AUDIT_CODE_ROOT wiring); xpasses when it lands and "
+        "the marker is removed"
+    ),
+)
+
+#: Item description used by the cross-repo fixture: Key Files live in code
+#: repo B (``src/codeb/feature.py``); no Acceptance Criteria heading, so the
+#: Phase 1 parent screen is skipped (no pi invocation — the flow stays
+#: hermetic while the git-derived scope is still exercised).
+_CROSS_REPO_DESCRIPTION = (
+    "## Key Files (predicted)\n"
+    "- `src/codeb/feature.py`\n"
+)
+
+
+def _make_cross_repo_pair(tmp_path: Path, prefix: str = "OSL"):
+    """Create TWO real temp git repos: worklog repo A + code repo B.
+
+    Layout::
+
+        <tmp>/projects/llm/                  (repo A — worklog owner)
+            .worklog/config.yaml             (prefix: OSL)
+            .gitignore                       (ignores .worklog/)
+            admin/registry.txt               (A-only distinctive marker)
+        <tmp>/projects/code/                 (repo B — code repo)
+            src/codeb/feature.py             (Key File; commit msg: OSL-1)
+            src/codeb/wip.py                 (uncommitted working-tree change)
+
+    Creates real git repositories for BOTH A and B (the AC1 contract demands
+    two real temp git repos). The ``wl-OSL-1-feature`` branch in B gives the
+    merge gate resolvable integration evidence inside B; B has no ``dev``
+    baseline, so the gate fails open and never attempts a push.
+
+    Returns ``(worklog_dir, repo_a_root, repo_b_root)``.
+    """
+    projects = tmp_path / "projects"
+    # Repo A — the worklog-owning project (real git repo).
+    repo_a = projects / "llm"
+    (repo_a / "admin").mkdir(parents=True)
+    (repo_a / "admin" / "registry.txt").write_text("a-registry\n")
+    (repo_a / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    worklog_dir = repo_a / ".worklog"
+    worklog_dir.mkdir()
+    (worklog_dir / "config.yaml").write_text(
+        f"projectName: LLM\nprefix: {prefix}\n", encoding="utf-8"
+    )
+    init_repo(repo_a, default_branch="main", sandbox_root=tmp_path)
+    commit_all(repo_a, "worklog repo initial")
+
+    # Repo B — the code repository the item's delivered files live in.
+    repo_b = projects / "code"
+    (repo_b / "src" / "codeb").mkdir(parents=True)
+    (repo_b / "src" / "codeb" / "feature.py").write_text("x = 1\n")
+    init_repo(repo_b, default_branch="main", sandbox_root=tmp_path)
+    commit_all(repo_b, "OSL-1: add codeb feature")
+    # Merge-gate integration evidence lives in B (a wl-<id>-* branch).
+    run_git(repo_b, ["branch", "wl-OSL-1-feature"], check=True)
+    # Uncommitted working-tree change so changed-files resolution is exercised.
+    (repo_b / "src" / "codeb" / "wip.py").write_text("y = 2\n")
+
+    return worklog_dir, repo_a, repo_b
+
+
+class TestCrossRepoCodeRoot:
+    """AC1 (LP-0MWDDRTHE00981PK): ``--code-root`` decouples the git-derived
+    audit scope from the worklog-owning repository.
+
+    Work item ``OSL-1`` is tracked in worklog repo A; its delivered code
+    lives in repo B. Audited with the explicit code root, every git-derived
+    surface (merge gate, file-scope manifest, changed files, green-run
+    evidence, code-quality scope) must resolve against B while all wl
+    reads/writes still target A's worklog — the two roots are independent.
+    """
+
+    @_CROSS_REPO_RED
+    def test_cross_repo_code_root_resolves_git_scope_to_code_repo(
+        self, tmp_path,
+    ):
+        """AC1: with ``--code-root <B>`` the merge gate, file-scope manifest,
+        changed files, green-run evidence and code-quality scope all resolve
+        against repo B, while every wl read/write stays on worklog repo A.
+        """
+        worklog_a, repo_a, repo_b = _make_cross_repo_pair(tmp_path)
+        repo_b_head = run_git(
+            repo_b, ["rev-parse", "HEAD"], check=True
+        ).stdout.strip()
+        recorded: list[list[str]] = []
+        runner = _make_minimal_runner(
+            recorded, description=_CROSS_REPO_DESCRIPTION, git_cwd=repo_b,
+        )
+        mock_cq = mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+        with (
+            # Launch from the worklog owner (repo A); code root is repo B.
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", repo_a),
+            mock.patch.object(
+                audit_runner, "_auto_green_run_outcome",
+                wraps=audit_runner._auto_green_run_outcome,
+            ) as auto_spy,
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality", mock_cq
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True, runner=runner,
+                worklog_dir=str(worklog_a), code_root=str(repo_b),
+            )
+
+        assert rc == 0, "cross-repo audit with --code-root must exit green"
+
+        # -- Merge gate, changed files, manifest, HEAD: every git command
+        # issued by the runner resolves against code repo B (never A / the
+        # launch root).
+        git_cmds = [c for c in recorded if c and c[0] == "git"]
+        assert git_cmds, "expected the cross-repo audit to run git commands"
+        for git_cmd in git_cmds:
+            assert git_cmd[1] == "-C", f"git command lacks -C: {git_cmd}"
+            assert Path(git_cmd[2]).resolve() == repo_b.resolve(), (
+                f"git command must resolve against code repo B: {git_cmd}"
+            )
+        # The merge gate's ref scan runs against B.
+        assert any(
+            "for-each-ref" in " ".join(cmd) for cmd in git_cmds
+        ), "merge gate must run for-each-ref against code repo B"
+        # Audited HEAD is code repo B's HEAD.
+        assert audit_runner._resolve_audited_head(runner) == repo_b_head
+
+        # -- Green-run evidence resolves the test-cache cwd to B.
+        assert auto_spy.called, "expected the automatic green-run path to run"
+        assert Path(
+            auto_spy.call_args.kwargs["cwd"]
+        ).resolve() == repo_b.resolve(), (
+            "green-run evidence must resolve against code repo B"
+        )
+
+        # -- Code-quality scope resolves to B and references B's files
+        # (either the changed-files path or the touched/Key-Files path —
+        # both must stay inside code repo B).
+        mock_cq.assert_called_once()
+        assert Path(
+            mock_cq.call_args.kwargs["project_root"]
+        ).resolve() == repo_b.resolve(), (
+            "code-quality scope must target code repo B"
+        )
+        assert any(
+            "src/codeb/" in str(f)
+            for f in mock_cq.call_args.kwargs.get("files", [])
+        ), "code-quality scope must reference code repo B's files"
+
+        # -- File-scope manifest resolves to B: B's Key File and B's repo
+        # index appear; worklog repo A's marker never does.
+        with mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", repo_b):
+            manifest = audit_runner._build_file_scope_manifest(
+                {"id": "OSL-1", "description": _CROSS_REPO_DESCRIPTION},
+                [], runner=runner, project_root=repo_b,
+            )
+        assert "src/codeb/feature.py" in manifest, manifest
+        assert "src/" in manifest, f"manifest lacks code repo B's index: {manifest}"
+        assert "admin" not in manifest, (
+            f"manifest must not leak worklog repo A's marker: {manifest}"
+        )
+
+        # -- Changed files resolve to B's working tree.
+        with mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", repo_b):
+            changed = audit_runner._git_changed_files(runner)
+        assert "src/codeb/wip.py" in changed, (
+            f"changed files must reflect code repo B: {changed}"
+        )
+
+        # -- wl reads/writes all target worklog repo A — never repo B.
+        wl_cmds = [c for c in recorded if c and c[0] == "wl"]
+        assert wl_cmds, "expected wl commands from the cross-repo audit"
+        for wl_cmd in wl_cmds:
+            assert "--worklog-dir" in wl_cmd, wl_cmd
+            assert str(worklog_a) in wl_cmd, (
+                f"wl command must target worklog repo A: {wl_cmd}"
+            )
+            assert str(repo_b) not in " ".join(wl_cmd), (
+                f"wl command must never reference the code repo: {wl_cmd}"
+            )
+
+    @_CROSS_REPO_RED
+    def test_cli_exposes_code_root_flag(self, tmp_path):
+        """The ``issue`` subcommand parses ``--code-root <dir>`` into a
+        ``code_root`` value (the CLI surface AC1 invokes).
+        """
+        _worklog_a, _repo_a, repo_b = _make_cross_repo_pair(tmp_path)
+        args = audit_runner.build_parser().parse_args([
+            "issue", "OSL-1", "--code-root", str(repo_b),
+        ])
+        assert args.code_root == str(repo_b)
