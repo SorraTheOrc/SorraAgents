@@ -159,6 +159,48 @@ root** (SA-0MULGDABC001T11L), so a foreign-cwd launch never scopes them to
 the launch directory. The module-level `TARGET_PROJECT_ROOT` is retained
 only as the cwd-derived fallback for direct/unit callers.
 
+**Explicit code-repository root (`--code-root` / `AUDIT_CODE_ROOT`,
+LP-0MVZ6R5H8007NYLR).** Some work items are tracked in one project's
+worklog while their delivered code lands in **another** project's
+repository (a *cross-repo* item — recorded precedent: `LP-0MVVYQ1U3006GDWT`,
+`LP-0MVSB0E7W003IMH4`). For those items the worklog-derived owning root is
+the worklog owner, whose repository contains none of the delivered files, so
+every git-derived surface would be mis-scoped (the merge gate looks for the
+item's commits in the wrong repo, the code-quality scan resolves an empty
+file set, and the Phase 2 FILE SCOPE manifest lists files absent from the
+target repo). `--code-root DIR` (env `AUDIT_CODE_ROOT`) supplies the
+**code-repository root** so the git-derived content resolves independently
+of the worklog:
+
+- **What it scopes:** the merge gate, the file-scope manifest, changed
+  files, green-run evidence, the code-quality scan, and the Phase 2 cwd —
+  all resolve against `DIR` (exported as `_AuditContext.per_audit_project_root`).
+- **Default:** the owning-project root (exactly today's behaviour). The
+  two axes are independent — `--worklog-dir` still governs **every** `wl`
+  read/write (it never leaks into `_run_wl`/`resolve_worklog_flags`), and
+  `--code-root` never changes the launch-context ownership verdict.
+- **Precedence:** `--code-root` flag > `AUDIT_CODE_ROOT` env > owning
+  project. A non-existent or non-git directory is a hard `Error: Audit scope
+  error: ...` (non-zero exit, **zero** pi calls) — the same fail-closed style
+  as the other scope errors.
+- **Read-only:** the option only *selects* a scope for read-only git queries
+  and test-cache reads; the runner never fetches, checks out or otherwise
+  mutates the code repository. The read-only audit mandate is preserved.
+- **Recorded in the report:** every persisted report carries a `## Audit
+  Scope` section naming both the resolved **code root** and the **worklog
+  root**, so a reader can tell which repository the evidence came from —
+  and can distinguish a genuine `Ready to close: No` from a mis-scoped one —
+  without remembering which flags were passed. The section is emitted on
+  **every** persisted report, including default (owning-root) audits.
+
+Without `--code-root`, a cross-repo item fails closed with an `Audit scope
+error` naming the sibling project whose repository holds the item's touched
+files, rather than proceeding to a mis-scoped Phase 1/2.
+
+A same-repo item is unaffected: passing `--code-root <owning-root>` (or the
+worktree checkout) is a strict no-op — identical manifest, HEAD attestation
+and verdict, byte for byte.
+
 ## Monitored Run Execution
 
 Audits can run for **hours**; the **launch → monitor → abort** contract is in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md). Summary:
