@@ -1385,21 +1385,9 @@ class TestStaleSiblingIsolation:
 #
 # TEST-FIRST CONTRACT — expected red until the implementation items land
 # (LP-0MWDDRVQ7005KOHN ``--code-root``/per-audit-root wiring, LP-0MWDDRWBG0013CS1
-# cross-repo detection). Marked ``xfail(strict=False)`` so the suite stays green
-# while the contract is documented; when the production change lands they xpass
-# and the markers are removed (precedent: SA-0MVUTD3IX004E03C).
+# cross-repo detection). The markers were removed once the production
+# change landed (LP-0MWDDRVQ7005KOHN --code-root / AUDIT_CODE_ROOT wiring).
 # ===========================================================================
-
-
-_CROSS_REPO_RED = pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "contract test (LP-0MWDDRTHE00981PK): expected red until the "
-        "cross-repo code-root implementation lands (LP-0MWDDRVQ7005KOHN "
-        "--code-root / AUDIT_CODE_ROOT wiring); xpasses when it lands and "
-        "the marker is removed"
-    ),
-)
 
 #: Item description used by the cross-repo fixture: Key Files live in code
 #: repo B (``src/codeb/feature.py``); no Acceptance Criteria heading, so the
@@ -1470,7 +1458,6 @@ class TestCrossRepoCodeRoot:
     reads/writes still target A's worklog — the two roots are independent.
     """
 
-    @_CROSS_REPO_RED
     def test_cross_repo_code_root_resolves_git_scope_to_code_repo(
         self, tmp_path,
     ):
@@ -1579,7 +1566,6 @@ class TestCrossRepoCodeRoot:
                 f"wl command must never reference the code repo: {wl_cmd}"
             )
 
-    @_CROSS_REPO_RED
     def test_cli_exposes_code_root_flag(self, tmp_path):
         """The ``issue`` subcommand parses ``--code-root <dir>`` into a
         ``code_root`` value (the CLI surface AC1 invokes).
@@ -1807,20 +1793,9 @@ class TestCrossRepoDetectionFailsClosed:
 # TEST-FIRST CONTRACT — expected red until the implementation item lands
 # (LP-0MWDDRVQ7005KOHN ``--code-root``/per-audit-root wiring). Marked
 # ``xfail(strict=False)`` so the suite stays green while the contract is
-# documented; when the production change lands they xpass and the markers
-# are removed (precedent: LP-0MWDDRTHE00981PK).
+# documented; the markers were removed once the production change landed
+# (LP-0MWDDRVQ7005KOHN --code-root / AUDIT_CODE_ROOT).
 # ===========================================================================
-
-
-_SAME_REPO_RED = pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "contract test (LP-0MWDDRUMH002LRZR): expected red until the "
-        "same-repo --code-root wiring lands (LP-0MWDDRVQ7005KOHN "
-        "--code-root / AUDIT_CODE_ROOT); xpasses when it lands and the "
-        "marker is removed"
-    ),
-)
 
 
 def _make_same_repo_fixture(tmp_path: Path, prefix: str = "OSL"):
@@ -1934,7 +1909,6 @@ class TestSameRepoCodeRootByteForByte:
             "git_cmds": [c for c in recorded if c and c[0] == "git"],
         }
 
-    @_SAME_REPO_RED
     def test_same_repo_byte_for_byte_with_and_without_code_root(self, tmp_path):
         """AC3: the SAME same-repo item run twice — once with an explicit
         ``--code-root <owning-root>``, once without — yields byte-for-byte

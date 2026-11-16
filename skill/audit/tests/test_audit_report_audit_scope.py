@@ -11,12 +11,9 @@ The tests drive the public ``cmd_issue`` entry point with ``persist=True`` and
 capture the exact report text handed to ``persist_audit()`` — this proves the
 section lands in the *persisted* report (not merely in stdout).
 
-TEST-FIRST CONTRACT — expected red until the implementation item lands
-(LP-0MWDDRVWX6006YE0Z "Implement ``## Audit Scope`` report line in persisted
-report"). Marked ``xfail(strict=False)`` so the suite stays green while the
-contract is documented; the tests xpass when the production change lands and
-the markers are removed (precedent: LP-0MWDDRTHE00981PK, LP-0MWDDRU1P0067SUV,
-LP-0MWDDRUMH002LRZR).
+The contract is green since the implementation landed
+(LP-0MWDDRWX6006YE0Z emitted the section; LP-0MWDDRVQ7005KOHN supplied the
+cross-repo ``--code-root`` pump); the xfail markers were removed.
 """
 from __future__ import annotations
 
@@ -25,8 +22,6 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
-
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -42,16 +37,9 @@ from audit.tests.test_audit_runner_launch_context import (
     _make_same_repo_fixture,
 )
 
-#: The contract is red until the ``## Audit Scope`` report line lands.
-_AUDIT_SCOPE_RED = pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "contract test (LP-0MWDDRV5U005GVHM): expected red until the "
-        "## Audit Scope report line lands (LP-0MWDDRWX6006YE0Z "
-        "'Implement ## Audit Scope report line in persisted report'); "
-        "xpasses when it lands and the marker is removed"
-    ),
-)
+#: The contract is green since the ``## Audit Scope`` report line landed
+#: (LP-0MWDDRWX6006YE0Z) and the cross-repo code-root pump passed
+#: (LP-0MWDDRVQ7005KOHN); the markers were removed.
 
 
 def _path_mentioned(text: str, path: Path) -> bool:
@@ -153,7 +141,6 @@ class TestPersistedReportAuditScope:
     """AC4 (LP-0MWDDRV5U005GVHM): the persisted report states its audit scope.
     """
 
-    @_AUDIT_SCOPE_RED
     def test_cross_repo_report_records_code_root_and_worklog(self, tmp_path):
         """A cross-repo item audited with an explicit ``--code-root`` persists
         a report whose ``## Audit Scope`` section names both the code root
@@ -187,14 +174,11 @@ class TestPersistedReportAuditScope:
             f"Audit Scope must name the worklog root {repo_a}: {section!r}"
         )
 
-        # The scope delta must not disturb the report's existing shape.
+        # The cross-repo test keeps no marker: it turned green with the
+        # cross-repo --code-root wiring (LP-0MWDDRVQ7005KOHN).
         assert "Ready to close:" in report
         assert "OSL-1" in report
 
-    # The cross-repo test above keeps ``@_AUDIT_SCOPE_RED`` (it additionally
-    # needs LP-0MWDDRVQ7005KOHN's --code-root parameter); this default-root
-    # test turned green with the ## Audit Scope emission (LP-0MWDDRWX6006YE0Z)
-    # and its marker is removed.
     def test_default_report_records_owning_root_as_scope(self, tmp_path):
         """With **no** explicit code root the section is still emitted — the
         default owning-project root is recorded as the code root (AC4's

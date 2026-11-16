@@ -989,6 +989,40 @@ invoking the test skill. Precedence: ``--no-execute`` flag > env var >
 auto-execute on cache miss (default).
 """
 
+AUDIT_CODE_ROOT_ENV = "AUDIT_CODE_ROOT"
+"""Environment variable name for the explicit code-repository root.
+
+When set, the git-derived audit content (merge gate, file-scope manifest,
+changed files, green-run evidence, code-quality scope, Phase 2 cwd) resolves
+against this repository instead of the worklog-owning project — independent
+of the worklog store (LP-0MVZ6R5H8007NYLR). Precedence: ``--code-root``
+flag > this env var > owning-project default. Never affects ``wl`` routing;
+``--worklog-dir`` keeps governing the worklog side. Read-only: the runner
+never fetches, checks out or mutates the pointed-at repository.
+"""
+
+
+def _resolve_code_root(flag_value: str | None) -> str | None:
+    """Resolve the explicit code-repository root for this audit run.
+
+    Precedence (LP-0MVZ6R5H8007NYLR AC1/AC2): ``--code-root`` flag >
+    ``AUDIT_CODE_ROOT`` env var > owning-project default (``None`` means
+    "use today's owning-project resolution"). ``None``/empty flag values
+    fall through to the env var; an empty env var is treated as unset.
+
+    Args:
+        flag_value: The parsed ``--code-root`` value (or ``None``).
+
+    Returns:
+        The resolved code root string, or ``None`` when neither the flag
+        nor the env var supplies one (the owning-project default applies).
+    """
+    if flag_value:
+        return flag_value
+    env_value = os.environ.get(AUDIT_CODE_ROOT_ENV)
+    return env_value or None
+
+
 AUDIT_STRICT_ENV = "AUDIT_STRICT"
 """Environment variable name for the audit test-failure mode.
 
@@ -12848,7 +12882,7 @@ def _build_merge_gate_failure_report(ctx: _AuditContext) -> str:
     return "\n".join(lines)
 
 
-def _phase_gate(ctx: _AuditContext) -> int | None:
+def _phase_gate(ctx: _AuditContext, code_root: str | None = None) -> int | None:
     """Phase 1 — launch-context resolution, model/green-run resolution, original
     status capture, freshness gates, and the in_progress claim.
 
@@ -12914,6 +12948,49 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     if runner is None:
         runner = _default_runner
 
+    # Explicit code-repository root (LP-0MVZ6R5H8007NYLR): ``--code-root``
+    # flag > ``AUDIT_CODE_ROOT`` env > owning-project default. Resolved and
+    # validated BEFORE any Phase 1 work: a non-git or non-existent directory
+    # is a hard error (non-zero exit, no pi call), matching the fail-closed
+    # style of the other scope errors. The option selects a READ-ONLY scope —
+    # nothing is fetched/checked out/mutated — and never leaks into ``wl``
+    # routing (``resolve_worklog_flags``/``_run_wl`` are untouched).
+    resolved_code_root = _resolve_code_root(code_root)
+    if resolved_code_root is not None:
+        code_root_path = Path(resolved_code_root).expanduser().resolve()
+        if not code_root_path.is_dir():
+            code_root_error = (
+                f"Audit scope error: --code-root {resolved_code_root!r} is "
+                f"not a directory. Point --code-root at the code repository "
+                f"whose git-derived content this audit should resolve "
+                f"against (read-only; the worklog stays resolved from "
+                f"--worklog-dir / the item prefix)."
+            )
+            if json_mode:
+                print(json.dumps({"error": code_root_error}, indent=2))
+            else:
+                print(f"Error: {code_root_error}", file=sys.stderr)
+            return 1
+        probe = subprocess.run(
+            ["git", "-C", str(code_root_path), "rev-parse",
+             "--is-inside-work-tree"],
+            check=False, capture_output=True, text=True,
+        )
+        if probe.returncode != 0 or probe.stdout.strip() != "true":
+            code_root_error = (
+                f"Audit scope error: --code-root {resolved_code_root!r} is "
+                f"not a git working tree (rev-parse failed). Point "
+                f"--code-root at the code repository whose git-derived "
+                f"content this audit should resolve against."
+            )
+            if json_mode:
+                print(json.dumps({"error": code_root_error}, indent=2))
+            else:
+                print(f"Error: {code_root_error}", file=sys.stderr)
+            return 1
+    else:
+        code_root_path = None
+
     # Resolve the git root for every runner-based git command
     # (SA-0MSLLGDW00098UCC): git-derived content must come from the OWNING
     # project's repository — never the launch cwd's. The owning root is the
@@ -12921,18 +12998,23 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # worktree of the owning project, or the owning project itself), keep
     # the launch cwd so a worktree launch still resolves git to the
     # worktree checkout (worktree branch HEAD and worktree-only changes
-    # stay correct — AC3). Then wrap the runner so every git call carries
+    # stay correct — AC3). An explicit ``--code-root`` overrides both: the
+    # git evidence resolves against the code repository regardless of the
+    # owning/worktree root. Then wrap the runner so every git call carries
     # `git -C <git_root>` when git_root differs from the launch root (AC1)
     # and stays byte-identical otherwise (zero regression for owning
     # launches).
     git_root = owning_root
     if _same_git_repository(TARGET_PROJECT_ROOT, owning_root):
         git_root = TARGET_PROJECT_ROOT
+    if code_root_path is not None:
+        git_root = code_root_path
     # Per-audit target project root (SA-0MULGDABC001T11L): same resolution as
     # the git root — the owning root by default, the launch cwd when it is the
-    # same git repository (owning or worktree checkout). Consumed by the
-    # residual TARGET_PROJECT_ROOT consumers below (F3 suite-execution cwd) and
-    # by later phases (code-quality scan, remediation, debug-log slug).
+    # same git repository (owning or worktree checkout), the explicit code
+    # root when given. Consumed by the residual TARGET_PROJECT_ROOT consumers
+    # below (F3 suite-execution cwd) and by later phases (code-quality scan,
+    # remediation, debug-log slug).
     per_audit_root = git_root
     runner = _cwd_aware_runner(git_root, runner)
     ctx.runner = runner
@@ -17683,7 +17765,8 @@ def cmd_issue(issue_id: str, persist: bool = True,
               child_in_main_slot: bool | None = None,
               batch_drain: bool | None = None,
               strict: bool | None = None,
-              ship_triggered: bool = False) -> int:
+              ship_triggered: bool = False,
+              code_root: str | None = None) -> int:
     """Audit a single work item.
 
     *batch_drain* (SA-0MTG5TP5Z008QBL5) controls the post-audit batch
@@ -17711,6 +17794,17 @@ def cmd_issue(issue_id: str, persist: bool = True,
     advance / 'No' demotion, the persisted report) is unchanged. Only
     ship-automated invocations set it; operator-invoked audits stay
     marker-free and keep independent flagging.
+
+    *code_root* (``--code-root``/``AUDIT_CODE_ROOT``, LP-0MVZ6R5H8007NYLR)
+    is an explicit code-repository root for the git-derived audit content
+    (merge gate, file-scope manifest, changed files, green-run evidence,
+    code-quality scope, Phase 2 cwd). It selects a read-only scope only — the
+    runner never fetches/checks out/mutates that repository — and it never
+    affects ``wl`` routing: ``worklog_dir`` (and the prefix-to-sibling
+    resolution) keeps governing every worklog read/write, so a cross-repo
+    item (worklog in project A, code in project B) is auditable in one
+    command. A non-git or non-existent value is a hard error (non-zero exit,
+    no model call) before any Phase 1 work.
 
     The resolved model name and source are included as a metadata line
     in the audit report output (issue-level and child reports).
@@ -17824,7 +17918,7 @@ def cmd_issue(issue_id: str, persist: bool = True,
         no_checkpoint=no_checkpoint,
         ship_triggered=ship_triggered,
     )
-    rc = _phase_gate(ctx)
+    rc = _phase_gate(ctx, code_root=code_root)
     if rc is not None:
         return rc
 
@@ -18536,6 +18630,15 @@ def build_parser() -> argparse.ArgumentParser:
                          ))
     p_issue.add_argument("--worklog-dir", default=None,
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
+    p_issue.add_argument("--code-root", default=None, metavar="DIR",
+                         help=(
+                             "Explicit code-repository root for the git-derived audit "
+                             "content (merge gate, file-scope manifest, changed files, "
+                             "green-run evidence, code-quality scope, Phase 2 cwd). "
+                             "Defaults to the owning-project root; env: AUDIT_CODE_ROOT. "
+                             "Read-only (never fetched/checked out). Never affects wl "
+                             "routing (--worklog-dir governs the worklog side)."
+                         ))
     p_issue.add_argument("--max-concurrency", type=int, default=None,
                          help=("Max concurrent pi/audit subprocesses. Precedence: this "
                                "flag > AUDIT_MAX_CONCURRENCY env > live proxy slot "
@@ -18928,6 +19031,7 @@ def _run_issue_command(args) -> int:
                         debug_log=args.debug_log,
                         force=args.force,
                         worklog_dir=args.worklog_dir,
+                        code_root=getattr(args, "code_root", None),
                         batch_phase2=_phase2_batch_enabled(args.batch_phase2),
                         green_run=args.green_run,
                         audit_children=args.audit_children,
