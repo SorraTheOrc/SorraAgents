@@ -237,7 +237,7 @@ class TestDrivenChildStraysIntoSiblingWorktree:
         _commit(sibling_worktree, "stray.py", branch_tag=SIBLING_ID)
         _commit(child_worktree, "own-work.py", branch_tag=CHILD_ID)
 
-        report, status_calls, invoked = _run_phase_parent(
+        report, _, invoked = _run_phase_parent(
             child_worktree,
             invoke_impl=lambda action, work_item_id, **_kw: {
                 "success": True, "work_item_id": work_item_id,

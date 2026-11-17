@@ -334,13 +334,9 @@ def test_phase_start_refuses_a_worktree_from_unpushed_local_dev(tmp_path: Path):
 
     with _phase_start_harness(
         work_item=_WORK_ITEM, repo_root=str(main)
-    ) as mocks:
-        mocks["wl_add_comment"].side_effect = (
-            lambda *args, **kwargs: comments.append(args[1]) or True
-        )
-        with patch.object(
-            implement, "git_worktree_add", side_effect=recording_worktree_add
-        ):
+    ) as mocks, patch.object(
+        implement, "git_worktree_add", side_effect=recording_worktree_add
+    ):
             report = implement.phase_start(
                 "WL-TESTBASE", json_output=True, no_refactor=True
             )
@@ -387,10 +383,10 @@ def test_phase_start_bases_a_worktree_on_the_pushed_tip(tmp_path: Path):
         gs.run_git(main, ["worktree", "add", "--track", "-b", branch, str(path), base_ref], check=True)
         return True
 
-    with _phase_start_harness(work_item=_WORK_ITEM, repo_root=str(main)):
-        with patch.object(
-            implement, "git_worktree_add", side_effect=recording_worktree_add
-        ):
+    with _phase_start_harness(work_item=_WORK_ITEM, repo_root=str(main)), \
+         patch.object(
+             implement, "git_worktree_add", side_effect=recording_worktree_add
+         ):
             report = implement.phase_start(
                 "WL-TESTBASE", json_output=True, no_refactor=True
             )

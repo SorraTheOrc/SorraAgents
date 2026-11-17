@@ -450,9 +450,10 @@ def test_prelock_verdict_is_bound_to_the_would_be_commit_tree(tmp_path):
         )
         return {**_tests_result(), "scope": scope}
 
-    with _finish_harness(tmp_path, repo_root=repo):
-        with patch.object(implement, "run_tests", side_effect=_fake):
-            report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
+    with _finish_harness(tmp_path, repo_root=repo), patch.object(
+        implement, "run_tests", side_effect=_fake
+    ):
+        report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
 
     assert report["success"] is True, report["message"]
     full_runs = [call for call in calls if call["scope"] == "full"]
@@ -607,9 +608,10 @@ def test_prelock_skipped_when_the_dev_push_gate_is_bypassed(tmp_path, monkeypatc
         ran.append(scope)
         return _tests_result()
 
-    with _finish_harness(tmp_path, repo_root=repo):
-        with patch.object(implement, "run_tests", side_effect=_fake_run_tests):
-            report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
+    with _finish_harness(tmp_path, repo_root=repo), patch.object(
+        implement, "run_tests", side_effect=_fake_run_tests
+    ):
+        report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
 
     assert report["success"] is True, report["message"]
     prelock = report["steps"]["full_suite_prelock"]
@@ -682,20 +684,21 @@ def test_concurrent_finishes_overlap_their_full_suite_runs(tmp_path, monkeypatch
             "WL-TEST", json_output=True, no_refactor=True
         )
 
-    with _finish_harness(tmp_path, repo_root=repo):
-        with patch.object(implement, "run_tests", side_effect=_fake_run_tests):
-            threads = [
-                threading.Thread(target=_finish, args=(label,), daemon=True)
-                for label in ("a", "b")
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=60)
-            assert not any(t.is_alive() for t in threads), (
-                "a concurrent finish did not complete — the full-suite runs "
-                "were serialised on the main-checkout lock"
-            )
+    with _finish_harness(tmp_path, repo_root=repo), patch.object(
+        implement, "run_tests", side_effect=_fake_run_tests
+    ):
+        threads = [
+            threading.Thread(target=_finish, args=(label,), daemon=True)
+            for label in ("a", "b")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not any(t.is_alive() for t in threads), (
+            "a concurrent finish did not complete — the full-suite runs "
+            "were serialised on the main-checkout lock"
+        )
 
     assert set(reports) == {"a", "b"}
     for label, report in reports.items():
