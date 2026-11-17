@@ -359,6 +359,19 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > compacting the rule. `skill_implement_md` moved 22343 → 22425 B, still under
 > its 22,500 B cap.
 >
+> **Tool-output budget rollout verification (2026-11-17,
+> SA-0MWJYIKGC004XHW5):** a fresh `measure_context.py --include-hidden`
+> re-measurement matched the committed thresholds exactly — `global_agents
+> 16391`, `project_agents 4271`, `skill_implement_md 22425`, `skills_prose
+> 2339`, `total 23001` — so the revision above is current rather than stale.
+> The rollout guard was then shown to fail when it should: deleting the
+> `skill/audit/SKILL.md` reference line turned
+> `TestSkillInventoryReferences::test_skill_md_references_shared_doc[audit]`
+> red, and removing `skill/shared/tool-output-budget.md` turned
+> `TestSharedDocExists::test_shared_doc_exists` plus the document-content class
+> red. Both mutations were reverted. No `CONTEXT_BUDGET_SKIP=1` bypass was
+> used at any point.
+>
 > ### Enforcement (committed gate)
 >
 > The regression gate is enforced in two places:
