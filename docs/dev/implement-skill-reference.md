@@ -319,6 +319,30 @@ Regression coverage:
 `TestDriveRecordsSpawnFailureEvidence`) — real git fixture repositories, both
 `phase_parent` call sites, and the end-to-end drive→parent hand-off.
 
+### The test suite is driven-session independent (SA-0MWJHN2I8005E7BK)
+
+The regression tests above call `phase_drive` directly: they play the parent
+driver, not a driven child. But `implement.py finish`'s full-suite gate runs
+*inside* whatever session invoked it, and a driven child session exports
+`IMPLEMENT_DRIVE_ACTIVE=1`. `run_tests.py` preserves the inherited environment
+(only git-repository overrides are stripped), so without isolation that marker
+reaches the suite and `phase_drive`'s recursion guard refuses every direct
+drive test — the tests are red purely because of *who ran the suite*, not
+because of any code change.
+
+`skill/implement/tests/conftest.py` therefore neutralises the ambient markers
+with an autouse fixture (`_no_ambient_drive_marker`): it removes
+`IMPLEMENT_DRIVE_ACTIVE` and its sibling `IMPLEMENT_KEEP_WORKTREE` for every
+test in the package. The convention mirrors the existing ambient-env
+neutralisation for `GIT_INDEX_FILE` and the lock-wait timeouts. A test that
+wants to simulate a driven context re-sets the marker inside its own body
+(`monkeypatch.setenv(implement.DRIVE_RECURSION_ENV, "1")`); monkeypatch
+unwinds LIFO, so the in-test value wins over the fixture and is restored at
+teardown. The mechanism is documented in the conftest docstring; this note
+records *why* the suite must be deterministic under either ambient state — the
+parent-driven full-suite gate is exactly where a real driven chain's audit
+verdict is computed.
+
 ## Assignee release when a kill cannot run an exit hook (SA-0MVVF75ZA007XNKB)
 
 A non-empty `assignee` is a **scheduling hold** (see the
