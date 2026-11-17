@@ -239,6 +239,58 @@ class TestSharedDocNamesPatterns:
         assert "--offset" in _text(SHARED_DOC)
 
 
+#: The static-context document that must cross-link the dynamic guidance.
+CONTEXT_BUDGET_DOC = REPO_ROOT / "docs" / "dev" / "context-budget.md"
+
+#: Heading that opens the static-vs-dynamic section (SA-0MWJYI6F7009CBKA).
+STATIC_DYNAMIC_HEADING = "## Static vs dynamic context"
+
+
+def _static_dynamic_section(path: Path) -> str:
+    """Return just the static-vs-dynamic section of *path*.
+
+    Isolating the section keeps the assertions about the 83%/10% evidence and
+    the complementary wording from being satisfied by unrelated prose
+    elsewhere in the document.
+    """
+    text = _text(path)
+    start = text.find(STATIC_DYNAMIC_HEADING)
+    if start < 0:
+        return ""
+    end = text.find("\n## ", start + len(STATIC_DYNAMIC_HEADING))
+    return text[start:] if end < 0 else text[start:end]
+
+
+class TestStaticDynamicCrossLink:
+    """AC1–AC3 — docs/dev/context-budget.md splits static from dynamic."""
+
+    def test_section_exists(self):
+        assert _static_dynamic_section(CONTEXT_BUDGET_DOC), (
+            "docs/dev/context-budget.md must carry a "
+            f"'{STATIC_DYNAMIC_HEADING}' section"
+        )
+
+    def test_section_scopes_the_committed_budget_to_static_startup(self):
+        section = _static_dynamic_section(CONTEXT_BUDGET_DOC).lower()
+        assert "static startup" in section
+        assert "runtime" in section
+
+    def test_section_links_the_shared_tool_output_budget_doc(self):
+        section = _static_dynamic_section(CONTEXT_BUDGET_DOC)
+        assert "skill/shared/tool-output-budget.md" in section
+
+    def test_section_names_the_measured_83_percent_evidence(self):
+        section = _static_dynamic_section(CONTEXT_BUDGET_DOC)
+        assert "83%" in section
+        assert "10%" in section
+        assert "409 KB" in section
+
+    def test_section_states_complementary_not_substitutes(self):
+        section = _static_dynamic_section(CONTEXT_BUDGET_DOC).lower()
+        assert "complementary" in section
+        assert "not substitutes" in section
+
+
 #: A bare `cat` over a generated artefact offered as a recommendation.
 #: Heredocs (`cat <<'JSON'`) and redirections are writes, not reads, so they
 #: are excluded by requiring a plain path token after `cat`.

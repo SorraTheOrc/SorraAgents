@@ -6,6 +6,34 @@ documents how to re-measure it. The reduction target is tracked by the epic
 [SA-0MSJI53RX006E2PS — Reduce initial LLM context from skills and
 skill-related startup files](https://github.com/SorraTheOrc/SorraAgents).
 
+## Static vs dynamic context: two complementary budgets
+
+This document — together with the committed
+`docs/dev/context-budget.thresholds.json` and the pre-push gate that enforces
+it — measures the **static startup** surface only: `AGENTS_GLOBAL.md`, the
+project `AGENTS.md`, the skills description prose and
+`skill/implement/SKILL.md`. It says nothing about what a session *adds* while
+it works.
+
+That runtime growth is a **second, separate budget**: the bytes a session
+accumulates from tool results — whole-file reads, unbounded searches, `cat`
+over generated artefacts. Measured on one live `implement` session (AI_Hell
+`AH-0MWH4F375000X08G`, 2026-11-16), tool results were **409 KB — 83% of the
+session context** after 8 min 34 s, against **51 KB — 10%** for the static
+startup surface.
+
+Canonical guidance for that **dynamic runtime** surface is
+[`skill/shared/tool-output-budget.md`](../../skill/shared/tool-output-budget.md):
+`jq` projections instead of `cat` over a generated artefact, capped `rg`
+searches (`-m`, `-c`, `-l` before widening), and `read` with
+`offset`/`limit` around a symbol a `rg -n` has already located.
+
+They are **complementary, not substitutes** — neither replaces the other. This
+document and its gate bound what a session *starts* with; the shared guidance
+bounds what *each tool call adds*. Auditing session logs for tool-output waste
+(and auto-filing improvement items from it) is deliberately out of scope here
+and tracked separately under `SA-0MWJWJ1HV000EBKP`.
+
 ## Measurement tool
 
 Canonical tool: `skill/context-audit/scripts/measure_context.py`.
