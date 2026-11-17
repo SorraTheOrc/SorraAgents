@@ -126,7 +126,7 @@ Two backstops cover sessions that never reach a lifecycle exit: `release_session
 Two lifecycle axes, managed independently:
 
 - **`status`** — lifecycle (open, in-progress, completed). Only set `completed` when formally closed (post-release).
-- **`stage`** — workflow progress (idea, intake_complete, plan_complete, in_progress, in_review). When advancing to `in_review`, also set `status` to `completed`.
+- **`stage`** — workflow progress (idea, intake_complete, plan_complete, in_review, done). **`in_progress` is a *status*, never a *stage*.** When advancing to `in_review`, also set `status` to `completed`.
 - **Epics/parent items:** once all children are terminal, advance the parent's `stage` to `in_review`.
 
 ## work-item Types
@@ -146,9 +146,7 @@ Before `in_review`, the full suite is enforced by the dev-push gate and cached f
 
 ## Test execution policy
 
-Agents must **never** invoke test commands directly — no ad-hoc `pytest`, `npm test`, `vitest`, `node --test`, or equivalent invocations. **Every agent-initiated test run goes through the test skill** (`/skill:test`, `run_tests.py`), covering full/changed scope and unit/smoke types. **No exceptions** for agent-initiated runs.
-
-Automated infrastructure gates (pre-push hook, `implement.py finish`, audit F3 cache miss) execute test commands directly as part of their own logic; these are **infrastructure**, not agent runs, and are **out of scope** for this policy.
+Agents must **never** invoke test commands directly — no ad-hoc `pytest`, `npm test`, `vitest`, `node --test`, or equivalent invocations. **Every agent-initiated test run goes through the test skill** (`/skill:test`, `run_tests.py`), covering full/changed scope and unit/smoke types. **No exceptions** — automated infrastructure gates (pre-push hook, `implement.py finish`, audit F3 cache miss) are out of scope.
 
 ## Background job etiquette
 
