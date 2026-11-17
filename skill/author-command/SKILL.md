@@ -35,6 +35,7 @@ User requests a new command ("Create a command to <do something>", "I need a com
 No CLI runner script. Use Pi prompt invocation or agent command framework.
 
 - Template: `./assets/command-template.md`
+- Tool output: follow the shared [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result
 
 ### Policy
 

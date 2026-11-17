@@ -387,6 +387,7 @@ Then output a summary of what each stage checked/found.
 
 ## Bundled Resources
 
+- [Tool output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result.
 - `plan_helpers.py` — Shared autoplan decision module. CLI entry points: `plan-if-needed`, `check-effort-risk`, `plan-approval-gate` (see usage above); importable as a Python module. Full import list: [docs/dev/plan-skill-reference.md](../../docs/dev/plan-skill-reference.md).
 
 ## Appendix: Clarifying questions & answers (must include)

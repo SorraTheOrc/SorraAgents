@@ -13,6 +13,8 @@ EXECUTE immediately when invoked via /skill:audit. Do NOT ask permission or offe
 
 Provide a concise, human-friendly summary of project status or a specific work item. Exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators.
 
+> **Tool output:** follow the shared [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result.
+
 ## When To Use
 
 1. **Scan for a work item ID** — `[A-Z]{2}-[A-Z0-9]+`; found → item-level (step 3), not found → project-level (step 2).

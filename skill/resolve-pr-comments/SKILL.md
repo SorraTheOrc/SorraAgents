@@ -132,6 +132,7 @@ Only proceed after user confirms the plan.
 5. **Don't resolve questions** — only threads where action was taken
 6. **Verify push access** before making changes
 7. **Handle conflicts** — notify user if the branch is behind
+8. **Size reads and searches** — follow the shared [tool-output budget](../shared/tool-output-budget.md): `jq` over `cat`, ~10 KB per result
 
 ## Error handling
 

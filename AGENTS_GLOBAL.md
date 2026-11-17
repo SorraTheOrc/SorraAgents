@@ -156,6 +156,12 @@ launch → prepare other work → one completion-aware wait with progress via
 `skill/shared/wait_for_job.py` → collect. Fixed `sleep N` polling of background
 processes is deprecated.
 
+## Tool output budget
+
+Never `cat` a generated artefact — project it with `jq`; cap searches and keep
+each tool result to ~10 KB. See the shared
+[tool-output budget](/home/rgardler/.pi/agent/skills/shared/tool-output-budget.md).
+
 ## Work-Item Management
 
 Run `wl --help` / `wl <cmd> --help` for full docs (create, update, comment, close, dep, sync, github import/push, plugins). **NEVER run `wl list` without a search term** — use `wl list <term> --json` (substring, matches filenames/paths/ids) or `wl search <keywords> --json` (FTS).

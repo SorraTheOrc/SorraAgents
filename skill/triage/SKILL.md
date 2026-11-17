@@ -35,6 +35,8 @@ References
 - Runbook: `./resources/runbook-test-failure.md`
 - Test-writing anti-patterns to avoid when creating test-failure work items:
   [Test Writing Guidelines](../shared/test-writing-guidelines.md)
+- Tool-output budget to follow when inspecting failures and artefacts:
+  [Tool output budget](../shared/tool-output-budget.md)
 
 Script
 ------

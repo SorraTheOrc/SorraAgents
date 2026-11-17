@@ -89,3 +89,9 @@ unnecessary questions when an obvious answer exists.
 
 Respect `.gitignore` and agent framework ignore rules when searching the repo
 during the interview phase.
+
+### 8. Follow the tool-output budget
+
+When reading files or searching the repo, follow the shared
+[tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, capped
+searches, ~10 KB per result.

@@ -40,6 +40,7 @@ References
 
 - Runner: `$(skill_path test)/scripts/run_tests.py` · Usefulness: `$(skill_path test)/scripts/evaluate_usefulness.py` · Triage: `$(skill_path triage)/scripts/check_or_create.py`
 - Canonicalization: `../test_runner.py` · Anti-patterns: [Test Writing Guidelines](../shared/test-writing-guidelines.md)
+- Tool output: [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result
 
 Workflow
 --------

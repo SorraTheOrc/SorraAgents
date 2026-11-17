@@ -1,13 +1,23 @@
-"""Tests for the tool-output budget guidance (SA-0MWJYHKDX006HS36).
+"""Tests for the tool-output budget guidance.
 
-Asserts the observable deliverables of the first rollout slice: the canonical
-shared doc exists, documents the five core points, and carries the required
-sections and traceability. The reference-inventory classes land with the
-rollout feature (SA-0MWJYHX6D008ZYE6).
+Asserts the observable deliverables of the rollout in two halves:
+
+- the document-content half (SA-0MWJYHKDX006HS36) — the canonical shared doc
+  exists, documents the five core points, and carries the required sections and
+  traceability;
+- the reference-inventory half (SA-0MWJYHX6D008ZYE6) — every listed skill,
+  `AGENTS_GLOBAL.md` and the four dev skill-reference docs reference the shared
+  doc individually, and no skill/reference doc recommends a bare `cat` over a
+  generated artefact.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
+
+import pytest
+
+from tests.skill_inventory import tracked_skill_names
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -106,3 +116,171 @@ class TestWorkItemTraceability:
     def test_states_single_source_of_truth(self):
         text = _text(SHARED_DOC)
         assert "single source of truth" in text.lower() or "single source of truth" in text.lower()
+
+
+#: The 20 skills that ship a `SKILL.md` and must reference the shared doc
+#: (parent SA-0MWJWJ1HV000EBKP Requirement 2). `context-audit` ships no
+#: `SKILL.md`; `pane-triage` does not read/search as its primary loop — both
+#: deliberately excluded (recorded in the parent Appendix).
+REQUIRED_SKILLS = (
+    "implement",
+    "audit",
+    "plan",
+    "test",
+    "refactor",
+    "find-related",
+    "resolve-pr-comments",
+    "intake",
+    "agent-log-review",
+    "cleanup",
+    "code-review",
+    "ship",
+    "triage",
+    "machine-hygiene",
+    "report",
+    "standup",
+    "test-churn",
+    "effort-and-risk",
+    "author-command",
+    "interview",
+)
+
+#: Dev reference docs holding relocated detail that describe reading context.
+REQUIRED_REFERENCE_DOCS = (
+    "implement-skill-reference.md",
+    "audit-skill-reference.md",
+    "plan-skill-reference.md",
+    "ship-skill-reference.md",
+)
+
+GLOBAL_AGENTS = REPO_ROOT / "AGENTS_GLOBAL.md"
+
+
+def _skill_md(skill: str) -> Path:
+    return REPO_ROOT / "skill" / skill / "SKILL.md"
+
+
+def _reference_doc(name: str) -> Path:
+    return REPO_ROOT / "docs" / "dev" / name
+
+
+class TestSkillInventoryReferences:
+    """AC1/AC4 — every listed skill references the shared doc, one by one."""
+
+    @pytest.mark.parametrize("skill", REQUIRED_SKILLS)
+    def test_listed_skill_is_tracked(self, skill: str):
+        tracked = tracked_skill_names(REPO_ROOT)
+        if tracked is None:
+            pytest.skip("git unavailable; cannot resolve tracked skill dirs")
+        assert skill in tracked, f"skill/{skill} is not tracked by git"
+
+    @pytest.mark.parametrize("skill", REQUIRED_SKILLS)
+    def test_skill_md_references_shared_doc(self, skill: str):
+        path = _skill_md(skill)
+        assert path.exists(), f"skill/{skill}/SKILL.md must exist"
+        assert "tool-output-budget" in _text(path), (
+            f"skill/{skill}/SKILL.md must reference "
+            "../shared/tool-output-budget.md"
+        )
+
+
+class TestGlobalAgentsReference:
+    """AC2 — one global rule line carries the jq rule and the ~10 KB rule."""
+
+    def test_global_agents_references_shared_doc(self):
+        assert "tool-output-budget" in _text(GLOBAL_AGENTS), (
+            "AGENTS_GLOBAL.md must reference the shared tool-output budget doc"
+        )
+
+    def test_rule_states_jq_over_cat_and_ten_kb_expectation(self):
+        blocks = [
+            block
+            for block in _text(GLOBAL_AGENTS).split("\n\n")
+            if "tool-output-budget" in block
+        ]
+        assert blocks, "no AGENTS_GLOBAL.md block references the shared doc"
+        rule = "\n".join(blocks)
+        assert "jq" in rule, "the rule line must state the jq-over-cat rule"
+        assert "cat" in rule
+        assert "10 KB" in rule, "the rule line must state the ~10 KB expectation"
+
+
+class TestDevReferenceDocReferences:
+    """AC3 — the four dev reference docs reference the shared doc."""
+
+    @pytest.mark.parametrize("doc", REQUIRED_REFERENCE_DOCS)
+    def test_reference_doc_references_shared_doc(self, doc: str):
+        path = _reference_doc(doc)
+        assert path.exists(), f"docs/dev/{doc} must exist"
+        assert "tool-output-budget" in _text(path), (
+            f"docs/dev/{doc} must reference "
+            "skill/shared/tool-output-budget.md"
+        )
+
+    def test_no_find_related_reference_doc_created(self):
+        # Deliberate scope decision: find-related/SKILL.md is untrimmed, so no
+        # relocated-detail doc exists or should be manufactured (parent Appendix Q1).
+        path = _reference_doc("find-related-skill-reference.md")
+        assert not path.exists(), (
+            "docs/dev/find-related-skill-reference.md must not be created"
+        )
+
+
+class TestSharedDocNamesPatterns:
+    """AC4 — the shared doc names the jq, rg -m and read --offset patterns."""
+
+    def test_names_jq_pattern(self):
+        assert "jq" in _text(SHARED_DOC)
+
+    def test_names_rg_m_cap_pattern(self):
+        assert "rg -m" in _text(SHARED_DOC)
+
+    def test_names_read_offset_pattern(self):
+        assert "--offset" in _text(SHARED_DOC)
+
+
+#: A bare `cat` over a generated artefact offered as a recommendation.
+#: Heredocs (`cat <<'JSON'`) and redirections are writes, not reads, so they
+#: are excluded by requiring a plain path token after `cat`.
+_BARE_CAT_ARTEFACT = re.compile(
+    r"^\s*(?:[-*>]\s*)?cat\s+[^\s<|>]*\.(?:json|jsonl|lock|log)\b"
+)
+
+#: Lines explicitly labelled as the anti-pattern are illustrative, not advice.
+_ANTI_PATTERN_MARKERS = ("WASTEFUL", "Never", "never")
+
+
+def _bare_cat_offenders(path: Path) -> list[str]:
+    offenders = []
+    for line in _text(path).splitlines():
+        if not _BARE_CAT_ARTEFACT.match(line):
+            continue
+        if any(marker in line for marker in _ANTI_PATTERN_MARKERS):
+            continue
+        offenders.append(f"{path.relative_to(REPO_ROOT)}: {line.strip()}")
+    return offenders
+
+
+class TestNoBareCatArtefactAdvice:
+    """AC5 — no skill/reference doc recommends `cat <artefact>.json`."""
+
+    def test_no_skill_md_recommends_bare_cat_of_artefact(self):
+        offenders: list[str] = []
+        tracked = tracked_skill_names(REPO_ROOT)
+        for path in sorted((REPO_ROOT / "skill").glob("*/SKILL.md")):
+            if tracked is not None and path.parent.name not in tracked:
+                continue
+            offenders.extend(_bare_cat_offenders(path))
+        assert not offenders, (
+            "skill docs recommend a bare `cat` over a generated artefact:\n"
+            + "\n".join(offenders)
+        )
+
+    def test_no_dev_reference_doc_recommends_bare_cat_of_artefact(self):
+        offenders: list[str] = []
+        for path in sorted((REPO_ROOT / "docs" / "dev").glob("*-skill-reference.md")):
+            offenders.extend(_bare_cat_offenders(path))
+        assert not offenders, (
+            "dev reference docs recommend a bare `cat` over a generated "
+            "artefact:\n" + "\n".join(offenders)
+        )

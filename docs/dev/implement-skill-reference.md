@@ -6,6 +6,10 @@ operational brief; this document preserves the full implementation reference
 for maintainers. Workflow semantics are unchanged — every command/flag
 documented here is still valid.
 
+> **Tool output:** when this reference tells you to read or search context,
+> follow the shared [tool-output budget](../../skill/shared/tool-output-budget.md)
+> — `jq` over `cat`, capped searches, ~10 KB per result.
+
 ## Project-local extensions and expected-dirty paths (SA-0MUYEV5AO006V0HK)
 
 `implement.py` loads the project-local extension for the `implement` skill via

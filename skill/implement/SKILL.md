@@ -28,6 +28,7 @@ through code, tests, and docs.
   [status lifecycle](../shared/status_lifecycle.py),
   [handling assets](../../docs/dev/implement-skill-reference.md#relocated-handling-assets),
   [timeouts](../../docs/dev/implement-skill-reference.md#relocated-test-timeout-configuration).
+- [Tool output budget](../shared/tool-output-budget.md) — size before you read.
 
 Security note — **protected branches** (`main`/`master`/`HEAD`) and **creating
 PRs** require explicit operator permission: never push to them or open PRs

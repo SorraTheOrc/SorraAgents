@@ -100,7 +100,7 @@ Remove temporary files. Produce a concise report: branches deleted (local + remo
 
 ## Worklog context
 
-Fetch relevant work item context before cleanup decisions: `wl show <id> --json`. Include clear comments referencing branches and actions in any work item updates.
+Fetch relevant work item context before cleanup decisions: `wl show <id> --json`. Include clear comments referencing branches and actions in any work item updates. Size every read per the shared [tool-output budget](../shared/tool-output-budget.md) — one `wl show` per item per session.
 
 End.
 

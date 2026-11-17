@@ -19,6 +19,8 @@ by construction — no second ranking.
 - Daily standup meetings
 - When asked for a standup report or team status
 
+> **Tool output:** follow the shared [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result.
+
 ## Invocation
 
 ```bash

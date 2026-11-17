@@ -320,6 +320,17 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > the threshold. (The cap was later revised to 22,500 B by
 > SA-0MUUI6ZCX001RO8V for the mandatory report AC-semantics note.)
 >
+> **Tool-output budget rollout bump (2026-11-17, SA-0MWJYHX6D008ZYE6 /
+> SA-0MWJYIKGC004XHW5):** rolling the shared
+> [tool-output budget](../../skill/shared/tool-output-budget.md) guidance out to
+> the 20 skills, the four dev skill-reference docs and the global rule list
+> added 232 B to `AGENTS_GLOBAL.md` (`global_agents 16159` → `16391`;
+> `total 22769` → `23001`; `project_agents` and `skills_prose` unchanged). The
+> growth is deliberate agent-efficiency guidance applied to every project, so
+> the thresholds were regenerated to the new measured surface rather than
+> compacting the rule. `skill_implement_md` moved 22343 → 22425 B, still under
+> its 22,500 B cap.
+>
 > ### Enforcement (committed gate)
 >
 > The regression gate is enforced in two places:

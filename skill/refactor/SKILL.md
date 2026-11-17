@@ -418,6 +418,7 @@ Comment delimiters vary by file type — `#` for Python, `//` for JS/TS, `<!-- -
 
 - [Implement](../implement/SKILL.md) — Integrated refactor step
 - [Code Review](../code-review/SKILL.md) — Complementary code quality skill
+- [Tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result
 
 
 ## Final step: standardized end-of-session report
