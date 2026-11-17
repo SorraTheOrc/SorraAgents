@@ -332,14 +332,22 @@ def test_phase_start_refuses_a_worktree_from_unpushed_local_dev(tmp_path: Path):
         created.append((branch, Path(path), base))
         return True
 
+    def recording_add_comment(_work_item_id, comment, *args, **kwargs):
+        comments.append(comment)
+        return True
+
     with _phase_start_harness(
         work_item=_WORK_ITEM, repo_root=str(main)
     ) as mocks, patch.object(
         implement, "git_worktree_add", side_effect=recording_worktree_add
     ):
-            report = implement.phase_start(
-                "WL-TESTBASE", json_output=True, no_refactor=True
-            )
+        # The harness mocks the comment writer; capture what it was handed so
+        # the "loud comment is posted" half of the refusal stays observable
+        # instead of being asserted against an always-empty list.
+        mocks["wl_add_comment"].side_effect = recording_add_comment
+        report = implement.phase_start(
+            "WL-TESTBASE", json_output=True, no_refactor=True
+        )
 
     assert report["success"] is False, report
     assert report.get("worktree_refused") is True, report
@@ -387,9 +395,9 @@ def test_phase_start_bases_a_worktree_on_the_pushed_tip(tmp_path: Path):
          patch.object(
              implement, "git_worktree_add", side_effect=recording_worktree_add
          ):
-            report = implement.phase_start(
-                "WL-TESTBASE", json_output=True, no_refactor=True
-            )
+        report = implement.phase_start(
+            "WL-TESTBASE", json_output=True, no_refactor=True
+        )
 
     assert report["success"] is True, report["message"]
     assert len(created) == 1, created
