@@ -132,9 +132,10 @@ worktree fingerprint (that fallback would reintroduce the unattributable
 verdict it exists to prevent). The implement finish gate calls it through its
 temporary index and passes the SHA in as the verdict's fingerprint.
 
-**Provenance kinds.** `FINGERPRINT_KIND_WORKTREE` (`"worktree"`) and
-`FINGERPRINT_KIND_TREE` (`"tree"`) are recorded as `fingerprint_kind` in each
-entry's `metadata.json`. Entries predating the field read as `"worktree"` —
+**Provenance kinds.** `FINGERPRINT_KIND_WORKTREE` (`"worktree"`),
+`FINGERPRINT_KIND_TREE` (`"tree"`) and `FINGERPRINT_KIND_CHANGE_SET`
+(`"change_set"`) are recorded as `fingerprint_kind` in each entry's
+`metadata.json`. Entries predating the field read as `"worktree"` —
 the historical default — so existing consumers keep their historical hits.
 
 **Explicit-fingerprint override.** `run_cached(..., fingerprint=<sha>)` binds
@@ -159,6 +160,37 @@ expose the same distinction to callers that manage execution themselves.
 `run_suite()` / `run_all()` / `guarded_run_all()` thread an optional
 `fingerprint` through to the cache, so the finish gate reaches it through the
 same canonical runner as every other consumer.
+
+**Change-set override for a rebased push (SA-0MWFJS9OL001ZTTC).** A
+`fingerprint`-keyed run is *also* keyed on the change set's **patch content**
+when `track_change_set=True` (the default):
+
+- `compute_change_set_state(cwd, target_tree=<tree>, base_ref="origin/dev")`
+  returns `{fingerprint, base_commit, base_tree, target_tree, paths}`, where
+  `fingerprint` is the SHA-256 of `git diff --full-index <base_tree>
+  <target_tree>` with pinned diff flags and the base is
+  `merge-base(HEAD, base_ref)` (falling back to `HEAD` when the target is a
+  would-be commit tree, or `HEAD^` when `HEAD` *is* the pushed commit).
+  Tree-to-tree diffs never read the index, so the finish gate's temporary
+  `GIT_INDEX_FILE` cannot skew it.
+- The verdict is stored under that key with `fingerprint_kind="change_set"`
+  and `change_set_base_tree` / `change_set_target_tree` /
+  `change_set_paths` metadata, in addition to the tree-keyed entry.
+- On a **tree-keyed miss** the lookup is retried under the change-set key, so
+  a rebased commit whose patch is unchanged is served instead of re-executed.
+  The result reports `fingerprint_kind="change_set"`,
+  `reused_via_change_set: true` and `change_set_target_tree` — the tree the
+  verdict was actually measured on. The inherited verdict is also mirrored
+  under the pushed tree's key, stamped `verdict_origin="change_set_reuse"`
+  with `measured_tree` (the tree the suite really ran against) and the
+  original `completed_at`, so tree-keyed consumers find it without its being
+  presented as directly executed evidence and without extending its lifetime.
+- Reuse is provable, not heuristic: the patch records every changed path with
+  its pre- and post-image object ids, so any content difference — ours or an
+  upstream change to a file the patch touches — changes the key and misses.
+  An empty change set (target tree == base tree) is never keyed.
+- `run_suite()` threads `base_ref` in as `change_set_base_ref`;
+  `track_change_set=False` restores the pre-change behaviour byte for byte.
 
 **CLI surface — `run_tests.py --scope full --fingerprint <sha>`**
 (SA-0MW7C6AYO0062GJB). The flag binds a full-suite run to an explicit
@@ -253,15 +285,19 @@ prefixes; the hook echoes them to the pusher):
 ```text
 run_tests: gate-subject pushed=<sha> checkout=<in-place|worktree> fingerprint_kind=tree tree=<tree sha>
 run_tests: gate-root <absolute path of the resolved checkout>
-run_tests: gate-verdict verdict=<cached|executed> sha=<sha> tree=<tree sha> fingerprint_kind=tree cache_hit=<true|false> cache_age_seconds=<age|n/a> entries=<n>
+run_tests: gate-verdict verdict=<cached|executed> sha=<sha> tree=<tree sha> fingerprint_kind=<tree|change_set> cache_hit=<true|false> cache_age_seconds=<age|n/a> entries=<n>[ reused_from_tree=<tree sha>]
 run_tests: gate-refused <actionable message including TEST_SCOPE_SKIP=1>
 ```
 
 `cache_hit` is `true` when the verdict was served from the cache, and
 `cache_age_seconds` is the age of the oldest reused entry (`n/a` on a miss —
-nothing was reused). The same facts appear in the JSON report under `gate`
+nothing was reused). `fingerprint_kind=change_set` plus `reused_from_tree=`
+means the verdict was recorded for the identical **change set** of a rebased
+commit and measured on that tree, not on the pushed tree
+(SA-0MWFJS9OL001ZTTC). The same facts appear in the JSON report under `gate`
 (`cache_hit`, `cache_age_seconds`, `fingerprint_kind`, `tree`, `pushed`,
-`entries`) and in each `cache_entries[]` item (`git_state`, `cache_age_seconds`).
+`entries`, `reused_from_tree`) and in each `cache_entries[]` item (`git_state`,
+`cache_age_seconds`, `reused_via_change_set`, `change_set_target_tree`).
 
 Every refusal path fails closed — a pushed-commit guard failure (`HEAD !=
 local_sha` with no clean checkout holding the commit, a dirty checkout) or an
