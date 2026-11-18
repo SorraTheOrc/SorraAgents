@@ -11,8 +11,9 @@ Each finish-gate test that needs an ambient index sets it itself
 (``would_be_commit_index`` exports it and restores the previous value), so the
 ambient value is removed for every test in this package.
 
-Lock-timeout neutralisation (SA-0MVY0G5EH000LIMB): when this package's suite
-is itself run by ``implement.py finish`` the gate exports
+Lock-timeout neutralisation (SA-0MVY0G5EH000LIMB, extended by
+SA-0MWFJS65O005JMJF): when this package's suite is itself run by
+``implement.py finish`` the gate exports
 ``IMPLEMENT_FINISH_LOCK_TIMEOUT`` / ``IMPLEMENT_START_LOCK_TIMEOUT`` so real
 finish calls can wait out a concurrent holder. A test that takes the main-checkout
 lock itself then calls ``phase_finish`` (which calls ``_finish_lock_timeout`` →
@@ -21,6 +22,14 @@ sleeps for the full duration before refusing — because the lock it is waiting 
 is held by the test's own fd, released only at test teardown. The inherited
 timeout therefore turns a ~0.05 s test into a multi-hour hang (25 s with a
 25-second timeout, verified).
+
+Since ``finish`` now has a **positive** default bounded wait (15 min), simply
+deleting the variables would be worse: every fail-fast refusal test would inherit
+the production default and sleep for it. The fixture therefore *sets* both
+variables to ``"0"`` — the explicit fail-fast/no-wait policy — so the
+neutralisation is independent of the production default. A test that needs a
+specific wait sets the variable itself in the test body; monkeypatch is LIFO, so
+the in-test ``setenv`` wins after the autouse fixture and is undone at teardown.
 
 The complete neutralisation set is the two lock-wait env vars read through
 ``_resolve_lock_timeout()`` in ``implement.py``:
@@ -55,7 +64,9 @@ suite is stubbed). Child-lock test files exercise the per-work-item child lock
 and patch ``_sync_parent_branch``, so they never contend the main-checkout lock.
 
 Where a test *does* need a specific timeout value it sets it explicitly within
-the test body, after the fixture has run.
+the test body, after the fixture has run. A test that needs the **production
+default** (rather than neutralisation) deletes the variable in the test body
+(``monkeypatch.delenv``) before reading it.
 """
 
 from __future__ import annotations
@@ -78,11 +89,14 @@ def _no_ambient_lock_timeout(monkeypatch):
     """Neutralise ambient lock-wait timeouts for every test.
 
     Prevents ``IMPLEMENT_FINISH_LOCK_TIMEOUT`` / ``IMPLEMENT_START_LOCK_TIMEOUT``
-    exported by an outer ``implement.py finish`` from poisoning test execution.
-    See the module docstring for the full mechanism (SA-0MVY0G5EH000LIMB).
+    exported by an outer ``implement.py finish`` from poisoning test execution,
+    and pins both to the explicit ``"0"`` (no-wait) policy so the positive
+    production default can never turn a fail-fast refusal test into a
+    15-minute sleep (SA-0MWFJS65O005JMJF). See the module docstring for the
+    full mechanism (SA-0MVY0G5EH000LIMB).
     """
-    monkeypatch.delenv("IMPLEMENT_FINISH_LOCK_TIMEOUT", raising=False)
-    monkeypatch.delenv("IMPLEMENT_START_LOCK_TIMEOUT", raising=False)
+    monkeypatch.setenv("IMPLEMENT_FINISH_LOCK_TIMEOUT", "0")
+    monkeypatch.setenv("IMPLEMENT_START_LOCK_TIMEOUT", "0")
 
 
 @pytest.fixture(autouse=True)

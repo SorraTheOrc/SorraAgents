@@ -60,6 +60,11 @@ Optional flags:
 
 Environment:
   IMPLEMENT_TEST_COMMAND    Override the finish test-step command (shell string)
+  IMPLEMENT_FINISH_LOCK_TIMEOUT
+                            Bounded wait in seconds for the main-checkout lock
+                            in `finish` (default 900 = 15 min; 0 = fail fast).
+                            The wait reports the holder and proceeds as soon as
+                            the holder releases.
   IMPLEMENT_DRIVE_PI_BIN    Pi executable used to spawn child sessions (default: pi)
   IMPLEMENT_DRIVE_CHILD_TIMEOUT  Per-child session timeout in seconds
   IMPLEMENT_DRIVE_PANE_SESSIONS  Opt in to the pane-driven transport (same as
@@ -3409,12 +3414,15 @@ def _verify_main_checkout(
 #: :func:`phase_start`.
 MAIN_CHECKOUT_LOCK_RELPATH = _REPO_LOCK_RELPATH
 
-#: Bounded wait for the per-repository lock in ``finish`` (seconds). Default
-#: ``0`` = fail fast: a second finish refuses immediately with an actionable
-#: message naming the holder (AC3 allows fail-fast). Set to a positive value
-#: (env ``IMPLEMENT_FINISH_LOCK_TIMEOUT``) to wait that long for a concurrent
-#: finish instead — the wait is always bounded, never indefinite.
-DEFAULT_FINISH_LOCK_TIMEOUT = 0.0
+#: Bounded wait for the per-repository lock in ``finish`` (seconds). A second
+#: finish performs **one** bounded internal wait on the lock: it reports the
+#: holder as progress and proceeds the moment the holder releases. The default
+#: is deliberately generous but finite — the locked window is short (commit →
+#: fast-forward → push → sync, with the full-suite verdict resolved *before*
+#: the lock, SA-0MWFJS3820032YB4), so 15 minutes covers a slow push while a
+#: dead or stuck holder can never wedge an unattended batch indefinitely.
+#: Override with env ``IMPLEMENT_FINISH_LOCK_TIMEOUT``; set ``0`` for fail-fast.
+DEFAULT_FINISH_LOCK_TIMEOUT = 900.0
 
 #: Bounded wait for the parent-branch refresh window in ``start`` (seconds).
 #: ``start`` must never be blocked by a concurrent finish: after this bound the
@@ -3492,8 +3500,11 @@ def acquire_main_checkout_lock(
     repo_root: str,
     work_item_id: str,
     timeout: float = 0.0,
+    *,
+    progress: Callable[[str], None] | None = None,
+    progress_interval: float = 30.0,
 ) -> tuple[int | None, str | None]:
-    """Take the exclusive per-checkout lock (fail fast by default).
+    """Take the exclusive per-checkout lock (fail fast by default here).
 
     Thin ``implement.py`` wrapper over :class:`shared.repo_lock.RepoLock`. The
     lock is an advisory ``flock`` on
@@ -3510,6 +3521,10 @@ def acquire_main_checkout_lock(
         timeout: Bounded wait in seconds (``0`` = fail fast). A positive value
             waits up to that deadline, then refuses with an actionable
             timeout message — never an indefinite hang.
+        progress: Optional callback receiving human-readable wait progress
+            (the lock path, the bound and the current holder, then throttled
+            heartbeats). ``phase_finish`` uses it for its bounded wait.
+        progress_interval: Minimum seconds between heartbeat messages.
 
     Returns:
         ``(fd, None)`` on success (caller must release via
@@ -3517,7 +3532,10 @@ def acquire_main_checkout_lock(
         complete, actionable refusal message when the lock is held.
     """
     return RepoLock(repo_root, relpath=MAIN_CHECKOUT_LOCK_RELPATH).acquire(
-        work_item_id, timeout=timeout
+        work_item_id,
+        timeout=timeout,
+        progress=progress,
+        progress_interval=progress_interval,
     )
 
 
@@ -13037,14 +13055,29 @@ def phase_finish(
     # exactly one finish per checkout may hold this critical section at a
     # time. The lock is an advisory flock — no measurable latency when free,
     # kernel-released when the holder dies, and recorded in the report for
-    # observability. The wait is bounded by ``IMPLEMENT_FINISH_LOCK_TIMEOUT``
-    # (default 0 = fail fast), so a concurrent finish never hangs this one.
-    # The window deliberately excludes the full-suite run above: the lock is
-    # held only for the mutations (SA-0MWFJS3820032YB4).
+    # observability. A second finish performs **one** bounded internal wait
+    # on the lock (default ``DEFAULT_FINISH_LOCK_TIMEOUT`` = 15 min, env
+    # ``IMPLEMENT_FINISH_LOCK_TIMEOUT``; ``0`` = fail fast): it reports the
+    # holder as progress and proceeds the moment the holder releases, so an
+    # agent never has to script fail-fast retry loops around ``finish``
+    # (SA-0MWFJS65O005JMJF). The window deliberately excludes the full-suite
+    # run above: the lock is held only for the mutations
+    # (SA-0MWFJS3820032YB4).
     lock_timeout = _finish_lock_timeout()
     lock_wait_started = time.monotonic()
+    lock_progress: list[str] = []
+
+    def _lock_wait_progress(message: str) -> None:
+        """Report one lock-wait progress line and keep it in the report."""
+        lock_progress.append(message)
+        # stderr only: a ``--json`` finish must keep stdout parseable.
+        LOG.info("%s", message)
+
     lock_fd, lock_refusal = acquire_main_checkout_lock(
-        repo_root, work_item_id, timeout=lock_timeout
+        repo_root,
+        work_item_id,
+        timeout=lock_timeout,
+        progress=_lock_wait_progress,
     )
     lock_wait_seconds = round(time.monotonic() - lock_wait_started, 3)
     report["steps"]["main_checkout_lock"] = {
@@ -13055,6 +13088,7 @@ def phase_finish(
         ),
         "timeout_seconds": lock_timeout,
         "waited_seconds": lock_wait_seconds,
+        "progress": lock_progress,
         "holder": lock_refusal if lock_fd is None else None,
     }
     if lock_fd is None:

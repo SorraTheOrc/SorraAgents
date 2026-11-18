@@ -135,6 +135,24 @@ def _no_ambient_git_index_file(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_lock_timeout(monkeypatch):
+    """Pin the ``implement.py`` lock waits to no-wait for every root test.
+
+    ``finish`` now performs one **bounded internal wait** on the main-checkout
+    lock, with a positive production default (15 min, SA-0MWFJS65O005JMJF).
+    Root-level tests that hold the lock themselves and then drive
+    ``phase_finish`` (e.g. the concurrent-orphan refusal tests) would inherit
+    that default and sleep for it. Pinning both lock-wait variables to ``"0"``
+    keeps every such test on the explicit fail-fast policy, independent of the
+    production default and of whatever an outer ``finish`` exported
+    (SA-0MVY0G5EH000LIMB). A test that needs a specific wait sets the variable
+    itself in the test body — monkeypatch is LIFO, so the in-test value wins.
+    """
+    monkeypatch.setenv("IMPLEMENT_FINISH_LOCK_TIMEOUT", "0")
+    monkeypatch.setenv("IMPLEMENT_START_LOCK_TIMEOUT", "0")
+
+
+@pytest.fixture(autouse=True)
 def isolated_implement_child_lock_store(tmp_path, monkeypatch):
     """Point ``implement.py``'s per-work-item lock store at a throwaway dir.
 

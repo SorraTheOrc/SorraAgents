@@ -2338,19 +2338,32 @@ shared helper `skill/shared/repo_lock.py` (`RepoLock`, beside
 lock also guards the adjacent window in `start` that moves the shared ref.
 Concurrency contract:
 
-- **One finish per main checkout.** Acquisition is a single non-blocking
-  `flock(LOCK_EX | LOCK_NB)` by default — no measurable latency when free, and
-  no wait when held: a second finish exits **non-zero** with a message naming
-  the holder (work item id, PID, ISO start time, repo root, host — recorded in
-  the lock file after acquisition) and **without modifying the checkout or the
-  work item** (no status write, no comment). Re-run once the holder
-  completes.
-- **Bounded wait, never a hang.** `IMPLEMENT_FINISH_LOCK_TIMEOUT` (seconds,
-  default `0` = fail fast) opts into waiting for a concurrent finish. The wait
-  is always bounded by that deadline; on expiry the refusal states the deadline
+- **One finish per main checkout — a second waits once, bounded.** Ownership
+  is a single non-blocking `flock(LOCK_EX | LOCK_NB)` when the lock is free:
+  no measurable latency. When it is held, `finish` performs **one bounded
+  internal wait** (default **900 s / 15 min**, `IMPLEMENT_FINISH_LOCK_TIMEOUT`
+  seconds; `0` opts into fail-fast) instead of refusing immediately. The wait
+  proceeds the moment the holder releases; only when the bound expires does it
+  exit **non-zero** with a message naming the holder (work item id, PID, ISO
+  start time, repo root, host — recorded in the lock file after acquisition),
+  the lock path and the recovery step, and **without modifying the checkout or
+  the work item** (no status write, no comment). Agents run `finish` **once**
+  and let the internal wait absorb contention — they must not script retry
+  loops (`for attempt …; finish; wait_for_job.py`) around it.
+- **Bounded wait, never a hang, with progress.** While waiting, `finish`
+  emits progress naming the lock path, the bound and the **current holder**
+  (immediately on contention, then a heartbeat at most every 30 s), so an
+  operator watching a long call sees who it is waiting for rather than an
+  apparently hung process. The wait is always bounded by
+  `IMPLEMENT_FINISH_LOCK_TIMEOUT`; on expiry the refusal states the deadline
   and still names the lock path, the holder and the recovery step. An
   indefinite wait is rejected outright (`RepoLock.acquire(timeout=None)` raises
   `ValueError`), so no code path can block forever.
+- **Signal-safe while waiting.** `SIGINT`/`SIGTERM` are handled between retries:
+  `implement.py`'s signal handler releases the per-work-item child lock, resets
+  the item claim and exits cleanly (code `2`); the un-acquired lock descriptor
+  is closed on any exception, so an interrupted wait leaves **no orphaned
+  lock** and a later run acquires immediately.
 - **No stale locks are possible.** The lock is the kernel's flock on the lock
   file's open file description, so a killed holder (SIGKILL included) releases
   it automatically — there is no PID bookkeeping to trust or clean up. Holder
@@ -4403,13 +4416,20 @@ interleave moves of the shared local `dev` ref — the 2026-10-25 shape where
 finish A's commit became reachable only from its feature branch while both
 runs reported success.
 
-- **Bounded wait, never a hang.** A second `finish` fails fast by default
-  (`IMPLEMENT_FINISH_LOCK_TIMEOUT=0`); a positive value waits at most that many
-  seconds and then refuses with the lock path, the holder (work item, pid,
-  start time, repo, host) and the recovery step. `start` waits at most
+- **One bounded internal wait, never a retry loop.** A second `finish` waits
+  **inside the call** for the lock (default **900 s / 15 min**,
+  `IMPLEMENT_FINISH_LOCK_TIMEOUT`; `0` = fail fast). While waiting it reports
+  the lock path and the **current holder** (work item, pid, start time, repo,
+  host) as progress — immediately on contention, then a heartbeat at most every
+  30 s — and proceeds automatically the moment the holder releases. Only when
+  the bound expires does it refuse, with the lock path, the holder and the
+  recovery step. Run `finish` **once**: do not script `for attempt …;
+  finish; wait_for_job.py` retry loops around it. `start` waits at most
   `IMPLEMENT_START_LOCK_TIMEOUT` (default 30 s) and then **skips** the refresh
   fail-open (`reason: "lock_held"`) — a start is never blocked by a finish.
-  An indefinite wait is rejected outright, so no code path blocks forever.
+  An indefinite wait is rejected outright, so no code path blocks forever; a
+  `SIGINT`/`SIGTERM` during the wait releases the child lock, resets the claim
+  and exits cleanly without leaving an orphaned lock.
 - **The full suite runs before the lock.** The dev-push hook executes the
   `--scope full` gate while the pusher holds this lock, so `finish` resolves
   the gate's tree-keyed verdict for the would-be-commit tree *before*
