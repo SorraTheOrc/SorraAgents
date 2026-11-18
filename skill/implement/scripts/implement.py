@@ -255,7 +255,13 @@ except ImportError:  # pragma: no cover - older test skill
     _classify_gate_result = None  # type: ignore[assignment]
     _GATE_REMEDIATION = {}  # type: ignore[assignment]
 
-from test_cache import FINGERPRINT_KIND_TREE, query_cached, run_cached
+from test_cache import (
+    FINGERPRINT_KIND_CHANGE_SET,
+    FINGERPRINT_KIND_TREE,
+    compute_change_set_state,
+    query_cached,
+    run_cached,
+)
 from test_runner import canonicalize_quiet_test_command
 
 # Canonical quiet full-suite commands — identical cache keys to the test
@@ -3537,6 +3543,13 @@ def resolve_prelock_full_suite_verdict(
     then *serves* that entry (``verdict=cached``) instead of executing the
     suite inside the lock.
 
+    The run also records the verdict under the change set's **patch** key
+    (``fingerprint_kind="change_set"``, SA-0MWFJS9OL001ZTTC). That is what
+    survives a lost push race: when ``dev`` advanced concurrently and the
+    commit was rebased, the tree is new but the patch is identical, so the
+    hook's re-run of the gate serves the verdict instead of paying for the
+    suite again inside the lock.
+
     Safety does not depend on this function. The lock still covers commit →
     fast-forward → push → ancestry assertion; the hook still binds its verdict
     to the pushed commit's tree, so a different tree is a cache miss and the
@@ -5207,6 +5220,42 @@ def _assert_remote_name_only(remote: str) -> None:
         )
 
 
+def _resolve_commit_change_set_fingerprint(
+    cwd: str, commit_hash: str | None, base_ref: str = "origin/dev"
+) -> str | None:
+    """Change-set fingerprint of *commit_hash*, or ``None`` when unavailable.
+
+    A rebase rewrites a commit and its tree but not the patch it contributes,
+    so the dev-push gate may serve a verdict recorded for the identical change
+    set instead of the pushed tree (SA-0MWFJS9OL001ZTTC). Read-only consumers
+    that look for the gate's evidence (post-push verification, gate-evidence
+    classification) must look under this key too, otherwise a perfectly green
+    change-set-served push would be reported as ``missing`` and refuse the
+    terminal transition.
+
+    *base_ref* must match the one the gate run used — ``origin/dev``, the test
+    skill's default and therefore the gate's — because the base tree is part
+    of the key's derivation. The push *target* branch
+    (:data:`DEFAULT_PARENT_BRANCH`) is deliberately not used here: local
+    ``dev`` and ``origin/dev`` can be at different commits, which would
+    derive a different key and hide the gate's own evidence.
+
+    Fail-soft: an unresolvable commit/tree, a non-repository, or a git
+    failure returns ``None`` — the caller falls back to its other keys.
+    """
+    tree = _resolve_commit_tree(cwd, commit_hash)
+    if not tree:
+        return None
+    try:
+        state = compute_change_set_state(
+            cwd, target_tree=tree, base_ref=base_ref
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence must never break finish
+        LOG.debug("Cannot compute the change-set key of %s in %s: %s", tree, cwd, exc)
+        return None
+    return state["fingerprint"] if state else None
+
+
 def _full_suite_cache_present(
     cwd: str, commit_hash: str | None = None
 ) -> bool:
@@ -5220,8 +5269,12 @@ def _full_suite_cache_present(
 
     The dev-push gate now binds its verdict to the pushed commit's **tree**
     (SA-0MW7C6BMZ00931JG), so when *commit_hash* is supplied the tree-keyed
-    entry is queried first. The historical loose-worktree query is kept as a
-    fallback so legacy entries and pre-tree-keying repos still report evidence.
+    entry is queried first. When the tree has no entry — a rebase rewrote it
+    and the gate served the identical *change set* instead
+    (SA-0MWFJS9OL001ZTTC) — the change-set key is queried next, so a green
+    change-set-served push is never misreported as ``no-evidence``. The
+    historical loose-worktree query is kept as a fallback so legacy entries
+    and pre-tree-keying repos still report evidence.
     """
     try:
         commands = _resolve_full_suite_commands(cwd) or []
@@ -5230,6 +5283,11 @@ def _full_suite_cache_present(
     if not commands:
         return False
     tree = _resolve_commit_tree(cwd, commit_hash)
+    change_set = (
+        _resolve_commit_change_set_fingerprint(cwd, commit_hash)
+        if tree is not None
+        else None
+    )
     for command in commands:
         try:
             if tree is not None and query_cached(
@@ -5237,6 +5295,13 @@ def _full_suite_cache_present(
                 cwd=cwd,
                 fingerprint=tree,
                 fingerprint_kind=FINGERPRINT_KIND_TREE,
+            ) is not None:
+                return True
+            if change_set is not None and query_cached(
+                command,
+                cwd=cwd,
+                fingerprint=change_set,
+                fingerprint_kind=FINGERPRINT_KIND_CHANGE_SET,
             ) is not None:
                 return True
             if query_cached(command, cwd=cwd) is not None:
@@ -5385,6 +5450,16 @@ def _resolve_post_push_verification(
     and every successful push reported a false ``missing`` verdict. The loose
     query is retained so pre-tree-keying entries still count as evidence.
 
+    **Change-set second** (SA-0MWFJS9OL001ZTTC): when a rebase rewrote the
+    pushed commit after the full suite had already passed, the gate serves the
+    verdict recorded for the identical patch under
+    ``fingerprint_kind="change_set"`` (and mirrors it under the pushed tree's
+    key stamped ``verdict_origin="change_set_reuse"``). Querying both keys
+    keeps such a push verifiable (and its
+    ``fingerprint_kind``/``change_set_target_tree``/``verdict_origin`` are
+    reported in the entry record, so the evidence states which tree it was
+    actually measured on).
+
     Verdict vocabulary:
 
     - ``green`` — every resolved full-suite command has a valid entry with
@@ -5414,12 +5489,19 @@ def _resolve_post_push_verification(
         if commit_hash
         else None
     )
+    # The identical change set, measured before a rebase rewrote the tree
+    # (SA-0MWFJS9OL001ZTTC). Resolved from the worktree that holds the pushed
+    # commit, falling back to the main checkout's object database.
+    change_set = _resolve_commit_change_set_fingerprint(worktree_path, commit_hash)
+    if change_set is None and commit_hash:
+        change_set = _resolve_commit_change_set_fingerprint(repo_root, commit_hash)
     verification: dict[str, Any] = {
         "verdict": POST_PUSH_VERDICT_NOT_APPLICABLE,
         "success": True,
         "executed": False,
         "commands": commands,
         "tree": tree,
+        "change_set": change_set,
         "entries": [],
         "reason": reason,
         "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -5442,12 +5524,19 @@ def _resolve_post_push_verification(
                         fingerprint=tree,
                         fingerprint_kind=FINGERPRINT_KIND_TREE,
                     )
-                    if entry is None:
-                        # Legacy/pre-tree-keying entry fallback: a loose
-                        # worktree entry still counts as evidence for the
-                        # pushed tree.
-                        entry = query_cached(command, cwd=cwd)
-                else:
+                if entry is None and change_set is not None:
+                    # A rebased push whose full suite already passed for the
+                    # identical change set (SA-0MWFJS9OL001ZTTC).
+                    entry = query_cached(
+                        command,
+                        cwd=cwd,
+                        fingerprint=change_set,
+                        fingerprint_kind=FINGERPRINT_KIND_CHANGE_SET,
+                    )
+                if entry is None:
+                    # Legacy/pre-tree-keying entry fallback: a loose
+                    # worktree entry still counts as evidence for the
+                    # pushed tree.
                     entry = query_cached(command, cwd=cwd)
             except Exception as exc:  # noqa: BLE001 - a broken cache is a miss
                 LOG.warning(
@@ -5490,6 +5579,9 @@ def _resolve_post_push_verification(
                 "scope": entry.get("scope"),
                 "git_state": entry.get("git_state"),
                 "fingerprint_kind": entry.get("fingerprint_kind"),
+                "verdict_origin": entry.get("verdict_origin"),
+                "measured_tree": entry.get("measured_tree"),
+                "change_set_target_tree": entry.get("change_set_target_tree"),
                 "stdout": (entry.get("stdout") or "")[:4000],
                 "stderr": (entry.get("stderr") or "")[:4000],
             }
@@ -9469,12 +9561,19 @@ def _cache_entry_from_run(
     and ``fingerprint_kind`` so the finish report and the completion comment
     can state *what* was reused, not merely that something was
     (SA-0MVQHVJEX0071R7G).
+
+    A change-set hit (``fingerprint_kind="change_set"``, the identical patch
+    measured on a different base, SA-0MWFJS9OL001ZTTC) also reports
+    ``reused_via_change_set`` and ``change_set_target_tree`` — the tree the
+    verdict was actually measured on.
     """
     return {
         "command": run.get("command") or command,
         "completed_at": run.get("completed_at", 0),
         "scope": run.get("scope", "full"),
         "fingerprint_kind": run.get("fingerprint_kind", ""),
+        "reused_via_change_set": bool(run.get("reused_via_change_set", False)),
+        "change_set_target_tree": run.get("change_set_target_tree", ""),
     }
 
 

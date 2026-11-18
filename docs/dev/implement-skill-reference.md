@@ -1688,7 +1688,12 @@ by `phase_drive`; the leaf was not):
 - **At most one full-suite gate per finish (AC6).** Transport/fast-forward
   retries only re-run the **push**; the tree-keyed gate verdict is served from
   the cache, and the changed-scope gate (Step 3) is never re-entered by the
-  retry loop.
+  retry loop. A non-fast-forward round rewrites the commit, so the retry's
+  pushed tree is *new* — its verdict is served from the **change-set** key
+  (`fingerprint_kind="change_set"`, the identical patch measured before the
+  race; SA-0MWFJS9OL001ZTTC), so a rebase round costs seconds rather than a
+  second ~5-18 min suite inside the lock. See
+  [A lost push race does not re-run the full suite](#a-lost-push-race-does-not-re-run-the-full-suite-sa-0mwfjs9ol001zttc).
 - **Load-flake gate failures are labelled, not misread as code failures
   (AC7).** When a gate refusal's stderr names suite *load* errors (`Cannot
   find package …`, `Cannot find module …`, `MODULE_NOT_FOUND` — a missing
@@ -2319,7 +2324,9 @@ the suite really runs), and a green pre-lock verdict is served *only* if the
 step-3d assertion proves the commit produces that same tree. Two escapes
 stand the pre-resolution down without weakening the gate: no would-be-commit
 tree to bind to (`not_a_git_worktree`) and the hook's own
-`TEST_SCOPE_SKIP=1`.
+`TEST_SCOPE_SKIP=1`. The same run also records a **change-set** verdict, which
+is what survives a lost push race — see
+[A lost push race](#a-lost-push-race-does-not-re-run-the-full-suite-sa-0mwfjs9ol001zttc).
 - **Observability.** `report["steps"]["main_checkout_lock"]` records the lock
   path, whether it was acquired, when, the configured bounded wait, how long
   the acquisition actually waited (`waited_seconds`) and the
@@ -2389,6 +2396,62 @@ the fresh worktree cache holds (tree-kind included) that the main checkout's
 run). Without it, pushing from the worktree would lose the pushed commit's
 green `scope: full` tree-kind entry as far as the main checkout's post-push
 verification and the audit skill (F3) are concerned.
+
+## A lost push race does not re-run the full suite (SA-0MWFJS9OL001ZTTC)
+
+`dev` is a shared ref, so concurrent finishes lose the non-fast-forward race
+routinely. `finish` then fetches, rebases the feature branch onto the advanced
+`origin/dev` and retries the push. That rebase rewrites the commit, and the
+rebased commit has a **new tree** — which missed the tree-keyed gate verdict
+and re-executed the whole suite *inside* the main-checkout lock, once per lost
+round (observed: 21 rebase events in one batch; ~5.4 min per round on AI_Hell,
+~18 min on tce-the-rising).
+
+The test cache therefore carries a second namespace,
+`fingerprint_kind="change_set"`: the SHA-256 of the **complete patch** the
+change set contributes (`skill/test_cache.py`,
+`compute_change_set_state()`). Every tree-keyed run also stores its verdict
+under that key, and a tree-keyed lookup that misses is retried under it — so
+the post-rebase gate run serves the verdict measured before the race
+(`verdict=cached fingerprint_kind=change_set reused_from_tree=<measured tree>`)
+and a lost race costs seconds.
+
+What makes the reuse *evidence* rather than a guess:
+
+- The patch is computed **tree-to-tree** (`git diff --full-index <base>…<target>`)
+  with pinned diff flags, so it records every changed path, the pre-image and
+  post-image object ids and every hunk — a change in our own work, or an
+  upstream change to a file the patch touches, changes one of those ids and
+  therefore the key. Two identical keys describe the same patch applied to the
+  same pre-image content; only *other* files may differ between the two trees,
+  and those come from a base that was itself gate-green when it was pushed.
+- The base is `merge-base(HEAD, <parent ref>)` — the parent the patch was
+  applied to — independent of whether `HEAD` is the pushed commit (the gate's
+  case) or the parent branch holding the uncommitted change set (the pre-lock
+  case), which is why both sides derive the same key.
+- An **empty** change set (tree equals base) is never keyed: one shared empty
+  key would serve one verdict for every no-op change set.
+- A tree-bound entry is never written *silently* for a tree the suite did not
+  measure. A change-set hit mirrors the verdict under the pushed tree's key
+  (so post-push verification and the audit find it), stamped
+  `verdict_origin="change_set_reuse"` with `measured_tree` — the tree the
+  suite actually ran against — and the original `completed_at`, so its
+  lifetime is not extended and it is never read as directly executed
+  evidence.
+- Consumers that look for the gate's evidence follow the same order —
+  tree-kind, then change-set kind, then the legacy loose-worktree key — so
+  `_resolve_post_push_verification` (which refuses the terminal transition on
+  `missing`) and `_full_suite_cache_present` (executed-vs-cached
+  classification) accept a change-set-served push instead of misreporting it.
+
+Regression pins: `tests/test_test_cache.py` (`test_change_set_fingerprint_*`,
+`test_run_cached_serves_a_change_set_verdict_after_a_rebase`,
+`test_run_cached_never_serves_a_change_set_verdict_for_a_different_patch`,
+`test_empty_change_set_is_never_keyed`) and
+`tests/test_pre_push_gate_reuse.py`
+(`test_rebased_push_is_served_from_the_change_set_verdict`,
+`test_rebased_push_with_a_content_change_still_executes`,
+`test_post_push_verification_accepts_a_change_set_served_push`).
 
 The post-push fast-forward of the main checkout's local parent branch is
 **main-checkout hygiene only** (it keeps the next worktree's base up to date),

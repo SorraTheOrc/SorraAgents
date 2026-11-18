@@ -21,11 +21,12 @@
 #
 #    The verdict is tree-keyed (SA-0MW7C6BMZ00931JG): the runner derives the
 #    pushed commit's tree SHA, binds the verdict with fingerprint_kind=tree and
-#    reports cache hit/miss plus the reused entry's age. The `gate-subject` and
-#    `gate-verdict` lines the hook echoes below therefore carry `tree=`,
-#    `fingerprint_kind=tree`, `cache_hit=` and `cache_age_seconds=`, so a
-#    served verdict is visible to the pusher. The pushed-commit guard itself is
-#    unchanged.
+#    reports cache hit/miss plus the reused entry's age. A rebased push of an
+#    identical change set is served from the `change_set` key instead
+#    (SA-0MWFJS9OL001ZTTC). The `gate-subject` and `gate-verdict` lines the hook
+#    echoes below therefore carry `tree=`, `fingerprint_kind=`, `cache_hit=` and
+#    `cache_age_seconds=`, so a served verdict is visible to the pusher. The
+#    pushed-commit guard itself is unchanged.
 #
 #    `implement.py finish` resolves this gate's verdict for the would-be-commit
 #    tree BEFORE it takes the exclusive main-checkout lock, so a finish push is
@@ -33,6 +34,23 @@
 #    while that lock is held (SA-0MWFJS3820032YB4). The tree binding is what
 #    makes the reuse safe: a push of any other tree is a cache miss and the
 #    suite really runs here.
+#
+#    A *lost push race* is the remaining cost (SA-0MWFJS9OL001ZTTC): the push
+#    is rejected non-fast-forward, `finish` rebases onto the concurrently
+#    advanced dev, and the rebased commit has a new tree — a tree-keyed miss
+#    that used to re-execute the ~5-18 min suite inside the lock. The runner
+#    therefore also keys the verdict on the change set's **patch content**
+#    (`fingerprint_kind=change_set`): a pure rebase rewrites the commit and its
+#    tree but not the patch, so the post-rebase run serves that verdict
+#    (`verdict=cached`, `fingerprint_kind=change_set`, with
+#    `reused_from_tree=` naming the tree the verdict was measured on) and pays
+#    seconds instead of another suite. The patch covers every changed path with
+#    its pre- and post-image object ids, so any content difference — ours or
+#    upstream's, in a file the patch touches — is a miss and the suite runs.
+#    A tree-bound entry is never written *silently* for a tree that was not
+#    measured: a change-set hit mirrors the verdict under the pushed tree's key
+#    stamped `verdict_origin=change_set_reuse` with `measured_tree` (the tree
+#    the suite actually ran against) and the original completion time.
 #
 # Set WORKLOG_SKIP_PRE_PUSH=1 to bypass worklog sync.
 # Set BRANCH_POLICY_SKIP=1 to bypass branch policy check (not recommended).
