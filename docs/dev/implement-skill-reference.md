@@ -2425,6 +2425,107 @@ refusal/success, hygiene script JSON + human output) and
 `tests/test_implement_finish_concurrent_orphan.py` (dev-ref window scenarios,
 including the bounded-wait timeout message and the `start` refresh window).
 
+## Measuring finish lock contention (SA-0MWFK10NH006QI7E)
+
+The epic's outcome is a measurable property, not a claim: **under a 6-way
+concurrent `finish` fan-out no session spends the majority of its wall-clock
+blocked on the per-repository lock** (median lock wait < 60 s, no single wait
+> 5 min). `scripts/measure_finish_contention.py` verifies it from recorded data
+and is reproducible on demand — no throwaway analysis script is needed to
+re-check the epic.
+
+```bash
+# "Before": re-derive the 2026-11-13 baseline with the same bucketing.
+python3 scripts/measure_finish_contention.py session \
+    --since 2026-11-13T00:00:00Z --until 2026-11-14T00:00:00Z \
+    --project AI_Hell-.worklog-worktrees --json
+
+# "After": the post-fix window (name the sibling fixes in effect).
+python3 scripts/measure_finish_contention.py session \
+    --since 2026-11-14T00:00:00Z --project .worklog-worktrees --json
+
+# The 6-way fan-out: six concurrent finishes through the real lock.
+python3 scripts/measure_finish_contention.py fanout --count 6 --json
+```
+
+The session mode reuses the parsing helpers in `scripts/measure_slot_wait.py`
+(SA-0MW7C69KU008ZT5K) — one definition of a wait sample, no second analyser.
+A session counts when its **first** record falls in the window and it ran an
+implement command (`--all-sessions` lifts that filter).
+
+### Metric definitions (identical before and after)
+
+| Metric | Definition |
+|---|---|
+| wall-clock span | `max(last record) - min(first record)` over the selected sessions |
+| summed session time | sum of each session's own span; effective parallelism = summed / wall-clock spans; peak concurrency = maximum overlapping spans |
+| bash-wait share | summed `bash` tool-call duration / summed session time |
+| buckets | each bash call classified once: `wait_for_job` → `own_finish` → `scoped_tests` → `polling` → `other` |
+| lock refusals | `Another run holds the repository lock` in a *run-source* result (`implement.py`, `wait_for_job.py`, `git push`); echoes from `grep`/`cat`/probes are filtered out |
+| lock-wait sample | reported `waited_seconds` / `Acquired the repository lock … after N s` (bounded-wait era), else a retry loop's duration, else the gap from a fail-fast refusal to an **immediately** retried finish (work done in between is not a wait) |
+| rebase event | a `non-fast-forward` marker in a run-source push result |
+| full-suite gate run | a distinct `run_tests: gate-subject pushed=<sha>` (de-duplicated by sha) |
+| no-op session | a session shorter than 120 s with no bash call — the drive retry that spawned and immediately gave up (visible when `--all-sessions` includes it) |
+
+The verdict evaluates the parent's three thresholds; a window with fewer than
+`--min-samples` (default 3) lock-wait samples is reported `inconclusive`, never
+as a hard pass or failure.
+
+### The synthetic fan-out
+
+Natural sessions only reach the target concurrency intermittently, and after
+the four sibling fixes landed the post-fix corpus is still thin — so the
+fan-out is made reproducible instead of hoped for. `fanout` drives the **real**
+`phase_finish` in N concurrent threads against one main checkout: the
+per-repository `flock`, the bounded wait and the whole finish ordering are the
+production ones. Only the external boundaries are stubbed — the pre-lock full
+suite to the recorded baseline duration (326 s, so each session is genuinely
+inside its expensive phase at the same moment, synchronised on a barrier) and
+the locked mutating window to 15 s (deliberately conservative; a real push
+completes in seconds). Each session's lock wait and measured lock hold are
+reported, and the same three thresholds decide `pass`/`fail`.
+
+### Recorded evidence
+
+The measurement is committed as
+[`docs/dev/finish-contention-measurement.json`](finish-contention-measurement.json)
+(`before`, `after`, `after_all_fixes` and `fanout` sections plus the findings).
+It is reproduced with the commands above and pinned by
+`tests/test_measure_finish_contention.py`.
+
+| Metric | Before (2026-11-13) | After (2026-11-14 onward) |
+|---|---|---|
+| implement sessions measured | 38 | 109 |
+| summed session minutes / wall-clock minutes | 1210 / 519 (2.33x) | 4042 / 6580 (0.61x) |
+| bash-wait share | 72% | 62% |
+| `wait_for_job` bucket | 418 min (34%) | 816 min (20%) |
+| lock refusals | 47 | 2 |
+| lock-wait samples (median / max) | 8 (70 s / 2142 s) | 2 (0 s / 0 s) |
+| sessions majority-blocked on the lock | 2 | 0 |
+| non-fast-forward rebase events | 28 | 23 |
+| full-suite gate runs | 2 | 4 |
+| 6-way fan-out lock wait (median / max) | — | 37.5 s / 75.2 s |
+| fan-out effective parallelism | — | 5.46x |
+
+**Which sibling fixes were in effect for the "after" window:**
+SA-0MWFJS3820032YB4 (dev-push full suite resolved before the lock, landed
+2026-11-13T23:57) covers the whole window; SA-0MWFJS9OL001ZTTC (lost-push-race
+change-set verdict, 2026-11-18T04:42), SA-0MWFJSCPT005BO2R (no no-op drive
+spawn, 2026-11-18T10:51) and SA-0MWFJS65O005JMJF (one bounded internal finish
+wait, 2026-11-18T13:02) cover only its tail. The `after_all_fixes` window
+(2026-11-18T13:03 onward) has one session, so the fan-out — not the natural
+corpus — is what evidences AC1.
+
+The absolute "before" totals differ from the ad hoc 2026-11-13 figure
+(668 min summed over 388 min for 36 sessions) because this harness fixes the
+window on a session's first record and spans the whole UTC day; its own
+re-measured before numbers are the apples-to-apples comparison point. The
+sessions-before-the-bounded-wait refusals (2) in the "after" window are from
+runs that started before that fix landed — they are recorded, not hidden. No
+follow-up work item is needed for the epic's outcome ACs; a later re-run of the
+`session` mode on a real post-fix corpus would strengthen the natural-session
+evidence.
+
 ## Verified reversible local-dev sync and post-push ancestry assertion (SA-0MVPZG7A0000N66U)
 
 **The dev-push gate's subject is the pushed commit, and the push runs from the

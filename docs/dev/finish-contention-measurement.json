@@ -1,0 +1,1474 @@
+{
+  "work_item": "SA-0MWFK10NH006QI7E",
+  "parent": "SA-0MWFJRWN00084FE1",
+  "recorded_at": "2026-11-18T13:47:00Z",
+  "harness": "scripts/measure_finish_contention.py",
+  "before": {
+    "success": true,
+    "mode": "session",
+    "sessions_root": "/home/rgardler/.pi/agent/sessions",
+    "selection": {
+      "since": "2026-11-13T00:00:00+00:00",
+      "until": "2026-11-14T00:00:00+00:00",
+      "project_filters": [
+        "AI_Hell-.worklog-worktrees"
+      ],
+      "implement_only": true,
+      "files_scanned": 813,
+      "sessions": 38
+    },
+    "window": {
+      "start": "2026-11-13T15:29:45.272000+00:00",
+      "end": "2026-11-14T00:08:36.598000+00:00",
+      "wall_clock_minutes": 518.9
+    },
+    "aggregate": {
+      "summed_session_minutes": 1210.2,
+      "wall_clock_minutes": 518.9,
+      "effective_parallelism": 2.33,
+      "peak_concurrency": 5,
+      "bash_minutes": 871.8,
+      "bash_share": 0.72,
+      "buckets": {
+        "wait_for_job": {
+          "minutes": 417.8,
+          "share": 0.345
+        },
+        "own_finish": {
+          "minutes": 217.6,
+          "share": 0.18
+        },
+        "scoped_tests": {
+          "minutes": 101.0,
+          "share": 0.083
+        },
+        "polling": {
+          "minutes": 25.5,
+          "share": 0.021
+        },
+        "other": {
+          "minutes": 110.0,
+          "share": 0.091
+        }
+      },
+      "lock": {
+        "refusals": 47,
+        "samples": 8,
+        "sessions_with_wait": 7,
+        "median_seconds": 70.235,
+        "mean_seconds": 545.263,
+        "max_seconds": 2142.232,
+        "majority_blocked_sessions": [
+          "01a1d61c-02ad-75ca-9a68-a81d6890f30b",
+          "01a1d634-8961-76ac-8e94-abe50f838d64"
+        ],
+        "reliable": true
+      },
+      "rebase_events": 28,
+      "full_suite_gate_runs": 2,
+      "no_op_sessions": 0
+    },
+    "thresholds": {
+      "median_lock_wait_seconds": 60.0,
+      "max_lock_wait_seconds": 300.0,
+      "majority_lock_share": 0.5,
+      "min_lock_samples": 3
+    },
+    "checks": [
+      {
+        "id": "no_session_majority_lock_blocked",
+        "passed": false,
+        "observed": 2,
+        "threshold_share": 0.5,
+        "detail": "sessions majority-blocked on the lock: 01a1d61c-02ad-75ca-9a68-a81d6890f30b, 01a1d634-8961-76ac-8e94-abe50f838d64"
+      },
+      {
+        "id": "median_lock_wait_under_60s",
+        "passed": false,
+        "observed_seconds": 70.235,
+        "threshold_seconds": 60.0,
+        "samples": 8,
+        "detail": "median lock wait is 70.235s over 8 samples (threshold <60s)"
+      },
+      {
+        "id": "max_lock_wait_under_300s",
+        "passed": false,
+        "observed_seconds": 2142.232,
+        "threshold_seconds": 300.0,
+        "samples": 8,
+        "detail": "max lock wait is 2142.232s over 8 samples (threshold <=300s)"
+      }
+    ],
+    "verdict": "fail",
+    "failures": [
+      "no_session_majority_lock_blocked",
+      "median_lock_wait_under_60s",
+      "max_lock_wait_under_300s"
+    ],
+    "sessions": [
+      {
+        "session_id": "01a1d5cb-cf50-728b-b89b-5940c844a28c",
+        "span_seconds": 2748.114,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d5f5-d5fc-73f3-9748-c6f911acc84c",
+        "span_seconds": 3228.305,
+        "lock_wait_seconds": 74.658,
+        "lock_share": 0.023,
+        "lock_refusals": 3
+      },
+      {
+        "session_id": "01a1d62d-6f6c-77bc-b0e4-11b490cd833e",
+        "span_seconds": 3913.072,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d669-bd25-76d2-871a-8e44d2c8c398",
+        "span_seconds": 4769.715,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 2
+      },
+      {
+        "session_id": "01a1d587-6f36-7570-938c-e1cf6496ccb6",
+        "span_seconds": 2790.954,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 2
+      },
+      {
+        "session_id": "01a1d5b5-ede3-7643-9a81-1c460db9ae96",
+        "span_seconds": 6643.283,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d61c-02ad-75ca-9a68-a81d6890f30b",
+        "span_seconds": 3745.933,
+        "lock_wait_seconds": 2142.232,
+        "lock_share": 0.572,
+        "lock_refusals": 8
+      },
+      {
+        "session_id": "01a1d67c-90e1-7641-83ca-6ad8d9a0f1c9",
+        "span_seconds": 1000.845,
+        "lock_wait_seconds": 30.409,
+        "lock_share": 0.03,
+        "lock_refusals": 1
+      },
+      {
+        "session_id": "01a1d696-8f3d-7130-8172-52a8cea8ffa5",
+        "span_seconds": 559.679,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d6a2-3272-7661-a62c-93b117a42ef3",
+        "span_seconds": 1402.023,
+        "lock_wait_seconds": 110.381,
+        "lock_share": 0.079,
+        "lock_refusals": 4
+      },
+      {
+        "session_id": "01a1d6bb-01f3-748a-a3c2-6cbfdd5bf937",
+        "span_seconds": 630.805,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d5c6-77f3-72f2-8b82-7a398c1cf4b2",
+        "span_seconds": 2732.38,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d60a-b0a9-7631-b709-23144a513306",
+        "span_seconds": 872.288,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d618-1c7a-7421-8170-2734fa231f12",
+        "span_seconds": 494.126,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d61f-bda1-75f7-b57f-a6f544101024",
+        "span_seconds": 1298.362,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 2
+      },
+      {
+        "session_id": "01a1d634-5dc7-75ce-b438-a02d13a9d69d",
+        "span_seconds": 1079.621,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 1
+      },
+      {
+        "session_id": "01a1d64c-325f-76f1-b98c-31e641827838",
+        "span_seconds": 2510.488,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 2
+      },
+      {
+        "session_id": "01a1d672-9953-77a1-b20a-ff3010695b42",
+        "span_seconds": 2090.17,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 2
+      },
+      {
+        "session_id": "01a1d6ba-217d-7140-aa11-2fcb52dc3482",
+        "span_seconds": 1148.616,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d634-8961-76ac-8e94-abe50f838d64",
+        "span_seconds": 2577.57,
+        "lock_wait_seconds": 1873.108,
+        "lock_share": 0.727,
+        "lock_refusals": 5
+      },
+      {
+        "session_id": "01a1d604-75b2-7001-ab09-0f75ce6ae9d7",
+        "span_seconds": 828.388,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d617-8a37-7328-a2d1-0d920293a578",
+        "span_seconds": 1413.112,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 3
+      },
+      {
+        "session_id": "01a1d62f-10d5-767d-845a-e69cf5a99467",
+        "span_seconds": 662.684,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d645-d315-732c-bd70-7bab9cfa3204",
+        "span_seconds": 4265.885,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 1
+      },
+      {
+        "session_id": "01a1d690-ea40-76ed-b126-0f5b2054aec1",
+        "span_seconds": 1695.708,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 1
+      },
+      {
+        "session_id": "01a1d687-06aa-703e-9811-064e6d1c2495",
+        "span_seconds": 639.579,
+        "lock_wait_seconds": 32.489,
+        "lock_share": 0.051,
+        "lock_refusals": 2
+      },
+      {
+        "session_id": "01a1d6b0-5a51-74e7-8a6f-21a002894bea",
+        "span_seconds": 1378.706,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 2
+      },
+      {
+        "session_id": "01a1d6c5-7eec-74a0-9670-31b6342d93ac",
+        "span_seconds": 842.392,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 1
+      },
+      {
+        "session_id": "01a1d6d9-70d8-75ea-b263-42d9944d3e24",
+        "span_seconds": 1034.028,
+        "lock_wait_seconds": 98.823,
+        "lock_share": 0.096,
+        "lock_refusals": 1
+      },
+      {
+        "session_id": "01a1d6e9-87a2-731a-9a26-d61764998c7a",
+        "span_seconds": 1070.727,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 1
+      },
+      {
+        "session_id": "01a1d6fa-09d5-7029-90b3-b06ced0111f9",
+        "span_seconds": 958.459,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d715-012f-72f0-8873-78d9d945a537",
+        "span_seconds": 2614.377,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d73d-d522-7461-91cc-0770f0d7df18",
+        "span_seconds": 2400.465,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 2
+      },
+      {
+        "session_id": "01a1d678-68fc-7463-a573-38084a32e570",
+        "span_seconds": 690.893,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d686-b892-7740-a064-72f3f6ed5b12",
+        "span_seconds": 1007.504,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d66c-7891-7205-a80a-559a671239b9",
+        "span_seconds": 775.407,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 1
+      },
+      {
+        "session_id": "01a1d65c-03b7-73d4-b95d-5148f5b83237",
+        "span_seconds": 1068.708,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d71d-92ba-74b6-843d-fa38dc94fab2",
+        "span_seconds": 3029.907,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      }
+    ]
+  },
+  "after": {
+    "success": true,
+    "mode": "session",
+    "sessions_root": "/home/rgardler/.pi/agent/sessions",
+    "selection": {
+      "since": "2026-11-14T00:00:00+00:00",
+      "until": null,
+      "project_filters": [
+        ".worklog-worktrees"
+      ],
+      "implement_only": true,
+      "files_scanned": 2483,
+      "sessions": 109
+    },
+    "window": {
+      "start": "2026-11-14T00:00:10.353000+00:00",
+      "end": "2026-11-18T13:40:13.775000+00:00",
+      "wall_clock_minutes": 6580.1
+    },
+    "aggregate": {
+      "summed_session_minutes": 4041.5,
+      "wall_clock_minutes": 6580.1,
+      "effective_parallelism": 0.61,
+      "peak_concurrency": 4,
+      "bash_minutes": 2505.5,
+      "bash_share": 0.62,
+      "buckets": {
+        "wait_for_job": {
+          "minutes": 815.9,
+          "share": 0.202
+        },
+        "own_finish": {
+          "minutes": 998.1,
+          "share": 0.247
+        },
+        "scoped_tests": {
+          "minutes": 562.4,
+          "share": 0.139
+        },
+        "polling": {
+          "minutes": 0.2,
+          "share": 0.0
+        },
+        "other": {
+          "minutes": 129.0,
+          "share": 0.032
+        }
+      },
+      "lock": {
+        "refusals": 2,
+        "samples": 2,
+        "sessions_with_wait": 2,
+        "median_seconds": 0.0,
+        "mean_seconds": 0.0,
+        "max_seconds": 0.0,
+        "majority_blocked_sessions": [],
+        "reliable": false
+      },
+      "rebase_events": 23,
+      "full_suite_gate_runs": 4,
+      "no_op_sessions": 0
+    },
+    "thresholds": {
+      "median_lock_wait_seconds": 60.0,
+      "max_lock_wait_seconds": 300.0,
+      "majority_lock_share": 0.5,
+      "min_lock_samples": 3
+    },
+    "checks": [
+      {
+        "id": "no_session_majority_lock_blocked",
+        "passed": true,
+        "observed": 0,
+        "threshold_share": 0.5,
+        "detail": "no session spends more than 50% of its wall-clock behind the per-repository lock"
+      },
+      {
+        "id": "median_lock_wait_under_60s",
+        "passed": null,
+        "observed_seconds": 0.0,
+        "threshold_seconds": 60.0,
+        "samples": 2,
+        "detail": "only 2 lock-wait samples (need 3); median not evaluable"
+      },
+      {
+        "id": "max_lock_wait_under_300s",
+        "passed": null,
+        "observed_seconds": 0.0,
+        "threshold_seconds": 300.0,
+        "samples": 2,
+        "detail": "only 2 lock-wait samples (need 3); max not evaluable"
+      }
+    ],
+    "verdict": "inconclusive",
+    "failures": [],
+    "sessions": [
+      {
+        "session_id": "01a1db08-8c1f-72a6-b66c-e8b668a949ba",
+        "span_seconds": 2976.561,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d87f-be28-7619-b01b-4d8420e7b434",
+        "span_seconds": 4193.881,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1da02-7b77-7015-b4cf-d838b3f214f3",
+        "span_seconds": 1879.621,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1da2d-fd04-72eb-a8a9-cfa11410238a",
+        "span_seconds": 1143.875,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1df31-52c1-77f0-b210-62050351174a",
+        "span_seconds": 1048.764,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1def3-dcbe-7551-9727-8ec6c9b28d7e",
+        "span_seconds": 1572.738,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1df0c-2174-7698-a50b-e3a097d53a1d",
+        "span_seconds": 1238.764,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1df26-6807-7479-9b9d-3b082dd55f25",
+        "span_seconds": 1813.91,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e1b7-44eb-7001-a00c-8b4200762af3",
+        "span_seconds": 684.676,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e1c1-fab8-72ac-8cbb-f774fec2c8a7",
+        "span_seconds": 2708.281,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e46e-e87f-71cb-931f-64497ad248c7",
+        "span_seconds": 1070.556,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e47f-806c-75f2-abf9-c6d80255a9de",
+        "span_seconds": 2288.784,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e4a2-9af7-74bd-8e3e-ceb2a47702a6",
+        "span_seconds": 1272.506,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e084-7e85-704f-8210-4911f7fd373e",
+        "span_seconds": 718.396,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e9dc-b3ac-7288-9f55-b39b8ecd8756",
+        "span_seconds": 2844.839,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea24-8b57-7249-b2f5-44adc2172149",
+        "span_seconds": 3416.657,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea08-5f9c-7372-adb8-c97c4b5ac0a6",
+        "span_seconds": 1318.628,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea84-bfe0-7461-bee1-9501dd4a16a9",
+        "span_seconds": 1537.992,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea9c-7179-76e2-a426-2d2ca143657b",
+        "span_seconds": 1130.071,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea5b-d54c-7281-9862-9b2b67e6be2c",
+        "span_seconds": 2663.009,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d9a3-9235-7045-bfbd-17afc635f687",
+        "span_seconds": 2686.048,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d75a-bc6e-745f-879a-eca43fe287a7",
+        "span_seconds": 2563.446,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 1
+      },
+      {
+        "session_id": "01a1d85a-a2c4-75f2-8311-d61990b71d60",
+        "span_seconds": 3389.86,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d896-51b0-716c-bc1a-54199d5ed494",
+        "span_seconds": 1399.404,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1db69-4dc9-728b-a397-3ad8756de4dc",
+        "span_seconds": 6297.718,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1dbc9-adaf-76d9-ad3e-f4e0ff68cb37",
+        "span_seconds": 7421.385,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ebfd-b9d5-730b-bf33-7d31f58029f5",
+        "span_seconds": 3433.477,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ecf5-234a-73d5-a3c2-13039c690828",
+        "span_seconds": 1739.519,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ed16-0fbd-7784-b237-9689081f3985",
+        "span_seconds": 2220.544,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ed38-1e86-7547-ae57-5e842ab10588",
+        "span_seconds": 1512.135,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1dd7c-9ac8-7726-a4ae-663eacf06eb1",
+        "span_seconds": 1803.832,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1dd98-5170-72df-a831-7d12cc43400a",
+        "span_seconds": 1816.172,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1df2b-4067-70f3-9d08-c3fb9883b9d1",
+        "span_seconds": 2404.961,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ddb9-0674-70d3-acb0-c5afb02cb6aa",
+        "span_seconds": 1263.706,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1df52-8f44-7774-93af-c2f86b851c0b",
+        "span_seconds": 4990.405,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1dfb4-b43e-7522-9b6b-936c95f10f26",
+        "span_seconds": 2803.38,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1def2-c14f-70f0-b1a0-8660831b1864",
+        "span_seconds": 1964.584,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1df1f-5aa7-7312-9e8c-48859c62291f",
+        "span_seconds": 1556.625,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1df3c-f63f-762d-832e-4e445619cb09",
+        "span_seconds": 3587.354,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1df74-0e99-7604-b19f-22752d07c00e",
+        "span_seconds": 954.303,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1dfb6-5589-7736-a9af-f52578ba584a",
+        "span_seconds": 3524.956,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e039-db35-72ca-8ea9-279abea0bc28",
+        "span_seconds": 2389.566,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e061-68b9-713f-a9be-9e834c8f75c8",
+        "span_seconds": 1203.873,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e46d-a492-70c0-9ba8-ad4ffcbd8050",
+        "span_seconds": 3570.624,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 1
+      },
+      {
+        "session_id": "01a1dfad-b0a1-7248-b8d4-1c7d5e297345",
+        "span_seconds": 2102.182,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1dfcd-f7c1-737d-9b64-a8a7682655eb",
+        "span_seconds": 3189.999,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e00c-724b-767b-b064-e82e71b81fe5",
+        "span_seconds": 1920.995,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e05c-4141-7400-bb88-d56f9a46cc0d",
+        "span_seconds": 1604.669,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e511-95bd-754e-b16f-97b9defa4e7f",
+        "span_seconds": 3529.392,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e12d-f9eb-704c-938c-94b77f2e905c",
+        "span_seconds": 3324.292,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e440-d124-71d5-880d-e326a1d7c1d5",
+        "span_seconds": 2923.938,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e5a4-4b00-710d-8305-31e10f90e9a2",
+        "span_seconds": 4873.677,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e65a-a2f0-72f9-b3e5-5da43b5d223a",
+        "span_seconds": 3123.216,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e02a-21fa-71fc-b7b6-b9b1f003d949",
+        "span_seconds": 3043.682,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e087-4272-717d-b812-77d05aabc93d",
+        "span_seconds": 1001.744,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e0f2-67ff-77bc-a52d-b6d9caa7cf0e",
+        "span_seconds": 790.782,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e4a7-9701-74ca-8cfd-9139c2eb4316",
+        "span_seconds": 2880.792,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e5ee-fd12-70ba-b478-db10ed15cf2f",
+        "span_seconds": 2943.745,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e61c-23d6-737a-a024-7d59db577e5f",
+        "span_seconds": 3319.712,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ee4b-f628-771e-8166-736479d565ee",
+        "span_seconds": 7786.415,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ed22-33cd-7036-8130-74b42d278ece",
+        "span_seconds": 3294.239,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ed69-32d5-76cb-a529-94e9b7df0740",
+        "span_seconds": 263.234,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ee26-e156-7646-97f8-33d15a915fca",
+        "span_seconds": 2332.283,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1eecb-7a07-735d-a8e5-5b871d37a7f0",
+        "span_seconds": 1538.885,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e542-d782-77fe-ab64-e7029d6333f0",
+        "span_seconds": 3113.511,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e5d9-47d2-7723-b8aa-a16fa8820e3d",
+        "span_seconds": 4235.485,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e61a-18a6-75cb-afc4-3683f1784734",
+        "span_seconds": 7159.848,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e68c-8cec-77d6-aaec-7f4fbdd41760",
+        "span_seconds": 4325.292,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e943-c4a3-7560-8984-334169832a4b",
+        "span_seconds": 2104.907,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e964-0206-7581-a82a-7ba400d7ae1b",
+        "span_seconds": 583.709,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e12a-7aba-7367-93f8-cbd14a7335a5",
+        "span_seconds": 181.318,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e158-301e-75ee-8749-8349d10b2a20",
+        "span_seconds": 249.595,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e15c-17d8-7531-824a-252324810964",
+        "span_seconds": 374.084,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e161-f7e9-77d0-811e-ecb8f0bbe4c1",
+        "span_seconds": 396.723,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e168-1cfc-7580-a5d2-f880d304085e",
+        "span_seconds": 395.696,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e16e-40bf-71f9-9905-2ac49c116310",
+        "span_seconds": 316.7,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e173-44b5-7344-9139-878730fa1797",
+        "span_seconds": 452.31,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e3d1-717c-75f0-830a-44e89be45c8a",
+        "span_seconds": 676.928,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e3e3-5ec2-7514-b60f-e6502454d440",
+        "span_seconds": 534.736,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e3f1-93fc-70f3-9878-dcebf55ab4b2",
+        "span_seconds": 314.203,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e3dc-89b0-7258-bdaa-67fc35c73f0a",
+        "span_seconds": 701.81,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e3f2-f554-779e-9c47-bc6789d40409",
+        "span_seconds": 1309.684,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e435-b458-707c-9897-0d00f638008b",
+        "span_seconds": 763.309,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e40a-e642-76eb-b169-65431486272c",
+        "span_seconds": 2795.333,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e441-8c5b-7076-90ea-44ff74324f08",
+        "span_seconds": 621.539,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e44b-275f-7019-ba4a-04058fddd472",
+        "span_seconds": 750.014,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e70a-80ca-72fe-87d9-b8d1376bf544",
+        "span_seconds": 276.264,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e9e6-719b-72de-b517-dae74af6425f",
+        "span_seconds": 919.74,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e9f4-9cb8-7710-992b-364512182d29",
+        "span_seconds": 357.499,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e9fa-4870-703a-8f5c-091b1f2b5a4c",
+        "span_seconds": 657.452,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea04-7e0e-72af-a8bf-d1c8bc7ab4f9",
+        "span_seconds": 427.769,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea0b-37c7-76f6-935b-f2b067ce0eea",
+        "span_seconds": 215.008,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea20-d7ff-72a1-a6eb-9f89eaa96f2b",
+        "span_seconds": 345.497,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea26-bb69-74aa-8a26-9888dfc40961",
+        "span_seconds": 549.585,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea2f-a721-7273-af90-bc205f97225b",
+        "span_seconds": 696.311,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea3a-e492-74b7-962d-d05646fea3e8",
+        "span_seconds": 526.086,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea43-59b7-70d8-8f04-5d0d4b8ab8cb",
+        "span_seconds": 456.068,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea5b-f378-77e7-add4-5bd3b8f0a4e6",
+        "span_seconds": 621.597,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea67-dde7-75ff-b8eb-aeba55cfd0ba",
+        "span_seconds": 1044.747,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea8c-5bf4-705e-bc6c-b99a93bec9e6",
+        "span_seconds": 1645.598,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1eaa7-098c-7591-bdc6-7c8fe8a2a388",
+        "span_seconds": 461.363,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea78-39a6-70e2-89ab-e20d0cd9b8cd",
+        "span_seconds": 368.124,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1d846-7d29-7258-bac4-14a11a67a530",
+        "span_seconds": 6987.685,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e67f-da89-7740-8b76-2cb1d4ac806b",
+        "span_seconds": 6714.568,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e5cb-e344-707e-9a65-9dcadc87acff",
+        "span_seconds": 6501.478,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1e4d9-67a0-72ce-aa72-7a8363048833",
+        "span_seconds": 3507.061,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ea27-ea00-723f-a40c-afe817c2afe1",
+        "span_seconds": 3282.538,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1eafd-cdb0-7747-bdcd-399b85d03f16",
+        "span_seconds": 5878.142,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      },
+      {
+        "session_id": "01a1ebc9-7925-767d-bdd1-72770a741ca5",
+        "span_seconds": 7881.913,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      }
+    ]
+  },
+  "after_all_fixes": {
+    "success": true,
+    "mode": "session",
+    "sessions_root": "/home/rgardler/.pi/agent/sessions",
+    "selection": {
+      "since": "2026-11-18T13:03:00+00:00",
+      "until": null,
+      "project_filters": [
+        ".worklog-worktrees"
+      ],
+      "implement_only": true,
+      "files_scanned": 2483,
+      "sessions": 1
+    },
+    "window": {
+      "start": "2026-11-18T13:14:34.890000+00:00",
+      "end": "2026-11-18T13:40:13.775000+00:00",
+      "wall_clock_minutes": 25.6
+    },
+    "aggregate": {
+      "summed_session_minutes": 25.6,
+      "wall_clock_minutes": 25.6,
+      "effective_parallelism": 1.0,
+      "peak_concurrency": 1,
+      "bash_minutes": 7.4,
+      "bash_share": 0.288,
+      "buckets": {
+        "wait_for_job": {
+          "minutes": 2.2,
+          "share": 0.084
+        },
+        "own_finish": {
+          "minutes": 0.0,
+          "share": 0.0
+        },
+        "scoped_tests": {
+          "minutes": 0.0,
+          "share": 0.0
+        },
+        "polling": {
+          "minutes": 0.0,
+          "share": 0.0
+        },
+        "other": {
+          "minutes": 5.2,
+          "share": 0.203
+        }
+      },
+      "lock": {
+        "refusals": 0,
+        "samples": 0,
+        "sessions_with_wait": 0,
+        "median_seconds": null,
+        "mean_seconds": null,
+        "max_seconds": null,
+        "majority_blocked_sessions": [],
+        "reliable": false
+      },
+      "rebase_events": 2,
+      "full_suite_gate_runs": 4,
+      "no_op_sessions": 0
+    },
+    "thresholds": {
+      "median_lock_wait_seconds": 60.0,
+      "max_lock_wait_seconds": 300.0,
+      "majority_lock_share": 0.5,
+      "min_lock_samples": 3
+    },
+    "checks": [
+      {
+        "id": "no_session_majority_lock_blocked",
+        "passed": true,
+        "observed": 0,
+        "threshold_share": 0.5,
+        "detail": "no session spends more than 50% of its wall-clock behind the per-repository lock"
+      },
+      {
+        "id": "median_lock_wait_under_60s",
+        "passed": null,
+        "observed_seconds": null,
+        "threshold_seconds": 60.0,
+        "samples": 0,
+        "detail": "only 0 lock-wait samples (need 3); median not evaluable"
+      },
+      {
+        "id": "max_lock_wait_under_300s",
+        "passed": null,
+        "observed_seconds": null,
+        "threshold_seconds": 300.0,
+        "samples": 0,
+        "detail": "only 0 lock-wait samples (need 3); max not evaluable"
+      }
+    ],
+    "verdict": "inconclusive",
+    "failures": [],
+    "sessions": [
+      {
+        "session_id": "01a1eecb-7a07-735d-a8e5-5b871d37a7f0",
+        "span_seconds": 1538.885,
+        "lock_wait_seconds": 0.0,
+        "lock_share": 0.0,
+        "lock_refusals": 0
+      }
+    ]
+  },
+  "fanout": {
+    "success": true,
+    "mode": "fanout",
+    "method": "real phase_finish x N against one main checkout, real per-repository flock; suites and git boundaries stubbed",
+    "parameters": {
+      "count": 6,
+      "suite_seconds": 326.0,
+      "lock_window_seconds": 15.0,
+      "lock_timeout_seconds": 900.0
+    },
+    "aggregate": {
+      "completed": 6,
+      "slowest_session_seconds": 416.244,
+      "summed_session_seconds": 2271.867,
+      "effective_parallelism": 5.46,
+      "median_lock_wait_seconds": 37.547,
+      "max_lock_wait_seconds": 75.172,
+      "median_lock_hold_seconds": 15.009,
+      "max_lock_share": 0.181
+    },
+    "thresholds": {
+      "median_lock_wait_seconds": 60.0,
+      "max_lock_wait_seconds": 300.0,
+      "majority_lock_share": 0.5
+    },
+    "checks": [
+      {
+        "id": "all_sessions_succeeded",
+        "passed": true,
+        "detail": "every concurrent finish completed successfully"
+      },
+      {
+        "id": "median_lock_wait_under_60s",
+        "passed": true,
+        "observed_seconds": 37.547,
+        "threshold_seconds": 60.0,
+        "samples": 6,
+        "detail": "median lock wait is 37.547s across 6 finishes (threshold <60s)"
+      },
+      {
+        "id": "max_lock_wait_under_300s",
+        "passed": true,
+        "observed_seconds": 75.172,
+        "threshold_seconds": 300.0,
+        "samples": 6,
+        "detail": "max lock wait is 75.172s across 6 finishes (threshold <=300s)"
+      },
+      {
+        "id": "no_session_majority_lock_blocked",
+        "passed": true,
+        "observed": 0,
+        "threshold_share": 0.5,
+        "detail": "no finish spends more than 50% of its wall-clock waiting for the per-repository lock"
+      }
+    ],
+    "verdict": "pass",
+    "failures": [],
+    "sessions": [
+      {
+        "session": "fanout-1",
+        "success": true,
+        "wall_seconds": 371.11,
+        "lock_wait_seconds": 30.03,
+        "lock_hold_seconds": 15.008,
+        "lock_share": 0.081,
+        "lock_acquired": true,
+        "message": null
+      },
+      {
+        "session": "fanout-2",
+        "success": true,
+        "wall_seconds": 356.098,
+        "lock_wait_seconds": 15.019,
+        "lock_hold_seconds": 15.009,
+        "lock_share": 0.042,
+        "lock_acquired": true,
+        "message": null
+      },
+      {
+        "session": "fanout-3",
+        "success": true,
+        "wall_seconds": 341.083,
+        "lock_wait_seconds": 0.002,
+        "lock_hold_seconds": 15.013,
+        "lock_share": 0.0,
+        "lock_acquired": true,
+        "message": null
+      },
+      {
+        "session": "fanout-4",
+        "success": true,
+        "wall_seconds": 401.191,
+        "lock_wait_seconds": 60.114,
+        "lock_hold_seconds": 15.009,
+        "lock_share": 0.15,
+        "lock_acquired": true,
+        "message": null
+      },
+      {
+        "session": "fanout-5",
+        "success": true,
+        "wall_seconds": 386.141,
+        "lock_wait_seconds": 45.065,
+        "lock_hold_seconds": 15.009,
+        "lock_share": 0.117,
+        "lock_acquired": true,
+        "message": null
+      },
+      {
+        "session": "fanout-6",
+        "success": true,
+        "wall_seconds": 416.244,
+        "lock_wait_seconds": 75.172,
+        "lock_hold_seconds": 15.007,
+        "lock_share": 0.181,
+        "lock_acquired": true,
+        "message": null
+      }
+    ]
+  },
+  "notes": [
+    "'before' window: 2026-11-13 UTC, AI_Hell implement worktree sessions \u2014 re-derives the 2026-11-13 baseline with identical bucketing (summed session time vs wall-clock, bash-wait share, wait_for_job / own finish / scoped tests / polling buckets, lock refusals and lock-wait samples, non-fast-forward rebase events, full-suite gate runs, no-op sessions).",
+    "'after' window: sessions since 2026-11-14 UTC across every project worktree. In effect for this window: SA-0MWFJS3820032YB4 (dev-push full suite resolved before the lock, landed 2026-11-13T23:57) for the whole window; SA-0MWFJS9OL001ZTTC (lost-push-race change-set verdict, 2026-11-18T04:42), SA-0MWFJSCPT005BO2R (no no-op drive spawn, 2026-11-18T10:51) and SA-0MWFJS65O005JMJF (one bounded internal finish wait, 2026-11-18T13:02) only for the tail of it.",
+    "'after_all_fixes' window: 2026-11-18T13:03Z onward with all four sibling items in effect. The natural session corpus is far too thin (one session) to evaluate the thresholds, which is why the 6-way synthetic fan-out supplies AC1.",
+    "The 'before' absolute totals differ from the ad hoc 2026-11-13 figure (668 min summed over 388 min for 36 sessions) because this harness fixes the window on a session's first record and spans the whole UTC day; its own before measurement (1210 min over 519 min for 38 sessions, 2.33x effective parallelism, peak concurrency 5) is the apples-to-apples comparison point.",
+    "Lock-wait samples: reported waited_seconds / 'Acquired ... after N s' (post-bounded-wait) or the absorbed duration of a retry loop / the gap to an immediately retried finish (pre-bounded-wait). Echoed text from grep/cat/probe commands is filtered out.",
+    "Fan-out parameters: pre-lock full-suite stub 326 s (the recorded 2026-11-13 baseline full-suite duration, SA-0MWFJRWN00084FE1), locked mutating window stub 15 s (deliberately conservative \u2014 observed real pushes complete in a few seconds). Only the external boundaries (build, suites, git commit/push, worklog) are stubbed; phase_finish ordering, the real per-repository flock and the real bounded wait are exercised.",
+    "Fan-out result: median lock wait 37.5 s (< 60 s target), max lock wait 75.2 s (< 300 s target), max lock share 18% of wall-clock, 5.46x effective parallelism across the six sessions \u2014 the parent epic's AC1 is met at the intended fan-out of 6.",
+    "Residual shortfall / follow-up: the natural post-fix session corpus is under-sampled (2 zero-second reported lock waits and 2 fail-fast refusals in the 2026-11-14+ window, both from sessions started before the bounded-wait fix), so a later re-run on real post-fix sessions is worth recording; no follow-up work item is required for the epic's outcome ACs because the fan-out measurement meets them.",
+    "Evidence only aggregates metrics and session ids; no prompt or response content is recorded."
+  ]
+}
