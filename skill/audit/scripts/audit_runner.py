@@ -893,6 +893,22 @@ without an accepted waiver, so a fresh chore is created instead of reusing
 the stale one (SA-0MVZNECSD005XB42 AC1).
 """
 
+AUDIT_VERIFICATION_CMD_MARKER = "Audit-Verification-Command:"
+"""Exact linter command that reproduces the tracked finding.
+
+Recorded on every candidate-false-positive chore so a later re-verification
+sweep re-runs it verbatim instead of guessing the rule/path from a title
+(SA-0MW7Z1JCE009G6J3 AC1).
+"""
+
+AUDIT_FINGERPRINT_MARKER = "Audit-Fingerprint:"
+"""Content fingerprint (file hash + rule) of the tracked finding's target.
+
+A sweep can compare this against the recomputed value to distinguish a
+finding that never fired from one whose target changed since filing
+(SA-0MW7Z1JCE009G6J3 AC1).
+"""
+
 # Marker embedded in a CFP chore's description when the same (rule, path)
 # identity is already tracked by an open Refactor-family item
 # (SA-0MWE1EAR30045VHO AC2). The chore's producer-decision purpose is
@@ -13655,6 +13671,50 @@ def _fp_finding_key(finding: dict) -> str:
     return f"{linter}:{code}:{file}:{line}"
 
 
+def _audit_verification_command(finding: dict) -> str:
+    """Exact ruff command that reproduces a candidate-false-positive finding.
+
+    Recorded on the tracking chore so a later re-verification sweep can
+    re-run it and decide whether the finding still fires
+    (SA-0MW7Z1JCE009G6J3 AC1). The path is normalised to repository-relative
+    form so the command is stable across worktrees. An empty string is
+    returned for a non-ruff finding (no safe command can be derived).
+    """
+    linter = (finding.get("linter") or "ruff").strip().lower()
+    code = str(finding.get("code") or "").strip()
+    if linter != "ruff" or not code:
+        return ""
+    path = _repo_relative_path(str(finding.get("file") or ""))
+    if not path:
+        return ""
+    return f"ruff check --isolated --select {code} {path}"
+
+
+def _audit_content_fingerprint(finding: dict) -> str:
+    """sha256 of the finding target's bytes + rule code (file hash + rule).
+
+    Mirrors ``refactor.workitem_creation.compute_content_fingerprint`` so both
+    producers record a comparable fingerprint (SA-0MW7Z1JCE009G6J3 AC1).
+    Returns an empty string when the target cannot be read.
+    """
+    raw = str(finding.get("file") or "").strip()
+    if not raw:
+        return ""
+    candidate = raw
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(str(TARGET_PROJECT_ROOT), raw)
+    try:
+        with open(candidate, "rb") as handle:
+            content = handle.read()
+    except (OSError, ValueError):
+        return ""
+    digest = hashlib.sha256()
+    digest.update(content)
+    digest.update(b"\x00")
+    digest.update(str(finding.get("code") or "").encode("utf-8"))
+    return digest.hexdigest()
+
+
 def _normalise_waiver(data: object) -> dict | None:
     """Normalise a waiver record to ``{linter, rule, file, line,
     justification, author}``; ``None`` when unusable.
@@ -14309,11 +14369,19 @@ def _chore_description_for_cfp_decision(
     file = finding.get("file", "?")
     line = finding.get("line", 0)
     waiver_target = issue_id or "<audited-item-id>"
+    verification_command = _audit_verification_command(finding)
+    fingerprint = _audit_content_fingerprint(finding)
+    tracking = ""
+    if verification_command:
+        tracking += f"\n{AUDIT_VERIFICATION_CMD_MARKER} {verification_command}"
+    if fingerprint:
+        tracking += f"\n{AUDIT_FINGERPRINT_MARKER} {fingerprint}"
     return (
         f"False-positive candidate (medium/low severity). "
         f"{code} in {file}:{line} — {entry.get('justification', '')}. "
         f"{FP_CHORE_ANNOTATION}.\n\n"
-        f"{CFP_CHORE_KEY_PREFIX} {key}\n\n"
+        f"{CFP_CHORE_KEY_PREFIX} {key}"
+        f"{tracking}\n\n"
         "Accept it once with:\n"
         f"`python3 $(skill_path audit)/scripts/audit_waiver.py add {waiver_target} "
         f"--rule {code} --file {file} --line {line} "
