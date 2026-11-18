@@ -11,7 +11,7 @@ through code, tests, and docs.
 ## Inputs
 
 - work-item id: required; validate `<prefix>-<hash>`, prompt if missing.
-- Optional freeform guidance in the arguments may shape the approach.
+- Optional freeform guidance may shape the approach.
 
 ## Outputs
 
@@ -20,7 +20,7 @@ through code, tests, and docs.
 
 ## References to Bundled Resources
 
-- Deep implementation reference (relocated detail, tables, guard matrices):
+- Deep reference (relocated detail, tables, guard matrices):
   [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md).
 - Intake/interview helpers: `intake`, `plan`, `interview`.
 - [Test writing guidelines](../shared/test-writing-guidelines.md),
@@ -290,7 +290,8 @@ child is re-checked each run against its `wl dep` edges and explicit
 `skip-blocked` with `blocking_ids`, never started; all blockers terminal ⇒
 the block is stale and the child starts. Precedence: `skip-terminal` →
 `skipped-held` → `skip-in-progress` → `skip-blocked` → `implement`. `drive`
-never spawns a `skip-blocked` child. Vocabulary (`blocking_ids`,
+never spawns a `skip-blocked` or already-terminal child. Vocabulary
+(`blocking_ids`,
 `blocker_details`, `stale_blocks`, `unvalidated_blocks`,
 `unresolved_blockers`, extended `blocked_children` entries) and parsing rule:
 [reference](../../docs/dev/implement-skill-reference.md).

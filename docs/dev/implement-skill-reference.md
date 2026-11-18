@@ -264,6 +264,64 @@ fake, injected commit-evidence provider, recording mutation fake).
 - No fetch/network in the evidence path; a stale `origin/dev` ref is accepted
   evidence on the failure path.
 
+## Pre-spawn re-validation: never spawn a session that can only no-op (SA-0MWFJSCPT005BO2R)
+
+`phase_parent` decides the next startable child in a **subprocess**, so the
+`next_child` it reports is already stale when `phase_drive` acts on it. Until
+SA-0MWFJSCPT005BO2R the driver spawned a fresh session for whatever the report
+named, so a child that had been finished concurrently, sent back to `blocked`
+by a producer, or left at `stage: in_review` still consumed a child-session
+slot: the session loaded the skill, found nothing to do and exited.
+
+### Recorded evidence (AI_Hell, 2026-11-13)
+
+The parent epic's drive chain (SA-0MWFJRWN00084FE1, comment
+SA-C0MWFJT68N001G1DR) recorded **9 of 36** implement sessions with three
+messages and ~50 s wall-clock each. Inspecting those session logs
+(`~/.pi/agent/sessions/…-wl-AH-0MWEZZ9TE001577J-…`) shows one shape: system +
+user (the skill body) + an **empty assistant message** with
+`stopReason: "error"`, `errorMessage: "Provider finish_reason: error"` and zero
+tokens. The `pi -p` process exited 0, so `_default_session_spawner` reported
+success and the loop re-spawned the same child (bounded by
+`max_child_sessions`) until a provider turn succeeded.
+
+The recorded no-ops were therefore driven by a **provider first-turn error**,
+not by a stale child state — no state check can predict that, and it stays an
+infrastructure concern (out of scope here). The re-validation below closes the
+driver-controlled no-op class instead: a stale parent report can no longer
+spend a session slot on a child that is terminal or still blocked.
+
+### Verdict rules
+
+`_revalidate_child_startable(child_id, children)` re-fetches the reported
+child (read-only `wl show`) immediately before the spawn and classifies it:
+
+| Re-fetched state | Verdict | Session |
+|---|---|---|
+| terminal status (`_is_terminal_child`: `completed`/`done`/`in_review`/`deleted`, or soft-deleted) | `skip-terminal` | **none** |
+| `stage: in_review` — stage-only terminality, the same rule the spawn-failure reconciliation uses | `skip-terminal` | **none** |
+| `blocked` whose outbound edges are not all terminal (or unvalidated) | `skip-blocked` + `blocking_ids` | **none** |
+| `blocked` whose outbound edges are all terminal (a stale block) | `implement` + `stale_block_ids` | spawned |
+| `open` / `in-progress` (a resume) | `implement` | spawned |
+| unreadable (empty fetch) | `implement` — **fail open** | spawned |
+
+- **Held children are not probed here.** The per-child lock acquired
+  immediately before the spawn is the authoritative check (it also recognises
+  the driver's own token-based re-entry), so the `skipped-held` verdict — and
+  its race — stays in one place.
+- **A skip is a soft wait.** `success: true`, `parent_advanced: false`, no
+  `failed_child`; the loop re-runs `parent` so the next child can start. A
+  parent report that keeps offering the same non-startable child stops the
+  chain (the message says it keeps offering the child and that the loop was
+  stopped), so the skip can never spin.
+- **Report surface.** Every verdict is recorded in
+  `report["revalidated_children"]` (`id`, `startable`, `action`, `status`,
+  `stage`, `reason`, plus `blocking_ids` / `stale_block_ids` / `unvalidated`
+  for a blocked child). A blocked verdict is also forwarded as
+  `blocked_children` / `blocked_child_details`, exactly like the existing
+  `skip-blocked` path. The human rendering prints
+  `⏭ <id> (skipped, no session): <reason>` instead of a session result.
+
 ## Spawn-failure evidence: a child that produced nothing is startable again (SA-0MWGZ8NWP009QD8G)
 
 A child whose session died **before writing anything** (spawn error, provider
@@ -941,7 +999,11 @@ Additional report fields:
   worktrees parked on `refs/wip/<id>` (the reset was refused);
 - `terminal_reconciled` — count of children recorded as done after a failed
   finish;
-- `reset_for_retry` — count of children reset for a fresh session.
+- `reset_for_retry` — count of children reset for a fresh session;
+- `revalidated_children` — the pre-spawn re-validation verdicts, one entry per
+  reported `next_child` (`{id, startable, action, status, stage, reason}` plus
+  `blocking_ids` / `stale_block_ids` / `unvalidated` for a blocked child;
+  SA-0MWFJSCPT005BO2R).
 
 These additions are the full report-surface delta for the recovery work:
 `finish_failure`, `infra_retries`, `infra_retry_limit` and `preserved_refs`

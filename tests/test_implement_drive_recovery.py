@@ -1393,9 +1393,15 @@ class TestFinishFailureTerminalReconciliation:
         assert report["failed_child"] == "SA-C1"
         assert report["children_driven"] == []
 
-    def test_happy_path_never_re_fetches_children(self, drive_harness):
-        """Reconciliation fetches happen only on the slow finish-failure
-        path (AC6) — a clean drive re-fetches no child."""
+    def test_happy_path_fetches_each_child_once_for_revalidation(
+        self, drive_harness,
+    ):
+        """Reconciliation fetches stay on the slow finish-failure path (AC6).
+
+        Since SA-0MWFJSCPT005BO2R a clean drive pays exactly **one** child
+        fetch per spawned session — the pre-spawn re-validation — and never
+        the failure-only reconciliation fetch.
+        """
         child = _child("SA-C1")
         harness = drive_harness(
             children=[child],
@@ -1409,7 +1415,8 @@ class TestFinishFailureTerminalReconciliation:
         report = harness.run()
 
         assert report["success"] is True
-        assert report["_show_calls"] == [PARENT]
+        assert report["_show_calls"] == [PARENT, "SA-C1"]
+        assert report["revalidated_children"][0]["startable"] is True
 
 
 # ---------------------------------------------------------------------------

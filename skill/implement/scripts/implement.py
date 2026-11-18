@@ -17523,6 +17523,16 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
             print(f"     {entry['message']}")
         if entry.get("reason"):
             print(f"     {entry['reason']}")
+    for verdict in report.get("revalidated_children") or []:
+        if verdict.get("startable"):
+            continue
+        # No session was spawned: the child was re-validated immediately
+        # before the spawn and is no longer startable
+        # (SA-0MWFJSCPT005BO2R).
+        print(
+            f"  ⏭ {verdict.get('id')} (skipped, no session): "
+            f"{verdict.get('reason', '')}"
+        )
     print(f"  Sessions spawned: {report.get('sessions_spawned', 0)}")
     if report.get("completed_late"):
         print(f"  Completed late: {report['completed_late']}")
@@ -18137,6 +18147,121 @@ def _describe_skip_blocked(details: list[dict[str, Any]]) -> str:
     return "; ".join(rendered)
 
 
+#: Action recorded by the pre-spawn re-validation for a child that may start.
+#: Deliberately the same literal the workflow uses for a startable child, so
+#: one vocabulary describes both the parent plan and the pre-spawn verdict.
+REVALIDATE_STARTABLE = "implement"
+
+
+def _revalidate_child_startable(
+    child_id: str,
+    children: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Re-fetch a reported ``next_child`` and decide whether it may spawn.
+
+    ``phase_parent`` names the next startable child from a **subprocess**, so
+    that decision is already stale when ``phase_drive`` acts on it: the child
+    may have been finished by a concurrent session, put back to ``blocked`` by
+    a producer, or claimed by another driver. Spawning a fresh session for
+    such a child burns a child-session slot on a run that can only load the
+    skill and exit (SA-0MWFJSCPT005BO2R).
+
+    The child is therefore re-fetched (read-only ``wl show``) immediately
+    before the spawn and classified with the same rules as
+    :func:`_classify_child`:
+
+    * **terminal** (:func:`_is_terminal_child` — a terminal status or a
+      soft-delete) is never re-spawned;
+    * **blocked** is refused only while the block **still holds**
+      (:func:`_blocked_child_state`); a stale block is startable again;
+    * **in-progress** is startable — a session resumes the claimed item;
+    * **unreadable** fails open (startable), so a transient worklog read
+      failure can never stall the chain.
+
+    A live lock holder is deliberately **not** consulted here: the per-child
+    lock acquired immediately before the spawn is the authoritative check (it
+    also recognises this process's own token-based re-entry), so the holder
+    verdict — and its race — stays in exactly one place.
+
+    Args:
+        child_id: The child ``phase_parent`` reported as ``next_child``.
+        children: The parent's children, used to resolve an in-chain blocker's
+            live status for a ``blocked`` child.
+
+    Returns:
+        A JSON-friendly verdict: ``id``, ``startable`` (bool), ``action``
+        (``"implement"`` / ``"skip-terminal"`` / ``"skip-blocked"``), the
+        fetched ``status`` / ``stage``, a human-readable ``reason`` when the
+        spawn is refused, and for a ``blocked`` child its ``blocking_ids``,
+        ``stale_block_ids`` and ``unvalidated`` flag.
+    """
+    verdict: dict[str, Any] = {
+        "id": child_id,
+        "startable": True,
+        "action": REVALIDATE_STARTABLE,
+        "status": "",
+        "stage": "",
+        "reason": "",
+    }
+    child = wl_show(child_id) or {}
+    if not child:
+        verdict["reason"] = (
+            "the child could not be re-fetched; failing open so a transient "
+            "worklog read failure cannot stall the drive chain"
+        )
+        return verdict
+
+    status = str(child.get("status", ""))
+    stage = str(child.get("stage", ""))
+    verdict["status"] = status
+    verdict["stage"] = stage
+
+    if _is_terminal_child(child):
+        verdict.update(
+            startable=False,
+            action="skip-terminal",
+            reason=(
+                f"it is already terminal (status={status or 'unknown'}"
+                + (f", stage={stage})" if stage else ")")
+            ),
+        )
+        return verdict
+
+    if stage == "in_review":
+        # Stage-only terminality: the same rule the spawn-failure
+        # reconciliation applies (SA-0MVHXWLPG007OQVN) — the child reached
+        # review, so a session for it can only no-op.
+        verdict.update(
+            startable=False,
+            action="skip-terminal",
+            reason=(
+                "it is already terminal (status="
+                f"{status or 'unknown'}, stage={stage})"
+            ),
+        )
+        return verdict
+
+    if status == "blocked":
+        state = _blocked_child_state(
+            child, wl_dep_blockers(child_id), children or []
+        )
+        verdict["blocking_ids"] = list(state["blocking_ids"])
+        verdict["stale_block_ids"] = list(state["stale_block_ids"])
+        verdict["unvalidated"] = bool(state["unvalidated"])
+        if state["holds"]:
+            held_by = ", ".join(state["blocking_ids"]) or (
+                "an unvalidated block"
+            )
+            verdict.update(
+                startable=False,
+                action=ACTION_SKIP_BLOCKED,
+                reason=f"its block still holds (blocked by {held_by})",
+            )
+            return verdict
+
+    return verdict
+
+
 def _finalise_stranded_child(
     child_id: str,
     evidence: dict[str, Any],
@@ -18354,6 +18479,17 @@ def phase_drive(
     ``completed-late`` and the chain continues; a genuinely incomplete child
     keeps the pre-existing hard failure (SA-0MVHXWLPG007OQVN).
 
+    A ``next_child`` reported by ``parent`` is re-validated immediately
+    **before** the spawn (:func:`_revalidate_child_startable`): a child that
+    became terminal, or whose ``blocked`` hold still holds, is not spawned at
+    all — no lock, no session. Every verdict is recorded per child in
+    ``revalidated_children`` and the skip is a soft wait (``success: true``,
+    no ``failed_child``) that re-runs ``parent`` for the next child; a parent
+    report that keeps offering the same non-startable child stops the chain
+    (bounded, never a spin). This closes the no-op-session class in which a
+    stale parent report made the driver spawn a session that could only load
+    the skill and exit (SA-0MWFJSCPT005BO2R).
+
     Failing ``finish`` executions are bounded too (SA-0MVLJXS7R000XIFL): a
     ``finishing_failed`` parent report is counted per child in
     ``finish_attempts`` (distinct from the session-spawn ``attempts``), and
@@ -18454,7 +18590,9 @@ def phase_drive(
         children recorded as done after their finish failed
         (SA-0MVLJXTYY005XQDV); ``reset_for_retry`` counts non-terminal
         children whose worktree was reset for a fresh session
-        (SA-0MVLJXVND0015LPW); ``preserved_refs`` lists the children whose
+        (SA-0MVLJXVND0015LPW); ``revalidated_children`` records the pre-spawn
+        re-validation verdict for every reported ``next_child``
+        (SA-0MWFJSCPT005BO2R); ``preserved_refs`` lists the children whose
         reset was **refused** because their worktree carries commits, each as
         ``{id, ref, commit}`` with the tip parked on ``refs/wip/<id>``
         (parent AC3, LP-0MVWEP2KB002WMRY). A child whose per-work-item lock is held by
@@ -18492,6 +18630,9 @@ def phase_drive(
         "terminal_reconciled": 0,
         "reset_for_retry": 0,
         "preserved_refs": [],
+        # Pre-spawn re-validation verdicts (SA-0MWFJSCPT005BO2R): one entry per
+        # reported ``next_child`` the driver re-checked before spawning it.
+        "revalidated_children": [],
         "finish_attempts": {},
         "finish_attempt_limit": None,
         "infra_retries": {},
@@ -18576,6 +18717,11 @@ def phase_drive(
     finish_attempts: dict[str, int] = {}
     infra_retries: dict[str, int] = {}
     reset_cids: set[str] = set()
+    #: Children the pre-spawn re-validation already refused in this drive. A
+    #: parent report that keeps offering the same non-startable child would
+    #: otherwise spin, so each child is skipped at most once
+    #: (SA-0MWFJSCPT005BO2R).
+    revalidation_skips: set[str] = set()
     # The report's own list, so entries recorded mid-loop (worktree cleanup
     # outcomes) are visible to the resolvers and to the final report.
     driven: list[dict[str, Any]] = report["children_driven"]
@@ -19109,6 +19255,56 @@ def phase_drive(
             )
             LOG.warning("%s", report["message"])
             break
+
+        # ── Pre-spawn re-validation (SA-0MWFJSCPT005BO2R) ──────────────
+        # ``parent`` decided in a subprocess, so its ``next_child`` may already
+        # be done, blocked again, or claimed elsewhere. A session spawned for
+        # such a child can only load the skill and exit, wasting a fan-out
+        # slot and polluting the drive report, so the child is re-fetched and
+        # re-classified immediately before the spawn. The verdict is a **soft
+        # wait** (``success: true``, no ``failed_child``) unless the parent
+        # keeps offering the same non-startable child, which stops the chain.
+        revalidation = _revalidate_child_startable(child_id, children)
+        report["revalidated_children"].append(revalidation)
+        if not revalidation["startable"]:
+            report["action"] = revalidation["action"]
+            report["parent_advanced"] = False
+            report["success"] = True
+            report["children_processed"] = parent_report.get(
+                "children_processed", []
+            )
+            if revalidation["action"] == ACTION_SKIP_BLOCKED:
+                detail: dict[str, Any] = {
+                    "id": child_id,
+                    "status": revalidation["status"],
+                    "action": ACTION_SKIP_BLOCKED,
+                    "blocking_ids": list(revalidation["blocking_ids"]),
+                    "unvalidated": bool(revalidation["unvalidated"]),
+                }
+                if revalidation["stale_block_ids"]:
+                    detail["stale"] = True
+                    detail["stale_block_ids"] = list(
+                        revalidation["stale_block_ids"]
+                    )
+                report["blocked_children"] = [child_id]
+                report["blocked_child_details"] = [detail]
+            report["message"] = (
+                f"No session spawned for {child_id}: the pre-spawn "
+                f"re-validation found {revalidation['reason']}. "
+                f"Re-run `implement.py drive {work_item_id}` to continue "
+                f"the chain."
+            )
+            LOG.warning("%s", report["message"])
+            if child_id in revalidation_skips:
+                # The parent keeps offering a child that is not startable:
+                # skipping it again would spin, so stop (bounded, truthful).
+                report["message"] = (
+                    f"{report['message']} The parent report keeps offering "
+                    f"{child_id}; stopping to avoid a loop."
+                )
+                break
+            revalidation_skips.add(child_id)
+            continue
 
         worktree_path = (
             parent_report.get("worktree_path")
