@@ -584,6 +584,7 @@ executable, wrapper error) keeps its `unparsed`/infrastructure classification.
 | `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). Vitest's default reporter — including browser mode — **is** parsed (see *Failure parsing* above), so a failing Vitest test is a structured failure, never this code. |
 | `state_changed_during_run` | The guarded checkout moved while a command executed (HEAD and/or the tracked tree it resolves to changed mid-run, e.g. a concurrent `implement.py finish` fast-forward); the mixed-tree verdict is quarantined (no cache entry under either state), the command's parsed failures are dropped and the suite is reported non-green with the distinct exit status 75 (`EX_TEMPFAIL`). The result carries the detail (checkout path + before/after commits) on `state_changed_during_run` — a non-empty dict for the suite, a list under the `run_all` aggregate; the human output prints a `notice: [state_changed_during_run] …` line naming the checkout movement and the required re-run. Runs whose only difference is churn attributable to another session (start-of-run-dirty → end-clean resolutions) are never flagged (SA-0MW3FF18I003KGZE AC3). |
 | `retry_discarded_failures` | **Non-fatal** (CG-0MWEHG69O005VM17): the runner accepted a stage (`status=0` + `retry-clean`/`accepted-transient`), so the FAIL records from its superseded attempt(s) were discarded as diagnostics — the suite stays **green** and the exit status is unchanged. The discarded records also appear on the structured `discarded_failures` field of the suite result / `run_all` aggregate, and the notice names the flaked file(s). A release gate consuming this output must NOT block on it. |
+| `no_suites_detected` | **Non-fatal** (SA-0MWNZLB07007S8QU): the resolved command set is empty — a greenfield repo with no pytest config, no node `test` script, no node suite dirs and no `.pi/test-config.json`. Nothing could fail, so the suite is reported **green** (`success=True`, `returncode=0`, `cached=False`, empty `failures`) with this code and a `no test suites detected for suite '<name>'` notice; the CLI exits 0 and the dev-push gate passes without `TEST_SCOPE_SKIP=1`. The code lets a consumer tell "nothing to run" from "the suites ran and passed" without parsing prose. |
 
 **Precedence.** Structured (parsable) test failures always win: `killed` and
 `unparsed_failure` are set only when `failures` is empty, so a genuine code
@@ -884,9 +885,18 @@ runner's auto-execution path, and its read-only cache classification):
    `test` script (TCE-like layouts).
 
 An empty resolved set (no extension file, no pytest suite, no hidden skill
-tests, no node dirs, no npm test script) is NOT an error: `run_tests.py`
-reports zero commands and the audit skill treats the repo as
-execution-impossible — fail-open partial, never blocks (F4 AC2).
+tests, no node dirs, no npm test script) is NOT an error and no longer an
+empty execution: `run_suite` returns **before** the execution loop with the
+defined no-suites verdict (`success=True`, `returncode=0`, `notice_code`
+`no_suites_detected`, empty `failures`) when the resolved command set is empty
+(SA-0MWNZLB07007S8QU, code half of `CUR-0MWIBGLIL00774EU`). So a greenfield
+checkout — e.g. a freshly initialised repo whose only content is `.githooks` —
+exits 0 and passes the dev-push gate with no `TEST_SCOPE_SKIP=1` bypass, and
+repos with one or more suites are unaffected (the guard is the empty-set path
+only). Previously the loop never bound `state_changed_flag`, so the post-loop
+read raised `UnboundLocalError` and the gate crashed instead of passing. The
+audit skill still treats such a repo as execution-impossible — fail-open
+partial, never blocks (F4 AC2).
 
 ### 1.1. Hidden project-local skill tests (SA-0MVQJSGLY0098DVB)
 

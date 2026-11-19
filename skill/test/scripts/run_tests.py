@@ -270,6 +270,15 @@ NOTICE_UNPARSED_FAILURE = "unparsed_failure"
 #: after an accepted retry. The discarded records also live on the structured
 #: ``discarded_failures`` field of the suite result.
 NOTICE_RETRY_DISCARDED = "retry_discarded_failures"
+#: Zero detected suites (SA-0MWNZLB07007S8QU): the resolved command set is
+#: empty — a greenfield checkout with no pytest configuration, no node package
+#: ``test`` script, no node suite dirs and no ``.pi/test-config.json``. Nothing
+#: could fail, so the suite reports a clean verdict with this code rather than
+#: executing an empty command set (which used to raise ``UnboundLocalError`` on
+#: ``state_changed_flag``). It is a PASS with an explanation — never a crash and
+#: never an infrastructure failure — so callers can distinguish "no suites to
+#: run" from "the suites ran and passed" without parsing prose.
+NOTICE_NO_SUITES_DETECTED = "no_suites_detected"
 
 #: Prefix of the no-free-slot notice produced by :func:`_test_concurrency_slot`.
 #: Exposed as a stable constant so a consumer handling a legacy result that
@@ -3204,12 +3213,42 @@ def run_suite(
         result.update(overrides)
         return result
 
+    # Zero detected suites (SA-0MWNZLB07007S8QU): return the defined no-suites
+    # verdict BEFORE the execution loop. A repo with nothing to detect (no
+    # pytest config, no node test script, no ``.pi/test-config.json``) has no
+    # command that could fail, so the run is green with an explicit
+    # ``no_suites_detected`` notice instead of a crash. Without this guard the
+    # loop body never executes and the post-loop read of
+    # ``state_changed_flag`` — bound only inside the loop — raised
+    # ``UnboundLocalError``, which broke the dev-push gate for every greenfield
+    # repository (CUR-0MWIBGLIL00774EU).
+    if not commands:
+        return _result(
+            success=True,
+            returncode=0,
+            command="",
+            cached=False,
+            notice=(
+                f"no test suites detected for suite '{name}' — nothing to run "
+                "(no pytest config, no node test script, no "
+                ".pi/test-config.json)"
+            ),
+            notice_code=NOTICE_NO_SUITES_DETECTED,
+        )
+
+    # Bound before the loop so the post-loop read below is defined even when a
+    # future path skips execution entirely (belt-and-braces for the zero-suite
+    # guard above — SA-0MWNZLB07007S8QU).
+    state_changed_flag: dict[str, Any] | None = None
+
     for cmd in commands:
         command_waits: list[float] = []
         command_elapsed: list[float] = []
         # Set when run_cached reports the guarded checkout moved while this
-        # command executed (SA-0MW3FF18I003KGZE).
-        state_changed_flag: dict[str, Any] | None = None
+        # command executed (SA-0MW3FF18I003KGZE). Reset per command; the
+        # pre-loop binding (SA-0MWNZLB07007S8QU) keeps the post-loop read
+        # defined when no command runs at all.
+        state_changed_flag = None
 
         def _record_wait(
             _queued_at: float,
