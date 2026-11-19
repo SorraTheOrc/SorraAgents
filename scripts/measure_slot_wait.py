@@ -712,13 +712,17 @@ def render_table(report: dict) -> str:
 def render_summary(report: dict) -> str:
     """One-paragraph corpus + verdict summary."""
     lines = [
-        f"window: {report['window_start']} .. {report['window_end']} "
-        f"(since post-fix {report['post_fix_commit']})",
-        f"corpus: root={report['sessions_root']} "
-        f"files_scanned={report['files_scanned']} "
-        f"files_with_samples={report['files_with_samples']} "
-        f"records_in_window={report['records_in_window']} "
-        f"samples={report['total_samples']}",
+        (
+            f"window: {report['window_start']} .. {report['window_end']} "
+            f"(since post-fix {report['post_fix_commit']})"
+        ),
+        (
+            f"corpus: root={report['sessions_root']} "
+            f"files_scanned={report['files_scanned']} "
+            f"files_with_samples={report['files_with_samples']} "
+            f"records_in_window={report['records_in_window']} "
+            f"samples={report['total_samples']}"
+        ),
     ]
     for check in report["checks"]:
         passed = check["passed"]
