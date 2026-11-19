@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MWMBFMVO0074V30
+# smell: simplification
+# severity: medium
+# description: Use a single `with` statement with multiple contexts instead of nested `with` statements
+# -->
 """The ``implement.py cleanup <id>`` action (SA-0MVTHIZE0007EAKZ).
 
 A plain leaf session that defers worktree removal (``finish --keep-worktree``

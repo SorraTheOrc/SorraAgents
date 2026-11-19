@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# <!-- REFACTOR-SA-0MWMBFHYN005STJV
+# smell: formatting
+# severity: low
+# description: Shebang is present but file is not executable
+# -->
 """Post-fix slot-wait re-measurement over the pi session-log corpus.
 
 Read-only companion to :mod:`measure_audit_performance`, built for

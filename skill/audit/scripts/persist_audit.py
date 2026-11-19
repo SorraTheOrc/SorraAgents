@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# <!-- REFACTOR-SA-0MWMBFKK8000CT58
+# smell: formatting
+# severity: low
+# description: Shebang is present but file is not executable
+# -->
 # <!-- REFACTOR-SA-0MWDKRD8G008Z164
 # smell: unknown
 # severity: low
