@@ -834,6 +834,13 @@ class TestChildPersistFailureFatal:
                     "Repository index (top-level layout):\n- src/ (42 files)"
                 ),
             ),
+            # The scope guards are out of scope for these child-persist tests:
+            # a Phase 1 scope error is now FATAL (SA-0MWO59IMN000RUHM) and would
+            # abort before the child is ever audited, hiding the behaviour under
+            # test. An empty touched set keeps both guards fail-open.
+            mock.patch.object(
+                audit_runner, "_resolve_touched_files", return_value=[]
+            ),
             mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_pi
             ),

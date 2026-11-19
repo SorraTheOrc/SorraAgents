@@ -908,7 +908,15 @@ pi/model call) the runner verifies:
    manifest must reference the item repository's files; a manifest built
    from the audit skill's own tree (or lacking the item repo) aborts with
    `Error: Audit scope error:` and a non-zero exit instead of emitting
-   misleading "unmet" verdicts.
+   misleading "unmet" verdicts. The manifest is validated against the root
+   it was **built** from — the per-audit target root, i.e. the code root
+   when `--code-root` is set — never the worklog owner
+   (`_scope_validation_root`, SA-0MWO59IMN000RUHM). The Phase 1 scope error
+   is **fatal**: `_phase1_parent_screening` raises `AuditScopeError`, so the
+   run exits non-zero, persists **no** report, and restores the pre-audit
+   status/stage. Before this, Phase 1 printed the error and continued,
+   persisting a `Ready to close: No` report whose acceptance-criteria table
+   was empty.
 4. **Child persistence** — a child audit that cannot be persisted
    (`wl audit-set` rc!=0, e.g. "Work item not found") aborts the run with a
    non-zero exit; `PERSIST_CONTENT_INVALID` (fallback notice persisted)
@@ -931,11 +939,11 @@ every AC `unmet`/`partial`.
 content from the worklog by supplying an explicit **code-repository root**:
 
 - **Scoped by the option** — the Phase 1 merge gate, the file-scope manifest
-  (changed files + repo index), the audited HEAD attestation, `--green-run`
-  evidence, the code-quality scan and the Phase 2 cwd all resolve against
-  `DIR`. Internally the value becomes `per_audit_root` (`git_root`), is
-  wrapped into the runner via `git -C <DIR>`, and is published as
-  `_AuditContext.per_audit_project_root` so every residual consumer follows
+  (changed files + repo index) **and its validation root**, the audited HEAD
+  attestation, `--green-run` evidence, the code-quality scan and the Phase 2
+  cwd all resolve against `DIR`. Internally the value becomes `per_audit_root`
+  (`git_root`), is wrapped into the runner via `git -C <DIR>`, and is published
+  as `_AuditContext.per_audit_project_root` so every residual consumer follows
   it.
 - **Default — owning project.** With neither the flag nor the env var the
   behaviour is today's: the worklog-derived owning root (or a worktree of

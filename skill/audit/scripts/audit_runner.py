@@ -1922,6 +1922,27 @@ def _audit_target_root(project_root: Path | None = None) -> Path:
     return project_root or _ACTIVE_AUDIT_ROOT or TARGET_PROJECT_ROOT
 
 
+def _scope_validation_root(owning_root: Path | None) -> Path | None:
+    """Root a FILE SCOPE manifest is validated against.
+
+    The manifest is *built* from the per-audit target root — the code root
+    when ``--code-root`` / ``AUDIT_CODE_ROOT`` is set (LP-0MVZ6R5H8007NYLR) —
+    so validation must use the same root (SA-0MWO59IMN000RUHM). Validating
+    against the worklog owning root made every genuine cross-repo audit abort
+    with an ``Audit scope error`` and persist an AC-less report, because a
+    manifest built from the code repository can never contain the worklog
+    project's distinctive top-level entries.
+
+    Returns the published per-audit root during a run; outside a run
+    (``_ACTIVE_AUDIT_ROOT`` unset) it returns *owning_root* unchanged so a
+    same-repo audit — and every direct/unit caller — behaves exactly as
+    before.
+    """
+    if _ACTIVE_AUDIT_ROOT is not None:
+        return Path(_ACTIVE_AUDIT_ROOT)
+    return owning_root
+
+
 # ------------------------------------------------------------------
 # Abort-recovery helpers (SA-0MTRH8C5O005URGR).
 # ------------------------------------------------------------------
@@ -11117,7 +11138,9 @@ def _run_phase2_deep_analysis(
     *owning_root* is the project root that owns the audited item (resolved
     from the worklog owner by the launch-context resolution); when omitted it
     is re-resolved from the
-    issue id. The FILE SCOPE manifest is validated against it and an
+    issue id. The FILE SCOPE manifest is validated against the root it was
+    built from — the per-audit root, i.e. the code root when ``--code-root``
+    is set (``_scope_validation_root``, SA-0MWO59IMN000RUHM) — and an
     ``AuditScopeError`` is raised when the manifest lacks the item repo
     (LP-0MSQ32HNR007AI6B) — the caller aborts instead of emitting 'unmet'
     verdicts from a wrong scope.
@@ -11228,7 +11251,8 @@ def _run_phase2_deep_analysis(
             runner, issue.get("id", ""), work_item=issue,
         )
         scope_error = _validate_file_scope_manifest(
-            file_scope, owning_root, touched_files=touched_files,
+            file_scope, _scope_validation_root(owning_root),
+            touched_files=touched_files,
         )
         if scope_error:
             raise AuditScopeError(scope_error)
@@ -15330,9 +15354,13 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     Fills ctx.ac_results with one verdict entry per AC; falls back to
     'partial' diagnostics on unparseable/provider-error output (with
     infra-failure provenance set on ctx.ac_fallback_used).
+
+    A FILE SCOPE manifest that does not cover the item repository raises
+    ``AuditScopeError`` — fatal for the run (no report is persisted and the
+    pre-audit lifecycle is restored), never a printed warning that continues
+    into an AC-less verdict (SA-0MWO59IMN000RUHM).
     """
     issue_id = ctx.issue_id
-    json_mode = ctx.json_mode
     runner = ctx.runner
     pi_bin = ctx.pi_bin
     phase1_model = ctx.resolved_phase1_model
@@ -15381,14 +15409,16 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             runner, work_item.get("id", ""), work_item=work_item,
         )
         scope_error = _validate_file_scope_manifest(
-            file_scope, owning_root, touched_files=touched_files,
+            file_scope, _scope_validation_root(owning_root),
+            touched_files=touched_files,
         )
         if scope_error:
-            if json_mode:
-                print(json.dumps({"error": scope_error}, indent=2))
-            else:
-                print(f"Error: {scope_error}", file=sys.stderr)
-            return 1
+            # Fatal, never a printed warning (AC4 of SA-0MWO59IMN000RUHM):
+            # ``cmd_issue`` catches AuditScopeError, exits non-zero and
+            # persists no report (the finally block restores the pre-audit
+            # lifecycle). Returning here used to continue into child
+            # screening/Phase 2 and persist a report whose AC table was empty.
+            raise AuditScopeError(scope_error)
         prompt = (
             f"[READ-ONLY AUDIT] You are performing a read-only audit. "
             f"Do NOT close, modify, create, or delete any work items. "
