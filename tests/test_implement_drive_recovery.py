@@ -3088,3 +3088,156 @@ class TestDriveTermination:
         assert harness.spawner.calls == []
         assert "tests: tests_failed" in report["message"]
         assert "exceeded its iteration bound" not in report["message"]
+
+
+# ---------------------------------------------------------------------------
+# Spawn-failure provider classification (F1, SA-0MWLDZ8ZN0030T15)
+# ---------------------------------------------------------------------------
+
+#: The exact headless reason shape ``_default_session_spawner`` emits for a
+#: non-zero child exit: the provider text arrives inside the 5-line tail.
+HEADLESS_PROVIDER_REASON = (
+    'Child session for SA-C1 exited with code 1: Error: No models match '
+    'pattern "MunitoAI/*"'
+)
+
+#: The pane flavours — both embed the same provider text after the colon.
+PANE_START_PROVIDER_REASON = (
+    'Failed to start the pane agent for SA-C1: agent start failed: '
+    'Error: No models match pattern "MunitoAI/*"'
+)
+PANE_INCOMPLETE_PROVIDER_REASON = (
+    'Pane agent for SA-C1 did not complete: Error: No models match pattern '
+    '"MunitoAI/*"'
+)
+
+
+class TestSpawnFailureClassifier:
+    """Pin the spawn-failure classifier's vocabulary and fail-safe (F1).
+
+    The drive loop may only ever spend its infrastructure-retry budget on a
+    genuine provider/model-resolution failure, so the classifier is driven by
+    an explicit allow-list (:data:`SPAWN_INFRA_REASONS`) and everything
+    unrecognised — including ``None``/``""`` — is ``unknown`` (never retried).
+    These tests land before F2 consumes the classifier.
+    """
+
+    @staticmethod
+    def _classify(reason):
+        return _production_implement_mod().classify_spawn_failure(reason)
+
+    def test_headless_exit_with_model_resolution_failure_is_infrastructure(
+        self,
+    ):
+        """AC1 (headless flavour): a child exiting on ``No models match
+        pattern "MunitoAI/*"`` classifies as infrastructure, names the
+        provider, and carries a remedy that names the concrete action."""
+        result = self._classify(HEADLESS_PROVIDER_REASON)
+
+        assert result["kind"] == "infrastructure"
+        assert result["provider"] == "MunitoAI"
+        # The classifier never rewrites the spawner's reason.
+        assert result["reason"] == HEADLESS_PROVIDER_REASON
+        assert "enabledModels" in result["remedy"]
+
+    @pytest.mark.parametrize(
+        "reason",
+        [PANE_START_PROVIDER_REASON, PANE_INCOMPLETE_PROVIDER_REASON],
+        ids=["pane-start", "pane-incomplete"],
+    )
+    def test_pane_flavours_carrying_provider_text_are_infrastructure(
+        self, reason,
+    ):
+        """AC1 (pane flavours): both pane reasons carrying the provider text
+        classify as infrastructure and name the same provider."""
+        result = self._classify(reason)
+
+        assert result["kind"] == "infrastructure"
+        assert result["provider"] == "MunitoAI"
+        assert "enabledModels" in result["remedy"]
+
+    def test_missing_api_key_is_infrastructure_with_api_key_remedy(self):
+        """AC1/AC4: the other provider-resolution failure — a missing
+        credential — is infrastructure and the remedy names the concrete
+        credential action."""
+        result = self._classify("No API key found for MunitoAI.")
+
+        assert result["kind"] == "infrastructure"
+        assert result["provider"] == "MunitoAI"
+        assert "API key" in result["remedy"]
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            # A Python traceback tail: a real defect, never retried.
+            (
+                "Child session for SA-C1 exited with code 1: Traceback "
+                "(most recent call last):\n  File \"x.py\", line 3\n"
+                "AssertionError"
+            ),
+            # An arbitrary message carrying no allow-listed fragment.
+            "Child session for SA-C1 exited with code 1: something went wrong",
+            # The "ambiguous pattern" diagnostic is a config ambiguity, not a
+            # retryable provider failure (retrying cannot disambiguate it).
+            (
+                'Pattern "sonnet" matches several providers: A, B. Use '
+                "provider/id to choose one."
+            ),
+            "",
+            None,
+        ],
+        ids=["traceback", "arbitrary", "ambiguous-pattern", "empty", "none"],
+    )
+    def test_unclassified_reasons_are_unknown(self, reason):
+        """AC3 (fail-safe): anything outside the allow-list is ``unknown`` —
+        never ``infrastructure`` — so a real defect still hard-stops."""
+        result = self._classify(reason)
+
+        assert result["kind"] == "unknown"
+        assert result["kind"] != "infrastructure"
+        assert result["provider"] is None
+        assert result["remedy"] == ""
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            # Headless timeout (no provider text).
+            "Child session for SA-C1 timed out after 1800s.",
+            # Pane timeout whose embedded herdr reason carries provider text:
+            # the timeout keeps its own reconciliation semantics.
+            (
+                "Pane agent for SA-C1 timed out after 1800s: Error: No "
+                'models match pattern "MunitoAI/*"'
+            ),
+        ],
+        ids=["headless-timeout", "pane-timeout-with-provider-text"],
+    )
+    def test_timeout_is_never_reclassified_as_infrastructure(self, reason):
+        """AC3: a ``timed out`` reason is not provider-infrastructure — the
+        timeout path keeps its own reconciliation semantics."""
+        result = self._classify(reason)
+
+        assert result["kind"] == "unknown"
+        assert result["provider"] is None
+
+    def test_classifier_is_allow_list_driven(self):
+        """AC1: the vocabulary is an explicit table — every allow-listed
+        fragment classifies as infrastructure when present in a reason, so a
+        new vocabulary entry is a data change, never prose sniffing."""
+        mod = _production_implement_mod()
+        fragments = [entry[0] for entry in mod.SPAWN_INFRA_REASONS]
+
+        assert fragments, "SPAWN_INFRA_REASONS must not be empty"
+        for fragment in fragments:
+            result = mod.classify_spawn_failure(
+                f"Child session for SA-C1 exited with code 1: {fragment} …"
+            )
+            assert result["kind"] == "infrastructure", fragment
+            assert result["remedy"], fragment
+
+    def test_result_shape_is_stable(self):
+        """AC1: the helper returns exactly ``{kind, reason, provider,
+        remedy}`` so F2 can consume it without re-deriving anything."""
+        result = self._classify(HEADLESS_PROVIDER_REASON)
+
+        assert set(result) == {"kind", "reason", "provider", "remedy"}

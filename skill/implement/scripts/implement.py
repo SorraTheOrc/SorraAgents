@@ -8520,6 +8520,136 @@ def classify_finish_failure(
     }
 
 
+#: The two failure kinds :func:`classify_spawn_failure` can return. A spawn
+#: failure is either a retryable provider/model-resolution failure or
+#: ``unknown`` — there is deliberately no ``gate`` kind, because a child
+#: session that never ran has not executed the child's finish gate
+#: (SA-0MWLDZ8ZN0030T15).
+SPAWN_FAILURE_KINDS: tuple[str, ...] = (
+    "infrastructure",
+    "unknown",
+)
+
+#: Allow-list of provider/model-resolution **fragments** (matched
+#: case-insensitively as a substring of the spawner's ``reason``) paired with
+#: the concrete remedy an operator must apply. Mirrors
+#: :data:`FINISH_INFRA_REFUSALS`: an unlisted reason is ``unknown`` and is
+#: never retried, so a genuine defect still hard-stops the drive chain
+#: (SA-0MWLDZ8ZN0030T15).
+#:
+#: The fragments are the messages Pi emits when a configured model cannot be
+#: served: ``resolveModelScopeFromModels`` reports
+#: ``No models match pattern "<pattern>"`` and the credential path reports
+#: ``No API key found for <provider>``. The pattern/credential text arrives
+#: inside the spawner reason because ``_default_session_spawner`` embeds the
+#: child's stderr tail and the pane spawner embeds the herdr reason.
+SPAWN_INFRA_REASONS: tuple[tuple[str, str], ...] = (
+    (
+        "No models match pattern",
+        (
+            "Remove the unservable model pattern from `enabledModels` in "
+            "the child's models.json (or add an entry that serves it via a "
+            "reachable provider), then re-run `implement.py drive` — "
+            "retrying cannot fix an unservable pattern."
+        ),
+    ),
+    (
+        "No API key found for",
+        (
+            "Provide the missing API key for the provider (`pi login` for "
+            "it, or set its API-key environment variable), then re-run "
+            "`implement.py drive`."
+        ),
+    ),
+)
+
+#: The provider name embedded in a recognised fragment. Group 1 captures the
+#: pattern/display name; the helper reduces a ``provider/model`` pattern to
+#: its provider half.
+SPAWN_INFRA_PROVIDER_PATTERNS: tuple[str, ...] = (
+    r'No models match pattern\s+"?([^"\s]+)"?',
+    r"No API key found for\s+([^.\s]+)",
+)
+
+
+def _spawn_failure_provider(reason: str) -> str | None:
+    """Extract the provider named by a recognised spawn-failure reason.
+
+    Only called once a :data:`SPAWN_INFRA_REASONS` fragment has matched, so a
+    ``None`` return means the fragment carried no extractable provider — the
+    caller reports the failure without a provider rather than inventing one.
+
+    Args:
+        reason: The spawner's failure reason.
+
+    Returns:
+        The provider name (``"MunitoAI"`` for ``"MunitoAI/*"``), or ``None``
+        when the reason names no provider.
+    """
+    for pattern in SPAWN_INFRA_PROVIDER_PATTERNS:
+        match = re.search(pattern, reason, re.IGNORECASE)
+        if not match:
+            continue
+        captured = match.group(1).strip().strip("\"'")
+        # A ``provider/model`` pattern names the provider before the slash;
+        # a bare model id is surfaced as-is (best effort, never invented).
+        return captured.split("/", 1)[0] or captured
+    return None
+
+
+def classify_spawn_failure(reason: Any) -> dict[str, Any]:
+    """Classify a failed *child spawn* into a failure kind.
+
+    The spawn-side counterpart of :func:`classify_finish_failure`
+    (SA-0MWLDZ8ZN0030T15). A driven child session can die at startup because
+    the configured model cannot be served (``No models match pattern
+    "MunitoAI/*"``, ``No API key found for …``); that is a transient
+    provider/model-resolution failure the drive loop may retry on its
+    infrastructure budget, whereas any other spawn failure is a genuine
+    defect that must hard-stop the chain.
+
+    Resolution rules:
+
+    * a reason containing ``timed out`` is ``unknown`` — the timeout path
+      keeps its own reconciliation semantics and is never reclassified as
+      provider-infrastructure, even when herdr echoes provider text into the
+      timeout message;
+    * ``kind == "infrastructure"`` only for an explicit
+      :data:`SPAWN_INFRA_REASONS` fragment hit (case-insensitive substring);
+    * anything else — including ``None``, ``""``, a traceback tail and any
+      arbitrary message — is ``kind == "unknown"`` (fail-safe: ``unknown`` is
+      never ``infrastructure``, so drive can never retry a real defect).
+
+    Args:
+        reason: The spawner's ``reason`` string (any type; non-strings and
+            ``None`` fail safe to ``unknown``).
+
+    Returns:
+        ``{"kind", "reason", "provider", "remedy"}`` where ``reason`` is the
+        caller's reason unchanged (so F2 can surface it verbatim), and
+        ``provider``/``remedy`` are ``None``/``""`` for an ``unknown``
+        classification.
+    """
+    raw = "" if reason is None else str(reason)
+    result: dict[str, Any] = {
+        "kind": "unknown",
+        "reason": raw,
+        "provider": None,
+        "remedy": "",
+    }
+    if not raw.strip() or "timed out" in raw.lower():
+        return result
+    for fragment, remedy in SPAWN_INFRA_REASONS:
+        if fragment.lower() in raw.lower():
+            return {
+                "kind": "infrastructure",
+                "reason": raw,
+                "provider": _spawn_failure_provider(raw),
+                "remedy": remedy,
+            }
+    return result
+
+
 def _fast_forward_local_dev_for_push(
     repo_root: str,
     commit_hash: str,
