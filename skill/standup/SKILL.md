@@ -41,6 +41,9 @@ python3 $(skill_path standup)/scripts/generate_standup.py [--json] [--count N] [
 
 Default time window: **24 hours starting at 06:00 the previous day** (yesterday 06:00 → today 06:00). Override with `--startTime` and/or `--duration`.
 
+The opt-in `STANDUP_PODCAST` env flag is not a CLI flag; it is documented in
+[Podcast publication](#podcast-publication-post-step).
+
 ### Sync-first
 
 Before its first `wl next` / `wl list` fetch, the script runs `wl sync` (via the
@@ -78,6 +81,61 @@ pushes the current branch so standup history is versioned automatically.
 > The machine-local `standups/` entry in `.git/info/exclude` was a stopgap and
 > has been removed (SA-0MUDYRHVZ005PQP4) — an ignored path would make `git add`
 > silently skip the file and the commit a silent no-op.
+
+### Podcast publication (post-step)
+
+When the script writes and commits a report, it can also publish that day's
+podcast episode by invoking ContentCreator's per-project standup→podcast
+pipeline. The post-step is **opt-in and off by default**.
+
+Enable it with the `STANDUP_PODCAST` environment flag:
+
+```bash
+STANDUP_PODCAST=1 python3 $(skill_path standup)/scripts/generate_standup.py
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `STANDUP_PODCAST` | unset (off) | `1` enables the post-step; any other value (including `0`) leaves it dormant |
+| `STANDUP_PODCAST_SCRIPT` | `scripts/standup-podcast.sh` in a sibling `ContentCreator` checkout | Override the path to ContentCreator's entry point |
+
+**When it fires.** Only after a report file has been written *and* committed.
+It never fires for `--no-sync`, `--no-commit`, or `--json`-to-stdout runs, which
+are the offline/deterministic and fetch-data paths.
+
+**What it invokes.** ContentCreator's entry point with the CLI-flags contract:
+
+```bash
+# resolved from the ContentCreator checkout, not this skill's directory
+cd "${CONTENT_CREATOR_ROOT:-$HOME/projects/ContentCreator}"
+bash scripts/standup-podcast.sh \
+    --project <slug> --project-name <Project> \
+    --report <project_root>/standups/YYYY_MM_DD.md
+```
+
+The project slug is auto-detected from `resolve_project_name()` (the same
+helper as the report heading, honouring `--worklog-dir` / `WL_WORKLOG_DIR`) and
+slugified; `ContextHub` → `contexthub` → the series
+`contexthub-standups` at `/podcast/contexthub-standups/feed.xml`.
+
+**Outcome.** The entry point prints `standup-podcast-result: <outcome>` and
+uses stable exit codes (0 = produced / already up to date / no report;
+non-zero = failure). The post-step maps them to
+`published` / `up-to-date` / `failed`.
+
+**Never fatal.** Every failure mode is a warning to stderr and never changes
+the standup's exit code or the report just written:
+
+- a missing ContentCreator checkout (or a missing entry point) is a graceful
+  skip — the hook looks for `scripts/standup-podcast.sh` in a sibling
+  `ContentCreator` checkout (next to the project root);
+- a non-zero exit (usage error, review failure, TTS failure) is a warning;
+- an already-produced date reports `up-to-date` and is an idempotent no-op, so
+  re-running never duplicates an episode.
+
+The ContentCreator contract lives in item WL-0MWHZ71FZ002N431 (entry point) and
+WL-0MWHZ60XD00455C7 (parameterised CLI); the hook is built contract-first and
+degrades to a warning if that contract is unavailable.
 
 ## Report Rendering
 
@@ -169,6 +227,20 @@ your clustered rendering is the versioned report, write it to that same dated
 path and commit only that file (`git add -- <path>`, `git commit -m
 "chore(standup): add standup report YYYY_MM_DD" -- <path>`, then push unless on
 `main`/`master`). `--json` to stdout writes no file and performs no commit.
+
+Because your rendering — not the script — writes the file, the automatic
+podcast post-step does **not** fire on this path. When `STANDUP_PODCAST=1` is
+set, publish explicitly after committing the clustered report:
+
+```bash
+cd "${CONTENT_CREATOR_ROOT:-$HOME/projects/ContentCreator}"
+bash scripts/standup-podcast.sh \
+    --project <slug> --project-name <Project> --report <path you just committed>
+```
+
+This mirrors what the script's own post-step does; it is non-fatal and
+idempotent in the same way (see
+[Podcast publication](#podcast-publication-post-step)).
 
 The project name in the header is resolved by the shared
 `skill.shared.project_name.resolve_project_name()` helper: it reads
