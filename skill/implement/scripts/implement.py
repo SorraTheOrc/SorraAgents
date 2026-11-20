@@ -16981,6 +16981,103 @@ def _release_orphaned_child_claim(child_id: str) -> dict[str, Any]:
     return result
 
 
+def _release_provider_failed_child(
+    child_id: str, spawn_classification: dict[str, Any],
+) -> dict[str, Any]:
+    """Release a child whose session never started because the model could
+    not be resolved.
+
+    When the infra-retry budget is exhausted for a
+    :func:`classify_spawn_failure`-classified ``infrastructure`` failure, the
+    child has never produced work — it was never able to start. This is
+    different from the timeout/signal path where the session ran and may have
+    produced work: here there is nothing to finish or finalise, so the child
+    is written ``status: open`` with an empty assignee so the next sweep or
+    ``drive`` can reclaim it without manual cleanup (AC1).
+
+    A comment names the provider and model, states that the session never
+    started, and gives the actionable remedy (AC3). The write uses
+    :class:`StatusLifecycle` for durability (AC5) and is idempotent: running
+    it on an already-``open`` child is a no-op that emits no duplicate comment
+    (AC5).
+
+    ``needsProducerReview`` is never set by this helper; the only persistent
+    hold remains that flag (per the assignee-release invariant).
+
+    Args:
+        child_id: The child work item whose claim to release.
+        spawn_classification: The :func:`classify_spawn_failure` payload
+            (must have ``kind == "infrastructure"``).
+
+    Returns:
+        ``{"released": bool, "status": str, "previous_status": str,
+        "previous_assignee": str, "reason": str}``. ``released`` is
+        ``False`` when there was nothing to release or the release write
+        failed.
+    """
+    result: dict[str, Any] = {
+        "released": False,
+        "status": "",
+        "previous_status": "",
+        "previous_assignee": "",
+        "reason": "",
+    }
+    child = wl_show(child_id)
+    if not child:
+        result["reason"] = "could not re-fetch the child work item"
+        return result
+
+    status = str(child.get("status", "") or "")
+    assignee = str(child.get("assignee", "") or "")
+    result["previous_status"] = status
+    result["previous_assignee"] = assignee
+    result["status"] = status
+
+    # Terminal children are never touched.
+    if status in ("completed", "in_review", "done", "deleted"):
+        result["reason"] = (
+            f"child is already terminal (status={status!r}); "
+            "no release needed"
+        )
+        return result
+
+    # Already released — idempotent no-op.
+    if status == "open" and not assignee:
+        result["released"] = True
+        result["reason"] = "child already open with no assignee; no-op"
+        return result
+
+    # Clear assignee and move to open.
+    try:
+        StatusLifecycle.update_status(child_id, "open", assignee="")
+    except (RuntimeError, ValueError) as exc:
+        result["reason"] = f"release write failed: {exc}"
+        return result
+
+    result["released"] = True
+    result["reason"] = (
+        "child released to open: the session never started because the "
+        "configured model could not be resolved; the item is reclaimable "
+        "on the next drive or sweep"
+    )
+
+    # Post a diagnostic comment naming the provider/model and the remedy.
+    remedy = spawn_classification.get("remedy", "")
+    description = _describe_spawn_failure(spawn_classification)
+    wl_add_comment(
+        child_id,
+        f"Drive released this child to ``open``: the session never started "
+        f"({description}) and the infra-retry budget is exhausted. "
+        f"Remedy: {remedy}",
+    )
+    LOG.info(
+        "Released provider-failed child %s to open "
+        "(was status=%s, assignee=%r)",
+        child_id, status, assignee,
+    )
+    return result
+
+
 def _reconcile_finish_failure(
     child_id: str,
     parent_report: dict[str, Any],
@@ -19901,23 +19998,32 @@ def phase_drive(
                         ),
                     )
 
-            # Not terminal: the hard failure stands. The killed session could
-            # not release the claim it held (a timeout kill is a SIGKILL, so
-            # no exit hook runs), so the surviving driver releases it with a
-            # durable write before any further diagnosis: an in-progress
-            # child would otherwise stay on a scheduling hold and be
-            # invisible to ``wl next`` (SA-0MVVF75ZA007XNKB). This also lets
-            # the evidence-gated finaliser below run — it refuses a child
-            # still carrying someone's assignee. The release never masks the
-            # failure: the chain still stops with ``failed_child``.
-            claim_release = _release_orphaned_child_claim(child_id)
-            entry["claim_release"] = claim_release
-            report["claim_release"] = claim_release
-            if claim_release.get("released"):
+            # Not terminal: the hard failure stands. Release the child's
+            # claim so the item is reclaimable.
+            #
+            # Provider-failed children (``infrastructure`` classification)
+            # never started, so there is nothing to finish or finalise: the
+            # child is written ``open`` with an empty assignee (SA-0MWLDZFL4006I9YY).
+            # Timeout/signal kills (``unknown`` classification) may have
+            # produced work, so the timeout path leaves ``in-progress`` with
+            # the assignee cleared — ``finish`` / ``drive --finalise-stranded``
+            # recovery still applies (SA-0MVVF75ZA007XNKB).
+            if spawn_classification["kind"] == "infrastructure":
+                release = _release_provider_failed_child(
+                    child_id, spawn_classification,
+                )
+                entry["child_release"] = release
+                report["child_release"] = release
+            else:
+                release = _release_orphaned_child_claim(child_id)
+                entry["claim_release"] = release
+                report["claim_release"] = release
+            # The release never masks the failure: the chain still stops
+            # with ``failed_child``.
+            if release.get("released"):
                 LOG.info(
-                    "Released the orphaned claim on %s after its child "
-                    "session failed: %s",
-                    child_id, claim_release["reason"],
+                    "Released the child %s after its session failed: %s",
+                    child_id, release["reason"],
                 )
 
             # Before stopping the chain, check whether the child is

@@ -3525,3 +3525,196 @@ class TestSpawnInfraRetry:
         assert not any(
             e.get("result") == "infra-retry" for e in report["children_driven"]
         )
+
+
+# ---------------------------------------------------------------------------
+# F3: the exhausted provider-failure path releases the child to `open`
+# (SA-0MWLDZFL4006I9YY)
+# ---------------------------------------------------------------------------
+
+
+class TestProviderFailedChildRelease:
+    """A child whose session never started is released to ``open``.
+
+    The timeout/signal path deliberately keeps ``in-progress`` with the
+    assignee cleared (a killed session may have produced work that ``finish``
+    / ``--finalise-stranded`` can recover). A provider failure is different:
+    the session never started, so the child is written ``open`` and is
+    immediately reclaimable by the next sweep or ``drive``
+    (SA-0MWLDZFL4006I9YY).
+    """
+
+    _RELEASE_PHRASE = "released this child to ``open``"
+
+    def _harness(
+        self, drive_harness, *, reports, spawn_results, child_state,
+    ):
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent(reports),
+            spawn_results=spawn_results,
+            child_states={"SA-C1": child_state},
+            worktree_path="/wt/SA-C1",
+        )
+        # Never touch the real store from the spawn-failure evidence path.
+        harness.patch(
+            "record_spawn_failure",
+            side_effect=lambda *args, **kwargs: None,
+        )
+        return harness
+
+    def _claimed_child(self) -> dict:
+        return _child("SA-C1", status="in-progress", assignee="Map")
+
+    def _release_comments(self, harness) -> list[str]:
+        return [
+            text for wid, text in harness.comments
+            if wid == "SA-C1" and self._RELEASE_PHRASE in text
+        ]
+
+    def _status_updates_for(self, harness, child_id: str = "SA-C1") -> list[dict]:
+        return [
+            update for update in harness.status_updates
+            if update.get("id") == child_id
+        ]
+
+    def test_exhausted_provider_failure_releases_child_to_open(
+        self, drive_harness,
+    ):
+        """AC1/AC6: an exhausted provider failure writes the child ``open``
+        with an empty assignee and records the release in the report."""
+        harness = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1") for _ in range(6)],
+            spawn_results=[_provider_failure("SA-C1") for _ in range(6)],
+            child_state=self._claimed_child(),
+        )
+
+        report = harness.run(infra_retry_limit=5, delay=lambda _s: None)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+
+        release = report.get("child_release")
+        assert release is not None, report
+        assert release["released"] is True
+        assert release["previous_status"] == "in-progress"
+        assert release["previous_assignee"] == "Map"
+        # The entry carries the same release outcome (AC6).
+        entry = report["children_driven"][-1]
+        assert entry.get("child_release") == release
+        assert "claim_release" not in entry
+
+        # The durable write moves the item to `open` with no assignee.
+        updates = self._status_updates_for(harness)
+        assert updates[-1]["status"] == "open"
+        assert updates[-1]["assignee"] == ""
+        # Every earlier (retry) write kept the child claimed in-progress.
+        assert all(
+            update["status"] == "in-progress"
+            for update in updates[:-1]
+        )
+
+    def test_provider_failed_comment_names_provider_model_and_remedy(
+        self, drive_harness,
+    ):
+        """AC3: the release comment names provider/model, says the session
+        never started, and gives the actionable remedy."""
+        harness = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1") for _ in range(6)],
+            spawn_results=[_provider_failure("SA-C1") for _ in range(6)],
+            child_state=self._claimed_child(),
+        )
+
+        harness.run(infra_retry_limit=5, delay=lambda _s: None)
+
+        comments = self._release_comments(harness)
+        assert len(comments) == 1, harness.comments
+        text = comments[0]
+        assert "MunitoAI" in text
+        assert "MunitoAI/*" in text
+        assert "never started" in text
+        # The actionable remedy, not the bare Pi error.
+        assert "enabledModels" in text
+
+    def test_no_release_before_budget_is_exhausted(self, drive_harness):
+        """AC2: between retry attempts the child stays ``in-progress`` (a
+        sweep cannot reclaim it mid-retry); only the exhausted attempt moves
+        it to ``open``."""
+        harness = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1") for _ in range(6)],
+            spawn_results=[_provider_failure("SA-C1") for _ in range(6)],
+            child_state=self._claimed_child(),
+        )
+
+        report = harness.run(infra_retry_limit=2, delay=lambda _s: None)
+
+        retries = [
+            e for e in report["children_driven"]
+            if e.get("result") == "infra-retry"
+        ]
+        assert len(retries) == 2
+        for entry in retries:
+            # No retry entry marks the child as released-to-open mid-retry.
+            assert "child_release" not in entry
+
+        # The child is re-claimed in-progress on each retry; only the
+        # exhausted attempt moves it to `open`. No sweep can reclaim it
+        # between attempts because it never leaves `in-progress`.
+        updates = self._status_updates_for(harness)
+        retry_updates = [
+            update for update in updates if update["status"] == "in-progress"
+        ]
+        assert len(retry_updates) == 2
+        assert updates[-1]["status"] == "open"
+        assert updates[-1]["assignee"] == ""
+
+    def test_timeout_path_still_keeps_in_progress(self, drive_harness):
+        """AC4: a timed-out (``unknown``) spawn failure still uses the
+        timeout release — assignee cleared, status left ``in-progress``."""
+        harness = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1")],
+            spawn_results=[
+                {
+                    "success": False,
+                    "returncode": None,
+                    "reason": (
+                        "Child session for SA-C1 timed out after 1800s."
+                    ),
+                },
+            ],
+            child_state=self._claimed_child(),
+        )
+
+        report = harness.run(infra_retry_limit=5, delay=lambda _s: None)
+
+        entry = report["children_driven"][-1]
+        assert entry["claim_release"]["released"] is True
+        assert "child_release" not in entry
+        updates = self._status_updates_for(harness)
+        assert updates[-1]["status"] == "in-progress"
+        assert updates[-1]["assignee"] == ""
+        assert self._release_comments(harness) == []
+
+    def test_release_is_idempotent_on_already_open_child(self, drive_harness):
+        """AC5: releasing an already-``open`` child is a no-op — no write, no
+        duplicate comment."""
+        harness = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1") for _ in range(2)],
+            spawn_results=[_provider_failure("SA-C1") for _ in range(2)],
+            child_state=_child("SA-C1", status="open", assignee=""),
+        )
+
+        report = harness.run(infra_retry_limit=1, delay=lambda _s: None)
+
+        release = report.get("child_release")
+        assert release is not None, report
+        assert release["released"] is True
+        assert "no-op" in release["reason"]
+        # No write touched the already-open child and no comment was posted.
+        assert self._status_updates_for(harness) == []
+        assert self._release_comments(harness) == []
