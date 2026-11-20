@@ -42,14 +42,6 @@ if str(_SKILLS_ROOT) not in sys.path:
 
 _MODULE_NAME = "generate_standup_post_step"
 
-# Test-first: the hook itself lands in SA-0MWJJQEU80008MW0. ``strict=True``
-# makes the suite fail (XPASS) once it does, which is the signal to drop this
-# marker in the implementation child.
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    reason="pending post-step hook implementation SA-0MWJJQEU80008MW0",
-)
-
 #: The hook's public surface — absent until the implementation child lands.
 _HOOK_API = ("PODCAST_OPT_IN_ENV", "podcast_hook_enabled", "publish_podcast_episode")
 
@@ -91,6 +83,14 @@ def _project(tmp_path: Path, name: str = "ContextHub") -> Path:
     worklog.mkdir(parents=True)
     (worklog / "config.yaml").write_text(f"projectName: {name}\nprefix: X\n", encoding="utf-8")
     return root
+
+
+def _contentcreator_stub(root: Path) -> Path:
+    """Create the sibling ContentCreator entry point the hook looks for."""
+    script = root.parent / "ContentCreator" / "scripts" / "standup-podcast.sh"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    return script
 
 
 def _run_main(mod, argv, tmp_path):
@@ -197,6 +197,7 @@ class TestInvocationContract:
         report = root / "standups" / "2026_11_13.md"
         report.parent.mkdir(parents=True)
         report.write_text("# Standup Report\n", encoding="utf-8")
+        _contentcreator_stub(root)
         captured: list[list[str]] = []
 
         def runner(cmd):
@@ -224,6 +225,7 @@ class TestInvocationContract:
         report = root / "standups" / "2026_11_13.md"
         report.parent.mkdir(parents=True)
         report.write_text("# Standup Report\n", encoding="utf-8")
+        _contentcreator_stub(root)
 
         mod = _reload_standup()
         try:
@@ -252,10 +254,7 @@ class TestInvocationContract:
 
     def test_nonzero_exit_is_recorded_and_never_raises(self, tmp_path):
         root = _project(tmp_path)
-        (root.parent / "ContentCreator" / "scripts").mkdir(parents=True)
-        (root.parent / "ContentCreator" / "scripts" / "standup-podcast.sh").write_text(
-            "#!/usr/bin/env bash\nexit 1\n", encoding="utf-8"
-        )
+        _contentcreator_stub(root)
         report = root / "standups" / "2026_11_13.md"
         report.parent.mkdir(parents=True)
         report.write_text("# Standup Report\n", encoding="utf-8")
@@ -269,10 +268,7 @@ class TestInvocationContract:
 
     def test_runner_exception_is_swallowed(self, tmp_path):
         root = _project(tmp_path)
-        (root.parent / "ContentCreator" / "scripts").mkdir(parents=True)
-        (root.parent / "ContentCreator" / "scripts" / "standup-podcast.sh").write_text(
-            "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
-        )
+        _contentcreator_stub(root)
         report = root / "standups" / "2026_11_13.md"
         report.parent.mkdir(parents=True)
         report.write_text("# Standup Report\n", encoding="utf-8")
