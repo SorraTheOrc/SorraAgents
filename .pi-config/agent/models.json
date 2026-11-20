@@ -10,9 +10,7 @@
       "models": [
         { "id": "plan" },
         { "id": "code" },
-        { "id": "author" },
-        { "id": "qwen3" },
-        { "id": "gpt120" }
+        { "id": "author" }
       ]
     },
     "deepseek": {
@@ -23,11 +21,11 @@
         {
           "id": "deepseek-v4-pro",
           "name": "DeepSeek V4 Pro",
-          "contextWindow": 1000000,
-          "maxTokens": 384000,
+          "contextWindow": 1048576,
+          "maxTokens": 393216,
           "input": ["text"],
           "reasoning": true,
-          "thinkingLevelMap": { "minimal": null, "low": null, "medium": null, "high": "high", "xhigh": "max" },
+          "thinkingLevelMap": { "minimal": null, "low": "low", "medium": null, "high": "high", "max": "max" },
           "cost": {
             "input": 1.74,
             "output": 3.48,
@@ -36,24 +34,17 @@
           },
           "compat": {
             "requiresReasoningContentOnAssistantMessages": true,
-            "thinkingFormat": "deepseek",
-            "reasoningEffortMap": {
-              "minimal": "high",
-              "low": "high",
-              "medium": "high",
-              "high": "high",
-              "xhigh": "max"
-            }
+            "thinkingFormat": "deepseek"
           }
         },
         {
-          "id": "deepseek-v4-flash",
+          "id": "deepseek-flash",
           "name": "DeepSeek V4 Flash",
-          "contextWindow": 1000000,
-          "maxTokens": 384000,
-          "input": ["text"],
+          "contextWindow": 1048576,
+          "maxTokens": 393216,
+          "input": ["text", "image"],
           "reasoning": true,
-          "thinkingLevelMap": { "minimal": null, "low": null, "medium": null, "high": "high", "xhigh": "max" },
+          "thinkingLevelMap": { "minimal": null, "low": "low", "medium": null, "high": "high", "max": "max" },
           "cost": {
             "input": 0.14,
             "output": 0.28,
@@ -62,14 +53,7 @@
           },
           "compat": {
             "requiresReasoningContentOnAssistantMessages": true,
-            "thinkingFormat": "deepseek",
-            "reasoningEffortMap": {
-              "minimal": "high",
-              "low": "high",
-              "medium": "high",
-              "high": "high",
-              "xhigh": "max"
-            }
+            "thinkingFormat": "deepseek"
           }
         }
       ]
@@ -86,14 +70,6 @@
     },
     "opencode-go": {
       "modelOverrides": {
-        "qwen3.6-plus": {
-          "thinkingLevelMap": { "off": null, "high": "high", "max": "max" },
-          "compat": { "thinkingFormat": "qwen" }
-        },
-        "qwen3.7-max": {
-          "thinkingLevelMap": { "off": null, "high": "high", "max": "max" },
-          "compat": { "thinkingFormat": "qwen" }
-        },
         "qwen3.7-plus": {
           "thinkingLevelMap": { "off": null, "high": "high", "max": "max" },
           "compat": { "thinkingFormat": "qwen" }

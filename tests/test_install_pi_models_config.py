@@ -11,7 +11,10 @@ that skipped any machine which already had a ``models.json``):
 - local-only providers/settings are preserved;
 - a second run is idempotent (no duplicated providers/models);
 - malformed destination JSON is warned about and left byte-for-byte intact;
-- the new models are reachable through the installed ``enabledModels``.
+- retired model ids and the unservable ``MunitoAI/*`` glob are pruned from a
+  pre-existing destination while the explicit named MunitoAI entry survives
+  (SA-0MWL5AL4B004X0FN);
+- the tracked patterns are installed and local patterns preserved.
 
 Related work item: SA-0MW6S4NAQ001MAM1 (parent SA-0MW0GL4590046BTK).
 """
@@ -87,7 +90,8 @@ def test_fresh_install_installs_tracked_munitoai_provider(sandbox_home: Path) ->
     assert models["providers"]["MunitoAI"] == TRACKED_MODELS["providers"]["MunitoAI"]
 
     settings = _load(_dest(sandbox_home) / "settings.json")
-    assert "MunitoAI/*" in settings["enabledModels"]
+    # The unservable glob is no longer tracked, so a fresh install omits it.
+    assert "MunitoAI/*" not in settings["enabledModels"]
     assert "deepseek/deepseek*" in settings["enabledModels"]
 
 
@@ -130,7 +134,7 @@ def test_preexisting_drifted_models_gains_munitoai(sandbox_home: Path) -> None:
     assert settings["theme"] == "light"
     assert settings["someLocalKey"] == {"nested": True}
     assert "my/local/*" in settings["enabledModels"]
-    assert "MunitoAI/*" in settings["enabledModels"]
+    assert "MunitoAI/*" not in settings["enabledModels"]
 
 
 def test_idempotent_rerun_creates_no_duplicates(sandbox_home: Path) -> None:
@@ -160,7 +164,7 @@ def test_idempotent_rerun_creates_no_duplicates(sandbox_home: Path) -> None:
     settings = _load(dest / "settings.json")
     enabled = settings["enabledModels"]
     assert len(enabled) == len(set(enabled)), "duplicate enabledModels after re-run"
-    assert enabled.count("MunitoAI/*") == 1
+    assert enabled.count("MunitoAI/*") == 0
     # Only one backup was written (the first modification).
     assert len(list(dest.glob("models.json.bak.*"))) == 1
 
@@ -184,15 +188,95 @@ def test_malformed_destination_json_is_warned_and_left_intact(
     assert not list(dest.glob("models.json.bak.*"))
 
 
-def test_installed_models_reachable_via_enabled_patterns(sandbox_home: Path) -> None:
+def test_preexisting_munitoai_glob_is_pruned_but_named_entry_retained(
+    sandbox_home: Path,
+) -> None:
+    """AC 10/AC 9: an already-installed glob is pruned; the named id survives."""
+    dest = _dest(sandbox_home)
+    dest.mkdir(parents=True)
+    (dest / "settings.json").write_text(
+        json.dumps(
+            {
+                "enabledModels": [
+                    "Local Proxy/plan",
+                    "MunitoAI/deepseek-ai/deepseek-v4-flash",
+                    "MunitoAI/*",
+                    "deepseek/deepseek*",
+                ],
+                "theme": "dark",
+            }
+        ),
+        encoding="utf-8",
+    )
+
     result = _run_install(sandbox_home)
     assert result.returncode == 0, result.stderr
 
-    models = _load(_dest(sandbox_home) / "models.json")
-    settings = _load(_dest(sandbox_home) / "settings.json")
+    settings = _load(dest / "settings.json")
     enabled = settings["enabledModels"]
+    # The wildcard is gone, even though it was present before the merge.
+    assert "MunitoAI/*" not in enabled
+    # The explicit named entry is retained unchanged, and local keys kept.
+    assert "MunitoAI/deepseek-ai/deepseek-v4-flash" in enabled
+    assert settings["theme"] == "dark"
 
-    # Both paid DeepSeek ids are present and covered by the MunitoAI/* pattern.
-    present_ids = [m["id"] for m in models["providers"]["MunitoAI"]["models"]]
-    assert present_ids == MUNITOAI_MODEL_IDS
-    assert "MunitoAI/*" in enabled
+
+def test_preexisting_retired_model_ids_are_pruned(sandbox_home: Path) -> None:
+    """AC 7: ids retired in the tracked config are pruned from a live file."""
+    dest = _dest(sandbox_home)
+    dest.mkdir(parents=True)
+    (dest / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "Local Proxy": {
+                        "api": "openai-completions",
+                        "baseUrl": "http://192.168.0.199:8000/v1",
+                        "apiKey": "not_needed",
+                        "models": [
+                            {"id": "plan"},
+                            {"id": "qwen3"},
+                            {"id": "gpt120"},
+                            {"id": "local-keep"},
+                        ],
+                    },
+                    "deepseek": {
+                        "models": [
+                            {"id": "deepseek-v4-flash"},
+                            {"id": "local-only-deepseek"},
+                        ]
+                    },
+                    "opencode-go": {
+                        "modelOverrides": {
+                            "qwen3.6-plus": {},
+                            "qwen3.7-max": {},
+                            "qwen3.7-plus": {},
+                            "local-override": {},
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_install(sandbox_home)
+    assert result.returncode == 0, result.stderr
+
+    models = _load(dest / "models.json")["providers"]
+    local_ids = [m["id"] for m in models["Local Proxy"]["models"]]
+    assert "qwen3" not in local_ids
+    assert "gpt120" not in local_ids
+    # Served and local-only ids survive.
+    assert "plan" in local_ids
+    assert "local-keep" in local_ids
+
+    deepseek_ids = [m["id"] for m in models["deepseek"]["models"]]
+    assert "deepseek-v4-flash" not in deepseek_ids
+    assert "deepseek-flash" in deepseek_ids
+    assert "local-only-deepseek" in deepseek_ids
+
+    overrides = models["opencode-go"]["modelOverrides"]
+    assert "qwen3.6-plus" not in overrides
+    assert "qwen3.7-max" not in overrides
+    assert "local-override" in overrides

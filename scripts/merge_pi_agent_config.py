@@ -30,6 +30,15 @@ Behaviour contract
   model, ``modelOverrides`` entry and top-level key is preserved verbatim.
 * **``enabledModels`` union.** Tracked patterns are appended to the
   destination list, preserving local patterns and de-duplicating.
+* **Retired-id prune.** When the tracked directory carries a
+  ``retired-models.json`` (``retiredModels`` maps provider -> retired model
+  ids; ``retiredEnabledModels`` is a list of retired patterns), those ids are
+  removed from the destination: a retired model ``id`` is dropped from the
+  provider's ``models`` list **and** from its ``modelOverrides`` keys, and a
+  retired pattern is dropped from ``enabledModels``. Only listed ids/patterns
+  are removed — every unlisted local-only provider, model, override and
+  pattern is still preserved verbatim — and the prunes are reported in the
+  merge summary.
 * **Idempotent.** A second run is semantically a no-op: no duplicated models,
   no lost local entries, and no second backup.
 * **Single timestamped backup** (``<file>.bak.<UTC stamp>``) is written before
@@ -65,6 +74,9 @@ from pathlib import Path
 from typing import Any
 
 BACKUP_FORMAT = "%Y%m%dT%H%M%SZ"
+
+# Tracked source of truth for ids/patterns pruned from the destination.
+RETIRED_FILENAME = "retired-models.json"
 
 # Report status values returned by the file-level merge functions.
 STATUS_OK = "ok"
@@ -153,6 +165,93 @@ def _merge_provider(dest_provider: Any, tracked_provider: Any) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Retired-id pruning
+# ---------------------------------------------------------------------------
+
+
+def prune_retired_models(
+    providers: Any, retired: Any
+) -> tuple[dict, dict[str, list[str]]]:
+    """Remove retired model ids from a provider map.
+
+    ``retired`` maps provider name -> iterable of retired model ids. For each
+    named provider a retired id is dropped both from the ``models`` list (by
+    ``id``) and from the ``modelOverrides`` map (by key). Only listed ids are
+    removed; every unlisted local-only model and override is preserved.
+
+    Returns ``(providers, pruned)`` where ``pruned`` maps the provider name to
+    a sorted list of the ids that were actually removed (omitted when nothing
+    was pruned). Neither input is mutated.
+    """
+    merged: dict = copy.deepcopy(providers) if isinstance(providers, dict) else {}
+    pruned: dict[str, list[str]] = {}
+    if not isinstance(retired, dict):
+        return merged, pruned
+
+    for provider_name, retired_ids in retired.items():
+        provider = merged.get(provider_name)
+        if not isinstance(provider, dict):
+            continue
+        ids = set(retired_ids or [])
+        if not ids:
+            continue
+        removed: set[str] = set()
+
+        models = provider.get("models")
+        if isinstance(models, list):
+            kept = []
+            for model in models:
+                model_id = model.get("id") if isinstance(model, dict) else None
+                if model_id is not None and model_id in ids:
+                    removed.add(model_id)
+                else:
+                    kept.append(model)
+            if len(kept) != len(models):
+                provider["models"] = kept
+
+        overrides = provider.get("modelOverrides")
+        if isinstance(overrides, dict):
+            for override_id in list(overrides.keys()):
+                if override_id in ids:
+                    overrides.pop(override_id)
+                    removed.add(override_id)
+
+        if removed:
+            pruned[provider_name] = sorted(removed)
+    return merged, pruned
+
+
+def prune_retired_enabled_models(
+    patterns: Any, retired: Any
+) -> tuple[list, list[str]]:
+    """Drop retired patterns from an ``enabledModels`` list.
+
+    Returns ``(patterns, pruned)`` where ``pruned`` is the sorted list of
+    patterns actually removed. Only listed patterns are removed; local-only
+    patterns survive. Neither input is mutated.
+    """
+    retired_set = set(retired or [])
+    merged: list = list(patterns or [])
+    if not retired_set:
+        return merged, []
+    pruned = sorted({p for p in merged if p in retired_set})
+    merged = [p for p in merged if p not in retired_set]
+    return merged, pruned
+
+
+def load_retired(tracked_dir: Path) -> dict:
+    """Load ``retired-models.json`` from ``tracked_dir`` (empty when absent)."""
+    path = Path(tracked_dir) / RETIRED_FILENAME
+    if not path.exists():
+        return {}
+    try:
+        data = _load_json(path)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# ---------------------------------------------------------------------------
 # Document-level merges
 # ---------------------------------------------------------------------------
 
@@ -200,13 +299,19 @@ def merge_enabled_models(
 
 
 def merge_models_document(
-    tracked_doc: Any, dest_doc: Any
+    tracked_doc: Any, dest_doc: Any, retired: Any = None
 ) -> tuple[dict, dict]:
-    """Merge a tracked ``models.json`` document into a destination document."""
+    """Merge a tracked ``models.json`` document into a destination document.
+
+    ``retired`` is the optional ``retiredModels`` map (provider -> retired ids)
+    applied after the tracked merge so previously-installed stale ids are
+    pruned from the destination.
+    """
     merged: dict = copy.deepcopy(dest_doc) if isinstance(dest_doc, dict) else {}
     merged_providers, summary = merge_providers(
         (tracked_doc or {}).get("providers", {}), merged.get("providers", {})
     )
+    merged_providers, pruned = prune_retired_models(merged_providers, retired)
     merged["providers"] = merged_providers
     # Preserve any other tracked top-level keys, without dropping local ones.
     for key, value in (tracked_doc or {}).items():
@@ -214,24 +319,27 @@ def merge_models_document(
             continue
         if key not in merged:
             merged[key] = copy.deepcopy(value)
-    return merged, {"providers": summary}
+    return merged, {"providers": summary, "pruned": pruned}
 
 
 def merge_settings_document(
-    tracked_doc: Any, dest_doc: Any
+    tracked_doc: Any, dest_doc: Any, retired: Any = None
 ) -> tuple[dict, dict]:
     """Merge a tracked ``settings.json`` document into a destination document.
 
     Only ``enabledModels`` is unioned; every other local key is preserved
     (tracked keys are only filled in when the destination lacks them), so an
-    operator's theme/defaults are never clobbered.
+    operator's theme/defaults are never clobbered. ``retired`` is the optional
+    list of retired ``enabledModels`` patterns pruned after the union.
     """
     merged: dict = copy.deepcopy(dest_doc) if isinstance(dest_doc, dict) else {}
     added: list[str] = []
+    pruned: list[str] = []
     if "enabledModels" in (tracked_doc or {}):
         merged_enabled, added = merge_enabled_models(
             tracked_doc["enabledModels"], merged.get("enabledModels", [])
         )
+        merged_enabled, pruned = prune_retired_enabled_models(merged_enabled, retired)
         merged["enabledModels"] = merged_enabled
     for key, value in (tracked_doc or {}).items():
         if key == "enabledModels":
@@ -240,6 +348,7 @@ def merge_settings_document(
             merged[key] = copy.deepcopy(value)
     return merged, {
         "added": added,
+        "pruned": pruned,
         "enabledModels": merged.get("enabledModels", []),
     }
 
@@ -299,25 +408,38 @@ def _load_json(path: Path) -> Any:
 
 
 def merge_models_file(
-    tracked_path: Path, dest_path: Path, *, backup_stamp: str | None = None
+    tracked_path: Path,
+    dest_path: Path,
+    *,
+    backup_stamp: str | None = None,
+    retired: Any = None,
 ) -> dict:
     """Merge tracked ``models.json`` into ``dest_path``.
 
     A missing destination is installed whole from the tracked file (status
     ``copied``). Unparseable destination JSON is reported as ``invalid_json``
-    and left untouched (fail-open). Returns a report dictionary.
+    and left untouched (fail-open). ``retired`` is the optional retiredModels
+    map applied after the merge (see :func:`prune_retired_models`). Returns a
+    report dictionary.
     """
     tracked_path = Path(tracked_path)
     dest_path = Path(dest_path)
 
     if not dest_path.exists():
         tracked_doc = _load_json(tracked_path)
+        providers, pruned = prune_retired_models(
+            tracked_doc.get("providers", {}), retired
+        )
+        if pruned:
+            tracked_doc = copy.deepcopy(tracked_doc)
+            tracked_doc["providers"] = providers
         write_json_atomic(dest_path, tracked_doc)
         return {
             "status": STATUS_COPIED,
             "changed": True,
             "backup": None,
             "providers": {name: "added" for name in tracked_doc.get("providers", {})},
+            "pruned": pruned,
         }
 
     try:
@@ -328,16 +450,18 @@ def merge_models_file(
             "changed": False,
             "backup": None,
             "providers": {},
+            "pruned": {},
         }
 
     tracked_doc = _load_json(tracked_path)
-    merged, report = merge_models_document(tracked_doc, dest_doc)
+    merged, report = merge_models_document(tracked_doc, dest_doc, retired)
     if merged == dest_doc:
         return {
             "status": STATUS_UNCHANGED,
             "changed": False,
             "backup": None,
             "providers": {name: "present" for name in report["providers"]},
+            "pruned": {},
         }
 
     backup = _write_backup(dest_path, backup_stamp)
@@ -347,24 +471,41 @@ def merge_models_file(
         "changed": True,
         "backup": str(backup),
         "providers": report["providers"],
+        "pruned": report.get("pruned", {}),
     }
 
 
 def merge_settings_file(
-    tracked_path: Path, dest_path: Path, *, backup_stamp: str | None = None
+    tracked_path: Path,
+    dest_path: Path,
+    *,
+    backup_stamp: str | None = None,
+    retired: Any = None,
 ) -> dict:
-    """Merge tracked ``settings.json`` into ``dest_path`` (``enabledModels`` union)."""
+    """Merge tracked ``settings.json`` into ``dest_path`` (``enabledModels`` union).
+
+    ``retired`` is the optional list of retired ``enabledModels`` patterns
+    pruned after the union.
+    """
     tracked_path = Path(tracked_path)
     dest_path = Path(dest_path)
 
     if not dest_path.exists():
         tracked_doc = _load_json(tracked_path)
+        if "enabledModels" in tracked_doc and retired:
+            pruned_patterns, pruned = prune_retired_enabled_models(
+                tracked_doc["enabledModels"], retired
+            )
+            if pruned:
+                tracked_doc = copy.deepcopy(tracked_doc)
+                tracked_doc["enabledModels"] = pruned_patterns
         write_json_atomic(dest_path, tracked_doc)
         return {
             "status": STATUS_COPIED,
             "changed": True,
             "backup": None,
             "added": list(tracked_doc.get("enabledModels", [])),
+            "pruned": [],
         }
 
     try:
@@ -375,16 +516,18 @@ def merge_settings_file(
             "changed": False,
             "backup": None,
             "added": [],
+            "pruned": [],
         }
 
     tracked_doc = _load_json(tracked_path)
-    merged, report = merge_settings_document(tracked_doc, dest_doc)
+    merged, report = merge_settings_document(tracked_doc, dest_doc, retired)
     if merged == dest_doc:
         return {
             "status": STATUS_UNCHANGED,
             "changed": False,
             "backup": None,
             "added": [],
+            "pruned": [],
         }
 
     backup = _write_backup(dest_path, backup_stamp)
@@ -394,25 +537,33 @@ def merge_settings_file(
         "changed": True,
         "backup": str(backup),
         "added": report["added"],
+        "pruned": report.get("pruned", []),
     }
 
 
 def merge_agent_config(
     tracked_dir: Path, dest_dir: Path, *, backup_stamp: str | None = None
 ) -> dict:
-    """Merge both ``models.json`` and ``settings.json`` from tracked to dest."""
+    """Merge both ``models.json`` and ``settings.json`` from tracked to dest.
+
+    ``retired-models.json`` in ``tracked_dir`` (when present) drives the prune
+    of stale model ids and ``enabledModels`` patterns from the destination.
+    """
     tracked_dir = Path(tracked_dir)
     dest_dir = Path(dest_dir)
     stamp = backup_stamp or _backup_stamp()
+    retired = load_retired(tracked_dir)
     models = merge_models_file(
         tracked_dir / "models.json",
         dest_dir / "models.json",
         backup_stamp=stamp,
+        retired=retired.get("retiredModels", {}),
     )
     settings = merge_settings_file(
         tracked_dir / "settings.json",
         dest_dir / "settings.json",
         backup_stamp=stamp,
+        retired=retired.get("retiredEnabledModels", []),
     )
     return {"models": models, "settings": settings}
 
@@ -431,12 +582,17 @@ def _print_models_report(report: dict) -> None:
             print(f"    Updated provider: {name}")
         else:
             print(f"    OK: already present provider: {name}")
+    for name, ids in report.get("pruned", {}).items():
+        for model_id in ids:
+            print(f"    Pruned retired model: {name}/{model_id}")
 
 
 def _print_settings_report(report: dict) -> None:
     print(f"  settings.json: {report['status']}")
     for pattern in report.get("added", []):
         print(f"    Added enabledModels: {pattern}")
+    for pattern in report.get("pruned", []):
+        print(f"    Pruned retired enabledModels: {pattern}")
     if report["status"] == "unchanged":
         print("    OK: already present enabledModels")
 
