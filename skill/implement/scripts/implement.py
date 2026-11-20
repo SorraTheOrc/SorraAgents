@@ -5678,6 +5678,16 @@ def _route_post_push_failure_to_triage(
         "commit_hash": commit_hash,
         "parent_work_item_id": work_item_id,
     }
+    # A verification that observed a moving checkout is a mixed-tree verdict:
+    # forward the explicit signal so the triage helper suppresses it instead
+    # of minting a phantom critical item (WL-0MVSPZ1FH000RWET AC3). The
+    # read-only verification normally never observes movement; this keeps the
+    # contract correct if a verdict ever carries one.
+    state_changed = verification.get("state_changed_during_run")
+    if state_changed:
+        payload["state_changed_during_run"] = state_changed
+    if verification.get("notice_code"):
+        payload["notice_code"] = verification["notice_code"]
     helper = _SKILLS_ROOT / "triage" / "scripts" / "check_or_create.py"
     if not helper.exists():
         LOG.warning(

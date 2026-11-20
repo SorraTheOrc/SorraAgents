@@ -164,7 +164,12 @@ from test.scripts.run_tests import (
     resolve_type_commands,
     suite_timeout_per_command,
 )
-from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
+from test_cache import (
+    DEFAULT_TTL_SECONDS,
+    mirror_cache_entries,
+    query_cached,
+    run_cached,
+)
 
 #: Audit-specific acceptance window for GREEN cached full-suite runs.
 #: The generic ``DEFAULT_TTL_SECONDS`` (2h) is kept for suite runs elsewhere;
@@ -4937,6 +4942,7 @@ def _run_tests_via_test_skill(
     key_files: Sequence[str] | None = None,
     baseline_commit: str | None = None,
     baseline_runner: Callable[..., dict[int, tuple[str, str]]] | None = None,
+    mirror_to: str | Path | None = None,
 ) -> dict:
     """Execute the full project test suite via the test skill's runner.
 
@@ -4955,6 +4961,13 @@ def _run_tests_via_test_skill(
     work item for the failing test (as a child of *parent_work_item_id* when
     provided). A triage helper failure is recorded but never crashes the run.
 
+    *mirror_to* (optional) names the checkout whose cache should receive the
+    entries this run writes — normally the main checkout when *cwd* is the
+    isolated F3 execution worktree (WL-0MVSPZ1FH000RWET). The execution
+    worktree is deleted after the run, so without the graft a subsequent
+    read-only audit would re-execute a suite whose verdict it already holds.
+    The graft is fail-soft and never overwrites an existing entry.
+
     Returns a dict:
       success   — True iff every suite command was executed and exited 0
                   with no parsed failures
@@ -4962,6 +4975,8 @@ def _run_tests_via_test_skill(
       failures  — structured failure records (test_name, stdout_excerpt,
                   stack_trace, suite_command)
       triaged   — triage helper results per failure
+      suppressed_phantoms — mixed-tree verdicts that were NOT triaged, each
+                  with the notice code and the suppression reason
       notice    — error string when the suite could not be executed at all
     """
     project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
@@ -4986,6 +5001,10 @@ def _run_tests_via_test_skill(
     #: nothing is parsed from it and NOTHING is triaged — a moved checkout must
     #: never mint a critical ``test-failure`` item. The run still fails.
     state_changed: list[dict] = []
+    #: Mixed-tree verdicts explicitly recorded as suppressed rather than merely
+    #: skipped, so the suppression reason is visible in the run report
+    #: (WL-0MVSPZ1FH000RWET AC3).
+    suppressed_phantoms: list[dict] = []
     notice = ""
     for command in full_suite_commands(project_root):
         try:
@@ -5020,6 +5039,14 @@ def _run_tests_via_test_skill(
         if movement:
             # Quarantine: no failure records, no triage, and the run is red.
             state_changed.append({**movement, "suite_command": command})
+            suppressed_phantoms.append({
+                "notice_code": movement.get(
+                    "notice_code", "state_changed_during_run"
+                ),
+                "suite_command": command,
+                "reason": movement.get("message")
+                or "checkout moved mid-run; the mixed-tree verdict was not triaged",
+            })
             print(
                 "notice: [state_changed_during_run] "
                 f"checkout {movement.get('checkout')} changed while the suite "
@@ -5135,9 +5162,21 @@ def _run_tests_via_test_skill(
         f"Test skill run completed: success={success} commands={len(results)} "
         f"failures={len(failures)} triaged={len(triaged)} "
         f"state_changed={len(state_changed)} "
+        f"suppressed_phantoms={len(suppressed_phantoms)} "
         f"notice={notice or 'none'}",
         file=sys.stderr,
     )
+    # Graft the entries this run wrote into the caller's cache before the
+    # isolated worktree (and its <git-dir>/test-cache) is removed
+    # (WL-0MVSPZ1FH000RWET). Fail-soft: cache plumbing never changes a verdict.
+    if mirror_to is not None:
+        try:
+            mirror_cache_entries(project_root, mirror_to)
+        except Exception as exc:  # noqa: BLE001 -- graft is best-effort
+            print(
+                f"notice: cache graft skipped ({exc})",
+                file=sys.stderr,
+            )
     return {
         "success": success,
         "results": results,
@@ -5152,6 +5191,8 @@ def _run_tests_via_test_skill(
         # The flagged commands (SA-0MW3FF18I003KGZE AC4) so the audit report
         # can name the checkout movement and the required re-run.
         "state_changed_during_run": state_changed,
+        # Mixed-tree verdicts suppressed from triage (WL-0MVSPZ1FH000RWET AC3).
+        "suppressed_phantoms": suppressed_phantoms,
         "notice": notice,
     }
 
@@ -13257,6 +13298,10 @@ def _phase_gate(ctx: _AuditContext, code_root: str | None = None) -> int | None:
                     touched_files=f3_touched,
                     key_files=f3_key,
                     baseline_commit=_resolve_baseline_commit(runner),
+                    # Graft the fresh entries into the main checkout's cache
+                    # before the execution worktree is removed
+                    # (WL-0MVSPZ1FH000RWET).
+                    mirror_to=per_audit_root,
                 )
                 if test_run.get("red_evaluation") is not None:
                     ctx.test_failure_evaluation = test_run["red_evaluation"]
@@ -13324,6 +13369,10 @@ def _phase_gate(ctx: _AuditContext, code_root: str | None = None) -> int | None:
                     touched_files=cached_touched,
                     key_files=_extract_key_files(ctx.description or ""),
                     baseline_commit=_resolve_baseline_commit(runner),
+                    # Graft the fresh entries into the main checkout's cache
+                    # before the execution worktree is removed
+                    # (WL-0MVSPZ1FH000RWET).
+                    mirror_to=per_audit_root,
                 )
                 if test_run.get("red_evaluation") is not None:
                     ctx.test_failure_evaluation = test_run["red_evaluation"]

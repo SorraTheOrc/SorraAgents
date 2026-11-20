@@ -1319,6 +1319,90 @@ def query_cached(
 
 
 # ---------------------------------------------------------------------------
+# Cache grafting (isolated-worktree run -> main checkout)
+# ---------------------------------------------------------------------------
+
+
+def mirror_cache_entries(
+    source: str | Path, destination: str | Path
+) -> list[str]:
+    """Graft *source*'s cache entries into *destination*'s cache.
+
+    An isolated full-suite run (the audit skill's F3 execution worktree) is a
+    linked worktree with no ``.worklog`` of its own, so :func:`cache_dir`
+    stores its entries under ``<git-dir>/test-cache`` — and ``git worktree
+    remove`` deletes that directory with the worktree. Read-only consumers
+    (subsequent audits and post-push verification) query the **main
+    checkout's** ``.worklog/cache``, so without a graft every audit re-executes
+    a suite whose verdict it already holds (WL-0MVSPZ1FH000RWET).
+
+    Mirrors the dev-push hook's ``mirror_suite_cache`` semantics: cache keys
+    are content-addressed (command + git state), so copying an entry the
+    destination lacks is always safe, and an entry that already exists is
+    **never overwritten** (a fresher/identical entry must not be replaced by
+    a copy). Fail-soft by design — cache plumbing must never fail the run:
+    every per-entry I/O error is logged and skipped, and the caller's verdict
+    is unaffected.
+
+    Args:
+        source: A checkout whose cache directory should be copied **from**
+            (normally the isolated execution worktree).
+        destination: A checkout whose cache directory should be copied
+            **into** (normally the main checkout).
+
+    Returns:
+        The entry directory names that were copied (empty when the source has
+        no cache, the two roots resolve to the same cache, or every entry was
+        already present).
+    """
+    try:
+        source_dir = cache_dir(source)
+        destination_dir = cache_dir(destination)
+    except (OSError, RuntimeError) as exc:  # pragma: no cover - defensive
+        LOG.warning("test cache: cannot resolve cache directories (%s)", exc)
+        return []
+    if source_dir.resolve() == destination_dir.resolve():
+        return []
+    if not source_dir.is_dir():
+        return []
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        LOG.warning(
+            "test cache: cannot create the destination cache %s (%s)",
+            destination_dir,
+            exc,
+        )
+        return []
+    import shutil
+
+    mirrored: list[str] = []
+    for entry in sorted(source_dir.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        target = destination_dir / entry.name
+        if target.exists():
+            # Never overwrite an existing entry: the key is content-addressed,
+            # so the destination's copy describes the same state.
+            continue
+        try:
+            shutil.copytree(entry, target)
+            mirrored.append(entry.name)
+        except OSError as exc:
+            LOG.warning("test cache: could not mirror %s (%s)", entry, exc)
+            shutil.rmtree(target, ignore_errors=True)
+    if mirrored:
+        LOG.info(
+            "test cache: grafted %d entr%s from %s into %s",
+            len(mirrored),
+            "y" if len(mirrored) == 1 else "ies",
+            source_dir,
+            destination_dir,
+        )
+    return mirrored
+
+
+# ---------------------------------------------------------------------------
 # Summary extraction
 # ---------------------------------------------------------------------------
 
@@ -1358,6 +1442,7 @@ __all__ = [
     "compute_git_state",
     "compute_tree_state",
     "lookup",
+    "mirror_cache_entries",
     "normalize_test_command",
     "query_cached",
     "run_cached",

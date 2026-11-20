@@ -4505,6 +4505,20 @@ parent itself gets no worktree.
     successful push and auto-file a spurious
     `[test-failure] post-push full-suite verification` item.
 
+  - **No moving-checkout execution (WL-0MVSPZ1FH000RWET).** Verification is
+    purely read-only: the verdict comes from the per-repo cache, so a sibling
+    `finish` fast-forwarding the main checkout's `dev` mid-run can never swap
+    files under a suite and produce phantom failures. Whenever a full suite
+    *does* execute — the audit skill's F3 cache-miss auto-execution — it runs
+    in a fresh **detached** worktree pinned at `origin/dev`
+    (`_create_execution_worktree` → `ctx.execution_root`), not in the audited
+    main checkout, and its entries are grafted into the main checkout's
+    `.worklog/cache` (`mirror_cache_entries`, never overwriting an existing
+    entry). A run that observes its checkout move mid-execution is quarantined
+    (`state_changed_during_run`, exit `75`) and is never triaged into a
+    `test-failure` item. See
+    [worktree isolation — the mid-run fast-forward race](worktree-isolation.md#the-mid-run-fast-forward-race-full-suite-verification).
+
   - **If `finish` refused on the verification**, generate the evidence through
     the test skill and re-run `finish` (idempotent — the no-diff path
     converges):

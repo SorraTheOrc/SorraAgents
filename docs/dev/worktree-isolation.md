@@ -489,6 +489,64 @@ are documented in the
 and its
 [verified sync / ancestry assertion section](implement-skill-reference.md#verified-reversible-local-dev-sync-and-post-push-ancestry-assertion-sa-0mvpzg7a0000n66u).
 
+### The mid-run fast-forward race (full-suite verification)
+
+`implement.py finish` fast-forwards the **main checkout's** local `dev` to the
+finished commit (`git merge --ff-only`). A full-suite run whose *working
+directory* is the main checkout reads source files lazily while it executes,
+so a sibling finish's fast-forward can swap those files **mid-run**: the suite
+starts at commit X, reads some files at commit Y, and reports failures that
+exist in neither tree — a **mixed-tree phantom** (WL-0MVSPZ1FH000RWET, found
+while verifying WL-0MVSLXT79008D4X6).
+
+The evidence (WL-0MVSLXT79008D4X6): the canonical suite reported 4 failures in
+`tests/herdr/send-to-pi.test.ts` and `tests/herdr/settings.test.ts` at commit
+`1abe9618` while the identical tree passed green in an isolated worktree
+minutes earlier. The failures were not reproducible from any single commit —
+the run had observed the main checkout moving under it.
+
+**Mitigation — full-suite verification never runs in a moving main checkout:**
+
+1. **Post-push verification is read-only.** `finish` resolves the full-suite
+   verdict from the per-repo cache for the pushed *tree*
+   (`_resolve_post_push_verification` → `query_cached(...)`) and **never
+executes a suite** (`verification["executed"] is False`). The dev-push pre-push
+   hook already ran the suite against the exact pushed commit and cached it.
+2. **The audit skill's F3 cache-miss auto-execution runs in an isolated
+   worktree.** On a full-suite cache miss the audit creates a fresh
+   **detached** worktree at `origin/dev`
+   (`_create_execution_worktree`, `ctx.execution_root`) and executes the suite
+   there — never in the audited (main/launch) checkout. The worktree is
+   removed after the run.
+3. **The isolated run's cache entries are grafted back.** Because the
+   execution worktree has no `.worklog`, its entries live under
+   `<git-dir>/test-cache` and vanish with the worktree. `mirror_cache_entries`
+   copies each missing entry into the main checkout's `.worklog/cache`
+   (never overwriting an existing entry — the dev-push hook's
+   `mirror_suite_cache` semantics), so read-only consumers and later audits
+   serve the verdict instead of re-executing.
+4. **A verdict observed while its checkout moved is quarantined.**
+   `run_cached` snapshots the guarded checkout around every executed run
+   (`snapshot_own_checkout` / `compare_own_checkout_states`) and, when HEAD or
+the tracked tree moved, discards the mixed verdict: nothing is cached under
+   either state, the run reports `state_changed_during_run` with the distinct
+   exit code `75` (`EX_TEMPFAIL`), and triage never mints a `test-failure` item
+   from it.
+5. **Triage suppresses known phantoms.** The triage helper
+   (`skill/triage/scripts/check_or_create.py`) refuses to create or enhance a
+   critical `test-failure` item when the payload carries an explicit phantom
+   signal (`state_changed_during_run`, or a `phantom: true` flag), returning
+   `suppressed: true` with the reason instead. Genuine failures on a stable
+   checkout triage exactly as before.
+
+Implementing code: `skill/implement/scripts/implement.py`
+(`_resolve_post_push_verification`), `skill/audit/scripts/audit_runner.py`
+(`_create_execution_worktree`, `_run_tests_via_test_skill(mirror_to=…)`),
+`skill/test_cache.py` (`STATE_CHANGED_EXIT_CODE`, `mirror_cache_entries`) and
+`skill/triage/scripts/check_or_create.py` (`detect_phantom`). `.githooks/pre-push`
+still runs the full suite in a worktree and mirrors it (`mirror_suite_cache`),
+which the audit graft mirrors rather than replaces.
+
 ### Residual risk
 
 The RCA proved the *silence* mechanism (a worktree-scoped run could mutate the
