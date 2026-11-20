@@ -11751,6 +11751,14 @@ class _AuditContext:
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
+    code_root: str = ""
+    """Explicit code-repository root (``--code-root`` / ``AUDIT_CODE_ROOT``).
+
+    Empty when the audit uses the owning project's repository. When set, the
+    F3 execution worktree is hosted on it instead of the worklog owner — a
+    worktree of the code repository belongs inside that repository
+    (SA-0MWO59J9T002IQ63; LP-0MVZ6R5H8007NYLR).
+    """
     per_audit_project_root: str = ""
     """Per-audit target project root (SA-0MULGDABC001T11L).
 
@@ -12408,8 +12416,27 @@ def _ensure_execution_worktree_submodules(worktree_path: Path) -> bool:
     return proc.returncode == 0
 
 
+def _execution_worktree_host(code_root: str | Path | None,
+                             owning_root: Path) -> Path:
+    """Root that hosts the F3 execution worktree.
+
+    The execution worktree is a worktree of the **code** repository, so a
+    cross-repo audit (``--code-root`` / ``AUDIT_CODE_ROOT``) must host it under
+    the code root's ``.worklog/worktrees`` — hosting it under the worklog owner
+    puts it inside the *other* project's checkout, where any test that resolves
+    the repository root or the worklog by walking up from its cwd resolves the
+    wrong project and fails (SA-0MWO59J9T002IQ63). Without a code root the
+    owning root is used, keeping same-repo behaviour byte-identical.
+    """
+    if code_root:
+        return Path(code_root)
+    return owning_root
+
+
 def _create_execution_worktree(owning_root: Path, runner: Runner,
-                               issue_id: str) -> tuple[Path | None, str]:
+                               issue_id: str,
+                               code_root: str | Path | None = None,
+                               ) -> tuple[Path | None, str]:
     """Create a fresh detached worktree at the latest ``origin/dev``.
 
     AC1 (SA-0MW4ZRLSI005PHL6): the F3 full-suite gate must execute against
@@ -12420,12 +12447,23 @@ def _create_execution_worktree(owning_root: Path, runner: Runner,
     SA-0MVTOR53E003IIEQ; symlink convention SA-0MSGS763C006SM1B), and
     returns the worktree path.
 
+    *code_root* (``--code-root`` / ``AUDIT_CODE_ROOT``) selects the **host
+    root**: a cross-repo audit's worktree is a worktree of the code
+    repository, so it is created under ``<code-root>/.worklog/worktrees``
+    (and the shared ``node_modules`` symlink is taken from there) — hosting
+    it inside the worklog owner made repo-root/worklog resolution inside the
+    suite reach the wrong project (SA-0MWO59J9T002IQ63). Omitting it keeps
+    the owning-root behaviour unchanged.
+
     Returns ``(worktree_path, evidence)``. ``worktree_path`` is ``None``
     when the worktree could not be created — callers fall back to the launch
     checkout (fail-open; an execution worktree is an improvement, never a
     new hard dependency).
     """
     evidence: list[str] = []
+    # Host root for the worktree AND for the shared node_modules symlink: the
+    # code repository for a cross-repo audit (SA-0MWO59J9T002IQ63).
+    host_root = _execution_worktree_host(code_root, owning_root)
     try:
         proc = runner(["git", "fetch", "origin", "dev"])
         if proc.returncode != 0:
@@ -12435,7 +12473,7 @@ def _create_execution_worktree(owning_root: Path, runner: Runner,
             return None, "origin/dev unresolvable; execution worktree unavailable"
         dev_sha = proc.stdout.strip()
         worktree_path = (
-            owning_root / ".worklog" / "worktrees"
+            host_root / ".worklog" / "worktrees"
             / f"{_EXECUTION_WORKTREE_PREFIX}-{issue_id}"
         )
         if worktree_path.exists():
@@ -12462,11 +12500,11 @@ def _create_execution_worktree(owning_root: Path, runner: Runner,
             evidence.append("submodule initialisation skipped/failed (best-effort)")
         # Reuse the merge-gate node_modules symlink convention
         # (SA-0MSGS763C006SM1B): never npm-install inside a worktree.
-        if (owning_root / "node_modules").exists() \
+        if (host_root / "node_modules").exists() \
                 and not (worktree_path / "node_modules").exists():
             try:
                 (worktree_path / "node_modules").symlink_to(
-                    owning_root / "node_modules", target_is_directory=True
+                    host_root / "node_modules", target_is_directory=True
                 )
                 evidence.append("node_modules symlinked into execution worktree")
             except OSError:
@@ -13058,6 +13096,11 @@ def _phase_gate(ctx: _AuditContext, code_root: str | None = None) -> int | None:
     per_audit_root = git_root
     runner = _cwd_aware_runner(git_root, runner)
     ctx.runner = runner
+    # Record the explicit code root (``--code-root`` / ``AUDIT_CODE_ROOT``,
+    # LP-0MVZ6R5H8007NYLR) so later helpers can distinguish it from the owning
+    # root — the F3 execution worktree is hosted on it
+    # (SA-0MWO59J9T002IQ63). Empty when no code root was supplied.
+    ctx.code_root = str(code_root_path) if code_root_path is not None else ""
     # Publish the per-audit root EARLY: the AC1/AC2 helpers below (execution
     # worktree + divergence guard) read ``ctx.per_audit_root`` / ``ctx.
     # execution_root``, whose ``per_audit_root`` property falls back to the
@@ -13114,7 +13157,7 @@ def _phase_gate(ctx: _AuditContext, code_root: str | None = None) -> int | None:
     # against ``per_audit_root`` (today's behaviour) rather than blocking.
     # ------------------------------------------------------------------
     execution_worktree_path, execution_worktree_evidence = _create_execution_worktree(
-        owning_root, runner, issue_id,
+        owning_root, runner, issue_id, code_root=ctx.code_root or None,
     )
     if execution_worktree_path is not None:
         ctx.execution_worktree = str(execution_worktree_path)
@@ -18169,7 +18212,10 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # ``.worklog/worktrees``. Best-effort and never touches the main
             # checkout's tracked content.
             _remove_execution_worktree(
-                Path(ctx.owning_root) if ctx.owning_root else None,
+                _execution_worktree_host(
+                    ctx.code_root or None,
+                    Path(ctx.owning_root) if ctx.owning_root else Path("."),
+                ),
                 ctx.runner, ctx.execution_worktree,
             )
             # Release the cross-host audit lease (LP-0MW96A9GW009KVF7,
