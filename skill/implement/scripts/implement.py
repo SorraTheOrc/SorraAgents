@@ -8572,6 +8572,29 @@ SPAWN_INFRA_PROVIDER_PATTERNS: tuple[str, ...] = (
 )
 
 
+def _spawn_failure_subject(reason: str) -> str | None:
+    """Extract the pattern/display text a recognised reason names.
+
+    The captured text is the model **pattern** for the no-match flavour
+    (``"MunitoAI/*"``) and the provider display name for the credential
+    flavour — surfaced verbatim rather than parsed, so a drive verdict can
+    name both the provider and the model the child could not serve.
+
+    Args:
+        reason: The spawner's failure reason.
+
+    Returns:
+        The captured pattern/display text, or ``None`` when the reason names
+        neither.
+    """
+    for pattern in SPAWN_INFRA_PROVIDER_PATTERNS:
+        match = re.search(pattern, reason, re.IGNORECASE)
+        if not match:
+            continue
+        return match.group(1).strip().strip("\"'") or None
+    return None
+
+
 def _spawn_failure_provider(reason: str) -> str | None:
     """Extract the provider named by a recognised spawn-failure reason.
 
@@ -8586,15 +8609,12 @@ def _spawn_failure_provider(reason: str) -> str | None:
         The provider name (``"MunitoAI"`` for ``"MunitoAI/*"``), or ``None``
         when the reason names no provider.
     """
-    for pattern in SPAWN_INFRA_PROVIDER_PATTERNS:
-        match = re.search(pattern, reason, re.IGNORECASE)
-        if not match:
-            continue
-        captured = match.group(1).strip().strip("\"'")
-        # A ``provider/model`` pattern names the provider before the slash;
-        # a bare model id is surfaced as-is (best effort, never invented).
-        return captured.split("/", 1)[0] or captured
-    return None
+    captured = _spawn_failure_subject(reason)
+    if captured is None:
+        return None
+    # A ``provider/model`` pattern names the provider before the slash;
+    # a bare model id is surfaced as-is (best effort, never invented).
+    return captured.split("/", 1)[0] or captured
 
 
 def classify_spawn_failure(reason: Any) -> dict[str, Any]:
@@ -17533,6 +17553,40 @@ def _describe_finish_failure(finish_failure: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+def _describe_spawn_failure(spawn_failure: dict[str, Any]) -> str:
+    """Render a classified **spawn** failure naming provider and model.
+
+    The spawn-side counterpart of :func:`_describe_finish_failure`
+    (SA-0MWLDZBTF004LJFP): turns a :func:`classify_spawn_failure` payload
+    into a single human-readable sentence that names the provider, the model
+    pattern the child could not serve, and the spawner's own reason — so a
+    drive verdict is never the bare ``No models match pattern …`` text.
+
+    ``provider``/``model`` are only rendered when the classifier extracted
+    them; an unrecognised reason therefore renders as its own text (the
+    caller only uses this for a classified infrastructure failure).
+
+    Args:
+        spawn_failure: The classified ``spawn_failure`` payload.
+
+    Returns:
+        A sentence such as ``provider/model-resolution failure for provider
+        'MunitoAI', model 'MunitoAI/*': <reason>``.
+    """
+    if not isinstance(spawn_failure, dict):
+        return ""
+    reason = str(spawn_failure.get("reason") or "unknown error")
+    provider = spawn_failure.get("provider")
+    model = _spawn_failure_subject(reason)
+    descriptors: list[str] = []
+    if provider:
+        descriptors.append(f"provider {provider!r}")
+    if model and model != provider:
+        descriptors.append(f"model {model!r}")
+    subject = f" for {', '.join(descriptors)}" if descriptors else ""
+    return f"provider/model-resolution failure{subject}: {reason}"
+
+
 def _competing_actor_suffix(actor_evidence: str) -> str:
     """Render the guard's concurrent-actor evidence, ``""`` when absent.
 
@@ -18695,12 +18749,16 @@ def phase_drive(
         finish_attempt_limit: Max failing ``finish`` executions per child in
             one drive invocation (default: ``max_child_sessions``). A
             non-positive value is clamped to 1.
-        infra_retry_limit: Max **infrastructure**-refusal retries per child in
-            one drive invocation (default: ``DEFAULT_INFRA_RETRY_LIMIT``).
-            These run on a budget separate from ``finish_attempt_limit``,
-            with bounded exponential backoff, and never spawn a session — a
-            refusal that clears within the budget lets the same ``finish``
-            succeed and the chain continue (LP-0MVWEP292000ODBS). A
+        infra_retry_limit: Max **infrastructure** retries per child in one
+            drive invocation (default: ``DEFAULT_INFRA_RETRY_LIMIT``). This is
+            **one shared budget** covering both a ``finish`` refused for an
+            infrastructure reason and a spawn-time provider/model-resolution
+            failure: the former re-runs ``parent`` without spawning a session
+            (LP-0MVWEP292000ODBS), the latter re-spawns the same child in the
+            same worktree after the same backoff (SA-0MWLDZBTF004LJFP). Both
+            run on a budget separate from ``finish_attempt_limit`` and the
+            session bound, so a transient refusal that clears within the
+            budget lets the child proceed and the chain continue. A
             non-positive value is clamped to 1.
         pane_sessions: Opt in to the Herdr pane-driven transport
             (``--pane-sessions`` / ``--no-pane-sessions``). ``None`` (the
@@ -18749,7 +18807,11 @@ def phase_drive(
         the number of retries consumed on the separate infra budget, and
         ``infra_retry_limit`` reports that bound (LP-0MVWEP292000ODBS); each
         retry also appears in ``children_driven`` as ``"infra-retry"`` with
-        the failing ``step``/``reason`` and the attempt number.
+        the failing ``step``/``reason`` and the attempt number. The counter is
+        **shared**: a spawn-time provider/model-resolution failure consumes
+        the same per-child budget, recording ``step: "spawn"`` plus the
+        extracted ``provider`` and a ``message`` naming provider and model
+        (SA-0MWLDZBTF004LJFP).
         ``terminal_reconciled`` counts
         children recorded as done after their finish failed
         (SA-0MVLJXTYY005XQDV); ``reset_for_retry`` counts non-terminal
@@ -19680,6 +19742,107 @@ def phase_drive(
                 )
                 continue
 
+            # Not terminal: classify the spawn failure before recording any
+            # evidence (SA-0MWLDZBTF004LJFP). A provider/model-resolution
+            # failure (an unservable ``enabledModels`` pattern, a missing API
+            # key) is transient: the child is healthy and never ran, so the
+            # same child is re-spawned on the shared infrastructure budget
+            # instead of abandoning it and stopping the chain. Anything the
+            # classifier does not recognise stays a hard failure (fail-safe).
+            spawn_classification = classify_spawn_failure(
+                reconciliation["reason"]
+                or str(spawn_result.get("reason", "") or "")
+            )
+            entry["spawn_failure_kind"] = spawn_classification["kind"]
+            if (
+                spawn_classification["kind"] == "infrastructure"
+                and infra_retries.get(child_id, 0) < infra_retry_limit
+            ):
+                infra_retries[child_id] = (
+                    infra_retries.get(child_id, 0) + 1
+                )
+                attempt = infra_retries[child_id]
+                backoff = _drive_infra_backoff_delay(attempt)
+                description = _describe_spawn_failure(spawn_classification)
+                # The retry is charged to the shared infra budget, never to
+                # the per-child session bound: the same child is re-spawned in
+                # the same worktree, so the failed attempt must not consume a
+                # ``--max-child-sessions`` slot (AC1).
+                attempts[child_id] = max(0, attempts.get(child_id, 1) - 1)
+                driven.append({
+                    "id": child_id,
+                    "result": "infra-retry",
+                    "step": "spawn",
+                    "reason": spawn_classification["reason"],
+                    "attempt": attempt,
+                    "provider": spawn_classification["provider"],
+                    "message": (
+                        f"{description} — infra-retry {attempt}/"
+                        f"{infra_retry_limit} in {backoff}s: re-spawning "
+                        "the same child in the same worktree."
+                    ),
+                })
+                # A claim orphaned by the dead session would be a scheduling
+                # hold the re-spawned session cannot clear, so the surviving
+                # driver releases it before retrying (assignee-release
+                # invariant); the item stays in-progress and startable.
+                entry["claim_release"] = _release_orphaned_child_claim(
+                    child_id
+                )
+                # The failed attempt's pane has no inspection value (the
+                # session never ran) and a retry creates a fresh one, so it is
+                # closed here rather than retained and leaked.
+                if pane_id:
+                    _close_driven_pane(
+                        child_id, pane_id, entry, report, pane_client,
+                        reason=(
+                            "spawn failed for a retryable provider reason; "
+                            "re-spawning the child"
+                        ),
+                    )
+                LOG.warning(
+                    "Child %s session failed for a provider/model-"
+                    "resolution reason (%s) — infra-retry %d/%d in %ss: "
+                    "re-spawning the same child.",
+                    child_id,
+                    description,
+                    attempt,
+                    infra_retry_limit,
+                    backoff,
+                )
+                # Durable verdict on the child: a producer can tell a retried
+                # provider failure from a gate failure without reading the
+                # driver's log, and the remedy is spelled out for a recurrence.
+                wl_add_comment(
+                    child_id,
+                    "Drive retried this child's session after a transient "
+                    f"provider/model-resolution failure ({description}). "
+                    f"Infra-retry {attempt}/{infra_retry_limit} in "
+                    f"{backoff}s: re-spawning the same child in the same "
+                    "worktree (no new worktree, no duplicate session). If "
+                    "it recurs, apply the remedy: "
+                    f"{spawn_classification['remedy']}",
+                )
+                sleeper(backoff)
+                continue
+
+            # A classified infrastructure failure that reaches here has spent
+            # the shared budget: the chain-stop verdict names the provider and
+            # model and spells out the remedy, instead of leaving the operator
+            # with the bare ``No models match pattern …`` text (AC3).
+            failure_reason_text = str(
+                spawn_result.get("reason", "unknown error")
+            )
+            spawn_failure_note = ""
+            if spawn_classification["kind"] == "infrastructure":
+                failure_reason_text = _describe_spawn_failure(
+                    spawn_classification
+                )
+                spawn_failure_note = (
+                    f"; the infra-retry budget of {infra_retry_limit} is "
+                    f"exhausted. Remedy: {spawn_classification['remedy']}"
+                )
+
             # Not terminal: record durable evidence that the child produced
             # nothing (SA-0MWGZ8NWP009QD8G). The placement guard cannot tell a
             # failed session from one whose work landed in the main checkout
@@ -19827,14 +19990,15 @@ def phase_drive(
                     f"Child session for {child_id} failed and the child is "
                     f"stranded (not terminal, but {stranded['evidence']}); "
                     f"finalise it or re-run drive with --finalise-stranded. "
-                    f"Reason: {spawn_result.get('reason', 'unknown error')}"
+                    f"Reason: {failure_reason_text}"
+                    f"{spawn_failure_note}"
                 )
                 report["failed_child"] = child_id
                 break
 
             report["message"] = (
                 f"Child session for {child_id} failed: "
-                f"{spawn_result.get('reason', 'unknown error')}"
+                f"{failure_reason_text}{spawn_failure_note}"
             )
             report["failed_child"] = child_id
             break

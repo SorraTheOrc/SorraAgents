@@ -872,6 +872,23 @@ in `children_driven`:
    within the infra budget is absorbed there, and a spent budget falls
    through to the finish-attempt bound below with the failure evidence
    appended to the stopping message.
+
+   The **same** per-child counter and budget also cover a *spawn-time*
+   provider/model-resolution failure (SA-0MWLDZBTF004LJFP): when
+   `_reconcile_spawn_failure` proves the child non-terminal and
+   `classify_spawn_failure` classifies the spawn reason `infrastructure`
+   (an unservable `enabledModels` pattern, a missing API key), the driver
+   re-spawns the **same** child in its **same** worktree after the same
+   backoff. That retry records `result: "infra-retry"` with `step: "spawn"`,
+   the spawner `reason`, the `attempt` number, the extracted `provider` and
+   a `message` naming the provider and model; it never creates a second
+   worktree, never re-records spawn-failure evidence for an attempt that
+   produced no work, and is charged to the infra budget rather than the
+   `--max-child-sessions` bound. A child reconciled `completed-late` is
+   never retried, and an unclassified spawn failure still hard-stops with
+   `failed_child`. When the budget is spent the stopping message names the
+   provider/model and spells out the remedy (`classify_spawn_failure`
+   carries it).
 2. **Bounded retry — `--finish-attempt-limit N`** (default: the
    `--max-child-sessions` value, so the default is one attempt and behaviour
    is unchanged from before this feature). Genuine failing finish executions
@@ -975,7 +992,7 @@ values):
 
 | `result` | Meaning |
 |---|---|
-| `infra-retry` | The child's `finish` was refused for a transient **infrastructure** reason; the loop retried `parent` on the separate `--infra-retry-limit` budget with backoff and no session spawn. Carries `step`, `reason`, `attempt` and the finish-failure `message`. |
+| `infra-retry` | The child's `finish` was refused for a transient **infrastructure** reason; the loop retried `parent` on the separate `--infra-retry-limit` budget with backoff and no session spawn. Carries `step`, `reason`, `attempt` and the finish-failure `message`. Also emitted for a retried **spawn-time** provider failure, where `step` is `"spawn"`, `reason` is the spawner reason, `provider` is the extracted provider and `message` names the provider and model (see the recovery tiers above). |
 | `finished` | The child's session exited successfully. |
 | `terminal-reconciled` | The child's `finish` failed but the child was already terminal; recorded as done, the chain continues. Carries `status`, `stage`, `evidence` and `finish_attempts`. |
 | `reset-for-retry` | The child was non-terminal after the finish bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. Carries `reset: true`, `status`, `stage`, `evidence`, `finish_attempts` and `discarded_paths` (the uncommitted files the reset removed — never a commit). |
@@ -992,8 +1009,9 @@ Additional report fields:
 - `finish_attempts` — map of child id → failing `finish` executions observed
   (the finish-attempt bound accounting);
 - `finish_attempt_limit` — the bound applied to this invocation;
-- `infra_retries` — map of child id → infrastructure-refusal retries taken on
-  the separate `--infra-retry-limit` budget;
+- `infra_retries` — map of child id → infrastructure retries taken on the
+  shared `--infra-retry-limit` budget. One counter per child across
+  finish-refusals **and** spawn-time provider failures;
 - `infra_retry_limit` — the infra-retry bound applied to this invocation;
 - `preserved_refs` — list of `{id, ref, commit}` entries for commit-carrying
   worktrees parked on `refs/wip/<id>` (the reset was refused);

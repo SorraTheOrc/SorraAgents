@@ -2032,3 +2032,67 @@ class TestRevalidateStartableBeforeSpawn:
 
         assert "⏭ SA-DONE (skipped, no session)" in out
         assert "already terminal" in out
+
+
+# ---------------------------------------------------------------------------
+# F2: spawn-time provider-failure retry ordering (SA-0MWLDZBTF004LJFP)
+# ---------------------------------------------------------------------------
+
+
+def _provider_failure_result(cid: str, model: str = "MunitoAI/*") -> dict:
+    """Scripted spawner result for a child session that died at model
+    resolution (the ``_default_session_spawner`` non-zero-exit shape)."""
+    return {
+        "success": False,
+        "returncode": 1,
+        "reason": (
+            f"Child session for {cid} exited with code 1: Error: No models "
+            f'match pattern "{model}"'
+        ),
+    }
+
+
+class TestSpawnInfraRetryOrdering:
+    """Ordering: reconciliation outranks retry (F2 AC4).
+
+    The retry decision runs *after* ``_reconcile_spawn_failure``: a child the
+    reconciliation proved terminal (``completed-late``) is never retried, so a
+    provider reason in the spawn output can never spawn a second session for
+    work that is already done.
+    """
+
+    def test_completed_late_child_is_never_retried(self, implement_mod):
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner([_provider_failure_result("SA-C1")])
+        # Startable at the spawn decision, terminal when the killed session is
+        # reconciled — the exact production shape the incident took.
+        states = {
+            "SA-C1": [
+                {"id": "SA-C1", "status": "in_progress",
+                 "stage": "intake_complete"},
+                {"id": "SA-C1", "status": "completed",
+                 "stage": "in_review"},
+            ],
+        }
+
+        report = _run(
+            m, runner, spawner, [{"id": "SA-C1"}],
+            child_states=states, infra_retry_limit=5, delay=lambda _s: None,
+        )
+
+        # Exactly one session: the terminal child was reconciled, not retried.
+        assert len(spawner.calls) == 1
+        assert report["success"] is True
+        assert report["infra_retries"] == {}
+        assert report["completed_late"] == 1
+        assert [
+            entry["result"] for entry in report["children_driven"]
+        ] == ["completed-late"]
+        assert not any(
+            entry.get("result") == "infra-retry"
+            for entry in report["children_driven"]
+        )
