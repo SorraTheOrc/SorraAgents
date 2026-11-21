@@ -12567,8 +12567,13 @@ def _remove_execution_worktree(owning_root: Path | None, runner: Runner,
         return
     try:
         runner(["git", "worktree", "remove", "--force", str(worktree_path)])
-    except Exception:  # noqa: BLE001 -- cleanup best-effort
-        pass
+    except Exception as exc:  # noqa: BLE001 -- cleanup best-effort
+        # S110 (SA-0MWQKFSUR0041FXV): surface the failure instead of a silent
+        # ``pass``; the audit still fails open and never aborts on cleanup.
+        print(
+            f"Execution worktree cleanup failed for {worktree_path}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def _launch_checkout_divergence(owning_root: Path, runner: Runner,
