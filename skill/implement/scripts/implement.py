@@ -20179,17 +20179,155 @@ def _placement_path_listing(paths: list[str], parent_branch: str) -> str:
     )
 
 
+#: Directory-name pattern of a per-item worktree: ``wl-<WORK-ITEM-ID>-<slug>``
+#: (created by ``implement.py start``) and ``audit-exec-<WORK-ITEM-ID>`` (the
+#: audit runner's sandbox). Both name their owning work item, so a worktree
+#: path can be mapped back to the item whose session it belongs to
+#: (WL-0MWQLHDOS006CAIH). Untagged trees (``wl-test-ff``,
+#: ``/tmp/wl-base-check``) deliberately do not match: their ownership is
+#: unresolvable and the placement guards stay fail-closed for them.
+WORKTREE_DIR_ITEM_RE = re.compile(
+    r"^(?:wl|audit-exec)-(?P<item_id>[A-Z][A-Z0-9]{1,9}-[A-Z0-9]{2,})(?:-|$)"
+)
+
+
+def _worktree_path_to_item_id(worktree_path: str | Path) -> str | None:
+    """Map a per-item worktree path to the work item that owns it.
+
+    The reverse of the naming convention ``implement.py start`` and the audit
+    runner use (``<worktree-root>/wl-<ID>-<slug>`` and
+    ``<worktree-root>/audit-exec-<ID>``). It is the cheap half of the debris
+    filter: a leftover tree can only be attributed to a *terminal* item — and
+    so be discounted as a foreign change surface — when its owner is named in
+    the directory name.
+
+    Args:
+        worktree_path: Any path; only its final component is inspected.
+
+    Returns:
+        The owning work-item id, or ``None`` when the directory name carries
+        none (scratch trees such as ``wl-base-check`` or ``wl-test-ff``). A
+        ``None`` keeps the caller fail-closed.
+    """
+    match = WORKTREE_DIR_ITEM_RE.match(Path(worktree_path).name)
+    if match is None:
+        return None
+    return match.group("item_id")
+
+
+def _worktree_owner_is_terminal(worktree_path: str | Path) -> bool | None:
+    """Resolve whether the work item owning *worktree_path* is terminal.
+
+    A leftover worktree of a ``completed``/``in_review``/``done``/``deleted``
+    item has no live session to race, so its dirt can never be evidence that a
+    driven child wrote outside its own worktree (WL-0MWQLHDOS006CAIH). Every
+    unresolvable case — no work-item id in the directory name, ``wl show``
+    unavailable, or a lookup that returns another item — yields ``None`` so
+    the caller keeps counting the surface (**fail closed**).
+
+    Returns:
+        ``True`` when the owning item is terminal, ``False`` when it is live,
+        ``None`` when ownership cannot be resolved.
+    """
+    item_id = _worktree_path_to_item_id(worktree_path)
+    if not item_id:
+        return None
+    try:
+        item = wl_show(item_id)
+    except Exception:  # noqa: BLE001 — a failed lookup must never crash a gate
+        item = {}
+    if not item or str(item.get("id", "")) != item_id:
+        LOG.warning(
+            "Could not resolve the work item %s owning the registered "
+            "worktree %s; keeping it as a foreign change surface.",
+            item_id,
+            worktree_path,
+        )
+        return None
+    return _is_terminal_child(item)
+
+
+def _is_live_foreign_surface(
+    sibling: str | Path,
+    worktree_path: str | Path,
+    repo_root: str | Path,
+) -> bool:
+    """Whether a registered sibling worktree can evidence a stray write.
+
+    A dirty sibling only means "a child wrote outside its worktree" when the
+    surface could belong to a **live** session and is in scope for this
+    repository. Two kinds of surface never qualify (WL-0MWQLHDOS006CAIH):
+
+    1. **Out-of-scope debris.** A sibling outside the repository's worktree
+       root (``.worklog/worktrees/`` — scratch trees under ``/tmp``, ad-hoc
+       manual checks) is never a foreign change surface. The comparison is
+       only meaningful when the child's own worktree lives inside that root:
+       a child working elsewhere (custom ``--worktree-path``, an ad-hoc tree)
+       leaves the scope unknown, so nothing is filtered — the pre-existing
+       fail-closed behaviour is preserved.
+    2. **Terminal-owner debris.** A leftover tree whose owning work item is
+       terminal (``completed``/``in_review``/``done``/``deleted``) has no live
+       session to race; its dirt predates the run. Wherever it lives.
+
+    Unresolved ownership stays fail-closed (see
+    :func:`_worktree_owner_is_terminal`). The worklog lookup is reached only
+    from a dirty-surface scan, so the guards' fast paths (the child's own
+    worktree carries work; no dirty siblings) never pay for a ``wl``
+    subprocess.
+
+    Args:
+        sibling: The registered sibling worktree under consideration.
+        worktree_path: The child's own worktree root.
+        repo_root: The main checkout root.
+
+    Returns:
+        True when the sibling must still be treated as a foreign change
+        surface; False when it is stale debris.
+    """
+    root = Path(repo_root).resolve()
+    wt = Path(worktree_path).resolve()
+    sibling_path = Path(sibling).resolve()
+    worktree_root = (root / DEFAULT_WORKTREE_DIR).resolve()
+
+    child_in_root = wt == worktree_root or worktree_root in wt.parents
+    sibling_in_root = (
+        sibling_path == worktree_root or worktree_root in sibling_path.parents
+    )
+    if child_in_root and not sibling_in_root:
+        LOG.info(
+            "Ignoring registered worktree %s: it lies outside the "
+            "repository's worktree root %s, so it is stale scratch debris "
+            "and never evidence of a stray write.",
+            sibling_path,
+            worktree_root,
+        )
+        return False
+
+    terminal = _worktree_owner_is_terminal(sibling_path)
+    if terminal is None:
+        return True
+    if terminal:
+        LOG.info(
+            "Ignoring registered worktree %s: its owning work item %s is "
+            "terminal, so no live session can be raced there and its dirt "
+            "is never evidence of a stray write.",
+            sibling_path,
+            _worktree_path_to_item_id(sibling_path),
+        )
+        return False
+    return True
+
+
 def _registered_sibling_worktree_paths(
     worktree_path: str | Path,
     repo_root: str | Path,
 ) -> list[Path]:
     """Return the registered linked worktrees of *repo_root* other than the child's own.
 
-    A sibling worktree is any path git registers as a worktree of the same
-    repository, excluding the main checkout root and the child's own
-    worktree. It is the foreign write surface a driven child must never
-    touch — it belongs to another work item's session, so writing there
-    races that session and silently widens the epic (SA-0MW5FIJNQ002Z24I).
+    Excluding the child's own worktree, the registry is the candidate
+    sibling surface set — callers filter each candidate through
+    :func:`_is_live_foreign_surface` only once it is known to be dirty, so a
+    clean registry never costs a worklog lookup (WL-0MWQLHDOS006CAIH).
     A foreign repository checkout — even one reachable by path — is never
     listed, because the registry is scoped to *repo_root* itself
     (cross-checkout attribution, SA-0MVXVBZF2009HRRN).
@@ -20230,6 +20368,11 @@ def _sibling_worktree_containing(
     there is invisible to the main-checkout scan, so a cwd that resolves
     into a registered sibling is checked as its own write surface
     (SA-0MW5FIJNQ002Z24I).
+
+    The registry is returned **raw**: filtering a candidate through
+    :func:`_is_live_foreign_surface` costs a worklog lookup, so the caller
+    applies it only after the child's own work and the sibling's dirt have
+    been checked (WL-0MWQLHDOS006CAIH).
 
     Args:
         cur: The resolved current directory.
@@ -20301,7 +20444,7 @@ def _worktree_placement_violation(
             return None  # work lives in the worktree; sibling dirt is unrelated
         if _git_path_has_changes(
             sibling, parent_branch, expected_dirty=root_expected
-        ):
+        ) and _is_live_foreign_surface(sibling, wt, root):
             offending = _main_checkout_offending_paths(
                 str(sibling), expected_dirty=root_expected
             )
@@ -20399,7 +20542,9 @@ def _child_main_checkout_violation(
     1. the child is non-terminal (the caller enforces this),
     2. another change surface holds the work — the main checkout holds
        uncommitted changes outside ``.worklog/``, or a **registered sibling
-       worktree** of the same repository holds changes, and
+       worktree** of the same repository holds changes and is a *live*
+       surface (:func:`_is_live_foreign_surface` — stale debris from stale
+       scratch trees and terminal items is never evidence), and
     3. the child's worktree holds NO changes (no dirty files and no commits
        ahead of the parent branch) — so the work did not land in the worktree.
 
@@ -20463,16 +20608,25 @@ def _child_main_checkout_violation(
         return None
 
     offending = _main_checkout_offending_paths(str(root), expected_dirty=root_expected)
-    sibling_offending = [
-        (
-            sibling,
-            _main_checkout_offending_paths(
-                str(sibling), expected_dirty=root_expected
-            ),
+    sibling_offending: list[tuple[Path, list[str]]] = []
+    for sibling in _registered_sibling_worktree_paths(wt, root):
+        # Cheap first (dirty scan), then the debris filter (path scope, then
+        # at most one worklog lookup), then the evidence listing: the fast
+        # paths never reach the worklog (WL-0MWQLHDOS006CAIH).
+        if not _git_path_has_changes(
+            sibling, parent_branch, expected_dirty=root_expected
+        ):
+            continue
+        if not _is_live_foreign_surface(sibling, wt, root):
+            continue
+        sibling_offending.append(
+            (
+                sibling,
+                _main_checkout_offending_paths(
+                    str(sibling), expected_dirty=root_expected
+                ),
+            )
         )
-        for sibling in _registered_sibling_worktree_paths(wt, root)
-        if _git_path_has_changes(sibling, parent_branch, expected_dirty=root_expected)
-    ]
     if not offending and not sibling_offending:
         return None  # no foreign change surface
 

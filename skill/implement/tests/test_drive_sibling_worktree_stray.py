@@ -523,3 +523,420 @@ class TestDriveRecordsSpawnFailureEvidence:
         self._drive(child_worktree)
 
         assert implement.read_spawn_failure(str(child_worktree), CHILD_ID) is None
+
+
+# ---------------------------------------------------------------------------
+# Stale debris is never evidence (WL-0MWQLHDOS006CAIH)
+# ---------------------------------------------------------------------------
+#
+# Incident: the epic drive ``WL-0MW50EHZ6007QBPB`` refused a **clean** child's
+# worktree and named four unrelated surfaces — three ``/tmp/wl-*`` scratch
+# trees and the leftover worktree of the already-``deleted`` item
+# ``WL-0MVOA0XVC0002PBG``. The chain could only continue after a manual
+# ``git worktree remove``.
+#
+# Contract the debris filter adds to the sibling-surface scan:
+#
+# - A registered sibling **outside** the repository's worktree root
+#   (``.worklog/worktrees/``) is scratch debris and is never evidence, dirty
+#   or not — *when the child's own worktree lives inside that root*, which is
+#   the only case where "outside the root" is meaningful. A child working
+#   outside the canonical root (a custom ``--worktree-path``, an ad-hoc tree)
+#   leaves the scope unknown, so the pre-fix fail-closed behaviour is kept.
+# - A sibling whose **owning work item is terminal** cannot be raced by a live
+#   session, so its dirt is never evidence either, wherever it lives.
+# - Unresolved ownership (no work-item id in the directory name, or ``wl show``
+#   unavailable/mismatched) stays **fail-closed**: the sibling still counts.
+# - The child's own work still short-circuits the whole check, and the dirty
+#   scan still runs before any worklog lookup — the fast paths gain no
+#   ``wl`` subprocess.
+
+DEBRIS_ITEM = "SA-DEBRISTERM0001"
+LIVE_ITEM = "SA-LIVESIB0000001"
+
+
+@pytest.fixture()
+def rooted_repo(tmp_path: Path) -> Path:
+    """A checkout whose linked worktrees live in the canonical root."""
+    root = tmp_path / "rooted-repo"
+    _init_repo(root)
+    (root / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    gs.commit_all(root, "ignore .worklog")
+    return root
+
+
+def _canonical_worktree(rooted_repo: Path, item_id: str) -> Path:
+    """Register a per-item worktree under ``<repo>/.worklog/worktrees/``."""
+    name = f"wl-{item_id}-slug"
+    path = rooted_repo / implement.DEFAULT_WORKTREE_DIR / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return gs.add_worktree(rooted_repo, path, name, base=PARENT_BRANCH)
+
+
+@pytest.fixture()
+def canonical_child(rooted_repo: Path) -> Path:
+    """The child's own clean worktree, inside the canonical worktree root."""
+    return _canonical_worktree(rooted_repo, CHILD_ID)
+
+
+def _patch_wl_show(items: dict[str, dict] | None = None):
+    """Patch ``wl show``: known ids resolve, unknown ids are a test failure.
+
+    ``None`` (or an empty map) patches with a lookup that raises, so a test
+    asserting "no worklog lookup on this path" fails loudly when one happens.
+    """
+    resolved = items or {}
+
+    def _fake(work_item_id: str) -> dict:
+        if work_item_id not in resolved:
+            raise AssertionError(f"unexpected wl show for {work_item_id}")
+        return dict(resolved[work_item_id])
+
+    return mock.patch.object(implement, "wl_show", side_effect=_fake)
+
+
+class TestWorktreeItemOwnership:
+    """The reverse helper that maps a worktree path to its owning item."""
+
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            (f"wl-{CHILD_ID}-test-first-guard", CHILD_ID),
+            (f"audit-exec-{CHILD_ID}", CHILD_ID),
+            (f"wl-{DEBRIS_ITEM}", DEBRIS_ITEM),
+            # Untagged trees carry no ownership: debris without an owner id.
+            ("wl-test-ff", None),
+            ("wl-base-check", None),
+            ("audit-code-root", None),
+            ("scratch", None),
+        ],
+    )
+    def test_worktree_directory_name_maps_to_its_item(
+        self, name: str, expected: str | None, tmp_path: Path
+    ) -> None:
+        assert implement._worktree_path_to_item_id(tmp_path / name) == expected
+
+    def test_terminal_owner_resolves_through_wl_show(
+        self, canonical_child: Path
+    ) -> None:
+        with _patch_wl_show({DEBRIS_ITEM: {"id": DEBRIS_ITEM, "status": "deleted"}}):
+            assert implement._worktree_owner_is_terminal(
+                Path(f"/tmp/wl-{DEBRIS_ITEM}-leftover")
+            ) is True
+
+    def test_live_owner_is_not_terminal(self, canonical_child: Path) -> None:
+        with _patch_wl_show({LIVE_ITEM: {"id": LIVE_ITEM, "status": "in-progress"}}):
+            assert implement._worktree_owner_is_terminal(
+                Path(f"/tmp/wl-{LIVE_ITEM}-live")
+            ) is False
+
+    def test_untagged_tree_has_unresolved_ownership(self) -> None:
+        with _patch_wl_show():
+            assert implement._worktree_owner_is_terminal(Path("/tmp/wl-base-check")) is None
+
+    def test_mismatched_lookup_is_unresolved_ownership(self) -> None:
+        with _patch_wl_show({LIVE_ITEM: {"id": CHILD_ID, "status": "completed"}}):
+            assert implement._worktree_owner_is_terminal(
+                Path(f"/tmp/wl-{LIVE_ITEM}-live")
+            ) is None
+
+    def test_unavailable_worklog_is_unresolved_ownership(self) -> None:
+        with mock.patch.object(
+            implement, "wl_show", side_effect=FileNotFoundError("wl missing")
+        ):
+            assert implement._worktree_owner_is_terminal(
+                Path(f"/tmp/wl-{LIVE_ITEM}-live")
+            ) is None
+
+
+class TestChildMainCheckoutViolationDebrisFilter:
+    """``_child_main_checkout_violation`` never counts stale debris."""
+
+    def _violation(
+        self,
+        rooted_repo: Path,
+        child_worktree: Path,
+        items: dict[str, dict] | None = None,
+    ) -> str | None:
+        with _patch_wl_show(items):
+            return implement._child_main_checkout_violation(
+                CHILD_ID,
+                str(child_worktree),
+                PARENT_BRANCH,
+                repo_root=str(rooted_repo),
+            )
+
+    def test_outside_root_scratch_tree_is_never_a_foreign_surface(
+        self, rooted_repo: Path, canonical_child: Path, tmp_path: Path
+    ) -> None:
+        scratch = gs.add_worktree(
+            rooted_repo,
+            tmp_path / "scratch" / f"wl-{CHILD_ID}-scratch",
+            f"wl-{CHILD_ID}-scratch",
+            base=PARENT_BRANCH,
+        )
+        (scratch / "scratch-marker.js").write_text("x = 1\n", encoding="utf-8")
+
+        # No ``wl show`` at all: an outside-root tree is debris on path alone.
+        assert self._violation(rooted_repo, canonical_child, None) is None
+
+    def test_outside_root_sibling_is_ignored_even_with_commits_ahead(
+        self, rooted_repo: Path, canonical_child: Path, tmp_path: Path
+    ) -> None:
+        scratch = gs.add_worktree(
+            rooted_repo,
+            tmp_path / "scratch2" / f"wl-{LIVE_ITEM}-scratch",
+            f"wl-{LIVE_ITEM}-scratch",
+            base=PARENT_BRANCH,
+        )
+        _commit(scratch, "scratch-work.py", branch_tag=LIVE_ITEM)
+
+        assert self._violation(rooted_repo, canonical_child, None) is None
+
+    def test_terminal_owner_leftover_tree_is_ignored(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        leftover = _canonical_worktree(rooted_repo, DEBRIS_ITEM)
+        (leftover / "index.ts").write_text("deleted-item work\n", encoding="utf-8")
+
+        assert (
+            self._violation(
+                rooted_repo,
+                canonical_child,
+                {DEBRIS_ITEM: {"id": DEBRIS_ITEM, "status": "completed"}},
+            )
+            is None
+        )
+
+    def test_deleted_owner_leftover_tree_is_ignored(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        leftover = _canonical_worktree(rooted_repo, DEBRIS_ITEM)
+        (leftover / "index.ts").write_text("deleted-item work\n", encoding="utf-8")
+
+        assert (
+            self._violation(
+                rooted_repo,
+                canonical_child,
+                {DEBRIS_ITEM: {"id": DEBRIS_ITEM, "status": "deleted"}},
+            )
+            is None
+        )
+
+    def test_dirty_live_sibling_still_fails_closed(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "stray.py").write_text("x = 1\n", encoding="utf-8")
+
+        violation = self._violation(
+            rooted_repo,
+            canonical_child,
+            {LIVE_ITEM: {"id": LIVE_ITEM, "status": "in-progress"}},
+        )
+
+        assert violation is not None
+        assert str(live) in violation
+        assert "stray.py" in violation
+        assert str(canonical_child) in violation
+
+    def test_untagged_inside_root_sibling_fails_closed(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        untagged = gs.add_worktree(
+            rooted_repo,
+            rooted_repo / implement.DEFAULT_WORKTREE_DIR / "wl-adhoc-check",
+            "wl-adhoc-check",
+            base=PARENT_BRANCH,
+        )
+        (untagged / "stray.py").write_text("x = 1\n", encoding="utf-8")
+
+        violation = self._violation(rooted_repo, canonical_child, None)
+
+        assert violation is not None
+        assert str(untagged) in violation
+
+    def test_unresolvable_owner_fails_closed(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "stray.py").write_text("x = 1\n", encoding="utf-8")
+
+        with mock.patch.object(implement, "wl_show", return_value={}):
+            violation = implement._child_main_checkout_violation(
+                CHILD_ID,
+                str(canonical_child),
+                PARENT_BRANCH,
+                repo_root=str(rooted_repo),
+            )
+
+        assert violation is not None
+        assert str(live) in violation
+
+    def test_child_holding_its_own_work_is_never_refused_and_skips_the_lookup(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "stray.py").write_text("x = 1\n", encoding="utf-8")
+        _commit(canonical_child, "own-work.py", branch_tag=CHILD_ID)
+
+        # The raising fake proves the fast path never reaches ``wl show``.
+        assert self._violation(rooted_repo, canonical_child, None) is None
+
+    def test_clean_inside_root_siblings_skip_the_lookup(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        _canonical_worktree(rooted_repo, LIVE_ITEM)
+
+        assert self._violation(rooted_repo, canonical_child, None) is None
+
+    def test_child_outside_the_canonical_root_keeps_the_pre_fix_behaviour(
+        self, repo: Path, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        """Scope unknown (ad-hoc worktrees) — the guard stays fail-closed.
+
+        The scope of "outside the repository's worktree root" cannot be
+        established when neither tree lives under it, so nothing is filtered.
+        """
+        (sibling_worktree / "stray.py").write_text("x = 1\n", encoding="utf-8")
+
+        with _patch_wl_show():
+            violation = implement._child_main_checkout_violation(
+                CHILD_ID, str(child_worktree), PARENT_BRANCH, repo_root=str(repo)
+            )
+
+        assert violation is not None
+        assert str(sibling_worktree) in violation
+
+
+class TestPlacementViolationDebrisFilter:
+    """The cwd-sensitive finish guard applies the same debris filter."""
+
+    def _violation(
+        self,
+        rooted_repo: Path,
+        child_worktree: Path,
+        cwd: Path,
+        items: dict[str, dict] | None = None,
+    ) -> str | None:
+        with _patch_wl_show(items):
+            return implement._worktree_placement_violation(
+                str(child_worktree),
+                cwd=str(cwd),
+                repo_root=str(rooted_repo),
+                parent_branch=PARENT_BRANCH,
+            )
+
+    def test_cwd_in_a_terminal_owner_tree_is_not_a_violation(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        leftover = _canonical_worktree(rooted_repo, DEBRIS_ITEM)
+        (leftover / "index.ts").write_text("deleted-item work\n", encoding="utf-8")
+
+        assert (
+            self._violation(
+                rooted_repo,
+                canonical_child,
+                leftover,
+                {DEBRIS_ITEM: {"id": DEBRIS_ITEM, "status": "completed"}},
+            )
+            is None
+        )
+
+    def test_cwd_in_an_outside_root_scratch_tree_is_not_a_violation(
+        self, rooted_repo: Path, canonical_child: Path, tmp_path: Path
+    ) -> None:
+        scratch = gs.add_worktree(
+            rooted_repo,
+            tmp_path / "scratch" / f"wl-{LIVE_ITEM}-scratch",
+            f"wl-{LIVE_ITEM}-scratch",
+            base=PARENT_BRANCH,
+        )
+        (scratch / "scratch-marker.js").write_text("x = 1\n", encoding="utf-8")
+
+        assert self._violation(rooted_repo, canonical_child, scratch, None) is None
+
+    def test_cwd_in_a_dirty_live_sibling_still_fails_closed(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "stray.py").write_text("x = 1\n", encoding="utf-8")
+
+        violation = self._violation(
+            rooted_repo,
+            canonical_child,
+            live,
+            {LIVE_ITEM: {"id": LIVE_ITEM, "status": "in-progress"}},
+        )
+
+        assert violation is not None
+        assert str(live) in violation
+        assert "stray.py" in violation
+
+    def test_child_work_short_circuits_before_any_lookup(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "stray.py").write_text("x = 1\n", encoding="utf-8")
+        _commit(canonical_child, "own-work.py", branch_tag=CHILD_ID)
+
+        assert self._violation(rooted_repo, canonical_child, live, None) is None
+
+
+class TestPhaseParentIgnoresStaleDebris:
+    """End to end: a clean child is admitted despite dirty debris siblings."""
+
+    def test_dirty_debris_siblings_do_not_block_a_clean_child(
+        self, rooted_repo: Path, canonical_child: Path, tmp_path: Path
+    ) -> None:
+        scratch = gs.add_worktree(
+            rooted_repo,
+            tmp_path / "scratch" / f"wl-{CHILD_ID}-scratch",
+            f"wl-{CHILD_ID}-scratch",
+            base=PARENT_BRANCH,
+        )
+        (scratch / "scratch-marker.js").write_text("x = 1\n", encoding="utf-8")
+        leftover = _canonical_worktree(rooted_repo, DEBRIS_ITEM)
+        (leftover / "index.ts").write_text("deleted-item work\n", encoding="utf-8")
+
+        def _wl_show(work_item_id: str) -> dict:
+            if work_item_id == PARENT_ID:
+                return {
+                    "id": PARENT_ID,
+                    "title": "Parent",
+                    "status": "plan_complete",
+                }
+            if work_item_id == DEBRIS_ITEM:
+                return {"id": DEBRIS_ITEM, "title": "Debris", "status": "completed"}
+            raise AssertionError(f"unexpected wl show for {work_item_id}")
+
+        def _invoke(action, work_item_id, **_kwargs):
+            raise AssertionError(f"unexpected subprocess action {action}")
+
+        with (
+            mock.patch.object(implement, "is_code_freeze_active", return_value=False),
+            mock.patch.object(implement, "wl_show", side_effect=_wl_show),
+            mock.patch.object(
+                implement, "wl_show_children", return_value=[_child()]
+            ),
+            mock.patch.object(implement, "wl_dep_blockers", return_value=[]),
+            mock.patch.object(
+                implement,
+                "_outbound_gate",
+                return_value={
+                    "blocked": False,
+                    "blockers": [],
+                    "coordination_blockers": [],
+                },
+            ),
+            mock.patch.object(
+                implement, "_discover_worktree", return_value=str(canonical_child)
+            ),
+            mock.patch.object(implement, "_invoke_implement", side_effect=_invoke),
+            mock.patch.object(implement, "wl_add_comment", return_value=True),
+        ):
+            report = implement.phase_parent(PARENT_ID, json_output=True)
+
+        assert report["success"] is True
+        assert report.get("placement_violation") is not True
+        assert report["next_child"] == CHILD_ID
