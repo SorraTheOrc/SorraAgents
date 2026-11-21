@@ -171,18 +171,19 @@ from test_cache import (
     run_cached,
 )
 
-#: Audit-specific acceptance window for GREEN cached full-suite runs.
-#: The generic ``DEFAULT_TTL_SECONDS`` (2h) is kept for suite runs elsewhere;
-#: the audit instead accepts gate-produced evidence (the dev-push pre-push
-#: hook/`ship` release gate full runs, SA-0MVECQUGF0064U81) for up to 24h at
-#: the SAME git state, so auditing an item pushed yesterday — or a re-audit,
-#: or an audit after HEAD drifted — reuses the cached green run instead of
-#: F3 auto-executing a fresh full suite. The git-state key still guarantees
-#: the tree is byte-identical to the proven run; the window only guards
-#: environmental drift (deps/infra). Failed runs are NOT extended: the cache
-#: trims non-zero-exit entries to the short 5-minute TTL
-#: (FAILED_RUN_TTL_SECONDS) regardless of this value.
-AUDIT_CACHE_TTL_SECONDS = 24 * 60 * 60
+#: No practical time bound for GREEN cached full-suite runs.
+#:
+#: The audit accepts GREEN cached full-suite evidence at a matching git state
+#: without any time limit. Code identity is guaranteed by the git-state cache
+#: key (byte-identical tree); environmental drift is caught fresh at the next
+#: dev-push gate and by the `ship` release gate before anything ships
+#: (SA-0MVECQUGF0064U81). This removes needless F3 re-executions for
+#: re-audits, backlog audits, and audits at a HEAD that has since drifted.
+#:
+#: Failed (non-zero-exit) entries are NOT extended: the cache trims them to
+#: the short 5-minute TTL (FAILED_RUN_TTL_SECONDS) regardless of this value,
+#: so a transient infra failure is never re-served as current evidence.
+AUDIT_CACHE_TTL_SECONDS = float("inf")
 
 # ---------------------------------------------------------------------------
 # Recursion guard: LIVE_REPO_GUARD_ACTIVE propagation (SA-0MUG47DYG006TV40)

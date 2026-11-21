@@ -823,22 +823,29 @@ def _with_pytest_config(tmp_path) -> Path:
 
 
 class TestAuditAcceptanceWindow:
-    """Read-only cache acceptance window (SA-0MVECQUGF0064U81).
+    """Read-only cache acceptance with no practical time bound (SA-0MVEJI9US).
 
-    The audit accepts GREEN cached full-suite evidence within its own 24h
-    window (``AUDIT_CACHE_TTL_SECONDS``) rather than the generic 2h
-    (``DEFAULT_TTL_SECONDS``): the dev-push gate proved the suite green at
-    the same git state, so a backdated-but-fresh entry must be reuseable
-    without F3 re-executing the whole suite.
+    The audit accepts GREEN cached full-suite evidence at a matching git state
+    at **any age** (``AUDIT_CACHE_TTL_SECONDS`` is unbounded) rather than only
+    within the generic 2h (``DEFAULT_TTL_SECONDS``): the dev-push gate proved
+    the suite green at the same git state, so a backdated entry must be
+    reuseable without F3 re-executing the whole suite. Non-zero-exit entries
+    still expire after the short 5-minute failed-run TTL.
     """
 
-    def test_green_entry_older_than_2h_within_24h_is_accepted(self, tmp_path):
-        """A green entry backdated 3h (beyond the generic 2h TTL) is still
-        classified GREEN by the audit — no F3 re-execution."""
+    def test_green_entry_120_days_old_is_accepted(self, tmp_path):
+        """AC1: a green entry backdated 120 days is still classified GREEN by
+        the audit — no F3 re-execution and no "expired" diagnostic.
+
+        The autouse ``_default_green_full_suite_cache`` fixture stubs
+        ``audit_runner.query_cached`` with a constant green entry; these
+        acceptance tests override it with the REAL ``test_cache.query_cached``
+        so the cache TTL logic is genuinely exercised.
+        """
         import time
 
         from test.scripts.run_tests import full_suite_commands
-        from test_cache import compute_git_state, store
+        from test_cache import compute_git_state, query_cached, store
 
         _with_pytest_config(tmp_path)
         _make_suite_dirs(tmp_path)
@@ -849,18 +856,46 @@ class TestAuditAcceptanceWindow:
             store(
                 cmd, state, cwd=str(tmp_path),
                 stdout="1 passed", stderr="", exit_code=0,
+                completed_at=time.time() - 120 * 24 * 3600,  # 120 days
+                scope="full",
+            )
+
+        with mock.patch.object(audit_runner, "query_cached", wraps=query_cached):
+            status, _, problems = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == audit_runner._FULL_SUITE_CACHE_GREEN, problems
+
+    def test_green_entry_older_than_2h_is_accepted(self, tmp_path):
+        """AC2: a green entry backdated 3h (beyond the generic 2h TTL) is
+        likewise accepted — the audit does not honour the generic TTL."""
+        import time
+
+        from test.scripts.run_tests import full_suite_commands
+        from test_cache import compute_git_state, query_cached, store
+
+        _with_pytest_config(tmp_path)
+        _make_suite_dirs(tmp_path)
+        commands = full_suite_commands(tmp_path)
+        state = compute_git_state(str(tmp_path))
+        for cmd in commands:
+            store(
+                cmd, state, cwd=str(tmp_path),
+                stdout="1 passed", stderr="", exit_code=0,
                 completed_at=time.time() - 3 * 3600,  # beyond the 2h generic TTL
                 scope="full",
             )
 
-        status, _, problems = audit_runner._classify_full_suite_cache(
-            _green_run_git_runner(), cwd=str(tmp_path),
-        )
+        with mock.patch.object(audit_runner, "query_cached", wraps=query_cached):
+            status, _, problems = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
         assert status == audit_runner._FULL_SUITE_CACHE_GREEN, problems
 
     def test_same_entry_is_a_miss_under_generic_2h_ttl(self, tmp_path):
         """Mechanism check: the backdated entry is NOT accepted by the
-        generic 2h TTL, so the audit window is what extends it."""
+        generic 2h TTL, so the audit's unbounded acceptance is what extends
+        it."""
         import time
 
         from test.scripts.run_tests import full_suite_commands
@@ -886,6 +921,68 @@ class TestAuditAcceptanceWindow:
             assert query_cached(cmd, cwd=str(tmp_path), ttl=DEFAULT_TTL_SECONDS) is None, (
                 "backdated entry must expire under the generic 2h TTL"
             )
+
+    def test_red_entry_expires_after_failed_run_ttl(self, tmp_path):
+        """AC3: a non-zero-exit entry backdated past the 5-minute failed-run
+        TTL is a miss and never classified as GREEN evidence."""
+        import time
+
+        from test.scripts.run_tests import full_suite_commands
+        from test_cache import (
+            FAILED_RUN_TTL_SECONDS,
+            compute_git_state,
+            query_cached,
+            store,
+        )
+
+        _with_pytest_config(tmp_path)
+        _make_suite_dirs(tmp_path)
+        commands = full_suite_commands(tmp_path)
+        assert commands, "expected a pytest+node command set"
+        state = compute_git_state(str(tmp_path))
+        for cmd in commands:
+            store(
+                cmd, state, cwd=str(tmp_path),
+                stdout="", stderr="1 failed", exit_code=1,
+                completed_at=time.time() - (FAILED_RUN_TTL_SECONDS + 60),
+                scope="full",
+            )
+
+        for cmd in commands:
+            assert query_cached(
+                cmd, cwd=str(tmp_path), ttl=audit_runner.AUDIT_CACHE_TTL_SECONDS,
+            ) is None, "a red entry older than the 5-minute TTL must be a miss"
+
+        with mock.patch.object(audit_runner, "query_cached", wraps=query_cached):
+            status, _, _ = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == audit_runner._FULL_SUITE_CACHE_MISS
+
+    def test_red_entry_within_failed_run_ttl_is_red(self, tmp_path):
+        """AC3 (complement): a fresh red entry (within 5 minutes) is still
+        classified RED, never GREEN."""
+        import time
+
+        from test.scripts.run_tests import full_suite_commands
+        from test_cache import compute_git_state, query_cached, store
+
+        _with_pytest_config(tmp_path)
+        _make_suite_dirs(tmp_path)
+        commands = full_suite_commands(tmp_path)
+        state = compute_git_state(str(tmp_path))
+        for cmd in commands:
+            store(
+                cmd, state, cwd=str(tmp_path),
+                stdout="", stderr="1 failed", exit_code=1,
+                completed_at=time.time() - 30, scope="full",
+            )
+
+        with mock.patch.object(audit_runner, "query_cached", wraps=query_cached):
+            status, _, _ = audit_runner._classify_full_suite_cache(
+                _green_run_git_runner(), cwd=str(tmp_path),
+            )
+        assert status == audit_runner._FULL_SUITE_CACHE_RED
 
 
 class TestAutoGreenRunResolution:

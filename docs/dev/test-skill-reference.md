@@ -20,7 +20,9 @@ infrastructure, not agent-invoked ad-hoc runs, and are out of scope.
 
 The rule exists because only the test-skill runner populates the per-repo test
 cache (§0 Cached execution below; git state + 2h TTL) that the audit skill
-reads read-only via `query_cached()` to auto-verify execution-dependent ACs.
+reads read-only via `query_cached()` to auto-verify execution-dependent ACs
+(the audit reads GREEN entries with no practical time bound — see
+§0 Cached execution below).
 An ad-hoc run at the same git state is invisible to the cache and degrades
 audit verification to F3 auto-execution or an operator `--green-run HEAD`
 attestation.
@@ -362,10 +364,13 @@ Agents that only need summary information (e.g. release verification,
 read-only audits) should use `--summary` instead of re-running the suite.
 
 The **audit skill** consumes the cache directly (read-only, via
-`query_cached()`): when the full suite was run green at the audited git state
-within the TTL, the audit runner automatically verifies execution-dependent
-acceptance criteria (e.g. "full project test suite passes") without any
-operator attestation or re-execution (SA-0MSIU5HFI0024D7W). Suite commands
+`query_cached()`): when the full suite was run green at the audited git state,
+the audit runner automatically verifies execution-dependent acceptance
+criteria (e.g. "full project test suite passes") without any operator
+attestation or re-execution (SA-0MSIU5HFI0024D7W). For GREEN entries the audit
+accepts evidence at a matching git state with no practical time bound — the
+generic 2h TTL is not applied to the audit's read (SA-0MVEJI9US); non-zero-exit
+entries still expire after the short 5-minute failed-run TTL. Suite commands
 only cover node suite dirs that actually exist in the target repo
 (`tests/node`, `tests/cli`, `tests/unit` — missing dirs are skipped,
 SA-0MSJELL44009XYIL), so a repo whose layout diverges from that set can still
