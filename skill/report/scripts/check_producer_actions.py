@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python3
 # <!-- REFACTOR-SA-0MVRCL0Q90016C7D
 # smell: formatting
 # severity: low
@@ -10,7 +10,6 @@
 # severity: low
 # description: Unparenthesized implicit string concatenation in collection
 # -->
-#!/usr/bin/env python3
 """Offline consistency check: no skill template advertises next-step producer actions.
 
 Work-item skills end their session with the canonical report whose
@@ -237,8 +236,10 @@ def _render_text(template_skills: list[str], matches: list[Match]) -> str:
             "next-step producer-action instructions/examples."
         )
     lines = [
-        f"❌ Consistency check failed — next-step producer-action "
-        f"instruction(s) found in {len(matches)} skill template(s):"
+        (
+            f"❌ Consistency check failed — next-step producer-action "
+            f"instruction(s) found in {len(matches)} skill template(s):"
+        )
     ]
     for match in matches:
         lines.append(

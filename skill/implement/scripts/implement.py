@@ -13899,7 +13899,10 @@ def phase_finish(
                                     exc, commit_hash, branch, worktree_path
                                 ),
                             )
-                            raise RuntimeError(
+                            # TRY004: isinstance() here dispatches an exception
+                            # class (control flow), not a value type, so raising
+                            # TypeError would be semantically wrong.
+                            raise RuntimeError(  # noqa: TRY004
                                 f"git push to dev transport lost: the SSH "
                                 f"connection closed before the ref update "
                                 f"after {exc.attempts} attempt(s), so a green "

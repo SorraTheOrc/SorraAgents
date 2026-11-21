@@ -149,16 +149,22 @@ def test_detects_next_step_producer_action_examples(producer_line):
     "producer_line",
     [
         # Current template wording (pre-contract-tightening).
-        '  [--producer-actions "<actions for the producer, or omit for '
-        '\'None needed\'>"] \\',
+        (
+            '  [--producer-actions "<actions for the producer, or omit for '
+            '\'None needed\'>"] \\'
+        ),
         # Tightened wording the doc change introduces.
-        '  [--producer-actions "<blocking, current-stage actions only; omit '
-        "for 'None needed'>\"] \\",
+        (
+            '  [--producer-actions "<blocking, current-stage actions only; omit '
+            "for 'None needed'>\"] \\"
+        ),
         # Explicit no-action value.
         "  --producer-actions \"None needed\" \\",
         # Genuine blocking actions must survive verbatim (no over-eager match).
-        '  --producer-actions "Answer the OPEN QUESTION in comment SA-C123 '
-        'before /skill:plan can start" \\',
+        (
+            '  --producer-actions "Answer the OPEN QUESTION in comment SA-C123 '
+            'before /skill:plan can start" \\'
+        ),
         '  --producer-actions "Approve the remediation list in comment #4" \\',
     ],
 )

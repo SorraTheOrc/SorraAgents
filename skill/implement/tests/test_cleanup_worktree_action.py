@@ -275,11 +275,12 @@ def test_cleanup_of_an_absent_worktree_is_a_reported_noop(tmp_path, capsys):
     """
     absent = tmp_path / "wt"
 
-    with _patched_cleanup(absent) as mocks:
-        with patch.object(implement, "remove_state") as remove_state:
-            report = implement.phase_cleanup(
-                ITEM_ID, json_output=True, worktree_path=str(absent)
-            )
+    with _patched_cleanup(absent) as mocks, patch.object(
+        implement, "remove_state"
+    ) as remove_state:
+        report = implement.phase_cleanup(
+            ITEM_ID, json_output=True, worktree_path=str(absent)
+        )
 
     assert report["success"] is True
     assert report["already_absent"] is True

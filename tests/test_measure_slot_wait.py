@@ -543,10 +543,14 @@ def test_render_summary_keeps_each_statement_on_its_own_line(harness):
     lines = harness.render_summary(report).splitlines()
 
     assert lines == [
-        "window: 2026-11-01T00:00:00+00:00 .. 2026-11-05T00:00:00+00:00 "
-        "(since post-fix abc1234)",
-        "corpus: root=/tmp/sessions files_scanned=7 files_with_samples=3 "
-        "records_in_window=12 samples=5",
+        (
+            "window: 2026-11-01T00:00:00+00:00 .. 2026-11-05T00:00:00+00:00 "
+            "(since post-fix abc1234)"
+        ),
+        (
+            "corpus: root=/tmp/sessions files_scanned=7 files_with_samples=3 "
+            "records_in_window=12 samples=5"
+        ),
         "  [PASS] p50_under_120s: p50=1.00s",
         "  [N/A ] no_queued_notice_30s: no notices",
         "verdict: PASS",
@@ -575,6 +579,7 @@ def test_harness_is_free_of_unparenthesised_implicit_concatenation():
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
 
     assert result.returncode == 0, (

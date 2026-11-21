@@ -2722,10 +2722,10 @@ class TestDriveVerdictEvidence:
 
         report = harness.run(finish_attempt_limit=3)
 
-        reset = [
+        reset = next(
             e for e in report["children_driven"]
             if e["result"] == "reset-for-retry"
-        ][0]
+        )
         assert "tests: tests_failed" in reset["message"]
         comments = [
             text for wid, text in harness.comments if wid == "SA-C1"
