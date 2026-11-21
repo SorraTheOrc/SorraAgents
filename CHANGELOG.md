@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.1.29 (2026-11-21)
+> **Release focus:** This release focuses on improving the reliability and efficiency of agent sessions and automated testing, with fixes that prevent false failures, spurious review holds, and unnecessary retries while ensuring concurrent sessions and cross-repo audits complete correctly. It also enhances reporting with more natural standup prose and the option to turn standup reports into podcast episodes.
+### Features
+- Agents now read only what they need, so long sessions stay focused and finish without losing earlier work. (SA-0MWJWJ1HV000EBKP)
+- Concurrent sessions now finish in minutes instead of waiting in long queues. (SA-0MWFJRWN00084FE1)
+- Fixed issues are now automatically re-checked and cleared, so the backlog only shows work that still needs doing. (SA-0MW7Z1JCE009G6J3)
+- Releases no longer block themselves with spurious producer-review holds from their own audits. (SA-0MW92TODX00064XQ)
+- Prevents real bugs from being mistaken for temporary errors and silently retried. (SA-0MWLDZ8ZN0030T15)
+- Transient model errors during a run are now retried automatically instead of stopping the chain. (SA-0MWLDZBTF004LJFP)
+- Failed tasks now reset cleanly with a clear note on what to fix, so they retry automatically. (SA-0MWLDZFL4006I9YY)
+- Daily standups now read as natural prose instead of robotic task lists. (SA-0MWBRJ3KI006XJ46)
+- Standup reports can now automatically become podcast episodes. (SA-0MWHZ7MD6007R07Z)
+### Bug Fixes
+- Fixed false test failures so automated checks no longer stall on errors your changes didn't cause. (SA-0MWJHN2I8005E7BK)
+- Worktree creation and dev pushes are working again after fixing a broken test. (SA-0MWKKO6W0005372V)
+- Cross-repo audits no longer report false test failures caused by misplaced worktrees. (SA-0MWO59J9T002IQ63)
+- Tests now run faster and more reliably on busy servers, so results are trustworthy. (SA-0MWNKX8HB009A3ML)
+- Cross-repo audits now correctly evaluate acceptance criteria instead of failing with empty results. (SA-0MWO59IMN000RUHM)
+- Agents no longer pick broken models, so sessions won't fail mid-task. (SA-0MWL5AL4B004X0FN)
+- Reports and status updates from worktrees now always reach the main worklog store. (SA-0MW0JHMJE006GWQB)
+- Failed child sessions no longer block your progress by blaming unrelated changes. (SA-0MWGZ86MS005OE61)
+- New repos with no tests can now push without errors instead of crashing. (SA-0MWNZLB07007S8QU)
+- Corrected the workflow stage list so agents no longer use a retired stage. (SA-0MUYHGUKY007SEW4)
+- Test results now stay cached and consistent, so fixes ship faster with fewer delays. (SA-0MSN6FBFF009VCOB)
+### Other
+- Improved test reliability so error-handling checks run correctly. (SA-0MWB8W0S2009M3TS)
+- Dev pushes no longer fail from overly tight test timeouts under heavy load. (SA-0MW41193M0054G15)
+- Cleaned up internal tooling so future bugs are caught earlier and slip through less often. (SA-0MWNPTFRT000JYSK)
+- Keeps the game running smoothly by cleaning up behind-the-scenes code issues. (SA-0MVWEH5ZA000ZIEW)
+- Internal tooling scripts now run directly, keeping development and testing smooth. (SA-0MWM7HADO000KMIO)
+- Internal tooling cleanup with no impact on gameplay. (SA-0MWFSGTCL007WUD2)
+
 ## v0.1.28 (2026-11-15)
 > **Release focus:** This release focuses on making the audit, finish, and release pipeline more reliable and much faster, with smarter test scoping, automatic temp cleanup, and fixes for stuck or looping audits. It also resolves numerous finish and reporting edge cases—such as flaky git retries, interrupted runs, and inaccurate session status—while adding automatic installation of paid DeepSeek models.
 ### Features
