@@ -122,6 +122,7 @@ python3 $(skill_path agent-log-review)/scripts/agent_log_review.py --parent-id S
 ## References
 
 - Maintainer reference: [docs/dev/agent-log-review-skill-reference.md](../../docs/dev/agent-log-review-skill-reference.md).
+- Tool output: [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result.
 - Epic: SA-0MUEKTJRD0010CGC (children SA-0MV6U4PW4007R7FE → SA-0MV6UHXBS00019UE).
 
 ## Final step: standardized end-of-session report

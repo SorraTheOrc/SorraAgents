@@ -172,6 +172,10 @@ is tracked as a follow-on work item rather than bundled into a metrics change.
 See [docs/dev/test-churn-skill-reference.md](../../docs/dev/test-churn-skill-reference.md)
 for the metric definitions, migration provenance and worked examples.
 
+When inspecting git/log artefacts, follow the shared
+[tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB
+per result.
+
 ## Tests
 
 Unit and end-to-end tests live under `tests/` in this skill directory.

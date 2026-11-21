@@ -108,6 +108,16 @@ an entry that predates the field reads as ``"worktree"`` (historical
 default), so a tree request misses it and fails closed rather than accepting a
 verdict recorded for a differently-identified tree (SA-0MVL2NH1G0094FA2 AC4).
 
+``"change_set"`` is the third kind (SA-0MWFJS9OL001ZTTC): the SHA-256 of the
+**complete patch** a change set contributes (:func:`compute_change_set_state`).
+A pure rebase rewrites the commit and its tree but not that patch, so a
+verdict measured before a lost push race stays valid evidence for the
+rebased commit — the patch covers every changed path plus the pre-image and
+post-image object ids, so a content change (ours or upstream's, in a file the
+patch touches) always produces a different key and misses. Entries of this
+kind record ``change_set_base_tree``/``change_set_target_tree`` so a consumer
+can state which tree the reused verdict was actually measured on.
+
 Writes are atomic (temp file + ``os.replace``); no locking is used.
 """
 
@@ -117,6 +127,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -158,9 +169,23 @@ class GitStateUnavailable(RuntimeError):
 
 #: Fingerprint provenance kinds. ``worktree`` is the historical default (the
 #: loose :func:`compute_git_state` fingerprint); ``tree`` is an explicitly
-#: supplied would-be-commit tree SHA (:func:`compute_tree_state`).
+#: supplied would-be-commit tree SHA (:func:`compute_tree_state`);
+#: ``change_set`` is the content hash of the patch a change set contributes
+#: (:func:`compute_change_set_state`), which survives a pure rebase
+#: (SA-0MWFJS9OL001ZTTC).
 FINGERPRINT_KIND_WORKTREE = "worktree"
 FINGERPRINT_KIND_TREE = "tree"
+FINGERPRINT_KIND_CHANGE_SET = "change_set"
+
+#: Domain separator mixed into the change-set hash so a patch hash can never
+#: be confused with any other SHA-256 this module computes. Bump the version
+#: when the patch-generation flags change: every previously stored
+#: change-set entry then misses instead of being matched against a
+#: differently-derived key.
+CHANGE_SET_FINGERPRINT_VERSION = b"change-set-v1\x00"
+
+#: Full hexadecimal tree/commit object names (40 for SHA-1, 64 for SHA-256).
+_OBJECT_NAME_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 #: The distinct non-zero exit status a run whose guarded checkout moved
 #: mid-run is reported with (``EX_TEMPFAIL`` — temporary failure, retryable)
@@ -365,6 +390,150 @@ def compute_tree_state(
             f"{proc.stderr.strip() or 'git write-tree failed'}"
         )
     return tree
+
+
+def compute_change_set_state(
+    cwd: str | Path | None = None,
+    *,
+    target_tree: str | None = None,
+    base_ref: str = "origin/dev",
+) -> dict[str, Any] | None:
+    """Return the fingerprint of the **patch** a change set contributes.
+
+    A change-set fingerprint identifies the content of a change independently
+    of the base it is applied to (SA-0MWFJS9OL001ZTTC). The dev-push gate is
+    tree-keyed, so a lost push race — ``dev`` advanced concurrently, the
+    feature branch is rebased, the commit and its tree are rewritten — misses
+    the tree-keyed entry and re-executes the whole suite even though the
+    change itself is byte-identical. This function produces the key that
+    survives that rebase.
+
+    The patch is computed **tree-to-tree** with ``--full-index``, so it covers
+    every changed path, its pre-image and post-image object ids and every
+    hunk. That is what makes reuse provable rather than assumed: a difference
+    in our own changes *or* in an upstream change to a file the patch touches
+    changes one of those object ids and therefore the fingerprint. Two
+    identical fingerprints describe the same patch applied to the same
+    pre-image content; only *other* files may differ between the two trees,
+    and those are covered by the base tree's own (gate-green) verdict.
+
+    The base tree is derived from *cwd*'s ``HEAD``:
+
+    * when ``HEAD``'s tree **is** *target_tree* (the checked-out pushed
+      commit — the dev-push gate's case), the base is ``merge-base(HEAD,
+      base_ref)``, falling back to ``HEAD^`` when *base_ref* is unavailable
+      (a repo with no remote tracking ref, or a root commit);
+    * otherwise *target_tree* is a would-be commit tree (the finish gate's
+      pre-commit case) and the base is ``merge-base(HEAD, base_ref)``,
+      falling back to ``HEAD`` itself.
+
+    Tree-to-tree diffs never consult the index, so an ambient temporary
+    ``GIT_INDEX_FILE`` (the finish gate's would-be-commit index) cannot skew
+    the result.
+
+    Args:
+        cwd: Repository/worktree the git commands run in.
+        target_tree: The tree the change set produces — the would-be-commit
+            tree SHA or the pushed commit's tree SHA. An unusable value (or
+            one this repository does not hold) disables tracking.
+        base_ref: Parent ref the change set targets (default ``origin/dev``).
+
+    Returns:
+        ``{"fingerprint", "base_commit", "base_tree", "target_tree",
+        "paths"}`` or ``None`` when there is nothing to key on: an unusable
+        or missing tree, git cannot answer, or the change set is empty (base
+        tree == target tree) — an empty patch must never become a cache key,
+        because every empty change set would then share one verdict.
+    """
+    cwd_str = str(Path(cwd or os.getcwd()).resolve())
+    tree = (target_tree or "").strip().lower()
+    if not _OBJECT_NAME_RE.fullmatch(tree):
+        return None
+    try:
+        head = (
+            _run_git(cwd_str, "rev-parse", "--verify", "HEAD^{commit}") or ""
+        ).strip()
+        if not head:
+            return None
+        head_tree = (
+            _run_git(cwd_str, "rev-parse", f"{head}^{{tree}}") or ""
+        ).strip()
+        base_commit = ""
+        if base_ref:
+            base_commit = (
+                _run_git(cwd_str, "merge-base", head, base_ref) or ""
+            ).strip()
+        if not base_commit:
+            # No usable parent ref: for a checked-out pushed commit the base
+            # is its first parent, otherwise HEAD itself is the base the
+            # would-be tree is built on.
+            fallback = "HEAD^" if head_tree == tree else "HEAD"
+            base_commit = (
+                _run_git(
+                    cwd_str, "rev-parse", "--verify", f"{fallback}^{{commit}}"
+                )
+                or ""
+            ).strip()
+        if not base_commit:
+            return None
+        base_tree = (
+            _run_git(cwd_str, "rev-parse", f"{base_commit}^{{tree}}") or ""
+        ).strip()
+        if base_tree and base_tree == tree and head_tree == tree:
+            # The target is already on the base ref — the commit has landed
+            # (post-push verification runs *after* the ref update) or it is the
+            # ref tip. The change set is then the commit's own patch, measured
+            # against its first parent: exactly the base the gate used before
+            # the push moved the ref. Without this the key would be empty
+            # post-push and the gate's own evidence invisible.
+            base_commit = (
+                _run_git(cwd_str, "rev-parse", "--verify", "HEAD^") or ""
+            ).strip()
+            base_tree = (
+                _run_git(cwd_str, "rev-parse", f"{base_commit}^{{tree}}")
+                if base_commit
+                else None
+            )
+            base_tree = (base_tree or "").strip()
+        if not base_tree or base_tree == tree:
+            # Nothing changed between base and target: no change set to key
+            # on (an empty patch would collide with every other empty patch).
+            return None
+        # ``--full-index`` records pre- and post-image object ids in full, so
+        # upstream churn in a touched file cannot hide behind an abbreviated
+        # index line. ``--no-renames`` and the pinned prefixes make the patch
+        # text independent of user/repo diff config.
+        patch = _run_git(
+            cwd_str,
+            "diff",
+            "--no-renames",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            base_tree,
+            tree,
+        )
+        if patch is None or not patch.strip():
+            return None
+        paths = _run_git(
+            cwd_str, "diff", "--no-renames", "--name-only", base_tree, tree
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+        LOG.warning("test cache: change-set fingerprint unavailable (%s)", exc)
+        return None
+    fingerprint = hashlib.sha256(
+        CHANGE_SET_FINGERPRINT_VERSION + patch.encode("utf-8", "surrogateescape")
+    ).hexdigest()
+    return {
+        "fingerprint": fingerprint,
+        "base_commit": base_commit,
+        "base_tree": base_tree,
+        "target_tree": tree,
+        "paths": [line for line in (paths or "").splitlines() if line],
+    }
 
 
 def _status_entries(cwd: str, *, strict: bool = False) -> list[tuple[str, str]]:
@@ -644,6 +813,18 @@ def lookup(
         "scope": meta.get("scope", "full"),
         "test_type": meta.get("test_type", "full"),
         "interpreter": meta.get("interpreter", ""),
+        # Change-set provenance (SA-0MWFJS9OL001ZTTC): the trees the reused
+        # verdict was measured between, so a consumer can state which tree a
+        # change-set-keyed verdict actually belongs to. ``verdict_origin``
+        # marks a tree-kind entry inherited from a change-set hit
+        # (``"change_set_reuse"``, with ``measured_tree`` naming the tree the
+        # suite really ran against) so it is never read as directly executed
+        # tree evidence.
+        "change_set_base_tree": meta.get("change_set_base_tree", ""),
+        "change_set_target_tree": meta.get("change_set_target_tree", ""),
+        "change_set_paths": list(meta.get("change_set_paths") or []),
+        "verdict_origin": meta.get("verdict_origin", ""),
+        "measured_tree": meta.get("measured_tree", ""),
         "cached": True,
     }
 
@@ -662,6 +843,7 @@ def store(
     interpreter: str = "",
     git_state_at_start: str = "",
     fingerprint_kind: str = FINGERPRINT_KIND_WORKTREE,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> Path:
     """Persist a run result, replacing any existing entry for the same key.
 
@@ -694,9 +876,16 @@ def store(
     (SA-0MVK154IE007OS3D AC2).
 
     *fingerprint_kind* records the provenance of *git_state*: ``"worktree"``
-    (default — the loose :func:`compute_git_state` fingerprint) or ``"tree"``
-    (an explicit would-be-commit tree SHA). Read-only consumers and later
-    lookups use it to refuse verdicts recorded for a different kind of tree.
+    (default — the loose :func:`compute_git_state` fingerprint), ``"tree"``
+    (an explicit would-be-commit tree SHA) or ``"change_set"`` (the patch
+    content hash from :func:`compute_change_set_state`). Read-only consumers
+    and later lookups use it to refuse verdicts recorded for a different kind
+    of tree.
+
+    *extra_metadata* adds informational keys to the entry's ``metadata.json``
+    (e.g. the trees a change-set-keyed verdict was measured between).
+    Reserved keys (the ones this function writes) always win, so a caller
+    cannot rewrite the entry's identity.
 
     Returns the entry directory path.
     """
@@ -716,6 +905,9 @@ def store(
         "exit_code": int(exit_code),
         "completed_at": completed_at if completed_at is not None else time.time(),
     }
+    if extra_metadata:
+        for key, value in extra_metadata.items():
+            meta.setdefault(key, value)
     _atomic_write(entry_dir / "stdout.txt", stdout)
     _atomic_write(entry_dir / "stderr.txt", stderr)
     _atomic_write(entry_dir / "metadata.json", json.dumps(meta, indent=2))
@@ -773,6 +965,8 @@ def run_cached(
     scope: str = "full",
     test_type: str = "full",
     fingerprint: str | None = None,
+    track_change_set: bool = True,
+    change_set_base_ref: str = "origin/dev",
 ) -> dict[str, Any]:
     """Run *command* through the cache.
 
@@ -811,6 +1005,34 @@ def run_cached(
       that pass nothing keep the historical loose-worktree keys byte for byte
       (test skill CLI, audit, pre-push).
 
+    *track_change_set* (default ``True``, only meaningful with *fingerprint*)
+    additionally keys the run on the **patch content** the change set
+    contributes (:func:`compute_change_set_state`, ``fingerprint_kind=
+    "change_set"``) and, on a tree-keyed miss, serves a verdict stored for
+    that same patch (SA-0MWFJS9OL001ZTTC). A pure rebase onto a concurrently
+    advanced parent rewrites the commit and its tree but not the patch, so
+    the verification a lost push race used to pay for again is served instead
+    of re-executed. The reuse is provable rather than heuristic: the patch
+    records every changed path plus its pre- and post-image object ids, so a
+    change in this work *or* an upstream change to a file the patch touches
+    yields a different key and misses. A change set identical to its base has
+    an empty patch and is never keyed (an empty key would be shared by every
+    empty change set). *change_set_base_ref* names the parent ref the patch is
+    computed against (default ``origin/dev``), falling back to ``HEAD`` /
+    ``HEAD^`` when it does not resolve.
+
+    On a change-set hit the result carries ``reused_via_change_set: True`` and
+    ``change_set_target_tree`` — the tree the reused verdict was actually
+    measured on — while ``fingerprint_kind`` reports ``"change_set"``.
+
+    A change-set *hit* also mirrors the served verdict under the pushed tree's
+    key, stamped ``verdict_origin="change_set_reuse"`` with the tree the suite
+    actually measured (``measured_tree``) and the original ``completed_at``:
+    the pushed tree is never silently presented as directly executed evidence
+    (``lookup`` returns both fields), and every read-only consumer (post-push
+    verification, gate-evidence classification, audit) finds the verdict under
+    the key it already queries.
+
     Returns a dict with ``stdout``, ``stderr``, ``exit_code``, ``completed_at``
     (epoch float), ``command`` (normalized), ``git_state`` (the state the
     entry is keyed on — empty when the cache was bypassed for an
@@ -821,6 +1043,7 @@ def run_cached(
     """
     cwd_path = Path(cwd or os.getcwd()).resolve()
     cwd_str = str(cwd_path)
+    normalized = normalize_test_command(command)
 
     # ``no_cache`` never reads or writes the cache, so it needs no fingerprint
     # (and must not fail when the tree cannot be fingerprinted).
@@ -833,6 +1056,17 @@ def run_cached(
     else:
         git_state_before = None if no_cache else _fingerprint_for_cache(cwd_str)
         fingerprint_kind = FINGERPRINT_KIND_WORKTREE
+
+    # Change-set binding (SA-0MWFJS9OL001ZTTC): the same change, measured on a
+    # different (re-based) parent. An unavailable state (non-git cwd, unusable
+    # tree, empty change set) only disables the extra key — never the run.
+    change_set: dict[str, Any] | None = None
+    if fingerprint is not None and track_change_set and not no_cache:
+        change_set = compute_change_set_state(
+            cwd_str,
+            target_tree=str(fingerprint),
+            base_ref=change_set_base_ref,
+        )
 
     if not force and git_state_before is not None:
         hit = lookup(
@@ -849,6 +1083,54 @@ def run_cached(
         # never serve a partial run as a full-suite result and vice versa).
         if hit is not None and hit.get("scope", "full") == scope:
             return {**hit, "state_changed_during_run": None}
+        # Tree-keyed miss: the exact tree has no verdict, but a verdict exists
+        # for the identical *change set* (a rebase rewrote the tree, not the
+        # patch). Serving it is what makes a lost push race cheap.
+        if change_set is not None:
+            change_hit = lookup(
+                command,
+                change_set["fingerprint"],
+                cwd=cwd_str,
+                ttl=ttl,
+                test_type=test_type,
+                fingerprint_kind=FINGERPRINT_KIND_CHANGE_SET,
+            )
+            if change_hit is not None and change_hit.get("scope", "full") == scope:
+                # Mirror the inherited verdict under the pushed tree's key so
+                # consumers that look for tree-kind evidence (post-push
+                # verification refuses the terminal transition on ``missing``)
+                # find it. The entry keeps the original ``completed_at`` (no
+                # extended lifetime) and states its origin, so it is never
+                # mistaken for a directly executed tree verdict.
+                if fingerprint is not None and not no_cache:
+                    store(
+                        normalized,
+                        str(fingerprint),
+                        cwd=cwd_str,
+                        stdout=change_hit.get("stdout", ""),
+                        stderr=change_hit.get("stderr", ""),
+                        exit_code=change_hit.get("exit_code", 0),
+                        completed_at=change_hit.get("completed_at"),
+                        scope=change_hit.get("scope", scope),
+                        test_type=test_type,
+                        interpreter=change_hit.get("interpreter", ""),
+                        git_state_at_start=str(fingerprint),
+                        fingerprint_kind=FINGERPRINT_KIND_TREE,
+                        extra_metadata={
+                            "verdict_origin": "change_set_reuse",
+                            "measured_tree": change_hit.get(
+                                "change_set_target_tree"
+                            )
+                            or "",
+                            "change_set_fingerprint": change_set["fingerprint"],
+                        },
+                    )
+                return {
+                    **change_hit,
+                    "state_changed_during_run": None,
+                    "reused_via_change_set": True,
+                    "primary_fingerprint_missed": str(fingerprint),
+                }
 
     normalized = normalize_test_command(command)
     # Detect a mid-run checkout move by bracketing the runner with the guarded
@@ -925,6 +1207,31 @@ def run_cached(
                 git_state_at_start=git_state_before or "",
                 fingerprint_kind=FINGERPRINT_KIND_TREE,
             )
+            # Mirror the same verdict under the change-set key so a later
+            # rebase of the identical patch is served instead of re-executed
+            # (SA-0MWFJS9OL001ZTTC). The entry records both trees, so a
+            # consumer can always state which tree this verdict measured.
+            if change_set is not None:
+                store(
+                    normalized,
+                    change_set["fingerprint"],
+                    cwd=cwd_str,
+                    stdout=proc.stdout or "",
+                    stderr=proc.stderr or "",
+                    exit_code=proc.returncode,
+                    completed_at=completed_at,
+                    scope=scope,
+                    test_type=test_type,
+                    interpreter=interpreter,
+                    git_state_at_start=change_set["fingerprint"],
+                    fingerprint_kind=FINGERPRINT_KIND_CHANGE_SET,
+                    extra_metadata={
+                        "change_set_base_commit": change_set["base_commit"],
+                        "change_set_base_tree": change_set["base_tree"],
+                        "change_set_target_tree": change_set["target_tree"],
+                        "change_set_paths": change_set["paths"],
+                    },
+                )
         else:
             # Key the entry on the state the run left behind: that is the
             # state every later consumer computes, so a completed run is
@@ -1012,6 +1319,90 @@ def query_cached(
 
 
 # ---------------------------------------------------------------------------
+# Cache grafting (isolated-worktree run -> main checkout)
+# ---------------------------------------------------------------------------
+
+
+def mirror_cache_entries(
+    source: str | Path, destination: str | Path
+) -> list[str]:
+    """Graft *source*'s cache entries into *destination*'s cache.
+
+    An isolated full-suite run (the audit skill's F3 execution worktree) is a
+    linked worktree with no ``.worklog`` of its own, so :func:`cache_dir`
+    stores its entries under ``<git-dir>/test-cache`` — and ``git worktree
+    remove`` deletes that directory with the worktree. Read-only consumers
+    (subsequent audits and post-push verification) query the **main
+    checkout's** ``.worklog/cache``, so without a graft every audit re-executes
+    a suite whose verdict it already holds (WL-0MVSPZ1FH000RWET).
+
+    Mirrors the dev-push hook's ``mirror_suite_cache`` semantics: cache keys
+    are content-addressed (command + git state), so copying an entry the
+    destination lacks is always safe, and an entry that already exists is
+    **never overwritten** (a fresher/identical entry must not be replaced by
+    a copy). Fail-soft by design — cache plumbing must never fail the run:
+    every per-entry I/O error is logged and skipped, and the caller's verdict
+    is unaffected.
+
+    Args:
+        source: A checkout whose cache directory should be copied **from**
+            (normally the isolated execution worktree).
+        destination: A checkout whose cache directory should be copied
+            **into** (normally the main checkout).
+
+    Returns:
+        The entry directory names that were copied (empty when the source has
+        no cache, the two roots resolve to the same cache, or every entry was
+        already present).
+    """
+    try:
+        source_dir = cache_dir(source)
+        destination_dir = cache_dir(destination)
+    except (OSError, RuntimeError) as exc:  # pragma: no cover - defensive
+        LOG.warning("test cache: cannot resolve cache directories (%s)", exc)
+        return []
+    if source_dir.resolve() == destination_dir.resolve():
+        return []
+    if not source_dir.is_dir():
+        return []
+    try:
+        destination_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        LOG.warning(
+            "test cache: cannot create the destination cache %s (%s)",
+            destination_dir,
+            exc,
+        )
+        return []
+    import shutil
+
+    mirrored: list[str] = []
+    for entry in sorted(source_dir.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        target = destination_dir / entry.name
+        if target.exists():
+            # Never overwrite an existing entry: the key is content-addressed,
+            # so the destination's copy describes the same state.
+            continue
+        try:
+            shutil.copytree(entry, target)
+            mirrored.append(entry.name)
+        except OSError as exc:
+            LOG.warning("test cache: could not mirror %s (%s)", entry, exc)
+            shutil.rmtree(target, ignore_errors=True)
+    if mirrored:
+        LOG.info(
+            "test cache: grafted %d entr%s from %s into %s",
+            len(mirrored),
+            "y" if len(mirrored) == 1 else "ies",
+            source_dir,
+            destination_dir,
+        )
+    return mirrored
+
+
+# ---------------------------------------------------------------------------
 # Summary extraction
 # ---------------------------------------------------------------------------
 
@@ -1039,6 +1430,7 @@ def summary_lines(
 __all__ = [
     "DEFAULT_TTL_SECONDS",
     "FAILED_RUN_TTL_SECONDS",
+    "FINGERPRINT_KIND_CHANGE_SET",
     "FINGERPRINT_KIND_TREE",
     "FINGERPRINT_KIND_WORKTREE",
     "STATE_CHANGED_EXIT_CODE",
@@ -1046,9 +1438,11 @@ __all__ = [
     "GitStateUnavailable",
     "cache_dir",
     "cache_key",
+    "compute_change_set_state",
     "compute_git_state",
     "compute_tree_state",
     "lookup",
+    "mirror_cache_entries",
     "normalize_test_command",
     "query_cached",
     "run_cached",

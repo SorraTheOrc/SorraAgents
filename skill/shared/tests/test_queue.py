@@ -354,12 +354,16 @@ def test_queue_length_reflects_contents():
 
 
 def test_orphaned_entries_cleaned_on_read():
-    """Entries older than TTL are pruned on dequeue."""
-    pq = PriorityQueue("unit-ttl", max_depth=10, timeout=5.0, ttl_seconds=0.2)
-    pq.enqueue("old", Priority.LOW)
-    time.sleep(0.3)  # older than TTL
+    """Entries older than TTL are pruned on dequeue.
 
-    entry = pq.dequeue(timeout=1.0)
+    Ages are injected via ``timestamp=`` (a supported testing hook) rather than
+    real sleeps, so the outcome cannot flip when a loaded host delays the test
+    past the TTL (SA-0MWMJTL77006JX4N).
+    """
+    pq = PriorityQueue("unit-ttl", max_depth=10, timeout=5.0, ttl_seconds=60.0)
+    pq.enqueue("old", Priority.LOW, timestamp=time.monotonic() - 300.0)
+
+    entry = pq.dequeue(timeout=0)
     # The old entry should have been pruned; queue should be empty
     assert entry is None
     assert len(pq) == 0
@@ -376,23 +380,29 @@ def test_fresh_entries_not_pruned():
 
 
 def test_ttl_cleanup_preserves_order():
-    """Pruning old entries doesn't disturb ordering of remaining entries."""
-    pq = PriorityQueue("unit-ttl-order", max_depth=10, timeout=5.0, ttl_seconds=0.2)
-    pq.enqueue("old1", Priority.LOW)  # t=0
-    time.sleep(0.15)  # t=0.15
-    pq.enqueue("new1", Priority.HIGH)  # t=0.15
-    time.sleep(0.15)  # t=0.30 — old1 now expired (>0.2s), new1 still fresh
-    pq.enqueue("new2", Priority.MEDIUM)  # t=0.30
+    """Pruning old entries doesn't disturb ordering of remaining entries.
+
+    Ages are injected via ``timestamp=`` (a supported testing hook) instead of
+    real sleeps. The previous sleep-based version left only ~50 ms of slack, so
+    on a busy host the "fresh" entry aged past the TTL and was correctly pruned
+    — a flaky test, not a queue defect (SA-0MWMJTL77006JX4N).
+    """
+    now = time.monotonic()
+    pq = PriorityQueue("unit-ttl-order", max_depth=10, timeout=5.0, ttl_seconds=60.0)
+    pq.enqueue("old1", Priority.LOW, timestamp=now - 300.0)  # expired
+    pq.enqueue("new1", Priority.HIGH, timestamp=now - 30.0)  # fresh
+    pq.enqueue("new2", Priority.MEDIUM, timestamp=now - 20.0)  # fresh
+    pq.enqueue("new3", Priority.MEDIUM, timestamp=now - 10.0)  # fresh
 
     entries = []
     while True:
-        entry = pq.dequeue(timeout=0.5)
+        entry = pq.dequeue(timeout=0)
         if entry is None:
             break
         entries.append(entry)
 
-    # old1 expired; new1 (HIGH) before new2 (MEDIUM), both fresh
-    assert [e.item_id for e in entries] == ["new1", "new2"]
+    # old1 expired; new1 (HIGH) before the MEDIUM tier, which stays FIFO
+    assert [e.item_id for e in entries] == ["new1", "new2", "new3"]
 
 
 # ---------------------------------------------------------------------------

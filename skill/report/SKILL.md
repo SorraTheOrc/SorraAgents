@@ -514,3 +514,5 @@ This completes the audit process for SA-0EXAMPLEAUDIT0 (Add unit tests for the p
   t-shirt (XS–XL) values rendered in Meta-Data.
 - `../shared/status_lifecycle.py` — the shared status/stage transitions
   whose results the Meta-Data Status/Stage fields reflect.
+- `../shared/tool-output-budget.md` — size every read/search before rendering
+  the report (`jq` over `cat`, ~10 KB per result).

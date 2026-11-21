@@ -102,6 +102,8 @@ wl show SA-0MPYMFZXO0004ZU4 --json
 python3 $(skill_path code-review)/scripts/code_quality.py --path . --json
 ```
 
+Size every read and search per the shared [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result.
+
 End.
 
 

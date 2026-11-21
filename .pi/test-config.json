@@ -1,5 +1,5 @@
 {
-  "timeoutPerCommand": 2700,
+  "timeoutPerCommand": 5400,
   "groups": {
     "audit": {
       "description": "Audit skill tests and audit-related test suites",

@@ -164,7 +164,12 @@ from test.scripts.run_tests import (
     resolve_type_commands,
     suite_timeout_per_command,
 )
-from test_cache import DEFAULT_TTL_SECONDS, query_cached, run_cached
+from test_cache import (
+    DEFAULT_TTL_SECONDS,
+    mirror_cache_entries,
+    query_cached,
+    run_cached,
+)
 
 #: Audit-specific acceptance window for GREEN cached full-suite runs.
 #: The generic ``DEFAULT_TTL_SECONDS`` (2h) is kept for suite runs elsewhere;
@@ -893,6 +898,22 @@ without an accepted waiver, so a fresh chore is created instead of reusing
 the stale one (SA-0MVZNECSD005XB42 AC1).
 """
 
+AUDIT_VERIFICATION_CMD_MARKER = "Audit-Verification-Command:"
+"""Exact linter command that reproduces the tracked finding.
+
+Recorded on every candidate-false-positive chore so a later re-verification
+sweep re-runs it verbatim instead of guessing the rule/path from a title
+(SA-0MW7Z1JCE009G6J3 AC1).
+"""
+
+AUDIT_FINGERPRINT_MARKER = "Audit-Fingerprint:"
+"""Content fingerprint (file hash + rule) of the tracked finding's target.
+
+A sweep can compare this against the recomputed value to distinguish a
+finding that never fired from one whose target changed since filing
+(SA-0MW7Z1JCE009G6J3 AC1).
+"""
+
 # Marker embedded in a CFP chore's description when the same (rule, path)
 # identity is already tracked by an open Refactor-family item
 # (SA-0MWE1EAR30045VHO AC2). The chore's producer-decision purpose is
@@ -988,6 +1009,40 @@ fail-open partial (execution-dependent ACs stay partial) instead of
 invoking the test skill. Precedence: ``--no-execute`` flag > env var >
 auto-execute on cache miss (default).
 """
+
+AUDIT_CODE_ROOT_ENV = "AUDIT_CODE_ROOT"
+"""Environment variable name for the explicit code-repository root.
+
+When set, the git-derived audit content (merge gate, file-scope manifest,
+changed files, green-run evidence, code-quality scope, Phase 2 cwd) resolves
+against this repository instead of the worklog-owning project — independent
+of the worklog store (LP-0MVZ6R5H8007NYLR). Precedence: ``--code-root``
+flag > this env var > owning-project default. Never affects ``wl`` routing;
+``--worklog-dir`` keeps governing the worklog side. Read-only: the runner
+never fetches, checks out or mutates the pointed-at repository.
+"""
+
+
+def _resolve_code_root(flag_value: str | None) -> str | None:
+    """Resolve the explicit code-repository root for this audit run.
+
+    Precedence (LP-0MVZ6R5H8007NYLR AC1/AC2): ``--code-root`` flag >
+    ``AUDIT_CODE_ROOT`` env var > owning-project default (``None`` means
+    "use today's owning-project resolution"). ``None``/empty flag values
+    fall through to the env var; an empty env var is treated as unset.
+
+    Args:
+        flag_value: The parsed ``--code-root`` value (or ``None``).
+
+    Returns:
+        The resolved code root string, or ``None`` when neither the flag
+        nor the env var supplies one (the owning-project default applies).
+    """
+    if flag_value:
+        return flag_value
+    env_value = os.environ.get(AUDIT_CODE_ROOT_ENV)
+    return env_value or None
+
 
 AUDIT_STRICT_ENV = "AUDIT_STRICT"
 """Environment variable name for the audit test-failure mode.
@@ -1872,6 +1927,27 @@ def _audit_target_root(project_root: Path | None = None) -> Path:
     return project_root or _ACTIVE_AUDIT_ROOT or TARGET_PROJECT_ROOT
 
 
+def _scope_validation_root(owning_root: Path | None) -> Path | None:
+    """Root a FILE SCOPE manifest is validated against.
+
+    The manifest is *built* from the per-audit target root — the code root
+    when ``--code-root`` / ``AUDIT_CODE_ROOT`` is set (LP-0MVZ6R5H8007NYLR) —
+    so validation must use the same root (SA-0MWO59IMN000RUHM). Validating
+    against the worklog owning root made every genuine cross-repo audit abort
+    with an ``Audit scope error`` and persist an AC-less report, because a
+    manifest built from the code repository can never contain the worklog
+    project's distinctive top-level entries.
+
+    Returns the published per-audit root during a run; outside a run
+    (``_ACTIVE_AUDIT_ROOT`` unset) it returns *owning_root* unchanged so a
+    same-repo audit — and every direct/unit caller — behaves exactly as
+    before.
+    """
+    if _ACTIVE_AUDIT_ROOT is not None:
+        return Path(_ACTIVE_AUDIT_ROOT)
+    return owning_root
+
+
 # ------------------------------------------------------------------
 # Abort-recovery helpers (SA-0MTRH8C5O005URGR).
 # ------------------------------------------------------------------
@@ -2168,6 +2244,107 @@ def _verify_launch_context(issue_id: str,
         file=sys.stderr,
     )
     return None
+
+
+def _sibling_project_roots() -> list[Path]:
+    """Roots of sibling projects carrying a prefix-matching worklog config.
+
+    Same candidate population as the shared prefix-to-sibling scan
+    (``SIBLING_SCAN_ROOT/*/.worklog/config.yaml`` — AC4 of
+    LP-0MWDDRU1P0067SUV). The scan root is read from the SHARED
+    ``skill.shared.status_lifecycle`` module at call time so tests that
+    patch that attribute (the documented patching point) are honoured.
+    Returns project roots (the parent of each ``.worklog`` dir), ordered
+    and de-duplicated.
+    """
+    from shared import status_lifecycle as shared_status_life
+    try:
+        configs = sorted(
+            shared_status_life.SIBLING_SCAN_ROOT.glob("*/.worklog/config.yaml")
+        )
+    except OSError:
+        return []
+    roots: list[Path] = []
+    for config in configs:
+        root = config.parent.parent
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _sibling_repo_holds_path(candidate: Path, rel_path: str) -> bool:
+    """One bounded existence check: does *rel_path* exist in the sibling
+    candidate's checkout?
+
+    A single filesystem probe per touched file (never a whole-repo scan —
+    AC4), deliberately NOT a subprocess: the audit's injectable runner and
+    the subprocess module are both mocked across many flow tests, and a
+    probe through them would report every candidate as holding the file
+    (false abort). The sibling project's delivered files are committed and
+    checked out, so working-tree presence is a faithful proxy for presence
+    at HEAD (AC3); an unverifiable candidate never triggers a false abort.
+    """
+    try:
+        return (candidate / rel_path).exists()
+    except OSError:
+        return False
+
+
+def _detect_cross_repo_scope_error(
+    runner: Runner,
+    issue_id: str,
+    work_item: dict,
+    owning_root: Path,
+    comments: Sequence[dict] | None = None,
+) -> str | None:
+    """Cross-repo detection (AC2, LP-0MWDDRU1P0067SUV; implementation
+    LP-0MWDDRWBG0013CS1): an item whose resolved touched-file set is
+    ENTIRELY absent from the owning repo — while present at HEAD in a
+    sibling candidate project's repository — must fail closed.
+
+    Returns an ``Audit scope error``-style message naming the sibling
+    candidate(s), or ``None`` to fail open / skip:
+
+    - touched set empty/undeterminable (``_resolve_touched_files`` returned
+      nothing) — the detection is skipped entirely and the existing
+      ``_validate_file_scope_manifest`` coverage check stays the backstop;
+    - ANY touched path exists in the owning repo (same-repo launch — zero
+      cost, the check only runs when the touched set is entirely absent);
+    - git/IO failures (never a false abort).
+
+    Once the ``--code-root`` option lands (LP-0MWDDRVQ7005KOHN), callers
+    must skip this detection when an explicit code root is supplied — it is
+    only correct for the no-explicit-code-root case.
+    """
+    touched = _resolve_touched_files(
+        runner, issue_id, work_item=work_item, comments=comments,
+    )
+    if not touched:
+        return None
+    owning = Path(owning_root).resolve()
+    try:
+        if any((owning / p).exists() for p in touched):
+            return None
+    except OSError:
+        return None
+    holders: list[Path] = []
+    for candidate in _sibling_project_roots():
+        if candidate.resolve() == owning:
+            continue
+        if all(_sibling_repo_holds_path(candidate, p) for p in touched):
+            holders.append(candidate)
+    if not holders:
+        return None
+    return (
+        "Audit scope error: the work item's delivered files "
+        f"({', '.join(touched)}) are absent from the owning project "
+        f"({owning}) but present at HEAD in the sibling project "
+        "repository candidate(s): "
+        f"{', '.join(str(h) for h in holders)}. No explicit code root was "
+        "given, so the audit would resolve the wrong repository. Re-run "
+        "with an explicit code root naming the sibling repository, or "
+        "launch from the sibling project."
+    )
 
 
 def _project_top_levels(project_root: Path) -> list[str]:
@@ -2758,6 +2935,11 @@ def _resolve_producer_review_decision(ctx: _AuditContext,
       (SA-0MVZNECSD005XB42 AC2)
     - ``Yes`` on an audit-generated candidate-false-positive tracker chore →
       ``untouched`` (AC4)
+    - ship-triggered run (``--ship-triggered``) + top-level ``Yes`` or
+      ``No`` → ``untouched`` with reason "ship-triggered audit - flag
+      untouched" — the release's own verification re-audit never arms the
+      producer queue (SA-0MW92TODX00064XQ AC1/AC2/AC3); only ship-automated
+      invocations set the marker
     - ``No`` + independent (not cascade-demotion-suppressed) + top-level →
       ``required`` regardless of ``merge_gate_blocker`` (AC3)
     - ``No`` + cascade-demotion-suppressed → ``untouched`` (producer Q2)
@@ -2790,6 +2972,20 @@ def _resolve_producer_review_decision(ctx: _AuditContext,
             "reason": (
                 "infrastructure-failure fallback 'No' — flag untouched"
             ),
+            "fingerprint": fingerprint,
+        }
+
+    # Ship-triggered run (SA-0MW92TODX00064XQ AC1/AC2/AC3): a release-gate
+    # verification re-audit is NOT an independent review, so a top-level
+    # 'Yes' or 'No' leaves the producer-review flag untouched (neither set
+    # nor cleared). Only ship-automated invocations set the marker; every
+    # other lifecycle behaviour (the 'Yes' advance / 'No' demotion, the
+    # persisted report) is unchanged. Children remain covered by the child
+    # rule below.
+    if ctx.ship_triggered and top_level and verdict in ("yes", "no"):
+        return {
+            "action": PRODUCER_REVIEW_UNTOUCHED,
+            "reason": "ship-triggered audit - flag untouched",
             "fingerprint": fingerprint,
         }
 
@@ -4746,6 +4942,7 @@ def _run_tests_via_test_skill(
     key_files: Sequence[str] | None = None,
     baseline_commit: str | None = None,
     baseline_runner: Callable[..., dict[int, tuple[str, str]]] | None = None,
+    mirror_to: str | Path | None = None,
 ) -> dict:
     """Execute the full project test suite via the test skill's runner.
 
@@ -4764,6 +4961,13 @@ def _run_tests_via_test_skill(
     work item for the failing test (as a child of *parent_work_item_id* when
     provided). A triage helper failure is recorded but never crashes the run.
 
+    *mirror_to* (optional) names the checkout whose cache should receive the
+    entries this run writes — normally the main checkout when *cwd* is the
+    isolated F3 execution worktree (WL-0MVSPZ1FH000RWET). The execution
+    worktree is deleted after the run, so without the graft a subsequent
+    read-only audit would re-execute a suite whose verdict it already holds.
+    The graft is fail-soft and never overwrites an existing entry.
+
     Returns a dict:
       success   — True iff every suite command was executed and exited 0
                   with no parsed failures
@@ -4771,6 +4975,8 @@ def _run_tests_via_test_skill(
       failures  — structured failure records (test_name, stdout_excerpt,
                   stack_trace, suite_command)
       triaged   — triage helper results per failure
+      suppressed_phantoms — mixed-tree verdicts that were NOT triaged, each
+                  with the notice code and the suppression reason
       notice    — error string when the suite could not be executed at all
     """
     project_root = Path(cwd or TARGET_PROJECT_ROOT).resolve()
@@ -4795,6 +5001,10 @@ def _run_tests_via_test_skill(
     #: nothing is parsed from it and NOTHING is triaged — a moved checkout must
     #: never mint a critical ``test-failure`` item. The run still fails.
     state_changed: list[dict] = []
+    #: Mixed-tree verdicts explicitly recorded as suppressed rather than merely
+    #: skipped, so the suppression reason is visible in the run report
+    #: (WL-0MVSPZ1FH000RWET AC3).
+    suppressed_phantoms: list[dict] = []
     notice = ""
     for command in full_suite_commands(project_root):
         try:
@@ -4829,6 +5039,14 @@ def _run_tests_via_test_skill(
         if movement:
             # Quarantine: no failure records, no triage, and the run is red.
             state_changed.append({**movement, "suite_command": command})
+            suppressed_phantoms.append({
+                "notice_code": movement.get(
+                    "notice_code", "state_changed_during_run"
+                ),
+                "suite_command": command,
+                "reason": movement.get("message")
+                or "checkout moved mid-run; the mixed-tree verdict was not triaged",
+            })
             print(
                 "notice: [state_changed_during_run] "
                 f"checkout {movement.get('checkout')} changed while the suite "
@@ -4944,9 +5162,21 @@ def _run_tests_via_test_skill(
         f"Test skill run completed: success={success} commands={len(results)} "
         f"failures={len(failures)} triaged={len(triaged)} "
         f"state_changed={len(state_changed)} "
+        f"suppressed_phantoms={len(suppressed_phantoms)} "
         f"notice={notice or 'none'}",
         file=sys.stderr,
     )
+    # Graft the entries this run wrote into the caller's cache before the
+    # isolated worktree (and its <git-dir>/test-cache) is removed
+    # (WL-0MVSPZ1FH000RWET). Fail-soft: cache plumbing never changes a verdict.
+    if mirror_to is not None:
+        try:
+            mirror_cache_entries(project_root, mirror_to)
+        except Exception as exc:  # noqa: BLE001 -- graft is best-effort
+            print(
+                f"notice: cache graft skipped ({exc})",
+                file=sys.stderr,
+            )
     return {
         "success": success,
         "results": results,
@@ -4961,6 +5191,8 @@ def _run_tests_via_test_skill(
         # The flagged commands (SA-0MW3FF18I003KGZE AC4) so the audit report
         # can name the checkout movement and the required re-run.
         "state_changed_during_run": state_changed,
+        # Mixed-tree verdicts suppressed from triage (WL-0MVSPZ1FH000RWET AC3).
+        "suppressed_phantoms": suppressed_phantoms,
         "notice": notice,
     }
 
@@ -8085,7 +8317,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
                            merge_gate_evidence: str | None = None,
                            snapshot_exempt: set[str] | None = None,
                            stale_pending_ids: set[str] | None = None,
-                           classification: str | None = None) -> str:
+                           classification: str | None = None,
+                           audit_scope: str | None = None) -> str:
     """Assemble the canonical issue-mode audit report.
 
     *ac_results* is a list of ``{"text": ..., "verdict": ..., "evidence": ...}``.
@@ -8147,6 +8380,14 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
       near the header so the persisted report carries the freshness gate data
       (SA-0MSKB6US1009CNHT, SA-0MVIDI8E00063OOP). The line is parsed back by
       ``_extract_content_fingerprint``.
+
+    *audit_scope* is an optional pre-formatted ``## Audit Scope`` section
+      (heading + body) stating the resolved code root and the worklog root.
+      When provided it is emitted near the header on **every** assembled
+      report — with or without an explicit ``--code-root`` — so the persisted
+      report always records which repository the evidence came from
+      (LP-0MVZ6R5H8007NYLR AC4 / child LP-0MWDDRWX6006YE0Z AC1). The caller
+      resolves the roots from ``_AuditContext`` before assembly.
 
     *classification* is the optional transient cause token (``timeout`` /
       ``provider_error`` / ``unparseable_output`` / ``concurrency_cap``) for
@@ -8343,6 +8584,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if content_fingerprint:
             lines.append("")
             lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
+        if audit_scope:
+            lines.extend(["", audit_scope])
         lines.extend(["", "## Summary", ""])
     else:
         lines = [
@@ -8376,6 +8619,8 @@ def _assemble_issue_report(issue: dict, ac_results: list[dict],
         if content_fingerprint:
             lines.append("")
             lines.append(f"{AUDIT_CONTENT_FINGERPRINT_PREFIX}{content_fingerprint}")
+        if audit_scope:
+            lines.extend(["", audit_scope])
         lines.extend(["", "## Summary", ""])
 
     # Count verdicts across parent criteria only (children have their own
@@ -10934,7 +11179,9 @@ def _run_phase2_deep_analysis(
     *owning_root* is the project root that owns the audited item (resolved
     from the worklog owner by the launch-context resolution); when omitted it
     is re-resolved from the
-    issue id. The FILE SCOPE manifest is validated against it and an
+    issue id. The FILE SCOPE manifest is validated against the root it was
+    built from — the per-audit root, i.e. the code root when ``--code-root``
+    is set (``_scope_validation_root``, SA-0MWO59IMN000RUHM) — and an
     ``AuditScopeError`` is raised when the manifest lacks the item repo
     (LP-0MSQ32HNR007AI6B) — the caller aborts instead of emitting 'unmet'
     verdicts from a wrong scope.
@@ -11045,7 +11292,8 @@ def _run_phase2_deep_analysis(
             runner, issue.get("id", ""), work_item=issue,
         )
         scope_error = _validate_file_scope_manifest(
-            file_scope, owning_root, touched_files=touched_files,
+            file_scope, _scope_validation_root(owning_root),
+            touched_files=touched_files,
         )
         if scope_error:
             raise AuditScopeError(scope_error)
@@ -11486,6 +11734,14 @@ class _AuditContext:
     max_child_audits: int | None
     run_tests: bool
     no_execute: bool = False
+    # Ship-automation marker (SA-0MW92TODX00064XQ): when True this run is a
+    # release-gate verification re-audit, NOT an independent review, so
+    # ``_resolve_producer_review_decision`` resolves ``untouched`` for a
+    # top-level 'Yes' or 'No' verdict and the ``--needs-producer-review``
+    # flag is never written (the write is suppressed, never cleared). Set
+    # from the ``--ship-triggered`` CLI flag by the ``issue`` command;
+    # only ship-automated invocations set it.
+    ship_triggered: bool = False
     # Audit test-failure mode (SA-0MW0JJ36Z000AF57). ``strict`` is resolved once
     # in cmd_issue from --strict/--no-strict > AUDIT_STRICT > permissive default;
     # ``strict_source`` records how it was resolved for the persisted report.
@@ -11536,6 +11792,14 @@ class _AuditContext:
 
     # Resolved / gate-phase state (set by _phase_gate)
     owning_root: str | None = None
+    code_root: str = ""
+    """Explicit code-repository root (``--code-root`` / ``AUDIT_CODE_ROOT``).
+
+    Empty when the audit uses the owning project's repository. When set, the
+    F3 execution worktree is hosted on it instead of the worklog owner — a
+    worktree of the code repository belongs inside that repository
+    (SA-0MWO59J9T002IQ63; LP-0MVZ6R5H8007NYLR).
+    """
     per_audit_project_root: str = ""
     """Per-audit target project root (SA-0MULGDABC001T11L).
 
@@ -12193,8 +12457,27 @@ def _ensure_execution_worktree_submodules(worktree_path: Path) -> bool:
     return proc.returncode == 0
 
 
+def _execution_worktree_host(code_root: str | Path | None,
+                             owning_root: Path) -> Path:
+    """Root that hosts the F3 execution worktree.
+
+    The execution worktree is a worktree of the **code** repository, so a
+    cross-repo audit (``--code-root`` / ``AUDIT_CODE_ROOT``) must host it under
+    the code root's ``.worklog/worktrees`` — hosting it under the worklog owner
+    puts it inside the *other* project's checkout, where any test that resolves
+    the repository root or the worklog by walking up from its cwd resolves the
+    wrong project and fails (SA-0MWO59J9T002IQ63). Without a code root the
+    owning root is used, keeping same-repo behaviour byte-identical.
+    """
+    if code_root:
+        return Path(code_root)
+    return owning_root
+
+
 def _create_execution_worktree(owning_root: Path, runner: Runner,
-                               issue_id: str) -> tuple[Path | None, str]:
+                               issue_id: str,
+                               code_root: str | Path | None = None,
+                               ) -> tuple[Path | None, str]:
     """Create a fresh detached worktree at the latest ``origin/dev``.
 
     AC1 (SA-0MW4ZRLSI005PHL6): the F3 full-suite gate must execute against
@@ -12205,12 +12488,23 @@ def _create_execution_worktree(owning_root: Path, runner: Runner,
     SA-0MVTOR53E003IIEQ; symlink convention SA-0MSGS763C006SM1B), and
     returns the worktree path.
 
+    *code_root* (``--code-root`` / ``AUDIT_CODE_ROOT``) selects the **host
+    root**: a cross-repo audit's worktree is a worktree of the code
+    repository, so it is created under ``<code-root>/.worklog/worktrees``
+    (and the shared ``node_modules`` symlink is taken from there) — hosting
+    it inside the worklog owner made repo-root/worklog resolution inside the
+    suite reach the wrong project (SA-0MWO59J9T002IQ63). Omitting it keeps
+    the owning-root behaviour unchanged.
+
     Returns ``(worktree_path, evidence)``. ``worktree_path`` is ``None``
     when the worktree could not be created — callers fall back to the launch
     checkout (fail-open; an execution worktree is an improvement, never a
     new hard dependency).
     """
     evidence: list[str] = []
+    # Host root for the worktree AND for the shared node_modules symlink: the
+    # code repository for a cross-repo audit (SA-0MWO59J9T002IQ63).
+    host_root = _execution_worktree_host(code_root, owning_root)
     try:
         proc = runner(["git", "fetch", "origin", "dev"])
         if proc.returncode != 0:
@@ -12220,7 +12514,7 @@ def _create_execution_worktree(owning_root: Path, runner: Runner,
             return None, "origin/dev unresolvable; execution worktree unavailable"
         dev_sha = proc.stdout.strip()
         worktree_path = (
-            owning_root / ".worklog" / "worktrees"
+            host_root / ".worklog" / "worktrees"
             / f"{_EXECUTION_WORKTREE_PREFIX}-{issue_id}"
         )
         if worktree_path.exists():
@@ -12247,11 +12541,11 @@ def _create_execution_worktree(owning_root: Path, runner: Runner,
             evidence.append("submodule initialisation skipped/failed (best-effort)")
         # Reuse the merge-gate node_modules symlink convention
         # (SA-0MSGS763C006SM1B): never npm-install inside a worktree.
-        if (owning_root / "node_modules").exists() \
+        if (host_root / "node_modules").exists() \
                 and not (worktree_path / "node_modules").exists():
             try:
                 (worktree_path / "node_modules").symlink_to(
-                    owning_root / "node_modules", target_is_directory=True
+                    host_root / "node_modules", target_is_directory=True
                 )
                 evidence.append("node_modules symlinked into execution worktree")
             except OSError:
@@ -12707,7 +13001,7 @@ def _build_merge_gate_failure_report(ctx: _AuditContext) -> str:
     return "\n".join(lines)
 
 
-def _phase_gate(ctx: _AuditContext) -> int | None:
+def _phase_gate(ctx: _AuditContext, code_root: str | None = None) -> int | None:
     """Phase 1 — launch-context resolution, model/green-run resolution, original
     status capture, freshness gates, and the in_progress claim.
 
@@ -12773,6 +13067,49 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     if runner is None:
         runner = _default_runner
 
+    # Explicit code-repository root (LP-0MVZ6R5H8007NYLR): ``--code-root``
+    # flag > ``AUDIT_CODE_ROOT`` env > owning-project default. Resolved and
+    # validated BEFORE any Phase 1 work: a non-git or non-existent directory
+    # is a hard error (non-zero exit, no pi call), matching the fail-closed
+    # style of the other scope errors. The option selects a READ-ONLY scope —
+    # nothing is fetched/checked out/mutated — and never leaks into ``wl``
+    # routing (``resolve_worklog_flags``/``_run_wl`` are untouched).
+    resolved_code_root = _resolve_code_root(code_root)
+    if resolved_code_root is not None:
+        code_root_path = Path(resolved_code_root).expanduser().resolve()
+        if not code_root_path.is_dir():
+            code_root_error = (
+                f"Audit scope error: --code-root {resolved_code_root!r} is "
+                f"not a directory. Point --code-root at the code repository "
+                f"whose git-derived content this audit should resolve "
+                f"against (read-only; the worklog stays resolved from "
+                f"--worklog-dir / the item prefix)."
+            )
+            if json_mode:
+                print(json.dumps({"error": code_root_error}, indent=2))
+            else:
+                print(f"Error: {code_root_error}", file=sys.stderr)
+            return 1
+        probe = subprocess.run(
+            ["git", "-C", str(code_root_path), "rev-parse",
+             "--is-inside-work-tree"],
+            check=False, capture_output=True, text=True,
+        )
+        if probe.returncode != 0 or probe.stdout.strip() != "true":
+            code_root_error = (
+                f"Audit scope error: --code-root {resolved_code_root!r} is "
+                f"not a git working tree (rev-parse failed). Point "
+                f"--code-root at the code repository whose git-derived "
+                f"content this audit should resolve against."
+            )
+            if json_mode:
+                print(json.dumps({"error": code_root_error}, indent=2))
+            else:
+                print(f"Error: {code_root_error}", file=sys.stderr)
+            return 1
+    else:
+        code_root_path = None
+
     # Resolve the git root for every runner-based git command
     # (SA-0MSLLGDW00098UCC): git-derived content must come from the OWNING
     # project's repository — never the launch cwd's. The owning root is the
@@ -12780,21 +13117,31 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # worktree of the owning project, or the owning project itself), keep
     # the launch cwd so a worktree launch still resolves git to the
     # worktree checkout (worktree branch HEAD and worktree-only changes
-    # stay correct — AC3). Then wrap the runner so every git call carries
+    # stay correct — AC3). An explicit ``--code-root`` overrides both: the
+    # git evidence resolves against the code repository regardless of the
+    # owning/worktree root. Then wrap the runner so every git call carries
     # `git -C <git_root>` when git_root differs from the launch root (AC1)
     # and stays byte-identical otherwise (zero regression for owning
     # launches).
     git_root = owning_root
     if _same_git_repository(TARGET_PROJECT_ROOT, owning_root):
         git_root = TARGET_PROJECT_ROOT
+    if code_root_path is not None:
+        git_root = code_root_path
     # Per-audit target project root (SA-0MULGDABC001T11L): same resolution as
     # the git root — the owning root by default, the launch cwd when it is the
-    # same git repository (owning or worktree checkout). Consumed by the
-    # residual TARGET_PROJECT_ROOT consumers below (F3 suite-execution cwd) and
-    # by later phases (code-quality scan, remediation, debug-log slug).
+    # same git repository (owning or worktree checkout), the explicit code
+    # root when given. Consumed by the residual TARGET_PROJECT_ROOT consumers
+    # below (F3 suite-execution cwd) and by later phases (code-quality scan,
+    # remediation, debug-log slug).
     per_audit_root = git_root
     runner = _cwd_aware_runner(git_root, runner)
     ctx.runner = runner
+    # Record the explicit code root (``--code-root`` / ``AUDIT_CODE_ROOT``,
+    # LP-0MVZ6R5H8007NYLR) so later helpers can distinguish it from the owning
+    # root — the F3 execution worktree is hosted on it
+    # (SA-0MWO59J9T002IQ63). Empty when no code root was supplied.
+    ctx.code_root = str(code_root_path) if code_root_path is not None else ""
     # Publish the per-audit root EARLY: the AC1/AC2 helpers below (execution
     # worktree + divergence guard) read ``ctx.per_audit_root`` / ``ctx.
     # execution_root``, whose ``per_audit_root`` property falls back to the
@@ -12851,7 +13198,7 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
     # against ``per_audit_root`` (today's behaviour) rather than blocking.
     # ------------------------------------------------------------------
     execution_worktree_path, execution_worktree_evidence = _create_execution_worktree(
-        owning_root, runner, issue_id,
+        owning_root, runner, issue_id, code_root=ctx.code_root or None,
     )
     if execution_worktree_path is not None:
         ctx.execution_worktree = str(execution_worktree_path)
@@ -12951,6 +13298,10 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
                     touched_files=f3_touched,
                     key_files=f3_key,
                     baseline_commit=_resolve_baseline_commit(runner),
+                    # Graft the fresh entries into the main checkout's cache
+                    # before the execution worktree is removed
+                    # (WL-0MVSPZ1FH000RWET).
+                    mirror_to=per_audit_root,
                 )
                 if test_run.get("red_evaluation") is not None:
                     ctx.test_failure_evaluation = test_run["red_evaluation"]
@@ -13018,6 +13369,10 @@ def _phase_gate(ctx: _AuditContext) -> int | None:
                     touched_files=cached_touched,
                     key_files=_extract_key_files(ctx.description or ""),
                     baseline_commit=_resolve_baseline_commit(runner),
+                    # Graft the fresh entries into the main checkout's cache
+                    # before the execution worktree is removed
+                    # (WL-0MVSPZ1FH000RWET).
+                    mirror_to=per_audit_root,
                 )
                 if test_run.get("red_evaluation") is not None:
                     ctx.test_failure_evaluation = test_run["red_evaluation"]
@@ -13430,6 +13785,50 @@ def _fp_finding_key(finding: dict) -> str:
     except (TypeError, ValueError):
         line = 0
     return f"{linter}:{code}:{file}:{line}"
+
+
+def _audit_verification_command(finding: dict) -> str:
+    """Exact ruff command that reproduces a candidate-false-positive finding.
+
+    Recorded on the tracking chore so a later re-verification sweep can
+    re-run it and decide whether the finding still fires
+    (SA-0MW7Z1JCE009G6J3 AC1). The path is normalised to repository-relative
+    form so the command is stable across worktrees. An empty string is
+    returned for a non-ruff finding (no safe command can be derived).
+    """
+    linter = (finding.get("linter") or "ruff").strip().lower()
+    code = str(finding.get("code") or "").strip()
+    if linter != "ruff" or not code:
+        return ""
+    path = _repo_relative_path(str(finding.get("file") or ""))
+    if not path:
+        return ""
+    return f"ruff check --isolated --select {code} {path}"
+
+
+def _audit_content_fingerprint(finding: dict) -> str:
+    """sha256 of the finding target's bytes + rule code (file hash + rule).
+
+    Mirrors ``refactor.workitem_creation.compute_content_fingerprint`` so both
+    producers record a comparable fingerprint (SA-0MW7Z1JCE009G6J3 AC1).
+    Returns an empty string when the target cannot be read.
+    """
+    raw = str(finding.get("file") or "").strip()
+    if not raw:
+        return ""
+    candidate = raw
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(str(TARGET_PROJECT_ROOT), raw)
+    try:
+        with open(candidate, "rb") as handle:
+            content = handle.read()
+    except (OSError, ValueError):
+        return ""
+    digest = hashlib.sha256()
+    digest.update(content)
+    digest.update(b"\x00")
+    digest.update(str(finding.get("code") or "").encode("utf-8"))
+    return digest.hexdigest()
 
 
 def _normalise_waiver(data: object) -> dict | None:
@@ -14086,11 +14485,19 @@ def _chore_description_for_cfp_decision(
     file = finding.get("file", "?")
     line = finding.get("line", 0)
     waiver_target = issue_id or "<audited-item-id>"
+    verification_command = _audit_verification_command(finding)
+    fingerprint = _audit_content_fingerprint(finding)
+    tracking = ""
+    if verification_command:
+        tracking += f"\n{AUDIT_VERIFICATION_CMD_MARKER} {verification_command}"
+    if fingerprint:
+        tracking += f"\n{AUDIT_FINGERPRINT_MARKER} {fingerprint}"
     return (
         f"False-positive candidate (medium/low severity). "
         f"{code} in {file}:{line} — {entry.get('justification', '')}. "
         f"{FP_CHORE_ANNOTATION}.\n\n"
-        f"{CFP_CHORE_KEY_PREFIX} {key}\n\n"
+        f"{CFP_CHORE_KEY_PREFIX} {key}"
+        f"{tracking}\n\n"
         "Accept it once with:\n"
         f"`python3 $(skill_path audit)/scripts/audit_waiver.py add {waiver_target} "
         f"--rule {code} --file {file} --line {line} "
@@ -14458,6 +14865,22 @@ def _phase_fetch_and_cq(ctx: _AuditContext) -> int | None:
     work_item = ctx.work_item
     children = ctx.children
     description = ctx.description
+
+    # Cross-repo detection (AC2, LP-0MWDDRU1P0067SUV; implementation
+    # LP-0MWDDRWBG0013CS1): with NO explicit code root, an item whose
+    # delivered (touched) files live only in a SIBLING project's repository
+    # must fail closed with an ``Audit scope error`` naming the sibling
+    # candidate(s) — before the merge gate mutates anything in the wrong
+    # repo and before any Phase 1 model call. Fail open when the touched
+    # set is empty/undeterminable or any touched path exists in the owning
+    # repo (same-repo launch is zero-cost).
+    if ctx.owning_root:
+        cross_repo_error = _detect_cross_repo_scope_error(
+            runner, issue_id, work_item=work_item,
+            owning_root=Path(ctx.owning_root), comments=ctx.comments,
+        )
+        if cross_repo_error:
+            raise AuditScopeError(cross_repo_error)
 
     # Merge gate (SA-0MT456M27001LRTL) — very start of Phase 1, BEFORE the
     # code-quality scan, children-stage check, or surface AC assessment.
@@ -15023,9 +15446,13 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
     Fills ctx.ac_results with one verdict entry per AC; falls back to
     'partial' diagnostics on unparseable/provider-error output (with
     infra-failure provenance set on ctx.ac_fallback_used).
+
+    A FILE SCOPE manifest that does not cover the item repository raises
+    ``AuditScopeError`` — fatal for the run (no report is persisted and the
+    pre-audit lifecycle is restored), never a printed warning that continues
+    into an AC-less verdict (SA-0MWO59IMN000RUHM).
     """
     issue_id = ctx.issue_id
-    json_mode = ctx.json_mode
     runner = ctx.runner
     pi_bin = ctx.pi_bin
     phase1_model = ctx.resolved_phase1_model
@@ -15074,14 +15501,16 @@ def _phase1_parent_screening(ctx: _AuditContext) -> None:
             runner, work_item.get("id", ""), work_item=work_item,
         )
         scope_error = _validate_file_scope_manifest(
-            file_scope, owning_root, touched_files=touched_files,
+            file_scope, _scope_validation_root(owning_root),
+            touched_files=touched_files,
         )
         if scope_error:
-            if json_mode:
-                print(json.dumps({"error": scope_error}, indent=2))
-            else:
-                print(f"Error: {scope_error}", file=sys.stderr)
-            return 1
+            # Fatal, never a printed warning (AC4 of SA-0MWO59IMN000RUHM):
+            # ``cmd_issue`` catches AuditScopeError, exits non-zero and
+            # persists no report (the finally block restores the pre-audit
+            # lifecycle). Returning here used to continue into child
+            # screening/Phase 2 and persist a report whose AC table was empty.
+            raise AuditScopeError(scope_error)
         prompt = (
             f"[READ-ONLY AUDIT] You are performing a read-only audit. "
             f"Do NOT close, modify, create, or delete any work items. "
@@ -16424,6 +16853,28 @@ def _phase_report(ctx: _AuditContext) -> int:
             issue_id, ctx.owning_root, ctx.checkpoint_dir,
         )
 
+        # Resolved audit scope (LP-0MVZ6R5H8007NYLR AC4): record which
+        # repository the evidence came from on every persisted report — the
+        # per-audit git evidence root (``--code-root`` override or the
+        # default owning-project root) and the worklog root are independent
+        # axes, and a cross-repo reader must be able to tell them apart
+        # without remembering which flags were passed (child
+        # LP-0MWDDRWX6006YE0Z AC1/AC2). Emitted at assembly so it lands in
+        # the persisted report before ``persist_audit()``.
+        code_root = (
+            ctx.per_audit_project_root
+            if ctx.per_audit_project_root else str(TARGET_PROJECT_ROOT)
+        )
+        try:
+            worklog_root = str(Path(worklog_dir).resolve().parent)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            worklog_root = "<unknown worklog root>"
+        audit_scope = (
+            "## Audit Scope\n\n"
+            f"Code root: {code_root}\n"
+            f"Worklog root: {worklog_root}"
+        )
+
         def _assemble_report() -> str:
             assembled = _assemble_issue_report(
                 work_item, ac_results, child_results,
@@ -16444,6 +16895,7 @@ def _phase_report(ctx: _AuditContext) -> int:
                 merge_gate_evidence=ctx.merge_gate_evidence,
                 snapshot_exempt=ctx.snapshot_exempt_children,
                 stale_pending_ids=stale_pending_ids,
+                audit_scope=audit_scope,
             )
             # Wrap report with failure notice if any subprocess calls failed
             if ctx.script_failure:
@@ -17502,7 +17954,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
               no_checkpoint: bool = False,
               child_in_main_slot: bool | None = None,
               batch_drain: bool | None = None,
-              strict: bool | None = None) -> int:
+              strict: bool | None = None,
+              ship_triggered: bool = False,
+              code_root: str | None = None) -> int:
     """Audit a single work item.
 
     *batch_drain* (SA-0MTG5TP5Z008QBL5) controls the post-audit batch
@@ -17521,6 +17975,26 @@ def cmd_issue(issue_id: str, persist: bool = True,
     ``False`` uses the unchanged separate-process path (a ``pi`` subprocess
     per child). Resolution precedence: explicit value (CLI flag, flag wins)
     > ``AUDIT_CHILD_IN_MAIN_SLOT`` env var > ``True`` (default).
+
+    *ship_triggered* (``--ship-triggered``, OFF by default) marks this run
+    as a ship-automated release-gate verification re-audit (SA-0MW92TODX00064XQ):
+    the producer-review flag is never written — a top-level 'Yes' or 'No'
+    verdict resolves ``untouched`` and leaves ``needsProducerReview`` as it
+    was (neither set nor cleared). All other lifecycle behaviour (the 'Yes'
+    advance / 'No' demotion, the persisted report) is unchanged. Only
+    ship-automated invocations set it; operator-invoked audits stay
+    marker-free and keep independent flagging.
+
+    *code_root* (``--code-root``/``AUDIT_CODE_ROOT``, LP-0MVZ6R5H8007NYLR)
+    is an explicit code-repository root for the git-derived audit content
+    (merge gate, file-scope manifest, changed files, green-run evidence,
+    code-quality scope, Phase 2 cwd). It selects a read-only scope only — the
+    runner never fetches/checks out/mutates that repository — and it never
+    affects ``wl`` routing: ``worklog_dir`` (and the prefix-to-sibling
+    resolution) keeps governing every worklog read/write, so a cross-repo
+    item (worklog in project A, code in project B) is auditable in one
+    command. A non-git or non-existent value is a hard error (non-zero exit,
+    no model call) before any Phase 1 work.
 
     The resolved model name and source are included as a metadata line
     in the audit report output (issue-level and child reports).
@@ -17632,8 +18106,9 @@ def cmd_issue(issue_id: str, persist: bool = True,
         max_citations_per_ac=max_citations_per_ac,
         explicit_checkpoint_dir=checkpoint_dir,
         no_checkpoint=no_checkpoint,
+        ship_triggered=ship_triggered,
     )
-    rc = _phase_gate(ctx)
+    rc = _phase_gate(ctx, code_root=code_root)
     if rc is not None:
         return rc
 
@@ -17786,7 +18261,10 @@ def cmd_issue(issue_id: str, persist: bool = True,
             # ``.worklog/worktrees``. Best-effort and never touches the main
             # checkout's tracked content.
             _remove_execution_worktree(
-                Path(ctx.owning_root) if ctx.owning_root else None,
+                _execution_worktree_host(
+                    ctx.code_root or None,
+                    Path(ctx.owning_root) if ctx.owning_root else Path("."),
+                ),
                 ctx.runner, ctx.execution_worktree,
             )
             # Release the cross-host audit lease (LP-0MW96A9GW009KVF7,
@@ -18312,6 +18790,17 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Append Pi debug output to this file (JSONL)")
     p_issue.add_argument("--force", action="store_true",
                          help="Bypass the freshness gate and force a full audit")
+    p_issue.add_argument("--ship-triggered", action="store_true",
+                         help=(
+                             "Ship-automation marker: this run is a release-gate "
+                             "verification re-audit, NOT an independent review. "
+                             "The producer-review flag is never written — a "
+                             "top-level 'Yes' or 'No' verdict leaves "
+                             "needsProducerReview untouched (neither set nor "
+                             "cleared). Only ship-automated invocations set this; "
+                             "operator-invoked audits stay marker-free and keep "
+                             "independent flagging (SA-0MW92TODX00064XQ)"
+                         ))
     p_issue.add_argument("--audit-children", action="store_true",
                          help=(
                              "Opt-in: auto-trigger a full audit for each active child "
@@ -18334,6 +18823,15 @@ def build_parser() -> argparse.ArgumentParser:
                          ))
     p_issue.add_argument("--worklog-dir", default=None,
                          help="Explicit .worklog directory to target (overrides auto-resolution)")
+    p_issue.add_argument("--code-root", default=None, metavar="DIR",
+                         help=(
+                             "Explicit code-repository root for the git-derived audit "
+                             "content (merge gate, file-scope manifest, changed files, "
+                             "green-run evidence, code-quality scope, Phase 2 cwd). "
+                             "Defaults to the owning-project root; env: AUDIT_CODE_ROOT. "
+                             "Read-only (never fetched/checked out). Never affects wl "
+                             "routing (--worklog-dir governs the worklog side)."
+                         ))
     p_issue.add_argument("--max-concurrency", type=int, default=None,
                          help=("Max concurrent pi/audit subprocesses. Precedence: this "
                                "flag > AUDIT_MAX_CONCURRENCY env > live proxy slot "
@@ -18726,6 +19224,7 @@ def _run_issue_command(args) -> int:
                         debug_log=args.debug_log,
                         force=args.force,
                         worklog_dir=args.worklog_dir,
+                        code_root=getattr(args, "code_root", None),
                         batch_phase2=_phase2_batch_enabled(args.batch_phase2),
                         green_run=args.green_run,
                         audit_children=args.audit_children,
@@ -18743,7 +19242,8 @@ def _run_issue_command(args) -> int:
                             args, "child_in_main_slot", None
                         ),
                         batch_drain=getattr(args, "batch_drain", None),
-                        strict=getattr(args, "strict", None))
+                        strict=getattr(args, "strict", None),
+                        ship_triggered=getattr(args, "ship_triggered", False))
         finally:
             # Ensure the reliability summary is emitted even on an early exit
             # (exception/timeout before _phase_report) — R7 AC4.

@@ -1,0 +1,9 @@
+{
+  "_comment": "Retired model ids and enabledModels patterns pruned from the installed ~/.pi/agent config by scripts/merge_pi_agent_config.py. Listed entries are removed from models.json (by id and by modelOverrides key) and from settings.json enabledModels. Every unlisted local-only provider, model, override and pattern is preserved. Removing the 'MunitoAI/*' glob (SA-0MWL5AL4B004X0FN) is why operators stop seeing 'No models match pattern' warnings; to restore paid MunitoAI models deliberately, drop the entry from retiredEnabledModels and re-run scripts/install_pi.sh.",
+  "retiredModels": {
+    "Local Proxy": ["qwen3", "gpt120"],
+    "deepseek": ["deepseek-v4-flash"],
+    "opencode-go": ["qwen3.6-plus", "qwen3.7-max"]
+  },
+  "retiredEnabledModels": ["MunitoAI/*"]
+}

@@ -128,11 +128,16 @@ def _patch_parent(m, children):
 def _patch_child_state(m, states: dict[str, dict]):
     """Route ``wl_show`` per child id while still serving the parent fetch.
 
-    ``phase_drive`` fetches the parent once and — after a failed spawn —
-    re-fetches the affected child to classify it. ``states`` maps child id to
-    the work-item dict ``wl_show`` should return for it. The parent fetch
-    (``PARENT``) and any unmapped id get a minimal placeholder, so a fetch for
-    the wrong id shows up as a non-terminal child instead of passing silently.
+    ``phase_drive`` fetches the parent once, re-validates the reported
+    ``next_child`` immediately before spawning it (a second ``wl show``), and —
+    after a failed spawn — re-fetches the affected child to classify it.
+    ``states`` maps child id to the work-item dict ``wl_show`` should return
+    for it; a **list** is consumed successively (the pre-spawn re-validation
+    reads the first entry, a later re-fetch the next, and the last entry
+    repeats), so a test can script a child that is startable at the spawn
+    decision and terminal at reconciliation. The parent fetch (``PARENT``) and
+    any unmapped id get a minimal placeholder, so a fetch for the wrong id
+    shows up as a non-terminal child instead of passing silently.
 
     Returns the patch plus the list of ids fetched, so a test can assert that
     reconciliation only happens on the failure path.
@@ -143,18 +148,30 @@ def _patch_child_state(m, states: dict[str, dict]):
         calls.append(work_item_id)
         if work_item_id == PARENT:
             return {"id": PARENT}
-        return states.get(work_item_id, {})
+        state = states.get(work_item_id, {})
+        if isinstance(state, list):
+            return state.pop(0) if len(state) > 1 else (state[0] if state else {})
+        return state
 
     return mock.patch.object(m, "wl_show", side_effect=_show), calls
 
 
-def _run(m, runner, spawner, children, child_states=None, **kwargs):
+def _run(
+    m, runner, spawner, children, child_states=None, blockers=None, **kwargs,
+):
     patches = list(_patch_parent(m, children))
     calls: list[str] = []
     comments: list[tuple[str, str]] = []
     if child_states is not None:
         state_patch, calls = _patch_child_state(m, child_states)
         patches.append(state_patch)
+    if blockers is not None:
+        # The pre-spawn re-validation re-reads a ``blocked`` child's outbound
+        # edges; ``blockers`` maps child id → edge dicts.
+        patches.append(mock.patch.object(
+            m, "wl_dep_blockers",
+            side_effect=lambda cid: blockers.get(cid, []),
+        ))
     # ``phase_drive`` may comment on the parent (stranded-child diagnostic).
     # Every drive test patches it so the orchestration loop stays hermetic and
     # never touches the real worklog.
@@ -339,11 +356,15 @@ class TestTimeoutReconciliation:
             {"success": True, "parent_advanced": True},
         ])
         spawner = RecordingSpawner([_timeout_result("SA-C1", 3600)])
+        # Startable at the spawn decision, terminal when the killed session is
+        # reconciled (the exact production shape).
         states = {
-            "SA-C1": {
-                "id": "SA-C1", "status": "completed",
-                "stage": "in_review",
-            },
+            "SA-C1": [
+                {"id": "SA-C1", "status": "in_progress",
+                 "stage": "in_progress"},
+                {"id": "SA-C1", "status": "completed",
+                 "stage": "in_review"},
+            ],
         }
 
         report = _run(
@@ -414,10 +435,12 @@ class TestTimeoutReconciliation:
             m, terminal_runner,
             RecordingSpawner([_timeout_result("SA-C1", 3600)]),
             children,
-            child_states={"SA-C1": {
-                "id": "SA-C1", "status": "completed",
-                "stage": "in_review",
-            }},
+            child_states={"SA-C1": [
+                {"id": "SA-C1", "status": "in_progress",
+                 "stage": "in_progress"},
+                {"id": "SA-C1", "status": "completed",
+                 "stage": "in_review"},
+            ]},
             child_timeout=3600,
         )["children_driven"][0]
 
@@ -470,9 +493,10 @@ class TestSpawnFailureReconciliation:
 
         report = _run(
             m, runner, spawner, [{"id": "SA-C1"}],
-            child_states={"SA-C1": {
-                "id": "SA-C1", "status": "done", "stage": "in_review",
-            }},
+            child_states={"SA-C1": [
+                {"id": "SA-C1", "status": "open", "stage": "intake_complete"},
+                {"id": "SA-C1", "status": "done", "stage": "in_review"},
+            ]},
         )
 
         assert "SA-C1" in report["_wl_show_calls"]
@@ -480,8 +504,14 @@ class TestSpawnFailureReconciliation:
         assert report["parent_advanced"] is True
         assert report["children_driven"][0]["result"] == "completed-late"
 
-    def test_successful_spawn_does_not_re_fetch_child(self, implement_mod):
-        """Reconciliation is scoped to the failure path (risk R1)."""
+    def test_successful_spawn_fetches_the_child_once(self, implement_mod):
+        """Reconciliation is failure-scoped (risk R1).
+
+        Since SA-0MWFJSCPT005BO2R a successful spawn pays exactly **one**
+        child fetch: the pre-spawn re-validation. The failure-only
+        reconciliation fetch is still never taken on the success path — the
+        child appears once, not twice.
+        """
         m = implement_mod
         runner = ScriptedParent([
             _child_report("SA-C1"),
@@ -497,7 +527,10 @@ class TestSpawnFailureReconciliation:
         )
 
         assert report["success"] is True
-        assert "SA-C1" not in report["_wl_show_calls"]
+        child_fetches = [
+            cid for cid in report["_wl_show_calls"] if cid != PARENT
+        ]
+        assert child_fetches == ["SA-C1"]
 
     def test_unreadable_child_state_keeps_hard_failure(self, implement_mod):
         """A failed fetch must fail closed — no crash, no silent success."""
@@ -531,9 +564,11 @@ class TestSpawnFailureReconciliation:
 
         report = _run(
             m, runner, spawner, [{"id": "SA-C1"}, {"id": "SA-C2"}],
-            child_states={"SA-C1": {
-                "id": "SA-C1", "status": "completed", "stage": "in_review",
-            }},
+            child_states={"SA-C1": [
+                {"id": "SA-C1", "status": "in_progress",
+                 "stage": "in_progress"},
+                {"id": "SA-C1", "status": "completed", "stage": "in_review"},
+            ]},
         )
 
         assert [c["id"] for c in spawner.calls] == ["SA-C1", "SA-C2"]
@@ -555,9 +590,11 @@ class TestSpawnFailureReconciliation:
 
         report = _run(
             m, runner, spawner, [{"id": "SA-C1"}],
-            child_states={"SA-C1": {
-                "id": "SA-C1", "status": "completed", "stage": "in_review",
-            }},
+            child_states={"SA-C1": [
+                {"id": "SA-C1", "status": "in_progress",
+                 "stage": "in_progress"},
+                {"id": "SA-C1", "status": "completed", "stage": "in_review"},
+            ]},
         )
 
         assert report["success"] is True
@@ -590,10 +627,18 @@ class TestTimeoutOutcomeEvidence:
             _timeout_result("SA-C2", 1800),
         ])
         states = {
-            "SA-C1": {"id": "SA-C1", "status": "completed",
-                      "stage": "in_review"},
-            "SA-C2": {"id": "SA-C2", "status": "in_review",
-                      "stage": "in_review"},
+            "SA-C1": [
+                {"id": "SA-C1", "status": "in_progress",
+                 "stage": "in_progress"},
+                {"id": "SA-C1", "status": "completed",
+                 "stage": "in_review"},
+            ],
+            "SA-C2": [
+                {"id": "SA-C2", "status": "in_progress",
+                 "stage": "in_progress"},
+                {"id": "SA-C2", "status": "in_review",
+                 "stage": "in_review"},
+            ],
         }
 
         report = _run(
@@ -634,9 +679,12 @@ class TestTimeoutOutcomeEvidence:
         report = _run(
             m, runner, RecordingSpawner([_timeout_result("SA-C1", 60)]),
             [{"id": "SA-C1"}],
-            child_states={"SA-C1": {
-                "id": "SA-C1", "status": "completed", "stage": "in_review",
-            }},
+            # Startable at the spawn decision (the pre-spawn re-validation
+            # must allow the session), terminal by reconciliation.
+            child_states={"SA-C1": [
+                {"id": "SA-C1", "status": "open", "stage": "intake_complete"},
+                {"id": "SA-C1", "status": "completed", "stage": "in_review"},
+            ]},
         )
 
         assert isinstance(report["success"], bool)
@@ -1476,10 +1524,12 @@ class TestDrivePaneLifecycle:
 
         report = _run(
             m, runner, spawner, [{"id": "SA-C1"}],
-            child_states={"SA-C1": {
-                "id": "SA-C1", "status": "completed",
-                "stage": "in_review",
-            }},
+            child_states={"SA-C1": [
+                {"id": "SA-C1", "status": "in_progress",
+                 "stage": "in_progress"},
+                {"id": "SA-C1", "status": "completed",
+                 "stage": "in_review"},
+            ]},
             pane_client=client,
             child_timeout=60,
         )
@@ -1678,3 +1728,371 @@ class TestDrivePaneLifecycle:
         assert "transport: pane, pane w1:p2" in out
         assert "Panes retained for inspection: 1" in out
         assert "herdr pane read w1:p2" in out
+
+
+# ---------------------------------------------------------------------------
+# SA-0MWFJSCPT005BO2R — pre-spawn re-validation: never spawn a no-op session
+# ---------------------------------------------------------------------------
+
+TERMINAL_CHILD = {"status": "completed", "stage": "in_review"}
+OPEN_CHILD = {"status": "open", "stage": "intake_complete"}
+
+
+class TestRevalidateStartableBeforeSpawn:
+    """The reported ``next_child`` is re-validated before its session spawns.
+
+    The recorded incident (AI_Hell, 2026-11-13) had nine ~50 s implement
+    sessions that loaded the skill and exited without doing work. The
+    session-level root cause was a provider error on the first turn (three
+    messages, empty assistant message with ``stopReason: "error"``), which a
+    state check cannot predict; the driver's own no-op class is a **stale
+    ``parent`` report** — a child that is already terminal, or whose
+    ``blocked`` hold still holds, by the time ``phase_drive`` acts on it.
+    ``phase_drive`` therefore re-fetches the reported child immediately before
+    the spawn and records the verdict in ``revalidated_children`` instead of
+    paying for a session that can only no-op. Spawning for a genuinely
+    startable child is unchanged (regression pinned below).
+    """
+
+    def test_already_terminal_child_is_not_spawned(self, implement_mod):
+        """A terminal child is skipped and the chain continues with the next."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-DONE"),
+            _child_report("SA-C2"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner()
+        children = [
+            {"id": "SA-DONE", "status": "completed", "stage": "in_review"},
+            {"id": "SA-C2", "status": "open", "stage": "intake_complete"},
+        ]
+
+        report = _run(
+            m, runner, spawner, children,
+            child_states={"SA-DONE": dict(TERMINAL_CHILD),
+                          "SA-C2": dict(OPEN_CHILD)},
+        )
+
+        assert [c["id"] for c in spawner.calls] == ["SA-C2"]
+        assert report["sessions_spawned"] == 1
+        assert report["parent_advanced"] is True
+        assert report["success"] is True
+        verdict = report["revalidated_children"][0]
+        assert verdict["id"] == "SA-DONE"
+        assert verdict["startable"] is False
+        assert verdict["action"] == "skip-terminal"
+        assert "already terminal" in verdict["reason"]
+        # The startable sibling's verdict is recorded too (additive surface).
+        assert report["revalidated_children"][1]["startable"] is True
+        assert "failed_child" not in report
+
+    def test_soft_deleted_child_is_not_spawned(self, implement_mod):
+        """A soft-deleted child (``deletedBy`` set, status open) is terminal."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-DEL"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner()
+
+        report = _run(
+            m, runner, spawner,
+            [{"id": "SA-DEL", "status": "open", "deletedBy": "operator"}],
+            child_states={"SA-DEL": {
+                "status": "open", "stage": "intake_complete",
+                "deletedBy": "operator",
+            }},
+        )
+
+        assert spawner.calls == []
+        assert report["sessions_spawned"] == 0
+        assert report["success"] is True
+        assert report["revalidated_children"][0]["action"] == "skip-terminal"
+
+    def test_stage_only_terminal_child_is_not_spawned(self, implement_mod):
+        """A child left at ``stage: in_review`` is terminal for the driver.
+
+        The spawn-failure reconciliation already treats this shape as terminal
+        (SA-0MVHXWLPG007OQVN); a pre-spawn decision must agree with it, or a
+        session is spawned for a child that can only no-op.
+        """
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-REV"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner()
+
+        report = _run(
+            m, runner, spawner,
+            [{"id": "SA-REV", "status": "open", "stage": "in_review"}],
+            child_states={"SA-REV": {"status": "open", "stage": "in_review"}},
+        )
+
+        assert spawner.calls == []
+        assert report["revalidated_children"][0]["action"] == "skip-terminal"
+
+    def test_blocked_child_whose_block_still_holds_is_not_spawned(
+        self, implement_mod,
+    ):
+        """A ``blocked`` child with a non-terminal blocker spawns nothing."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-B"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner()
+
+        report = _run(
+            m, runner, spawner,
+            [{"id": "SA-B", "status": "blocked", "stage": "plan_complete"}],
+            child_states={"SA-B": {
+                "status": "blocked", "stage": "plan_complete",
+            }},
+            blockers={"SA-B": [{"id": "SA-X", "status": "in-progress"}]},
+        )
+
+        assert spawner.calls == []
+        assert report["sessions_spawned"] == 0
+        assert report["success"] is True
+        assert report["action"] == "skip-blocked"
+        assert report["blocked_children"] == ["SA-B"]
+        assert report["blocked_child_details"][0]["blocking_ids"] == ["SA-X"]
+        assert report["revalidated_children"][0]["startable"] is False
+        assert "block still holds" in report["revalidated_children"][0]["reason"]
+
+    def test_stale_block_is_startable_again(self, implement_mod):
+        """A ``blocked`` child whose blockers are all terminal is spawned."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-B"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner()
+
+        report = _run(
+            m, runner, spawner,
+            [{"id": "SA-B", "status": "blocked", "stage": "plan_complete"}],
+            child_states={"SA-B": {
+                "status": "blocked", "stage": "plan_complete",
+            }},
+            blockers={"SA-B": [{"id": "SA-X", "status": "completed"}]},
+        )
+
+        assert [c["id"] for c in spawner.calls] == ["SA-B"]
+        assert report["sessions_spawned"] == 1
+        verdict = report["revalidated_children"][0]
+        assert verdict["startable"] is True
+        assert verdict["stale_block_ids"] == ["SA-X"]
+
+    def test_genuinely_startable_child_is_still_spawned(self, implement_mod):
+        """Regression: the re-validation never blocks real work."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner()
+
+        report = _run(
+            m, runner, spawner,
+            [{"id": "SA-C1", "status": "open", "stage": "intake_complete"}],
+            child_states={"SA-C1": dict(OPEN_CHILD)},
+        )
+
+        assert [c["id"] for c in spawner.calls] == ["SA-C1"]
+        assert report["sessions_spawned"] == 1
+        assert report["revalidated_children"] == [{
+            "id": "SA-C1",
+            "startable": True,
+            "action": "implement",
+            "status": "open",
+            "stage": "intake_complete",
+            "reason": "",
+        }]
+
+    def test_in_progress_child_is_startable(self, implement_mod):
+        """An in-progress child is a resume, never a refused spawn."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-IP"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner()
+
+        report = _run(
+            m, runner, spawner,
+            [{"id": "SA-IP", "status": "in_progress"}],
+            child_states={"SA-IP": {
+                "status": "in_progress", "stage": "in_progress",
+            }},
+        )
+
+        assert [c["id"] for c in spawner.calls] == ["SA-IP"]
+        assert report["revalidated_children"][0]["startable"] is True
+
+    def test_unreadable_child_fails_open(self, implement_mod):
+        """A transient worklog read failure never stalls the chain."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner()
+
+        report = _run(
+            m, runner, spawner,
+            [{"id": "SA-C1", "status": "open"}],
+            child_states={},  # every child fetch returns {} (unreadable)
+        )
+
+        assert [c["id"] for c in spawner.calls] == ["SA-C1"]
+        verdict = report["revalidated_children"][0]
+        assert verdict["startable"] is True
+        assert "could not be re-fetched" in verdict["reason"]
+
+    def test_rerunning_the_same_batch_produces_zero_no_op_sessions(
+        self, implement_mod,
+    ):
+        """AC3: the same batch re-run spawns no session for a done child."""
+        m = implement_mod
+        spawner = RecordingSpawner()
+
+        for _ in range(2):
+            runner = ScriptedParent([
+                _child_report("SA-DONE"),
+                {"success": True, "parent_advanced": True,
+                 "message": "advanced"},
+            ])
+            report = _run(
+                m, runner, spawner,
+                [{"id": "SA-DONE", "status": "completed",
+                  "stage": "in_review"}],
+                child_states={"SA-DONE": dict(TERMINAL_CHILD)},
+            )
+            assert report["sessions_spawned"] == 0
+            assert [v["id"] for v in report["revalidated_children"]] == [
+                "SA-DONE"
+            ]
+            assert report["revalidated_children"][0]["startable"] is False
+            assert report["success"] is True
+
+        assert spawner.calls == []
+
+    def test_a_parent_that_keeps_offering_the_same_child_stops(
+        self, implement_mod,
+    ):
+        """The re-validation skip cannot spin: a repeat offer stops the chain."""
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-DONE"),
+            _child_report("SA-DONE"),
+        ])
+        spawner = RecordingSpawner()
+
+        report = _run(
+            m, runner, spawner,
+            [{"id": "SA-DONE", "status": "completed", "stage": "in_review"}],
+            child_states={"SA-DONE": dict(TERMINAL_CHILD)},
+        )
+
+        assert spawner.calls == []
+        assert report["sessions_spawned"] == 0
+        assert report["parent_advanced"] is False
+        assert "keeps offering" in report["message"]
+        assert "failed_child" not in report
+
+    def test_human_report_names_a_revalidated_skip(
+        self, implement_mod, capsys,
+    ):
+        """The human summary must show the skip, never present it as work."""
+        m = implement_mod
+        report = {
+            "phase": "drive",
+            "work_item_id": PARENT,
+            "success": True,
+            "parent_advanced": False,
+            "sessions_spawned": 0,
+            "children_driven": [],
+            "revalidated_children": [{
+                "id": "SA-DONE",
+                "startable": False,
+                "action": "skip-terminal",
+                "status": "completed",
+                "stage": "in_review",
+                "reason": "it is already terminal "
+                          "(status=completed, stage=in_review)",
+            }],
+            "message": "No session spawned for SA-DONE.",
+        }
+
+        m._emit_phase_report(report, json_output=False)
+        out = capsys.readouterr().out
+
+        assert "⏭ SA-DONE (skipped, no session)" in out
+        assert "already terminal" in out
+
+
+# ---------------------------------------------------------------------------
+# F2: spawn-time provider-failure retry ordering (SA-0MWLDZBTF004LJFP)
+# ---------------------------------------------------------------------------
+
+
+def _provider_failure_result(cid: str, model: str = "MunitoAI/*") -> dict:
+    """Scripted spawner result for a child session that died at model
+    resolution (the ``_default_session_spawner`` non-zero-exit shape)."""
+    return {
+        "success": False,
+        "returncode": 1,
+        "reason": (
+            f"Child session for {cid} exited with code 1: Error: No models "
+            f'match pattern "{model}"'
+        ),
+    }
+
+
+class TestSpawnInfraRetryOrdering:
+    """Ordering: reconciliation outranks retry (F2 AC4).
+
+    The retry decision runs *after* ``_reconcile_spawn_failure``: a child the
+    reconciliation proved terminal (``completed-late``) is never retried, so a
+    provider reason in the spawn output can never spawn a second session for
+    work that is already done.
+    """
+
+    def test_completed_late_child_is_never_retried(self, implement_mod):
+        m = implement_mod
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True, "message": "advanced"},
+        ])
+        spawner = RecordingSpawner([_provider_failure_result("SA-C1")])
+        # Startable at the spawn decision, terminal when the killed session is
+        # reconciled — the exact production shape the incident took.
+        states = {
+            "SA-C1": [
+                {"id": "SA-C1", "status": "in_progress",
+                 "stage": "intake_complete"},
+                {"id": "SA-C1", "status": "completed",
+                 "stage": "in_review"},
+            ],
+        }
+
+        report = _run(
+            m, runner, spawner, [{"id": "SA-C1"}],
+            child_states=states, infra_retry_limit=5, delay=lambda _s: None,
+        )
+
+        # Exactly one session: the terminal child was reconciled, not retried.
+        assert len(spawner.calls) == 1
+        assert report["success"] is True
+        assert report["infra_retries"] == {}
+        assert report["completed_late"] == 1
+        assert [
+            entry["result"] for entry in report["children_driven"]
+        ] == ["completed-late"]
+        assert not any(
+            entry.get("result") == "infra-retry"
+            for entry in report["children_driven"]
+        )

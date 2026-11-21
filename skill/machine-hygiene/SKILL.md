@@ -16,6 +16,8 @@ and reports before-and-after state.
 **Read-only by default** — no process is killed, deleted, or modified without
 explicit operator/producer approval.
 
+> **Tool output:** follow the shared [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result.
+
 ## Triggers
 
 - `/skill:machine-hygiene`

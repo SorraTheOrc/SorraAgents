@@ -1359,6 +1359,163 @@ def _resolve_project_root():
     return str(Path.cwd().resolve())
 
 
+# ── Podcast post-step ────────────────────────────────────────────────
+#
+# Right after the dated report is written and committed, an OPT-IN post-step
+# publishes the day's episode by invoking ContentCreator's per-project
+# standup→podcast entry point (SA-0MWHZ7MD6007R07Z). It mirrors the commit
+# helper's contract: opt-in, non-fatal (every failure is a warning and never
+# changes the exit code) and idempotent (ContentCreator reports
+# ``up-to-date`` for an already-produced date).
+
+#: Opt-in env flag. Default off: only the exact value ``"1"`` enables it.
+PODCAST_OPT_IN_ENV = "STANDUP_PODCAST"
+
+#: Env override for ContentCreator's entry point path.
+PODCAST_SCRIPT_ENV = "STANDUP_PODCAST_SCRIPT"
+
+#: Entry point location, relative to the project root (a sibling checkout).
+PODCAST_SCRIPT_RELATIVE = Path("..") / "ContentCreator" / "scripts" / "standup-podcast.sh"
+
+#: Upper bound (seconds) on the whole podcast invocation.
+PODCAST_TIMEOUT = 1800
+
+
+def podcast_hook_enabled(env=None):
+    """Return True when the podcast post-step is opted in.
+
+    Args:
+        env: Environment mapping (defaults to ``os.environ``). Read at call
+            time so tests and callers can override it.
+
+    Returns:
+        True only when the opt-in flag is exactly ``"1"``.
+    """
+    source = os.environ if env is None else env
+    return str(source.get(PODCAST_OPT_IN_ENV, "")).strip() == "1"
+
+
+def _podcast_slug(name):
+    """Slugify a project name the way ContentCreator does."""
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+
+
+def _default_podcast_runner(project_root):
+    """Return a runner that shells out to ``bash`` from *project_root*.
+
+    Mirrors :func:`_default_git_runner`: it never raises, returning
+    ``(returncode, stdout, stderr)`` for every outcome.
+    """
+    def _run(cmd):
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+                timeout=PODCAST_TIMEOUT,
+                check=False,
+            )
+            return (result.returncode, result.stdout or "", result.stderr or "")
+        except subprocess.TimeoutExpired:
+            return (1, "", "Command timed out")
+        except Exception as e:  # noqa: BLE001
+            return (1, "", str(e))
+
+    return _run
+
+
+def publish_podcast_episode(report_path, project_root=None, env=None, runner=None):
+    """Publish a standup report as a podcast episode (non-fatal).
+
+    This is the post-step the implementation plan names
+    ``_invoke_podcast_pipeline``: it invokes ContentCreator's entry point with
+    the CLI-flags contract ``--project <slug> --report <path>``. It never
+    raises and never changes the caller's exit code.
+
+    Args:
+        report_path: The standup report just written.
+        project_root: Project root the report belongs to; defaults to
+            :func:`_resolve_project_root`.
+        env: Environment mapping (defaults to ``os.environ``).
+        runner: Optional injectable runner for tests. It receives the argument
+            list and returns ``(returncode, stdout, stderr)``. The default
+            runs ``bash`` from *project_root*.
+
+    Returns:
+        A status dict: ``{"status": "published" | "up-to-date" | "skipped" |
+        "failed", ...}``.
+    """
+    source = os.environ if env is None else env
+    root = Path(project_root or _resolve_project_root())
+
+    override = str(source.get(PODCAST_SCRIPT_ENV) or "").strip()
+    script = Path(override) if override else root / PODCAST_SCRIPT_RELATIVE
+    if not script.is_file():
+        _warn(
+            "standup podcast post-step skipped: ContentCreator entry point not "
+            f"found at {script} (set {PODCAST_SCRIPT_ENV} to override)"
+        )
+        return {"status": "skipped", "reason": "script_missing", "script": str(script)}
+
+    project_name = resolve_project_name(worklog_dir=str(root / ".worklog"))
+    slug = _podcast_slug(project_name) or _podcast_slug(root.name)
+    cmd = [
+        "bash",
+        str(script),
+        "--project",
+        slug,
+        "--project-name",
+        project_name,
+        "--report",
+        str(Path(report_path).resolve()),
+    ]
+
+    run = runner or _default_podcast_runner(root)
+    try:
+        returncode, stdout, stderr = run(cmd)
+    except Exception as e:  # noqa: BLE001
+        _warn(f"standup podcast post-step failed to run: {e}")
+        return {"status": "failed", "reason": "runner_error", "error": str(e)}
+
+    detail = ""
+    for line in (stdout or "").splitlines():
+        if line.startswith("standup-podcast-result:"):
+            detail = line.split(":", 1)[1].strip()
+
+    if returncode != 0:
+        message = (stderr or stdout or "").strip().splitlines()
+        tail = message[-1] if message else "no output"
+        _warn(f"standup podcast post-step failed (exit {returncode}): {tail}")
+        return {"status": "failed", "returncode": returncode, "detail": detail}
+
+    if detail == "up-to-date":
+        return {"status": "up-to-date", "returncode": 0, "detail": detail}
+    return {"status": "published", "returncode": 0, "detail": detail}
+
+
+def _maybe_publish_podcast(
+    report_path, project_root, *, json_output, no_sync, no_commit, env=None, runner=None
+):
+    """Run the podcast post-step only in the triggering modes.
+
+    ``--json``-to-stdout, ``--no-sync`` and ``--no-commit`` runs never trigger
+    publication (they are the offline/deterministic and fetch-data paths), and
+    the hook stays dormant unless :func:`podcast_hook_enabled` says otherwise.
+
+    Returns:
+        The :func:`publish_podcast_episode` status dict, or
+        ``{"status": "disabled"}`` when gating excludes the run.
+    """
+    if json_output or no_sync or no_commit:
+        return {"status": "disabled"}
+    if not podcast_hook_enabled(env):
+        return {"status": "disabled"}
+    return publish_podcast_episode(
+        report_path, project_root=project_root, env=env, runner=runner
+    )
+
+
 def main():
     global WORKLOG_DIR
     args = sys.argv[1:]
@@ -1454,6 +1611,16 @@ def main():
         if not no_commit:
             # The file is written cwd-relative; commit the actual written path.
             commit_report_file(os.path.abspath(output_path), _resolve_project_root())
+        try:
+            _maybe_publish_podcast(
+                os.path.abspath(output_path),
+                _resolve_project_root(),
+                json_output=json_output,
+                no_sync=no_sync,
+                no_commit=no_commit,
+            )
+        except Exception as e:  # noqa: BLE001
+            _warn(f"standup podcast post-step skipped: {e}")
     elif json_output:
         # --json without --output-path: stream raw JSON to stdout (documented
         # fetch-data contract). The default dated file applies to the rendered
@@ -1471,6 +1638,16 @@ def main():
         print(f"Report written to {output_path}", file=sys.stderr)
         if not no_commit:
             commit_report_file(output_path, project_root)
+        try:
+            _maybe_publish_podcast(
+                output_path,
+                project_root,
+                json_output=json_output,
+                no_sync=no_sync,
+                no_commit=no_commit,
+            )
+        except Exception as e:  # noqa: BLE001
+            _warn(f"standup podcast post-step skipped: {e}")
 
     return 0
 

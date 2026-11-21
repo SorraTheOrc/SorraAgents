@@ -60,6 +60,11 @@ Optional flags:
 
 Environment:
   IMPLEMENT_TEST_COMMAND    Override the finish test-step command (shell string)
+  IMPLEMENT_FINISH_LOCK_TIMEOUT
+                            Bounded wait in seconds for the main-checkout lock
+                            in `finish` (default 900 = 15 min; 0 = fail fast).
+                            The wait reports the holder and proceeds as soon as
+                            the holder releases.
   IMPLEMENT_DRIVE_PI_BIN    Pi executable used to spawn child sessions (default: pi)
   IMPLEMENT_DRIVE_CHILD_TIMEOUT  Per-child session timeout in seconds
   IMPLEMENT_DRIVE_PANE_SESSIONS  Opt in to the pane-driven transport (same as
@@ -255,7 +260,13 @@ except ImportError:  # pragma: no cover - older test skill
     _classify_gate_result = None  # type: ignore[assignment]
     _GATE_REMEDIATION = {}  # type: ignore[assignment]
 
-from test_cache import FINGERPRINT_KIND_TREE, query_cached, run_cached
+from test_cache import (
+    FINGERPRINT_KIND_CHANGE_SET,
+    FINGERPRINT_KIND_TREE,
+    compute_change_set_state,
+    query_cached,
+    run_cached,
+)
 from test_runner import canonicalize_quiet_test_command
 
 # Canonical quiet full-suite commands — identical cache keys to the test
@@ -496,6 +507,14 @@ def _resolve_test_timeout(cwd: str) -> int:
 
 # State file name stored inside the worktree
 STATE_FILE_NAME = ".implement_state.json"
+
+#: Worktree-local record of a driven child session that failed before doing any
+#: work (a spawn error, non-zero exit or timeout with the child left
+#: non-terminal). It lives under ``.worklog/`` — a prefix every dirty-path
+#: helper excludes — so the record can never be mistaken for the child's work.
+#: Read by the placement guard, cleared when the next session starts
+#: (SA-0MWGZ8NWP009QD8G / AH-0MWFHLDAS008YG0P).
+SPAWN_FAILURE_FILE = ".worklog/spawn-failure.json"
 
 
 # ---------------------------------------------------------------------------
@@ -3016,8 +3035,9 @@ def _main_checkout_guard_violations(
     - a project-declared expected-dirty path (*expected_dirty*), nor
     - a path in *own_churn* whose status code is not a deletion.
 
-    *own_churn* is the file list of finish's own Step-5 fast-forward of the
-    main checkout's ``dev`` branch: those working-tree changes are attributed
+    *own_churn* is the file list of finish's own fast-forward of the
+    main checkout's ``dev`` branch (the **post-push** advance,
+    WL-0MWFKDH78002T2CR AC1): those working-tree changes are attributed
     to finish and never abort. It is deliberately narrow
     (SA-0MVXVC03O0034A7V): :func:`_record_finish_own_churn` only ever returns
     checkout-relative paths that were *observed dirty in this checkout* after
@@ -3131,7 +3151,8 @@ def _record_finish_own_churn(
 ) -> list[str]:
     """Paths of finish's own fast-forward that were *observed* dirty here.
 
-    The diff between the main checkout's HEAD before the Step-5 fast-forward
+    The diff between the main checkout's HEAD before the fast-forward
+    (which runs only **after** the push succeeds, WL-0MWFKDH78002T2CR AC1)
     and after is **not** by itself churn: on 2026-10-31 a finish reported seven
     paths (``docs/Game Design Document.md``, five ``src/powerups/*``, …) whose
     ``baseline_paths`` was 0 — that was the file list of the commit local
@@ -3393,12 +3414,15 @@ def _verify_main_checkout(
 #: :func:`phase_start`.
 MAIN_CHECKOUT_LOCK_RELPATH = _REPO_LOCK_RELPATH
 
-#: Bounded wait for the per-repository lock in ``finish`` (seconds). Default
-#: ``0`` = fail fast: a second finish refuses immediately with an actionable
-#: message naming the holder (AC3 allows fail-fast). Set to a positive value
-#: (env ``IMPLEMENT_FINISH_LOCK_TIMEOUT``) to wait that long for a concurrent
-#: finish instead — the wait is always bounded, never indefinite.
-DEFAULT_FINISH_LOCK_TIMEOUT = 0.0
+#: Bounded wait for the per-repository lock in ``finish`` (seconds). A second
+#: finish performs **one** bounded internal wait on the lock: it reports the
+#: holder as progress and proceeds the moment the holder releases. The default
+#: is deliberately generous but finite — the locked window is short (commit →
+#: fast-forward → push → sync, with the full-suite verdict resolved *before*
+#: the lock, SA-0MWFJS3820032YB4), so 15 minutes covers a slow push while a
+#: dead or stuck holder can never wedge an unattended batch indefinitely.
+#: Override with env ``IMPLEMENT_FINISH_LOCK_TIMEOUT``; set ``0`` for fail-fast.
+DEFAULT_FINISH_LOCK_TIMEOUT = 900.0
 
 #: Bounded wait for the parent-branch refresh window in ``start`` (seconds).
 #: ``start`` must never be blocked by a concurrent finish: after this bound the
@@ -3476,8 +3500,11 @@ def acquire_main_checkout_lock(
     repo_root: str,
     work_item_id: str,
     timeout: float = 0.0,
+    *,
+    progress: Callable[[str], None] | None = None,
+    progress_interval: float = 30.0,
 ) -> tuple[int | None, str | None]:
-    """Take the exclusive per-checkout lock (fail fast by default).
+    """Take the exclusive per-checkout lock (fail fast by default here).
 
     Thin ``implement.py`` wrapper over :class:`shared.repo_lock.RepoLock`. The
     lock is an advisory ``flock`` on
@@ -3494,6 +3521,10 @@ def acquire_main_checkout_lock(
         timeout: Bounded wait in seconds (``0`` = fail fast). A positive value
             waits up to that deadline, then refuses with an actionable
             timeout message — never an indefinite hang.
+        progress: Optional callback receiving human-readable wait progress
+            (the lock path, the bound and the current holder, then throttled
+            heartbeats). ``phase_finish`` uses it for its bounded wait.
+        progress_interval: Minimum seconds between heartbeat messages.
 
     Returns:
         ``(fd, None)`` on success (caller must release via
@@ -3501,7 +3532,10 @@ def acquire_main_checkout_lock(
         complete, actionable refusal message when the lock is held.
     """
     return RepoLock(repo_root, relpath=MAIN_CHECKOUT_LOCK_RELPATH).acquire(
-        work_item_id, timeout=timeout
+        work_item_id,
+        timeout=timeout,
+        progress=progress,
+        progress_interval=progress_interval,
     )
 
 
@@ -3526,6 +3560,13 @@ def resolve_prelock_full_suite_verdict(
     else — and lands in the tree-keyed cache. The hook's ``--gate-commit`` run
     then *serves* that entry (``verdict=cached``) instead of executing the
     suite inside the lock.
+
+    The run also records the verdict under the change set's **patch** key
+    (``fingerprint_kind="change_set"``, SA-0MWFJS9OL001ZTTC). That is what
+    survives a lost push race: when ``dev`` advanced concurrently and the
+    commit was rebased, the tree is new but the patch is identical, so the
+    hook's re-run of the gate serves the verdict instead of paying for the
+    suite again inside the lock.
 
     Safety does not depend on this function. The lock still covers commit →
     fast-forward → push → ancestry assertion; the hook still binds its verdict
@@ -5197,6 +5238,42 @@ def _assert_remote_name_only(remote: str) -> None:
         )
 
 
+def _resolve_commit_change_set_fingerprint(
+    cwd: str, commit_hash: str | None, base_ref: str = "origin/dev"
+) -> str | None:
+    """Change-set fingerprint of *commit_hash*, or ``None`` when unavailable.
+
+    A rebase rewrites a commit and its tree but not the patch it contributes,
+    so the dev-push gate may serve a verdict recorded for the identical change
+    set instead of the pushed tree (SA-0MWFJS9OL001ZTTC). Read-only consumers
+    that look for the gate's evidence (post-push verification, gate-evidence
+    classification) must look under this key too, otherwise a perfectly green
+    change-set-served push would be reported as ``missing`` and refuse the
+    terminal transition.
+
+    *base_ref* must match the one the gate run used — ``origin/dev``, the test
+    skill's default and therefore the gate's — because the base tree is part
+    of the key's derivation. The push *target* branch
+    (:data:`DEFAULT_PARENT_BRANCH`) is deliberately not used here: local
+    ``dev`` and ``origin/dev`` can be at different commits, which would
+    derive a different key and hide the gate's own evidence.
+
+    Fail-soft: an unresolvable commit/tree, a non-repository, or a git
+    failure returns ``None`` — the caller falls back to its other keys.
+    """
+    tree = _resolve_commit_tree(cwd, commit_hash)
+    if not tree:
+        return None
+    try:
+        state = compute_change_set_state(
+            cwd, target_tree=tree, base_ref=base_ref
+        )
+    except Exception as exc:  # noqa: BLE001 - evidence must never break finish
+        LOG.debug("Cannot compute the change-set key of %s in %s: %s", tree, cwd, exc)
+        return None
+    return state["fingerprint"] if state else None
+
+
 def _full_suite_cache_present(
     cwd: str, commit_hash: str | None = None
 ) -> bool:
@@ -5210,8 +5287,12 @@ def _full_suite_cache_present(
 
     The dev-push gate now binds its verdict to the pushed commit's **tree**
     (SA-0MW7C6BMZ00931JG), so when *commit_hash* is supplied the tree-keyed
-    entry is queried first. The historical loose-worktree query is kept as a
-    fallback so legacy entries and pre-tree-keying repos still report evidence.
+    entry is queried first. When the tree has no entry — a rebase rewrote it
+    and the gate served the identical *change set* instead
+    (SA-0MWFJS9OL001ZTTC) — the change-set key is queried next, so a green
+    change-set-served push is never misreported as ``no-evidence``. The
+    historical loose-worktree query is kept as a fallback so legacy entries
+    and pre-tree-keying repos still report evidence.
     """
     try:
         commands = _resolve_full_suite_commands(cwd) or []
@@ -5220,6 +5301,11 @@ def _full_suite_cache_present(
     if not commands:
         return False
     tree = _resolve_commit_tree(cwd, commit_hash)
+    change_set = (
+        _resolve_commit_change_set_fingerprint(cwd, commit_hash)
+        if tree is not None
+        else None
+    )
     for command in commands:
         try:
             if tree is not None and query_cached(
@@ -5227,6 +5313,13 @@ def _full_suite_cache_present(
                 cwd=cwd,
                 fingerprint=tree,
                 fingerprint_kind=FINGERPRINT_KIND_TREE,
+            ) is not None:
+                return True
+            if change_set is not None and query_cached(
+                command,
+                cwd=cwd,
+                fingerprint=change_set,
+                fingerprint_kind=FINGERPRINT_KIND_CHANGE_SET,
             ) is not None:
                 return True
             if query_cached(command, cwd=cwd) is not None:
@@ -5375,6 +5468,16 @@ def _resolve_post_push_verification(
     and every successful push reported a false ``missing`` verdict. The loose
     query is retained so pre-tree-keying entries still count as evidence.
 
+    **Change-set second** (SA-0MWFJS9OL001ZTTC): when a rebase rewrote the
+    pushed commit after the full suite had already passed, the gate serves the
+    verdict recorded for the identical patch under
+    ``fingerprint_kind="change_set"`` (and mirrors it under the pushed tree's
+    key stamped ``verdict_origin="change_set_reuse"``). Querying both keys
+    keeps such a push verifiable (and its
+    ``fingerprint_kind``/``change_set_target_tree``/``verdict_origin`` are
+    reported in the entry record, so the evidence states which tree it was
+    actually measured on).
+
     Verdict vocabulary:
 
     - ``green`` — every resolved full-suite command has a valid entry with
@@ -5404,12 +5507,19 @@ def _resolve_post_push_verification(
         if commit_hash
         else None
     )
+    # The identical change set, measured before a rebase rewrote the tree
+    # (SA-0MWFJS9OL001ZTTC). Resolved from the worktree that holds the pushed
+    # commit, falling back to the main checkout's object database.
+    change_set = _resolve_commit_change_set_fingerprint(worktree_path, commit_hash)
+    if change_set is None and commit_hash:
+        change_set = _resolve_commit_change_set_fingerprint(repo_root, commit_hash)
     verification: dict[str, Any] = {
         "verdict": POST_PUSH_VERDICT_NOT_APPLICABLE,
         "success": True,
         "executed": False,
         "commands": commands,
         "tree": tree,
+        "change_set": change_set,
         "entries": [],
         "reason": reason,
         "checked_at": datetime.now(timezone.utc).isoformat(),
@@ -5432,12 +5542,19 @@ def _resolve_post_push_verification(
                         fingerprint=tree,
                         fingerprint_kind=FINGERPRINT_KIND_TREE,
                     )
-                    if entry is None:
-                        # Legacy/pre-tree-keying entry fallback: a loose
-                        # worktree entry still counts as evidence for the
-                        # pushed tree.
-                        entry = query_cached(command, cwd=cwd)
-                else:
+                if entry is None and change_set is not None:
+                    # A rebased push whose full suite already passed for the
+                    # identical change set (SA-0MWFJS9OL001ZTTC).
+                    entry = query_cached(
+                        command,
+                        cwd=cwd,
+                        fingerprint=change_set,
+                        fingerprint_kind=FINGERPRINT_KIND_CHANGE_SET,
+                    )
+                if entry is None:
+                    # Legacy/pre-tree-keying entry fallback: a loose
+                    # worktree entry still counts as evidence for the
+                    # pushed tree.
                     entry = query_cached(command, cwd=cwd)
             except Exception as exc:  # noqa: BLE001 - a broken cache is a miss
                 LOG.warning(
@@ -5480,6 +5597,9 @@ def _resolve_post_push_verification(
                 "scope": entry.get("scope"),
                 "git_state": entry.get("git_state"),
                 "fingerprint_kind": entry.get("fingerprint_kind"),
+                "verdict_origin": entry.get("verdict_origin"),
+                "measured_tree": entry.get("measured_tree"),
+                "change_set_target_tree": entry.get("change_set_target_tree"),
                 "stdout": (entry.get("stdout") or "")[:4000],
                 "stderr": (entry.get("stderr") or "")[:4000],
             }
@@ -5558,6 +5678,16 @@ def _route_post_push_failure_to_triage(
         "commit_hash": commit_hash,
         "parent_work_item_id": work_item_id,
     }
+    # A verification that observed a moving checkout is a mixed-tree verdict:
+    # forward the explicit signal so the triage helper suppresses it instead
+    # of minting a phantom critical item (WL-0MVSPZ1FH000RWET AC3). The
+    # read-only verification normally never observes movement; this keeps the
+    # contract correct if a verdict ever carries one.
+    state_changed = verification.get("state_changed_during_run")
+    if state_changed:
+        payload["state_changed_during_run"] = state_changed
+    if verification.get("notice_code"):
+        payload["notice_code"] = verification["notice_code"]
     helper = _SKILLS_ROOT / "triage" / "scripts" / "check_or_create.py"
     if not helper.exists():
         LOG.warning(
@@ -6067,8 +6197,10 @@ def _transport_lost_comment(
             f"Branch: {branch}",
             f"Worktree: {worktree_path}",
             (
-                "Local dev was restored to origin/dev (the commit stays on "
-                "its feature branch)."
+                "Local dev was never advanced (the fast-forward is "
+                "deferred until after a successful push), so it is provably "
+                "unchanged from its pre-finish tip; the commit stays on its "
+                "feature branch."
             ),
             "",
             "Gate output (tail):",
@@ -6093,8 +6225,10 @@ def _dev_push_gate_failure_comment(
         f"Branch: {branch}",
         f"Worktree: {worktree_path}",
         (
-            "Local dev was restored to origin/dev (the commit stays on its "
-            "feature branch)."
+            "Local dev was never advanced (the fast-forward is deferred "
+            "until after a successful push), so it is provably unchanged "
+            "from its pre-finish tip; the commit stays on its feature "
+            "branch."
         ),
     ]
     if stderr_tail:
@@ -7894,6 +8028,127 @@ def _sync_parent_branch_locked(
     return result
 
 
+def _resolve_start_base(
+    repo_root: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+    refresh_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve a safe worktree base: a **pushed tip**, never a local mutant.
+
+    ``phase_start`` forks a child worktree from the shared parent branch.
+    That branch is a *shared, locally-mutable* ref: a concurrent ``finish``
+    historically fast-forwarded it to an about-to-be-pushed commit inside its
+    write-then-restore window, so a ``start`` that resolved ``dev`` in that
+    window created its branch from an unpushed commit and permanently
+    grafted another item's commit onto it (WL-0MWFKDH78002T2CR AC3).
+
+    This helper verifies that local ``parent_branch`` is a **known pushed
+    tip** — equal to the fetched ``refs/remotes/origin/<parent>``, or an
+    ancestor of it (stale-but-pushed). A local branch that carries commits
+    the remote does not have (ahead of, or diverged from, ``origin``) is
+    refused: ``start`` must not branch from it. ``phase_start`` aborts the
+    whole start on that verdict — no worktree, item released to ``open`` —
+    so a foreign commit can never become a new branch's base.
+
+    Fail-open only when the remote tip cannot be resolved at all (a failed
+    fetch): the base cannot be *proven* unsafe and the historical local-base
+    fallback is preserved, exactly like the Step-6.5 refresh's own offline
+    contract. A ``refresh_result`` whose ``method == "synced"`` short-circuits
+    (the refresh already proved local == fetched origin, so no second fetch
+    or verdict is needed); otherwise the helper fetches itself — read-only,
+    never under the per-repository lock — so the verdict is grounded on a
+    current remote-tracking ref even when the refresh skipped (lock held /
+    dirty tree / divergence).
+
+    Args:
+        repo_root: Absolute path to the main checkout.
+        parent_branch: The shared parent branch (default ``dev``).
+        refresh_result: Optional :func:`_sync_parent_branch_locked` result
+            used to short-circuit the synced case.
+
+    Returns:
+        Dict with ``method`` (``local_dev`` | ``refused``), ``base`` (the ref
+        to branch the worktree from, or ``None`` when refused), ``reason``
+        and, on refusal, a loud ``warning`` naming both tips and the remedy.
+    """
+    if refresh_result and refresh_result.get("method") == "synced":
+        # The refresh just proved local == the fetched origin tip.
+        return {
+            "method": "local_dev",
+            "base": parent_branch,
+            "reason": "refresh_synced",
+        }
+    result: dict[str, Any] = {
+        "method": "local_dev",
+        "base": parent_branch,
+        "reason": "in_sync",
+    }
+    remote_ref = f"refs/remotes/origin/{parent_branch}"
+    fetch_result = run_cmd(
+        ["git", "fetch", "origin", parent_branch],
+        cwd=repo_root,
+        check=False,
+        timeout=120,
+    )
+    if fetch_result.returncode != 0:
+        result["reason"] = "fetch_failed"
+        result["warning"] = (
+            f"Cannot verify that local {parent_branch} is a pushed tip: "
+            f"git fetch origin {parent_branch} failed in {repo_root}. "
+            f"Branching from local {parent_branch} anyway (fail-open, "
+            f"matching the Step-6.5 refresh's offline fallback); re-run "
+            f"start once the remote is reachable to be certain."
+        )
+        LOG.warning("%s", result["warning"])
+        return result
+    local_tip = _resolve_full_commit(repo_root, f"refs/heads/{parent_branch}")
+    remote_tip = _resolve_full_commit(repo_root, remote_ref)
+    result["local_tip"] = local_tip
+    result["remote_tip"] = remote_tip
+    if not remote_tip:
+        result["reason"] = "no_remote_tracking_ref"
+        result["warning"] = (
+            f"Cannot verify that local {parent_branch} is a pushed tip: "
+            f"{remote_ref} does not resolve after a successful fetch. "
+            f"Branching from local {parent_branch} anyway (fail-open)."
+        )
+        LOG.warning("%s", result["warning"])
+        return result
+    if local_tip == remote_tip:
+        result["reason"] = "in_sync"
+        return result
+    ancestor_result = run_cmd(
+        ["git", "merge-base", "--is-ancestor", local_tip, remote_ref],
+        cwd=repo_root,
+        check=False,
+    )
+    if ancestor_result.returncode == 0:
+        # Local dev is an ancestor of the remote tip: every local commit is
+        # published; the base is stale-but-pushed (safe).
+        result["reason"] = "behind_remote"
+        return result
+    result["method"] = "refused"
+    result["base"] = None
+    result["reason"] = "local_dev_not_a_pushed_tip"
+    result["warning"] = (
+        f"Refusing to create a worktree from local {parent_branch}: it is "
+        f"not a known pushed tip. local={local_tip}, "
+        f"origin/{parent_branch}={remote_tip}. A concurrent `finish` may "
+        f"have advanced it to an unpushed commit (WL-0MWFKDH78002T2CR) or "
+        f"the branch holds deliberate local commits. Resolve first, then "
+        f"re-run start:\n"
+        f"  1. Inspect: git -C {repo_root} log --oneline --graph "
+        f"--decorate --all -20\n"
+        f"  2. Verify nothing important is lost "
+        f"(git -C {repo_root} log {remote_ref}..{parent_branch})\n"
+        f"  3. Push the local commits, or discard them deliberately "
+        f"(git -C {repo_root} reset --hard {remote_ref}) — never without "
+        f"operator confirmation."
+    )
+    LOG.warning("%s", result["warning"])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Verified, reversible local-dev sync + post-push ancestry assertion
 # (SA-0MVPZG7A0000N66U, parent SA-0MVNQURZM001TKJY AC1/AC2)
@@ -8275,12 +8530,169 @@ def classify_finish_failure(
     }
 
 
+#: The two failure kinds :func:`classify_spawn_failure` can return. A spawn
+#: failure is either a retryable provider/model-resolution failure or
+#: ``unknown`` — there is deliberately no ``gate`` kind, because a child
+#: session that never ran has not executed the child's finish gate
+#: (SA-0MWLDZ8ZN0030T15).
+SPAWN_FAILURE_KINDS: tuple[str, ...] = (
+    "infrastructure",
+    "unknown",
+)
+
+#: Allow-list of provider/model-resolution **fragments** (matched
+#: case-insensitively as a substring of the spawner's ``reason``) paired with
+#: the concrete remedy an operator must apply. Mirrors
+#: :data:`FINISH_INFRA_REFUSALS`: an unlisted reason is ``unknown`` and is
+#: never retried, so a genuine defect still hard-stops the drive chain
+#: (SA-0MWLDZ8ZN0030T15).
+#:
+#: The fragments are the messages Pi emits when a configured model cannot be
+#: served: ``resolveModelScopeFromModels`` reports
+#: ``No models match pattern "<pattern>"`` and the credential path reports
+#: ``No API key found for <provider>``. The pattern/credential text arrives
+#: inside the spawner reason because ``_default_session_spawner`` embeds the
+#: child's stderr tail and the pane spawner embeds the herdr reason.
+SPAWN_INFRA_REASONS: tuple[tuple[str, str], ...] = (
+    (
+        "No models match pattern",
+        (
+            "Remove the unservable model pattern from `enabledModels` in "
+            "the child's models.json (or add an entry that serves it via a "
+            "reachable provider), then re-run `implement.py drive` — "
+            "retrying cannot fix an unservable pattern."
+        ),
+    ),
+    (
+        "No API key found for",
+        (
+            "Provide the missing API key for the provider (`pi login` for "
+            "it, or set its API-key environment variable), then re-run "
+            "`implement.py drive`."
+        ),
+    ),
+)
+
+#: The provider name embedded in a recognised fragment. Group 1 captures the
+#: pattern/display name; the helper reduces a ``provider/model`` pattern to
+#: its provider half.
+SPAWN_INFRA_PROVIDER_PATTERNS: tuple[str, ...] = (
+    r'No models match pattern\s+"?([^"\s]+)"?',
+    r"No API key found for\s+([^.\s]+)",
+)
+
+
+def _spawn_failure_subject(reason: str) -> str | None:
+    """Extract the pattern/display text a recognised reason names.
+
+    The captured text is the model **pattern** for the no-match flavour
+    (``"MunitoAI/*"``) and the provider display name for the credential
+    flavour — surfaced verbatim rather than parsed, so a drive verdict can
+    name both the provider and the model the child could not serve.
+
+    Args:
+        reason: The spawner's failure reason.
+
+    Returns:
+        The captured pattern/display text, or ``None`` when the reason names
+        neither.
+    """
+    for pattern in SPAWN_INFRA_PROVIDER_PATTERNS:
+        match = re.search(pattern, reason, re.IGNORECASE)
+        if not match:
+            continue
+        return match.group(1).strip().strip("\"'") or None
+    return None
+
+
+def _spawn_failure_provider(reason: str) -> str | None:
+    """Extract the provider named by a recognised spawn-failure reason.
+
+    Only called once a :data:`SPAWN_INFRA_REASONS` fragment has matched, so a
+    ``None`` return means the fragment carried no extractable provider — the
+    caller reports the failure without a provider rather than inventing one.
+
+    Args:
+        reason: The spawner's failure reason.
+
+    Returns:
+        The provider name (``"MunitoAI"`` for ``"MunitoAI/*"``), or ``None``
+        when the reason names no provider.
+    """
+    captured = _spawn_failure_subject(reason)
+    if captured is None:
+        return None
+    # A ``provider/model`` pattern names the provider before the slash;
+    # a bare model id is surfaced as-is (best effort, never invented).
+    return captured.split("/", 1)[0] or captured
+
+
+def classify_spawn_failure(reason: Any) -> dict[str, Any]:
+    """Classify a failed *child spawn* into a failure kind.
+
+    The spawn-side counterpart of :func:`classify_finish_failure`
+    (SA-0MWLDZ8ZN0030T15). A driven child session can die at startup because
+    the configured model cannot be served (``No models match pattern
+    "MunitoAI/*"``, ``No API key found for …``); that is a transient
+    provider/model-resolution failure the drive loop may retry on its
+    infrastructure budget, whereas any other spawn failure is a genuine
+    defect that must hard-stop the chain.
+
+    Resolution rules:
+
+    * a reason containing ``timed out`` is ``unknown`` — the timeout path
+      keeps its own reconciliation semantics and is never reclassified as
+      provider-infrastructure, even when herdr echoes provider text into the
+      timeout message;
+    * ``kind == "infrastructure"`` only for an explicit
+      :data:`SPAWN_INFRA_REASONS` fragment hit (case-insensitive substring);
+    * anything else — including ``None``, ``""``, a traceback tail and any
+      arbitrary message — is ``kind == "unknown"`` (fail-safe: ``unknown`` is
+      never ``infrastructure``, so drive can never retry a real defect).
+
+    Args:
+        reason: The spawner's ``reason`` string (any type; non-strings and
+            ``None`` fail safe to ``unknown``).
+
+    Returns:
+        ``{"kind", "reason", "provider", "remedy"}`` where ``reason`` is the
+        caller's reason unchanged (so F2 can surface it verbatim), and
+        ``provider``/``remedy`` are ``None``/``""`` for an ``unknown``
+        classification.
+    """
+    raw = "" if reason is None else str(reason)
+    result: dict[str, Any] = {
+        "kind": "unknown",
+        "reason": raw,
+        "provider": None,
+        "remedy": "",
+    }
+    if not raw.strip() or "timed out" in raw.lower():
+        return result
+    for fragment, remedy in SPAWN_INFRA_REASONS:
+        if fragment.lower() in raw.lower():
+            return {
+                "kind": "infrastructure",
+                "reason": raw,
+                "provider": _spawn_failure_provider(raw),
+                "remedy": remedy,
+            }
+    return result
+
+
 def _fast_forward_local_dev_for_push(
     repo_root: str,
     commit_hash: str,
     parent_branch: str = DEFAULT_PARENT_BRANCH,
 ) -> dict[str, Any]:
     """Advance the main checkout's local parent branch to *commit_hash*.
+
+    **Call contract (WL-0MWFKDH78002T2CR AC1): this helper runs only after
+    ``git push`` reports success** — it is invoked from the post-push step in
+    ``phase_finish`` (Step 6a.5), never before or during a push. Advancing
+    local ``dev`` to an unpushed commit opened a write-then-restore window in
+    which a concurrent ``start`` forked a worktree from that committed tip and
+    permanently grafted another item's commit onto its branch.
 
     This fast-forward is **main-checkout hygiene only**: the dev-push gate's
     subject is the pushed commit (resolved from the worktree that holds it),
@@ -8481,7 +8893,13 @@ def _restore_local_dev_after_failed_push(
     fast_forward: dict[str, Any] | None,
     parent_branch: str = DEFAULT_PARENT_BRANCH,
 ) -> dict[str, Any]:
-    """Undo finish's own pre-push fast-forward after a failed push (AC1).
+    """Undo finish's own fast-forward after a failed push (AC1).
+
+    **Call contract (WL-0MWFKDH78002T2CR AC2): every failed/refused push
+    reports ``no_advance_to_undo``** — the fast-forward is deferred until
+    after the push succeeds, so there is never an advance to undo. The helper
+    is retained as the failure-path record surface and as a conservative
+    safety net for any future write that would need an undo.
 
     Invariant: local ``dev`` must never be left pointing at an unpushed finish
     commit after a failed push. Otherwise the next child worktree forks from a
@@ -9321,12 +9739,19 @@ def _cache_entry_from_run(
     and ``fingerprint_kind`` so the finish report and the completion comment
     can state *what* was reused, not merely that something was
     (SA-0MVQHVJEX0071R7G).
+
+    A change-set hit (``fingerprint_kind="change_set"``, the identical patch
+    measured on a different base, SA-0MWFJS9OL001ZTTC) also reports
+    ``reused_via_change_set`` and ``change_set_target_tree`` — the tree the
+    verdict was actually measured on.
     """
     return {
         "command": run.get("command") or command,
         "completed_at": run.get("completed_at", 0),
         "scope": run.get("scope", "full"),
         "fingerprint_kind": run.get("fingerprint_kind", ""),
+        "reused_via_change_set": bool(run.get("reused_via_change_set", False)),
+        "change_set_target_tree": run.get("change_set_target_tree", ""),
     }
 
 
@@ -10856,6 +11281,130 @@ def remove_state(worktree_path: str) -> None:
         LOG.debug("State file removed: %s", state_path)
 
 
+def record_spawn_failure(
+    worktree_path: str,
+    child_id: str,
+    reason: str,
+) -> dict[str, Any] | None:
+    """Record that a driven child session failed before producing any work.
+
+    The driver observes the failure directly (a spawn error, a non-zero exit
+    or a timeout with the child left non-terminal). ``phase_parent`` and
+    ``phase_drive`` **cannot** reconstruct it from the filesystem later: a
+    child that produced nothing looks exactly like a child whose work landed
+    somewhere else. Without this evidence the placement guard
+    (:func:`_child_main_checkout_violation`) attributes pre-existing dirt in
+    the main checkout or in a sibling worktree to the failed child and fails
+    the chain closed, naming paths the child never touched
+    (SA-0MWGZ8NWP009QD8G / AH-0MWFHLDAS008YG0P).
+
+    The record is written to :data:`SPAWN_FAILURE_FILE` inside the child's
+    worktree. ``.worklog/`` is excluded by every dirty-path helper, so the
+    record never counts as work: the child stays re-spawnable rather than
+    being presented as finishable. The record is cleared when the next session
+    starts (:func:`clear_spawn_failure` in ``phase_start``) and disappears with
+    the worktree.
+
+    Args:
+        worktree_path: The child's worktree root.
+        child_id: The child work item ID the record belongs to.
+        reason: Human-readable failure evidence (the spawner's reason).
+
+    Returns:
+        The recorded evidence dict, or ``None`` when the worktree is gone or
+        the write failed (fail-open: this record is diagnostic evidence, never
+        a gate).
+    """
+    wt = Path(worktree_path)
+    if not wt.is_dir():
+        LOG.warning(
+            "Not recording the spawn failure for %s: worktree %s is gone.",
+            child_id,
+            wt,
+        )
+        return None
+    evidence = {
+        "child_id": child_id,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "reason": reason,
+    }
+    path = wt / SPAWN_FAILURE_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(evidence, indent=2), encoding="utf-8")
+    except OSError as exc:
+        LOG.warning(
+            "Could not record the spawn failure for %s in %s: %s",
+            child_id,
+            wt,
+            exc,
+        )
+        return None
+    LOG.info("Recorded the spawn failure for %s in %s", child_id, path)
+    return evidence
+
+
+def read_spawn_failure(
+    worktree_path: str, child_id: str | None = None
+) -> dict[str, Any] | None:
+    """Read recorded spawn-failure evidence from a child's worktree.
+
+    Args:
+        worktree_path: The child's worktree root.
+        child_id: When given, evidence recorded for a *different* child is
+            ignored (a worktree belongs to one item; this keeps a stale record
+            from excusing another item).
+
+    Returns:
+        The evidence dict, or ``None`` when there is no record, it is
+        unreadable, or it belongs to another child. Unreadable evidence fails
+        open (the placement guard applies unchanged).
+    """
+    path = Path(worktree_path) / SPAWN_FAILURE_FILE
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        LOG.warning("Ignoring unreadable spawn-failure record %s: %s", path, exc)
+        return None
+    if not isinstance(data, dict):
+        LOG.warning("Ignoring malformed spawn-failure record %s: %r", path, data)
+        return None
+    recorded_child = str(data.get("child_id") or "")
+    if child_id and recorded_child and recorded_child != child_id:
+        LOG.debug(
+            "Ignoring spawn-failure record %s: it belongs to %s, not %s.",
+            path,
+            recorded_child,
+            child_id,
+        )
+        return None
+    return data
+
+
+def clear_spawn_failure(worktree_path: str) -> bool:
+    """Clear recorded spawn-failure evidence (a fresh session attempt).
+
+    Args:
+        worktree_path: The child's worktree root.
+
+    Returns:
+        True when a record was removed, False when there was none (or the
+        removal failed — fail-open, the record is diagnostic only).
+    """
+    path = Path(worktree_path) / SPAWN_FAILURE_FILE
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        LOG.warning("Could not clear the spawn-failure record %s: %s", path, exc)
+        return False
+    LOG.debug("Cleared spawn-failure record %s", path)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Stash hygiene helpers
 # ---------------------------------------------------------------------------
@@ -11679,7 +12228,53 @@ def _phase_start_locked(
             abs_wt_path,
         )
     else:
-        LOG.info("Creating worktree at %s from branch %s...", abs_wt_path, parent_branch)
+        # AC3 (WL-0MWFKDH78002T2CR): the worktree base must be a **known
+        # pushed tip**, never a locally-mutable ``dev`` a concurrent finish
+        # could have parked on an unpushed commit. Positive evidence of
+        # unpushed local commits refuses the whole start (no worktree, item
+        # released to open); an unresolvable remote tip fails open, like the
+        # Step-6.5 refresh.
+        base_resolution = _resolve_start_base(
+            repo_root, parent_branch, refresh_result=refresh_result
+        )
+        report["steps"]["worktree_base"] = base_resolution
+        if base_resolution["method"] == "refused":
+            msg = (
+                f"Cannot create a worktree for {work_item_id}: "
+                f"{base_resolution['warning']}"
+            )
+            LOG.warning("%s", msg)
+            report["success"] = False
+            report["message"] = msg
+            report["worktree_refused"] = True
+            wl_add_comment(
+                work_item_id,
+                "Start phase refused: local dev is not a known pushed tip "
+                "(it carries commits origin/dev does not have).\n"
+                f"- local dev: {base_resolution.get('local_tip')}\n"
+                f"- origin/dev: {base_resolution.get('remote_tip')}\n"
+                "Resolve the branch (push the local commits, or reset with "
+                "operator confirmation), then re-run start.",
+            )
+            try:
+                StatusLifecycle.update_status(work_item_id, "open", assignee="")
+            except RuntimeError:
+                LOG.error(
+                    "Failed to reset work item %s status to open", work_item_id
+                )
+            if json_output:
+                print(format_json_output(report))
+            else:
+                print(f"\n⛔ {msg}\n")
+            return report
+        worktree_base = base_resolution["base"] or parent_branch
+        LOG.info(
+            "Creating worktree at %s from branch %s (verified pushed "
+            "tip: %s)...",
+            abs_wt_path,
+            worktree_base,
+            base_resolution.get("reason", "in_sync"),
+        )
         # Snapshot the parent's tracking config BEFORE the registration so the
         # post-add guard can distinguish "this registration poisoned the
         # parent" (a hard failure) from a pre-existing defect (detection's
@@ -11689,8 +12284,11 @@ def _phase_start_locked(
             _git_config_get(repo_root, f"branch.{parent_branch}.remote"),
             _git_config_get(repo_root, f"branch.{parent_branch}.merge"),
         )
-        if not git_worktree_add(branch, abs_wt_path, parent_branch):
-            msg = f"Failed to create worktree at {abs_wt_path} from {parent_branch}"
+        if not git_worktree_add(branch, abs_wt_path, worktree_base):
+            msg = (
+                f"Failed to create worktree at {abs_wt_path} from "
+                f"{worktree_base}"
+            )
             LOG.error(msg)
             report["success"] = False
             report["message"] = msg
@@ -11788,6 +12386,10 @@ def _phase_start_locked(
         verification_only=bool(verification_only),
     )
     write_state(state, abs_wt_path)
+    # A fresh session attempt starts from a clean slate: any recorded
+    # spawn-failure evidence describes the *previous* session, which is why
+    # this child is startable again (SA-0MWGZ8NWP009QD8G).
+    clear_spawn_failure(abs_wt_path)
 
     report["worktree_path"] = abs_wt_path
     report["branch"] = branch
@@ -11901,20 +12503,27 @@ def _recover_non_fast_forward_push(
     # the completion comment reference the commit that actually lands.
     new_commit = git_get_commit_hash(worktree_path) or commit_hash
 
-    # AC1 (SA-0MW3H07A8004Q54C): Step 5's fast-forward was refused (or pointed
-    # at the pre-rebase commit) because dev had moved. The rebase now yields a
-    # commit based on origin/dev, so retry the fast-forward *here* — the main
-    # checkout's dev (and its HEAD when dev is checked out) then tracks the
-    # pushed commit. Best-effort by contract: a second refusal is recorded and
-    # never fails the finish, exactly like Step 5.
-    ff_retry = _fast_forward_local_dev_for_push(
-        repo_root, new_commit, parent_branch
-    )
+    # AC1 (WL-0MWFKDH78002T2CR): never advance local ``dev`` to the rebased
+    # commit while the retry push is still in flight — it would recreate the
+    # write-then-restore window that let a concurrent ``start`` fork a
+    # worktree from an unpushed commit. The advance is deferred to the single
+    # post-push step in ``phase_finish`` (Step 6a.5); recording the deferral
+    # here keeps the report's ``retry`` surface honest without touching any
+    # ref. Nothing on this path may move the main checkout's local ``dev``.
+    ff_retry: dict[str, Any] = {
+        "method": "deferred",
+        "success": True,
+        "advanced": False,
+        "commit": new_commit,
+        "reason": "deferred_until_post_push",
+        "own_churn": [],
+    }
     if ff_retry_out is not None:
         ff_retry_out.clear()
         ff_retry_out.update(ff_retry)
     LOG.info(
-        "Post-rebase local %s fast-forward retry: method=%s advanced=%s",
+        "Post-rebase local %s fast-forward deferred until the retry push "
+        "succeeds (method=%s advanced=%s)",
         parent_branch,
         ff_retry.get("method"),
         ff_retry.get("advanced"),
@@ -11998,9 +12607,16 @@ def phase_finish(
         outside this worktree (SA-0MVPI41SR008JYXL)
     4. Test (with fix-and-re-run loop)
     5. Commit
-    6. Verified, reversible fast-forward of dev in the main checkout
-       (context-budget fix; restored to origin/dev on push failure)
-    7. Push to dev (rebase + retry on concurrent advance)
+    6. Push to dev (rebase + retry on concurrent advance). Local ``dev`` in
+       the main checkout is **never moved while a push is in flight**: the
+       fast-forward is deferred (Step 5 of the run records the deferral, not
+       an advance) and executes only after the push reports success (Step
+       6a.5). A failed/refused push leaves local ``dev`` provably unchanged
+       (WL-0MWFKDH78002T2CR AC1/AC2).
+    6a.5. Post-push local-dev fast-forward: ``_fast_forward_local_dev_for_push``
+       runs only after ``git push`` reports success (and the ancestry
+       assertion + read-only verification passed), so a concurrent ``start``
+       can never fork a worktree from an unpushed commit.
     8. Post-push ancestry assertion: the pushed commit must be an ancestor
        of refs/remotes/origin/dev or finish fails loudly naming the hash
        (SA-0MVPZG7A0000N66U AC2)
@@ -12599,14 +13215,29 @@ def phase_finish(
     # exactly one finish per checkout may hold this critical section at a
     # time. The lock is an advisory flock — no measurable latency when free,
     # kernel-released when the holder dies, and recorded in the report for
-    # observability. The wait is bounded by ``IMPLEMENT_FINISH_LOCK_TIMEOUT``
-    # (default 0 = fail fast), so a concurrent finish never hangs this one.
-    # The window deliberately excludes the full-suite run above: the lock is
-    # held only for the mutations (SA-0MWFJS3820032YB4).
+    # observability. A second finish performs **one** bounded internal wait
+    # on the lock (default ``DEFAULT_FINISH_LOCK_TIMEOUT`` = 15 min, env
+    # ``IMPLEMENT_FINISH_LOCK_TIMEOUT``; ``0`` = fail fast): it reports the
+    # holder as progress and proceeds the moment the holder releases, so an
+    # agent never has to script fail-fast retry loops around ``finish``
+    # (SA-0MWFJS65O005JMJF). The window deliberately excludes the full-suite
+    # run above: the lock is held only for the mutations
+    # (SA-0MWFJS3820032YB4).
     lock_timeout = _finish_lock_timeout()
     lock_wait_started = time.monotonic()
+    lock_progress: list[str] = []
+
+    def _lock_wait_progress(message: str) -> None:
+        """Report one lock-wait progress line and keep it in the report."""
+        lock_progress.append(message)
+        # stderr only: a ``--json`` finish must keep stdout parseable.
+        LOG.info("%s", message)
+
     lock_fd, lock_refusal = acquire_main_checkout_lock(
-        repo_root, work_item_id, timeout=lock_timeout
+        repo_root,
+        work_item_id,
+        timeout=lock_timeout,
+        progress=_lock_wait_progress,
     )
     lock_wait_seconds = round(time.monotonic() - lock_wait_started, 3)
     report["steps"]["main_checkout_lock"] = {
@@ -12617,6 +13248,7 @@ def phase_finish(
         ),
         "timeout_seconds": lock_timeout,
         "waited_seconds": lock_wait_seconds,
+        "progress": lock_progress,
         "holder": lock_refusal if lock_fd is None else None,
     }
     if lock_fd is None:
@@ -12847,35 +13479,28 @@ def phase_finish(
                 pushed=False,
             )
 
-            # ── Step 5: Verified, reversible local-dev fast-forward ───────
+            # ── Step 5: Deferred local-dev fast-forward (never pre-push) ──
             # Main-checkout hygiene only — never the dev-push gate's subject.
-            # Bring the main checkout's local dev branch up to the new commit
-            # so the next worktree forks from an up-to-date base. The dev push
-            # itself runs from the worktree holding the commit (Step 6), so
-            # the pre-push hook measures the pushed tree, not this checkout
-            # (SA-0MVTFMB7K002Y1F3 AC5).
+            # The main checkout's local dev branch is brought up to the new
+            # commit **only after the push reports success** (Step 6a.5):
+            # advancing it before the push created a write-then-restore
+            # window in which a concurrent ``start`` resolved ``dev`` to the
+            # unpushed tip and grafted another item's commit onto its branch
+            # (WL-0MWFKDH78002T2CR AC1/AC2). Here finish records the
+            # deferral; the failed-push restore paths therefore find nothing
+            # to undo (``no_advance_to_undo``), so local ``dev`` is provably
+            # unchanged on every failed/refused push.
             # ``repo_root`` was resolved (stale state rejected) at Step 0.75.
-            #
-            # The advance is *loud and reversible* (SA-0MVPZG7A0000N66U AC1):
-            # it is recorded in the report, undoable on push failure (restore
-            # to refs/remotes/origin/dev), and refuses loudly — naming the
-            # refs and hashes — instead of the previous silent
-            # ``except Exception`` whenever it cannot fast-forward safely.
-            # The commit is inherently unpublishable at this point, so the
-            # post-push ancestry assertion (Step 6a) is the authority on
-            # whether it actually landed.
-            LOG.info(
-                "Fast-forwarding dev in main checkout (%s) to %s ...",
-                repo_root,
-                commit_hash,
-            )
-            local_dev_fast_forward = _fast_forward_local_dev_for_push(
-                repo_root, commit_hash, parent_branch
-            )
+            local_dev_fast_forward = {
+                "method": "deferred",
+                "success": True,
+                "advanced": False,
+                "commit": commit_hash,
+                "reason": "deferred_until_post_push",
+                "own_churn": [],
+            }
             report["steps"]["local_dev_fast_forward"] = local_dev_fast_forward
-            main_checkout_guard["own_churn"] = list(
-                local_dev_fast_forward.get("own_churn") or []
-            )
+            main_checkout_guard["own_churn"] = []
 
             # ── Step 5b: Main-checkout guard verify (pre-push) ───────────
             # A foreign mutation of the main checkout must abort before the
@@ -13036,8 +13661,11 @@ def phase_finish(
                             f"Commit: {commit_hash}\nBranch: {branch}\n"
                             f"Worktree: {worktree_path}\n"
                             f"Actual HEAD: {exc.actual_head or 'unresolved'}\n"
-                            f"Local dev was restored to origin/dev. The commit "
-                            f"stays on its feature branch {branch}.",
+                            f"Local dev was never advanced (the fast-forward "
+                            f"is deferred until after a successful push); it "
+                            f"is provably unchanged from its pre-finish tip. "
+                            f"The commit stays on its feature branch "
+                            f"{branch}.",
                         )
                         raise RuntimeError(
                             f"git push to dev failed (push-subject mismatch): {exc}"
@@ -13066,8 +13694,10 @@ def phase_finish(
                             f"(pre-push hook still running, likely the full "
                             f"test suite). Commit {exc.commit_hash} is local "
                             f"on branch {exc.branch}.\n"
-                            f"Local dev was restored to origin/dev (the commit "
-                            f"stays on its feature branch).\n"
+                            f"Local dev was never advanced (the fast-forward "
+                            f"is deferred until after a successful push); it "
+                            f"is provably unchanged from its pre-finish tip. "
+                            f"The commit stays on its feature branch.\n"
                             f"Push manually: git push origin "
                             f"{exc.branch}:refs/heads/dev",
                         )
@@ -13115,7 +13745,9 @@ def phase_finish(
                                 f"spent.\n"
                                 f"Commit: {commit_hash}\nBranch: {branch}\n"
                                 f"Worktree: {worktree_path} (retained)\n"
-                                f"Local dev was restored to origin/dev. Rebase "
+                                f"Local dev was never advanced (the "
+                                f"fast-forward is deferred until after a "
+                                f"successful push). Rebase "
                                 f"the feature branch and re-run finish once the "
                                 f"concurrent runs settle:\n"
                                 f"  cd {worktree_path} && git rebase origin/dev && "
@@ -13288,8 +13920,10 @@ def phase_finish(
                             f"rejected.\n"
                             f"Commit: {commit_hash}\nBranch: {branch}\n"
                             f"Worktree: {worktree_path}\n"
-                            f"Local dev was restored to origin/dev (the commit "
-                            f"stays on its feature branch). Re-running finish "
+                            f"Local dev was never advanced (the fast-forward "
+                            f"is deferred until after a successful push); it "
+                            f"is provably unchanged from its pre-finish tip. "
+                            f"Re-running finish "
                             f"retries automatically.",
                         )
                         raise RuntimeError(
@@ -13521,6 +14155,39 @@ def phase_finish(
                 report["hash"] = commit_hash
                 wl_add_comment(work_item_id, refusal_comment)
                 raise RuntimeError(refusal_message)
+
+            # ── Step 6a.5: Post-push local-dev fast-forward (AC1) ─────────
+            # The only local-``dev`` mutation in finish, and it runs strictly
+            # *after* ``git push`` reported success (and after the post-push
+            # ancestry assertion and the read-only verification above both
+            # passed). The commit is now a known ``refs/remotes/origin/dev``
+            # tip, so the advance can never leave local ``dev`` pointing at an
+            # unpushed commit a concurrent ``start`` could fork from
+            # (WL-0MWFKDH78002T2CR AC1/AC2). The failed/refused-push paths
+            # earlier in this run never touched local ``dev`` (Step 5 recorded
+            # a deferral), so their restore steps found nothing to undo.
+            # Its file churn is attributed to finish for the pre-worktree-
+            # removal guard verify below.
+            LOG.info(
+                "Fast-forwarding dev in main checkout (%s) to %s "
+                "(post-push)...",
+                repo_root,
+                commit_hash,
+            )
+            local_dev_fast_forward = _fast_forward_local_dev_for_push(
+                repo_root, commit_hash, parent_branch
+            )
+            # Preserve the recovery's deferral record (a non-fast-forward
+            # rebase earlier recorded ``retry`` on the Step-5 marker): the
+            # post-push result replaces the marker but must not swallow the
+            # retry evidence.
+            prior_ff = report["steps"]["local_dev_fast_forward"] or {}
+            if prior_ff.get("retry"):
+                local_dev_fast_forward["retry"] = prior_ff["retry"]
+            report["steps"]["local_dev_fast_forward"] = local_dev_fast_forward
+            main_checkout_guard["own_churn"] = list(
+                local_dev_fast_forward.get("own_churn") or []
+            )
 
             # ── Step 6b: Worktree removal ownership ───────────────────────
             # One owner per worktree (SA-0MVTE8XAJ002IUDR): a driven child
@@ -14921,6 +15588,25 @@ def phase_parent(
             "(lifecycle owner's decision).",
         )
 
+    def _startable_again_note(cid: str, worktree_path: str) -> str:
+        """Explain a spawn-failed child in the implement-next message.
+
+        A child whose last session died before producing any work carries
+        recorded evidence (SA-0MWGZ8NWP009QD8G). Its worktree is clean, so it
+        is startable again rather than a placement violation; saying so
+        explicitly stops the operator reading the bare "in progress" message
+        as a stuck child that needs a manual ``abort``.
+        """
+        evidence = read_spawn_failure(worktree_path, cid)
+        if not evidence:
+            return ""
+        report["spawn_failure"] = evidence
+        return (
+            f" Its previous session failed before producing any work "
+            f"({evidence.get('reason') or 'unknown failure'}), so it is "
+            f"startable again."
+        )
+
     def _report_implement_next(
         cid: str, worktree_path: str, branch: str, message: str,
         start_result: dict[str, Any] | None = None,
@@ -15164,7 +15850,8 @@ def phase_parent(
                     cid, worktree_path, "",
                     f"Child {cid} is in progress. Implement in "
                     f"{worktree_path}, then re-run "
-                    f"`implement.py parent {work_item_id}`.",
+                    f"`implement.py parent {work_item_id}`."
+                    + _startable_again_note(cid, worktree_path),
                 )
             else:
                 pending_ids.append(cid)
@@ -15224,7 +15911,8 @@ def phase_parent(
                 cid, worktree_path, "",
                 f"Child {cid} worktree exists at {worktree_path}. "
                 f"Implement, then re-run "
-                f"`implement.py parent {work_item_id}`.",
+                f"`implement.py parent {work_item_id}`."
+                + _startable_again_note(cid, worktree_path),
             )
 
         # No worktree — start the child in its own subprocess.
@@ -16293,6 +16981,103 @@ def _release_orphaned_child_claim(child_id: str) -> dict[str, Any]:
     return result
 
 
+def _release_provider_failed_child(
+    child_id: str, spawn_classification: dict[str, Any],
+) -> dict[str, Any]:
+    """Release a child whose session never started because the model could
+    not be resolved.
+
+    When the infra-retry budget is exhausted for a
+    :func:`classify_spawn_failure`-classified ``infrastructure`` failure, the
+    child has never produced work — it was never able to start. This is
+    different from the timeout/signal path where the session ran and may have
+    produced work: here there is nothing to finish or finalise, so the child
+    is written ``status: open`` with an empty assignee so the next sweep or
+    ``drive`` can reclaim it without manual cleanup (AC1).
+
+    A comment names the provider and model, states that the session never
+    started, and gives the actionable remedy (AC3). The write uses
+    :class:`StatusLifecycle` for durability (AC5) and is idempotent: running
+    it on an already-``open`` child is a no-op that emits no duplicate comment
+    (AC5).
+
+    ``needsProducerReview`` is never set by this helper; the only persistent
+    hold remains that flag (per the assignee-release invariant).
+
+    Args:
+        child_id: The child work item whose claim to release.
+        spawn_classification: The :func:`classify_spawn_failure` payload
+            (must have ``kind == "infrastructure"``).
+
+    Returns:
+        ``{"released": bool, "status": str, "previous_status": str,
+        "previous_assignee": str, "reason": str}``. ``released`` is
+        ``False`` when there was nothing to release or the release write
+        failed.
+    """
+    result: dict[str, Any] = {
+        "released": False,
+        "status": "",
+        "previous_status": "",
+        "previous_assignee": "",
+        "reason": "",
+    }
+    child = wl_show(child_id)
+    if not child:
+        result["reason"] = "could not re-fetch the child work item"
+        return result
+
+    status = str(child.get("status", "") or "")
+    assignee = str(child.get("assignee", "") or "")
+    result["previous_status"] = status
+    result["previous_assignee"] = assignee
+    result["status"] = status
+
+    # Terminal children are never touched.
+    if status in ("completed", "in_review", "done", "deleted"):
+        result["reason"] = (
+            f"child is already terminal (status={status!r}); "
+            "no release needed"
+        )
+        return result
+
+    # Already released — idempotent no-op.
+    if status == "open" and not assignee:
+        result["released"] = True
+        result["reason"] = "child already open with no assignee; no-op"
+        return result
+
+    # Clear assignee and move to open.
+    try:
+        StatusLifecycle.update_status(child_id, "open", assignee="")
+    except (RuntimeError, ValueError) as exc:
+        result["reason"] = f"release write failed: {exc}"
+        return result
+
+    result["released"] = True
+    result["reason"] = (
+        "child released to open: the session never started because the "
+        "configured model could not be resolved; the item is reclaimable "
+        "on the next drive or sweep"
+    )
+
+    # Post a diagnostic comment naming the provider/model and the remedy.
+    remedy = spawn_classification.get("remedy", "")
+    description = _describe_spawn_failure(spawn_classification)
+    wl_add_comment(
+        child_id,
+        f"Drive released this child to ``open``: the session never started "
+        f"({description}) and the infra-retry budget is exhausted. "
+        f"Remedy: {remedy}",
+    )
+    LOG.info(
+        "Released provider-failed child %s to open "
+        "(was status=%s, assignee=%r)",
+        child_id, status, assignee,
+    )
+    return result
+
+
 def _reconcile_finish_failure(
     child_id: str,
     parent_report: dict[str, Any],
@@ -16875,6 +17660,40 @@ def _describe_finish_failure(finish_failure: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+def _describe_spawn_failure(spawn_failure: dict[str, Any]) -> str:
+    """Render a classified **spawn** failure naming provider and model.
+
+    The spawn-side counterpart of :func:`_describe_finish_failure`
+    (SA-0MWLDZBTF004LJFP): turns a :func:`classify_spawn_failure` payload
+    into a single human-readable sentence that names the provider, the model
+    pattern the child could not serve, and the spawner's own reason — so a
+    drive verdict is never the bare ``No models match pattern …`` text.
+
+    ``provider``/``model`` are only rendered when the classifier extracted
+    them; an unrecognised reason therefore renders as its own text (the
+    caller only uses this for a classified infrastructure failure).
+
+    Args:
+        spawn_failure: The classified ``spawn_failure`` payload.
+
+    Returns:
+        A sentence such as ``provider/model-resolution failure for provider
+        'MunitoAI', model 'MunitoAI/*': <reason>``.
+    """
+    if not isinstance(spawn_failure, dict):
+        return ""
+    reason = str(spawn_failure.get("reason") or "unknown error")
+    provider = spawn_failure.get("provider")
+    model = _spawn_failure_subject(reason)
+    descriptors: list[str] = []
+    if provider:
+        descriptors.append(f"provider {provider!r}")
+    if model and model != provider:
+        descriptors.append(f"model {model!r}")
+    subject = f" for {', '.join(descriptors)}" if descriptors else ""
+    return f"provider/model-resolution failure{subject}: {reason}"
+
+
 def _competing_actor_suffix(actor_evidence: str) -> str:
     """Render the guard's concurrent-actor evidence, ``""`` when absent.
 
@@ -17029,6 +17848,16 @@ def _emit_phase_report(report: dict[str, Any], json_output: bool) -> None:
             print(f"     {entry['message']}")
         if entry.get("reason"):
             print(f"     {entry['reason']}")
+    for verdict in report.get("revalidated_children") or []:
+        if verdict.get("startable"):
+            continue
+        # No session was spawned: the child was re-validated immediately
+        # before the spawn and is no longer startable
+        # (SA-0MWFJSCPT005BO2R).
+        print(
+            f"  ⏭ {verdict.get('id')} (skipped, no session): "
+            f"{verdict.get('reason', '')}"
+        )
     print(f"  Sessions spawned: {report.get('sessions_spawned', 0)}")
     if report.get("completed_late"):
         print(f"  Completed late: {report['completed_late']}")
@@ -17643,6 +18472,121 @@ def _describe_skip_blocked(details: list[dict[str, Any]]) -> str:
     return "; ".join(rendered)
 
 
+#: Action recorded by the pre-spawn re-validation for a child that may start.
+#: Deliberately the same literal the workflow uses for a startable child, so
+#: one vocabulary describes both the parent plan and the pre-spawn verdict.
+REVALIDATE_STARTABLE = "implement"
+
+
+def _revalidate_child_startable(
+    child_id: str,
+    children: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Re-fetch a reported ``next_child`` and decide whether it may spawn.
+
+    ``phase_parent`` names the next startable child from a **subprocess**, so
+    that decision is already stale when ``phase_drive`` acts on it: the child
+    may have been finished by a concurrent session, put back to ``blocked`` by
+    a producer, or claimed by another driver. Spawning a fresh session for
+    such a child burns a child-session slot on a run that can only load the
+    skill and exit (SA-0MWFJSCPT005BO2R).
+
+    The child is therefore re-fetched (read-only ``wl show``) immediately
+    before the spawn and classified with the same rules as
+    :func:`_classify_child`:
+
+    * **terminal** (:func:`_is_terminal_child` — a terminal status or a
+      soft-delete) is never re-spawned;
+    * **blocked** is refused only while the block **still holds**
+      (:func:`_blocked_child_state`); a stale block is startable again;
+    * **in-progress** is startable — a session resumes the claimed item;
+    * **unreadable** fails open (startable), so a transient worklog read
+      failure can never stall the chain.
+
+    A live lock holder is deliberately **not** consulted here: the per-child
+    lock acquired immediately before the spawn is the authoritative check (it
+    also recognises this process's own token-based re-entry), so the holder
+    verdict — and its race — stays in exactly one place.
+
+    Args:
+        child_id: The child ``phase_parent`` reported as ``next_child``.
+        children: The parent's children, used to resolve an in-chain blocker's
+            live status for a ``blocked`` child.
+
+    Returns:
+        A JSON-friendly verdict: ``id``, ``startable`` (bool), ``action``
+        (``"implement"`` / ``"skip-terminal"`` / ``"skip-blocked"``), the
+        fetched ``status`` / ``stage``, a human-readable ``reason`` when the
+        spawn is refused, and for a ``blocked`` child its ``blocking_ids``,
+        ``stale_block_ids`` and ``unvalidated`` flag.
+    """
+    verdict: dict[str, Any] = {
+        "id": child_id,
+        "startable": True,
+        "action": REVALIDATE_STARTABLE,
+        "status": "",
+        "stage": "",
+        "reason": "",
+    }
+    child = wl_show(child_id) or {}
+    if not child:
+        verdict["reason"] = (
+            "the child could not be re-fetched; failing open so a transient "
+            "worklog read failure cannot stall the drive chain"
+        )
+        return verdict
+
+    status = str(child.get("status", ""))
+    stage = str(child.get("stage", ""))
+    verdict["status"] = status
+    verdict["stage"] = stage
+
+    if _is_terminal_child(child):
+        verdict.update(
+            startable=False,
+            action="skip-terminal",
+            reason=(
+                f"it is already terminal (status={status or 'unknown'}"
+                + (f", stage={stage})" if stage else ")")
+            ),
+        )
+        return verdict
+
+    if stage == "in_review":
+        # Stage-only terminality: the same rule the spawn-failure
+        # reconciliation applies (SA-0MVHXWLPG007OQVN) — the child reached
+        # review, so a session for it can only no-op.
+        verdict.update(
+            startable=False,
+            action="skip-terminal",
+            reason=(
+                "it is already terminal (status="
+                f"{status or 'unknown'}, stage={stage})"
+            ),
+        )
+        return verdict
+
+    if status == "blocked":
+        state = _blocked_child_state(
+            child, wl_dep_blockers(child_id), children or []
+        )
+        verdict["blocking_ids"] = list(state["blocking_ids"])
+        verdict["stale_block_ids"] = list(state["stale_block_ids"])
+        verdict["unvalidated"] = bool(state["unvalidated"])
+        if state["holds"]:
+            held_by = ", ".join(state["blocking_ids"]) or (
+                "an unvalidated block"
+            )
+            verdict.update(
+                startable=False,
+                action=ACTION_SKIP_BLOCKED,
+                reason=f"its block still holds (blocked by {held_by})",
+            )
+            return verdict
+
+    return verdict
+
+
 def _finalise_stranded_child(
     child_id: str,
     evidence: dict[str, Any],
@@ -17860,6 +18804,17 @@ def phase_drive(
     ``completed-late`` and the chain continues; a genuinely incomplete child
     keeps the pre-existing hard failure (SA-0MVHXWLPG007OQVN).
 
+    A ``next_child`` reported by ``parent`` is re-validated immediately
+    **before** the spawn (:func:`_revalidate_child_startable`): a child that
+    became terminal, or whose ``blocked`` hold still holds, is not spawned at
+    all — no lock, no session. Every verdict is recorded per child in
+    ``revalidated_children`` and the skip is a soft wait (``success: true``,
+    no ``failed_child``) that re-runs ``parent`` for the next child; a parent
+    report that keeps offering the same non-startable child stops the chain
+    (bounded, never a spin). This closes the no-op-session class in which a
+    stale parent report made the driver spawn a session that could only load
+    the skill and exit (SA-0MWFJSCPT005BO2R).
+
     Failing ``finish`` executions are bounded too (SA-0MVLJXS7R000XIFL): a
     ``finishing_failed`` parent report is counted per child in
     ``finish_attempts`` (distinct from the session-spawn ``attempts``), and
@@ -17901,12 +18856,16 @@ def phase_drive(
         finish_attempt_limit: Max failing ``finish`` executions per child in
             one drive invocation (default: ``max_child_sessions``). A
             non-positive value is clamped to 1.
-        infra_retry_limit: Max **infrastructure**-refusal retries per child in
-            one drive invocation (default: ``DEFAULT_INFRA_RETRY_LIMIT``).
-            These run on a budget separate from ``finish_attempt_limit``,
-            with bounded exponential backoff, and never spawn a session — a
-            refusal that clears within the budget lets the same ``finish``
-            succeed and the chain continue (LP-0MVWEP292000ODBS). A
+        infra_retry_limit: Max **infrastructure** retries per child in one
+            drive invocation (default: ``DEFAULT_INFRA_RETRY_LIMIT``). This is
+            **one shared budget** covering both a ``finish`` refused for an
+            infrastructure reason and a spawn-time provider/model-resolution
+            failure: the former re-runs ``parent`` without spawning a session
+            (LP-0MVWEP292000ODBS), the latter re-spawns the same child in the
+            same worktree after the same backoff (SA-0MWLDZBTF004LJFP). Both
+            run on a budget separate from ``finish_attempt_limit`` and the
+            session bound, so a transient refusal that clears within the
+            budget lets the child proceed and the chain continue. A
             non-positive value is clamped to 1.
         pane_sessions: Opt in to the Herdr pane-driven transport
             (``--pane-sessions`` / ``--no-pane-sessions``). ``None`` (the
@@ -17955,12 +18914,18 @@ def phase_drive(
         the number of retries consumed on the separate infra budget, and
         ``infra_retry_limit`` reports that bound (LP-0MVWEP292000ODBS); each
         retry also appears in ``children_driven`` as ``"infra-retry"`` with
-        the failing ``step``/``reason`` and the attempt number.
+        the failing ``step``/``reason`` and the attempt number. The counter is
+        **shared**: a spawn-time provider/model-resolution failure consumes
+        the same per-child budget, recording ``step: "spawn"`` plus the
+        extracted ``provider`` and a ``message`` naming provider and model
+        (SA-0MWLDZBTF004LJFP).
         ``terminal_reconciled`` counts
         children recorded as done after their finish failed
         (SA-0MVLJXTYY005XQDV); ``reset_for_retry`` counts non-terminal
         children whose worktree was reset for a fresh session
-        (SA-0MVLJXVND0015LPW); ``preserved_refs`` lists the children whose
+        (SA-0MVLJXVND0015LPW); ``revalidated_children`` records the pre-spawn
+        re-validation verdict for every reported ``next_child``
+        (SA-0MWFJSCPT005BO2R); ``preserved_refs`` lists the children whose
         reset was **refused** because their worktree carries commits, each as
         ``{id, ref, commit}`` with the tip parked on ``refs/wip/<id>``
         (parent AC3, LP-0MVWEP2KB002WMRY). A child whose per-work-item lock is held by
@@ -17998,6 +18963,9 @@ def phase_drive(
         "terminal_reconciled": 0,
         "reset_for_retry": 0,
         "preserved_refs": [],
+        # Pre-spawn re-validation verdicts (SA-0MWFJSCPT005BO2R): one entry per
+        # reported ``next_child`` the driver re-checked before spawning it.
+        "revalidated_children": [],
         "finish_attempts": {},
         "finish_attempt_limit": None,
         "infra_retries": {},
@@ -18082,6 +19050,11 @@ def phase_drive(
     finish_attempts: dict[str, int] = {}
     infra_retries: dict[str, int] = {}
     reset_cids: set[str] = set()
+    #: Children the pre-spawn re-validation already refused in this drive. A
+    #: parent report that keeps offering the same non-startable child would
+    #: otherwise spin, so each child is skipped at most once
+    #: (SA-0MWFJSCPT005BO2R).
+    revalidation_skips: set[str] = set()
     # The report's own list, so entries recorded mid-loop (worktree cleanup
     # outcomes) are visible to the resolvers and to the final report.
     driven: list[dict[str, Any]] = report["children_driven"]
@@ -18616,6 +19589,56 @@ def phase_drive(
             LOG.warning("%s", report["message"])
             break
 
+        # ── Pre-spawn re-validation (SA-0MWFJSCPT005BO2R) ──────────────
+        # ``parent`` decided in a subprocess, so its ``next_child`` may already
+        # be done, blocked again, or claimed elsewhere. A session spawned for
+        # such a child can only load the skill and exit, wasting a fan-out
+        # slot and polluting the drive report, so the child is re-fetched and
+        # re-classified immediately before the spawn. The verdict is a **soft
+        # wait** (``success: true``, no ``failed_child``) unless the parent
+        # keeps offering the same non-startable child, which stops the chain.
+        revalidation = _revalidate_child_startable(child_id, children)
+        report["revalidated_children"].append(revalidation)
+        if not revalidation["startable"]:
+            report["action"] = revalidation["action"]
+            report["parent_advanced"] = False
+            report["success"] = True
+            report["children_processed"] = parent_report.get(
+                "children_processed", []
+            )
+            if revalidation["action"] == ACTION_SKIP_BLOCKED:
+                detail: dict[str, Any] = {
+                    "id": child_id,
+                    "status": revalidation["status"],
+                    "action": ACTION_SKIP_BLOCKED,
+                    "blocking_ids": list(revalidation["blocking_ids"]),
+                    "unvalidated": bool(revalidation["unvalidated"]),
+                }
+                if revalidation["stale_block_ids"]:
+                    detail["stale"] = True
+                    detail["stale_block_ids"] = list(
+                        revalidation["stale_block_ids"]
+                    )
+                report["blocked_children"] = [child_id]
+                report["blocked_child_details"] = [detail]
+            report["message"] = (
+                f"No session spawned for {child_id}: the pre-spawn "
+                f"re-validation found {revalidation['reason']}. "
+                f"Re-run `implement.py drive {work_item_id}` to continue "
+                f"the chain."
+            )
+            LOG.warning("%s", report["message"])
+            if child_id in revalidation_skips:
+                # The parent keeps offering a child that is not startable:
+                # skipping it again would spin, so stop (bounded, truthful).
+                report["message"] = (
+                    f"{report['message']} The parent report keeps offering "
+                    f"{child_id}; stopping to avoid a loop."
+                )
+                break
+            revalidation_skips.add(child_id)
+            continue
+
         worktree_path = (
             parent_report.get("worktree_path")
             or _discover_worktree(child_id)
@@ -18826,6 +19849,128 @@ def phase_drive(
                 )
                 continue
 
+            # Not terminal: classify the spawn failure before recording any
+            # evidence (SA-0MWLDZBTF004LJFP). A provider/model-resolution
+            # failure (an unservable ``enabledModels`` pattern, a missing API
+            # key) is transient: the child is healthy and never ran, so the
+            # same child is re-spawned on the shared infrastructure budget
+            # instead of abandoning it and stopping the chain. Anything the
+            # classifier does not recognise stays a hard failure (fail-safe).
+            spawn_classification = classify_spawn_failure(
+                reconciliation["reason"]
+                or str(spawn_result.get("reason", "") or "")
+            )
+            entry["spawn_failure_kind"] = spawn_classification["kind"]
+            if (
+                spawn_classification["kind"] == "infrastructure"
+                and infra_retries.get(child_id, 0) < infra_retry_limit
+            ):
+                infra_retries[child_id] = (
+                    infra_retries.get(child_id, 0) + 1
+                )
+                attempt = infra_retries[child_id]
+                backoff = _drive_infra_backoff_delay(attempt)
+                description = _describe_spawn_failure(spawn_classification)
+                # The retry is charged to the shared infra budget, never to
+                # the per-child session bound: the same child is re-spawned in
+                # the same worktree, so the failed attempt must not consume a
+                # ``--max-child-sessions`` slot (AC1).
+                attempts[child_id] = max(0, attempts.get(child_id, 1) - 1)
+                driven.append({
+                    "id": child_id,
+                    "result": "infra-retry",
+                    "step": "spawn",
+                    "reason": spawn_classification["reason"],
+                    "attempt": attempt,
+                    "provider": spawn_classification["provider"],
+                    "message": (
+                        f"{description} — infra-retry {attempt}/"
+                        f"{infra_retry_limit} in {backoff}s: re-spawning "
+                        "the same child in the same worktree."
+                    ),
+                })
+                # A claim orphaned by the dead session would be a scheduling
+                # hold the re-spawned session cannot clear, so the surviving
+                # driver releases it before retrying (assignee-release
+                # invariant); the item stays in-progress and startable.
+                entry["claim_release"] = _release_orphaned_child_claim(
+                    child_id
+                )
+                # The failed attempt's pane has no inspection value (the
+                # session never ran) and a retry creates a fresh one, so it is
+                # closed here rather than retained and leaked.
+                if pane_id:
+                    _close_driven_pane(
+                        child_id, pane_id, entry, report, pane_client,
+                        reason=(
+                            "spawn failed for a retryable provider reason; "
+                            "re-spawning the child"
+                        ),
+                    )
+                LOG.warning(
+                    "Child %s session failed for a provider/model-"
+                    "resolution reason (%s) — infra-retry %d/%d in %ss: "
+                    "re-spawning the same child.",
+                    child_id,
+                    description,
+                    attempt,
+                    infra_retry_limit,
+                    backoff,
+                )
+                # Durable verdict on the child: a producer can tell a retried
+                # provider failure from a gate failure without reading the
+                # driver's log, and the remedy is spelled out for a recurrence.
+                wl_add_comment(
+                    child_id,
+                    "Drive retried this child's session after a transient "
+                    f"provider/model-resolution failure ({description}). "
+                    f"Infra-retry {attempt}/{infra_retry_limit} in "
+                    f"{backoff}s: re-spawning the same child in the same "
+                    "worktree (no new worktree, no duplicate session). If "
+                    "it recurs, apply the remedy: "
+                    f"{spawn_classification['remedy']}",
+                )
+                sleeper(backoff)
+                continue
+
+            # A classified infrastructure failure that reaches here has spent
+            # the shared budget: the chain-stop verdict names the provider and
+            # model and spells out the remedy, instead of leaving the operator
+            # with the bare ``No models match pattern …`` text (AC3).
+            failure_reason_text = str(
+                spawn_result.get("reason", "unknown error")
+            )
+            spawn_failure_note = ""
+            if spawn_classification["kind"] == "infrastructure":
+                failure_reason_text = _describe_spawn_failure(
+                    spawn_classification
+                )
+                spawn_failure_note = (
+                    f"; the infra-retry budget of {infra_retry_limit} is "
+                    f"exhausted. Remedy: {spawn_classification['remedy']}"
+                )
+
+            # Not terminal: record durable evidence that the child produced
+            # nothing (SA-0MWGZ8NWP009QD8G). The placement guard cannot tell a
+            # failed session from one whose work landed in the main checkout
+            # or in a sibling worktree; without this record the next run
+            # attributes unrelated dirt to the child and fails the chain
+            # closed. Only a child with no attributable work of its own is
+            # recorded, so a session that did produce work never excuses a
+            # later stray.
+            spawn_failure = None
+            if (
+                _classify_child_worktree(child_id, worktree_path, parent_branch)
+                in (CHILD_CLEAN, CHILD_NO_WORK)
+            ):
+                spawn_failure = record_spawn_failure(
+                    worktree_path,
+                    child_id,
+                    reconciliation["reason"]
+                    or str(spawn_result.get("reason", "") or "session failed"),
+                )
+            entry["spawn_failure_recorded"] = spawn_failure is not None
+
             # Not terminal: dispose of the pane this session created. A
             # timeout means the wait expired and the session is gone, so its
             # pane is closed (AC4: the timeout bound closes the pane and stops
@@ -18853,23 +19998,32 @@ def phase_drive(
                         ),
                     )
 
-            # Not terminal: the hard failure stands. The killed session could
-            # not release the claim it held (a timeout kill is a SIGKILL, so
-            # no exit hook runs), so the surviving driver releases it with a
-            # durable write before any further diagnosis: an in-progress
-            # child would otherwise stay on a scheduling hold and be
-            # invisible to ``wl next`` (SA-0MVVF75ZA007XNKB). This also lets
-            # the evidence-gated finaliser below run — it refuses a child
-            # still carrying someone's assignee. The release never masks the
-            # failure: the chain still stops with ``failed_child``.
-            claim_release = _release_orphaned_child_claim(child_id)
-            entry["claim_release"] = claim_release
-            report["claim_release"] = claim_release
-            if claim_release.get("released"):
+            # Not terminal: the hard failure stands. Release the child's
+            # claim so the item is reclaimable.
+            #
+            # Provider-failed children (``infrastructure`` classification)
+            # never started, so there is nothing to finish or finalise: the
+            # child is written ``open`` with an empty assignee (SA-0MWLDZFL4006I9YY).
+            # Timeout/signal kills (``unknown`` classification) may have
+            # produced work, so the timeout path leaves ``in-progress`` with
+            # the assignee cleared — ``finish`` / ``drive --finalise-stranded``
+            # recovery still applies (SA-0MVVF75ZA007XNKB).
+            if spawn_classification["kind"] == "infrastructure":
+                release = _release_provider_failed_child(
+                    child_id, spawn_classification,
+                )
+                entry["child_release"] = release
+                report["child_release"] = release
+            else:
+                release = _release_orphaned_child_claim(child_id)
+                entry["claim_release"] = release
+                report["claim_release"] = release
+            # The release never masks the failure: the chain still stops
+            # with ``failed_child``.
+            if release.get("released"):
                 LOG.info(
-                    "Released the orphaned claim on %s after its child "
-                    "session failed: %s",
-                    child_id, claim_release["reason"],
+                    "Released the child %s after its session failed: %s",
+                    child_id, release["reason"],
                 )
 
             # Before stopping the chain, check whether the child is
@@ -18952,14 +20106,15 @@ def phase_drive(
                     f"Child session for {child_id} failed and the child is "
                     f"stranded (not terminal, but {stranded['evidence']}); "
                     f"finalise it or re-run drive with --finalise-stranded. "
-                    f"Reason: {spawn_result.get('reason', 'unknown error')}"
+                    f"Reason: {failure_reason_text}"
+                    f"{spawn_failure_note}"
                 )
                 report["failed_child"] = child_id
                 break
 
             report["message"] = (
                 f"Child session for {child_id} failed: "
-                f"{spawn_result.get('reason', 'unknown error')}"
+                f"{failure_reason_text}{spawn_failure_note}"
             )
             report["failed_child"] = child_id
             break
@@ -19254,6 +20409,14 @@ def _child_main_checkout_violation(
     :func:`_worktree_placement_violation`, minus the cwd-sensitive check that
     only applies to ``phase_finish``.
 
+    A child with recorded **spawn-failure evidence**
+    (:func:`record_spawn_failure`) is exempt: its session died before writing
+    anything, so the foreign dirt found here is pre-existing and cannot be
+    attributed to it. Such a child is reported startable again
+    (SA-0MWGZ8NWP009QD8G / AH-0MWFHLDAS008YG0P). Only the driver writes that
+    record, and only for a child that produced no work, so the genuine
+    cross-worktree-write detection (SA-0MW5FIJNQ002Z24I) is unchanged.
+
     Args:
         child_id: The child work item ID (named in the message).
         worktree_path: Absolute path to the child's worktree.
@@ -19282,6 +20445,21 @@ def _child_main_checkout_violation(
     if _git_path_has_changes(
         wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
     ):
+        return None
+
+    # A child whose session failed before producing any work cannot have
+    # written the surfaces scanned below: the driver recorded that evidence
+    # when the session died (SA-0MWGZ8NWP009QD8G). Whatever dirt is found is
+    # then pre-existing and unrelated, so the caller reports the child as
+    # startable again instead of failing the chain closed. Genuine
+    # cross-worktree writes carry no such record, so the SA-0MW5FIJNQ002Z24I
+    # detection is unaffected.
+    if read_spawn_failure(str(wt), child_id):
+        LOG.info(
+            "Child %s has a recorded session failure and no work of its own; "
+            "foreign change surfaces are not attributed to it.",
+            child_id,
+        )
         return None
 
     offending = _main_checkout_offending_paths(str(root), expected_dirty=root_expected)

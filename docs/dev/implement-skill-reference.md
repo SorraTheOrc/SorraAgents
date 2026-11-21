@@ -6,6 +6,10 @@ operational brief; this document preserves the full implementation reference
 for maintainers. Workflow semantics are unchanged — every command/flag
 documented here is still valid.
 
+> **Tool output:** when this reference tells you to read or search context,
+> follow the shared [tool-output budget](../../skill/shared/tool-output-budget.md)
+> — `jq` over `cat`, capped searches, ~10 KB per result.
+
 ## Project-local extensions and expected-dirty paths (SA-0MUYEV5AO006V0HK)
 
 `implement.py` loads the project-local extension for the `implement` skill via
@@ -259,6 +263,147 @@ fake, injected commit-evidence provider, recording mutation fake).
 - Session-per-child isolation and per-child worktree semantics are unchanged.
 - No fetch/network in the evidence path; a stale `origin/dev` ref is accepted
   evidence on the failure path.
+
+## Pre-spawn re-validation: never spawn a session that can only no-op (SA-0MWFJSCPT005BO2R)
+
+`phase_parent` decides the next startable child in a **subprocess**, so the
+`next_child` it reports is already stale when `phase_drive` acts on it. Until
+SA-0MWFJSCPT005BO2R the driver spawned a fresh session for whatever the report
+named, so a child that had been finished concurrently, sent back to `blocked`
+by a producer, or left at `stage: in_review` still consumed a child-session
+slot: the session loaded the skill, found nothing to do and exited.
+
+### Recorded evidence (AI_Hell, 2026-11-13)
+
+The parent epic's drive chain (SA-0MWFJRWN00084FE1, comment
+SA-C0MWFJT68N001G1DR) recorded **9 of 36** implement sessions with three
+messages and ~50 s wall-clock each. Inspecting those session logs
+(`~/.pi/agent/sessions/…-wl-AH-0MWEZZ9TE001577J-…`) shows one shape: system +
+user (the skill body) + an **empty assistant message** with
+`stopReason: "error"`, `errorMessage: "Provider finish_reason: error"` and zero
+tokens. The `pi -p` process exited 0, so `_default_session_spawner` reported
+success and the loop re-spawned the same child (bounded by
+`max_child_sessions`) until a provider turn succeeded.
+
+The recorded no-ops were therefore driven by a **provider first-turn error**,
+not by a stale child state — no state check can predict that, and it stays an
+infrastructure concern (out of scope here). The re-validation below closes the
+driver-controlled no-op class instead: a stale parent report can no longer
+spend a session slot on a child that is terminal or still blocked.
+
+### Verdict rules
+
+`_revalidate_child_startable(child_id, children)` re-fetches the reported
+child (read-only `wl show`) immediately before the spawn and classifies it:
+
+| Re-fetched state | Verdict | Session |
+|---|---|---|
+| terminal status (`_is_terminal_child`: `completed`/`done`/`in_review`/`deleted`, or soft-deleted) | `skip-terminal` | **none** |
+| `stage: in_review` — stage-only terminality, the same rule the spawn-failure reconciliation uses | `skip-terminal` | **none** |
+| `blocked` whose outbound edges are not all terminal (or unvalidated) | `skip-blocked` + `blocking_ids` | **none** |
+| `blocked` whose outbound edges are all terminal (a stale block) | `implement` + `stale_block_ids` | spawned |
+| `open` / `in-progress` (a resume) | `implement` | spawned |
+| unreadable (empty fetch) | `implement` — **fail open** | spawned |
+
+- **Held children are not probed here.** The per-child lock acquired
+  immediately before the spawn is the authoritative check (it also recognises
+  the driver's own token-based re-entry), so the `skipped-held` verdict — and
+  its race — stays in one place.
+- **A skip is a soft wait.** `success: true`, `parent_advanced: false`, no
+  `failed_child`; the loop re-runs `parent` so the next child can start. A
+  parent report that keeps offering the same non-startable child stops the
+  chain (the message says it keeps offering the child and that the loop was
+  stopped), so the skip can never spin.
+- **Report surface.** Every verdict is recorded in
+  `report["revalidated_children"]` (`id`, `startable`, `action`, `status`,
+  `stage`, `reason`, plus `blocking_ids` / `stale_block_ids` / `unvalidated`
+  for a blocked child). A blocked verdict is also forwarded as
+  `blocked_children` / `blocked_child_details`, exactly like the existing
+  `skip-blocked` path. The human rendering prints
+  `⏭ <id> (skipped, no session): <reason>` instead of a session result.
+
+## Spawn-failure evidence: a child that produced nothing is startable again (SA-0MWGZ8NWP009QD8G)
+
+A child whose session died **before writing anything** (spawn error, provider
+failure, non-zero exit, timeout) is left `in-progress` with a worktree that
+holds no work: no dirty files and no commits ahead of `dev`. The placement
+guard cannot distinguish that child from one whose work landed in the main
+checkout or in a sibling worktree — both look identical on disk — so before
+SA-0MWGZ8NWP009QD8G the next `drive`/`parent` run attributed **pre-existing,
+unrelated** dirt to the failed child and failed the chain closed, naming paths
+it had never touched. Recovering needed a manual `implement.py abort`.
+
+### The record
+
+On its non-terminal spawn-failure path `phase_drive` records the failure as
+durable evidence: `record_spawn_failure()` writes
+`<worktree>/.worklog/spawn-failure.json` with the child id, a UTC timestamp and
+the spawner's reason, and marks the `children_driven` entry
+`spawn_failure_recorded: true`. The location matters:
+
+- **Under `.worklog/`** — the prefix every dirty-path helper excludes — so the
+  record can never be mistaken for work. The child stays *no work*
+  (`CHILD_CLEAN`), i.e. re-spawnable, never presentable as finishable.
+- **Worktree-local** — it describes *that* worktree's last session and
+disappears when the worktree is removed; a missing worktree is never
+re-created just to hold a record.
+
+It is written **only** for a child that produced no attributable work of its
+own (`_classify_child_worktree` ⇒ `CHILD_CLEAN` / `CHILD_NO_WORK`), so a
+session that did work never
+excuses a later stray. `phase_start` clears the record (`clear_spawn_failure`)
+when the next session begins, because the evidence describes the *previous*
+session; recording and clearing are both fail-open — the record is diagnostic
+evidence, never a gate.
+
+### How the guard reads it
+
+`_child_main_checkout_violation` returns **no violation** for a child carrying
+recorded spawn-failure evidence (matched by child id): a session that died
+before writing cannot have produced the foreign dirt, so those surfaces are
+pre-existing and unrelated. `phase_parent` then reports the child for
+implementation in both branches — the `skip-in-progress` path and the
+`implement` path — with `report["spawn_failure"]` carrying the evidence and a
+message saying it is **startable again**, so the next `drive` re-spawns it
+without manual intervention.
+
+Evidence-free children keep the full guard: a child that genuinely wrote into
+a sibling worktree still fails closed (SA-0MW5FIJNQ002Z24I), and an unreadable
+or foreign-child record is ignored so the guard applies unchanged. Residual
+limit: a session that wrote into a foreign surface *and* died before doing the
+work it owns is indistinguishable from a spawn failure once the driver has
+recorded the failure — the record is only written when the child's own
+worktree is genuinely empty.
+
+Regression coverage:
+`skill/implement/tests/test_drive_sibling_worktree_stray.py`
+(`TestSpawnFailureEvidence`, `TestSpawnFailedChildIsStartableAgain`,
+`TestDriveRecordsSpawnFailureEvidence`) — real git fixture repositories, both
+`phase_parent` call sites, and the end-to-end drive→parent hand-off.
+
+### The test suite is driven-session independent (SA-0MWJHN2I8005E7BK)
+
+The regression tests above call `phase_drive` directly: they play the parent
+driver, not a driven child. But `implement.py finish`'s full-suite gate runs
+*inside* whatever session invoked it, and a driven child session exports
+`IMPLEMENT_DRIVE_ACTIVE=1`. `run_tests.py` preserves the inherited environment
+(only git-repository overrides are stripped), so without isolation that marker
+reaches the suite and `phase_drive`'s recursion guard refuses every direct
+drive test — the tests are red purely because of *who ran the suite*, not
+because of any code change.
+
+`skill/implement/tests/conftest.py` therefore neutralises the ambient markers
+with an autouse fixture (`_no_ambient_drive_marker`): it removes
+`IMPLEMENT_DRIVE_ACTIVE` and its sibling `IMPLEMENT_KEEP_WORKTREE` for every
+test in the package. The convention mirrors the existing ambient-env
+neutralisation for `GIT_INDEX_FILE` and the lock-wait timeouts. A test that
+wants to simulate a driven context re-sets the marker inside its own body
+(`monkeypatch.setenv(implement.DRIVE_RECURSION_ENV, "1")`); monkeypatch
+unwinds LIFO, so the in-test value wins over the fixture and is restored at
+teardown. The mechanism is documented in the conftest docstring; this note
+records *why* the suite must be deterministic under either ambient state — the
+parent-driven full-suite gate is exactly where a real driven chain's audit
+verdict is computed.
 
 ## Assignee release when a kill cannot run an exit hook (SA-0MVVF75ZA007XNKB)
 
@@ -727,6 +872,23 @@ in `children_driven`:
    within the infra budget is absorbed there, and a spent budget falls
    through to the finish-attempt bound below with the failure evidence
    appended to the stopping message.
+
+   The **same** per-child counter and budget also cover a *spawn-time*
+   provider/model-resolution failure (SA-0MWLDZBTF004LJFP): when
+   `_reconcile_spawn_failure` proves the child non-terminal and
+   `classify_spawn_failure` classifies the spawn reason `infrastructure`
+   (an unservable `enabledModels` pattern, a missing API key), the driver
+   re-spawns the **same** child in its **same** worktree after the same
+   backoff. That retry records `result: "infra-retry"` with `step: "spawn"`,
+   the spawner `reason`, the `attempt` number, the extracted `provider` and
+   a `message` naming the provider and model; it never creates a second
+   worktree, never re-records spawn-failure evidence for an attempt that
+   produced no work, and is charged to the infra budget rather than the
+   `--max-child-sessions` bound. A child reconciled `completed-late` is
+   never retried, and an unclassified spawn failure still hard-stops with
+   `failed_child`. When the budget is spent the stopping message names the
+   provider/model and spells out the remedy (`classify_spawn_failure`
+   carries it).
 2. **Bounded retry — `--finish-attempt-limit N`** (default: the
    `--max-child-sessions` value, so the default is one attempt and behaviour
    is unchanged from before this feature). Genuine failing finish executions
@@ -830,13 +992,13 @@ values):
 
 | `result` | Meaning |
 |---|---|
-| `infra-retry` | The child's `finish` was refused for a transient **infrastructure** reason; the loop retried `parent` on the separate `--infra-retry-limit` budget with backoff and no session spawn. Carries `step`, `reason`, `attempt` and the finish-failure `message`. |
+| `infra-retry` | The child's `finish` was refused for a transient **infrastructure** reason; the loop retried `parent` on the separate `--infra-retry-limit` budget with backoff and no session spawn. Carries `step`, `reason`, `attempt` and the finish-failure `message`. Also emitted for a retried **spawn-time** provider failure, where `step` is `"spawn"`, `reason` is the spawner reason, `provider` is the extracted provider and `message` names the provider and model (see the recovery tiers above). |
 | `finished` | The child's session exited successfully. |
 | `terminal-reconciled` | The child's `finish` failed but the child was already terminal; recorded as done, the chain continues. Carries `status`, `stage`, `evidence` and `finish_attempts`. |
 | `reset-for-retry` | The child was non-terminal after the finish bound; its worktree was reset to the parent-branch HEAD and its status set back to `open` for a fresh session. Carries `reset: true`, `status`, `stage`, `evidence`, `finish_attempts` and `discarded_paths` (the uncommitted files the reset removed — never a commit). |
 | `completed-late` | Session timeout/exit after the child reached a terminal state (see the timeout section). |
 | `finalised` | A stranded child was finalised via `--finalise-stranded`. |
-| `failed` | The child is not terminal; the chain stops and `failed_child` is set. |
+| `failed` | The child is not terminal; the chain stops and `failed_child` is set. Carries `spawn_failure_recorded: true` when the driver recorded spawn-failure evidence in the child's worktree (see the spawn-failure section), so the next run recognises it as startable again. |
 
 Additional report fields:
 
@@ -847,14 +1009,19 @@ Additional report fields:
 - `finish_attempts` — map of child id → failing `finish` executions observed
   (the finish-attempt bound accounting);
 - `finish_attempt_limit` — the bound applied to this invocation;
-- `infra_retries` — map of child id → infrastructure-refusal retries taken on
-  the separate `--infra-retry-limit` budget;
+- `infra_retries` — map of child id → infrastructure retries taken on the
+  shared `--infra-retry-limit` budget. One counter per child across
+  finish-refusals **and** spawn-time provider failures;
 - `infra_retry_limit` — the infra-retry bound applied to this invocation;
 - `preserved_refs` — list of `{id, ref, commit}` entries for commit-carrying
   worktrees parked on `refs/wip/<id>` (the reset was refused);
 - `terminal_reconciled` — count of children recorded as done after a failed
   finish;
-- `reset_for_retry` — count of children reset for a fresh session.
+- `reset_for_retry` — count of children reset for a fresh session;
+- `revalidated_children` — the pre-spawn re-validation verdicts, one entry per
+  reported `next_child` (`{id, startable, action, status, stage, reason}` plus
+  `blocking_ids` / `stale_block_ids` / `unvalidated` for a blocked child;
+  SA-0MWFJSCPT005BO2R).
 
 These additions are the full report-surface delta for the recovery work:
 `finish_failure`, `infra_retries`, `infra_retry_limit` and `preserved_refs`
@@ -1601,7 +1768,12 @@ by `phase_drive`; the leaf was not):
 - **At most one full-suite gate per finish (AC6).** Transport/fast-forward
   retries only re-run the **push**; the tree-keyed gate verdict is served from
   the cache, and the changed-scope gate (Step 3) is never re-entered by the
-  retry loop.
+  retry loop. A non-fast-forward round rewrites the commit, so the retry's
+  pushed tree is *new* — its verdict is served from the **change-set** key
+  (`fingerprint_kind="change_set"`, the identical patch measured before the
+  race; SA-0MWFJS9OL001ZTTC), so a rebase round costs seconds rather than a
+  second ~5-18 min suite inside the lock. See
+  [A lost push race does not re-run the full suite](#a-lost-push-race-does-not-re-run-the-full-suite-sa-0mwfjs9ol001zttc).
 - **Load-flake gate failures are labelled, not misread as code failures
   (AC7).** When a gate refusal's stderr names suite *load* errors (`Cannot
   find package …`, `Cannot find module …`, `MODULE_NOT_FOUND` — a missing
@@ -1854,7 +2026,7 @@ checkout**, so the main checkout's own churn is never a failure:
 
 - refs checked out in a registered worktree other than *that* checkout's root,
   plus the `branch.<name>.*` config those worktrees own (ownership-based,
-  SA-0MV8311B3005DNG8) — so `implement.py finish`'s own Step-5 fast-forward in
+  SA-0MV8311B3005DNG8) — so `implement.py finish`'s own **post-push** fast-forward in
   the main checkout, and worktrees registered/removed mid-run, are churn;
 - `refs/heads/dev` and the whole `refs/remotes/origin/*` namespace
   (WL-0MV5MYBKJ0033P8U);
@@ -1907,7 +2079,7 @@ Regression pins: `skill/shared/tests/test_git_sandbox.py` (`TestGuardedRoots`,
 ## Finish main-checkout guard (WL-0MVPADZ1Z000FOSG AC3)
 
 The test guards above protect a **test run**. But `implement.py finish`
-itself operates on the main checkout — Step-5 fast-forward, Step-6b worktree
+itself operates on the main checkout — post-push fast-forward, Step-6b worktree
 removal and the post-push ancestry assertion (the Step-6 dev push now runs from
 the worktree that holds the pushed commit, SA-0MVTFMB7K002Y1F3) — so a foreign
 actor mutating the main checkout mid-finish (the 2026-10-26 `packages/shared`
@@ -1934,10 +2106,11 @@ window on the success path **and** on every pre-push abort path
   verify. They are worktree-local refusals outside the guard's failure-path
   set; an operator reading a report from one of them sees the refusal message
   itself, never `verifies`.
-- **Verify before the push** (Step 5b, `pre_push`): after the fast-forward,
-  `own_churn` (the fast-forward's own file list, `git diff --name-only` of
-  the pre-fast-forward HEAD → the merged commit) is attributed to finish and
-  excluded; everything else that changed aborts.
+- **Verify before the push** (Step 5b, `pre_push`): the local-`dev`
+  fast-forward is **deferred until after the push reports success**
+  (WL-0MWFKDH78002T2CR AC1), so the pre-push verify expects a checkout
+  finish itself has not yet touched: `own_churn` is empty here and anything
+  that changed since the baseline aborts.
 - **Verify before worktree removal** (Step 6c, `pre_worktree_removal`): a
   mutation that appeared while the push ran (e.g. a concurrent actor) must
   still abort loudly.
@@ -1957,8 +2130,8 @@ this table and the constant drift apart.
 | `build_failure` | the Step-2 build fails | yes (the run is already failing) |
 | `gate_failure` | the Step-3 gate fails in `--json` mode, or every fix-and-re-run retry is exhausted | yes (already failing) |
 | `user_abort` | the interactive fix loop's `abort` choice (or EOF/`KeyboardInterrupt`) | yes (already failing) |
-| `pre_push` | after the Step-5 fast-forward, immediately before the push | yes — `_abort_on_main_checkout_violation` |
-| `pre_worktree_removal` | after the push, before the worktree is removed | yes — `_abort_on_main_checkout_violation` |
+| `pre_push` | before the push (the local-`dev` fast-forward is deferred until after push success, so there is no own churn yet) | yes — `_abort_on_main_checkout_violation` |
+| `pre_worktree_removal` | after the push and the post-push local-`dev` fast-forward (its churn is attributed via `own_churn`), before the worktree is removed | yes — `_abort_on_main_checkout_violation` |
 
 A verify that passes still records a `pass` entry, so a green main checkout is
 observable on every path (e.g.
@@ -2009,7 +2182,7 @@ expected-dirty paths are never a failure.
 | `guard["repo_root"]` | The main checkout the guard snapshots and verifies (`_resolve_main_repo_root`, below) |
 | `guard["snapshot_at"]` | ISO timestamp of the baseline snapshot |
 | `guard["baseline_paths"]` | Number of dirty/untracked entries in the baseline snapshot |
-| `guard["own_churn"]` | The attribution allow-list: checkout-relative paths from finish's own fast-forward that were observed dirty in this checkout (never a deletion) |
+| `guard["own_churn"]` | The attribution allow-list: checkout-relative paths from finish's **post-push** fast-forward that were observed dirty in this checkout (never a deletion). Empty for every pre-push verify — the advance is deferred until after the push succeeds (WL-0MWFKDH78002T2CR AC1) |
 | `guard["verifies"]` | Ordered list of verify entries, one per verify point reached |
 | `guard["verdict"]` | Verdict of the most recent verify (`pass` or `fail`) |
 | `verifies[].stage` | The stage label from the table above (`VERIFY_STAGES`) |
@@ -2174,7 +2347,8 @@ symlink (fails), and the unmodified main checkout (fails).
 ## Single-owner per-repository lock (WL-0MVPADZ1Z000FOSG AC5, SA-0MVPZG3IQ009IJMO)
 
 `implement.py finish` serialises its main-checkout critical section (commit →
-fast-forward → push → worktree removal → post-push parent-branch sync) with a
+push → post-push fast-forward → worktree removal → post-push parent-branch
+sync) with a
 **per-repository exclusive advisory lock**:
 `<main-checkout>/.worklog/locks/main-checkout.lock`. The mechanics live in the
 shared helper `skill/shared/repo_lock.py` (`RepoLock`, beside
@@ -2182,19 +2356,32 @@ shared helper `skill/shared/repo_lock.py` (`RepoLock`, beside
 lock also guards the adjacent window in `start` that moves the shared ref.
 Concurrency contract:
 
-- **One finish per main checkout.** Acquisition is a single non-blocking
-  `flock(LOCK_EX | LOCK_NB)` by default — no measurable latency when free, and
-  no wait when held: a second finish exits **non-zero** with a message naming
-  the holder (work item id, PID, ISO start time, repo root, host — recorded in
-  the lock file after acquisition) and **without modifying the checkout or the
-  work item** (no status write, no comment). Re-run once the holder
-  completes.
-- **Bounded wait, never a hang.** `IMPLEMENT_FINISH_LOCK_TIMEOUT` (seconds,
-  default `0` = fail fast) opts into waiting for a concurrent finish. The wait
-  is always bounded by that deadline; on expiry the refusal states the deadline
+- **One finish per main checkout — a second waits once, bounded.** Ownership
+  is a single non-blocking `flock(LOCK_EX | LOCK_NB)` when the lock is free:
+  no measurable latency. When it is held, `finish` performs **one bounded
+  internal wait** (default **900 s / 15 min**, `IMPLEMENT_FINISH_LOCK_TIMEOUT`
+  seconds; `0` opts into fail-fast) instead of refusing immediately. The wait
+  proceeds the moment the holder releases; only when the bound expires does it
+  exit **non-zero** with a message naming the holder (work item id, PID, ISO
+  start time, repo root, host — recorded in the lock file after acquisition),
+  the lock path and the recovery step, and **without modifying the checkout or
+  the work item** (no status write, no comment). Agents run `finish` **once**
+  and let the internal wait absorb contention — they must not script retry
+  loops (`for attempt …; finish; wait_for_job.py`) around it.
+- **Bounded wait, never a hang, with progress.** While waiting, `finish`
+  emits progress naming the lock path, the bound and the **current holder**
+  (immediately on contention, then a heartbeat at most every 30 s), so an
+  operator watching a long call sees who it is waiting for rather than an
+  apparently hung process. The wait is always bounded by
+  `IMPLEMENT_FINISH_LOCK_TIMEOUT`; on expiry the refusal states the deadline
   and still names the lock path, the holder and the recovery step. An
   indefinite wait is rejected outright (`RepoLock.acquire(timeout=None)` raises
   `ValueError`), so no code path can block forever.
+- **Signal-safe while waiting.** `SIGINT`/`SIGTERM` are handled between retries:
+  `implement.py`'s signal handler releases the per-work-item child lock, resets
+  the item claim and exits cleanly (code `2`); the un-acquired lock descriptor
+  is closed on any exception, so an interrupted wait leaves **no orphaned
+  lock** and a later run acquires immediately.
 - **No stale locks are possible.** The lock is the kernel's flock on the lock
   file's open file description, so a killed holder (SIGKILL included) releases
   it automatically — there is no PID bookkeeping to trust or clean up. Holder
@@ -2230,7 +2417,9 @@ the suite really runs), and a green pre-lock verdict is served *only* if the
 step-3d assertion proves the commit produces that same tree. Two escapes
 stand the pre-resolution down without weakening the gate: no would-be-commit
 tree to bind to (`not_a_git_worktree`) and the hook's own
-`TEST_SCOPE_SKIP=1`.
+`TEST_SCOPE_SKIP=1`. The same run also records a **change-set** verdict, which
+is what survives a lost push race — see
+[A lost push race](#a-lost-push-race-does-not-re-run-the-full-suite-sa-0mwfjs9ol001zttc).
 - **Observability.** `report["steps"]["main_checkout_lock"]` records the lock
   path, whether it was acquired, when, the configured bounded wait, how long
   the acquisition actually waited (`waited_seconds`) and the
@@ -2253,6 +2442,107 @@ metadata, SIGKILL crash release, cross-checkout independence, `phase_finish`
 refusal/success, hygiene script JSON + human output) and
 `tests/test_implement_finish_concurrent_orphan.py` (dev-ref window scenarios,
 including the bounded-wait timeout message and the `start` refresh window).
+
+## Measuring finish lock contention (SA-0MWFK10NH006QI7E)
+
+The epic's outcome is a measurable property, not a claim: **under a 6-way
+concurrent `finish` fan-out no session spends the majority of its wall-clock
+blocked on the per-repository lock** (median lock wait < 60 s, no single wait
+> 5 min). `scripts/measure_finish_contention.py` verifies it from recorded data
+and is reproducible on demand — no throwaway analysis script is needed to
+re-check the epic.
+
+```bash
+# "Before": re-derive the 2026-11-13 baseline with the same bucketing.
+python3 scripts/measure_finish_contention.py session \
+    --since 2026-11-13T00:00:00Z --until 2026-11-14T00:00:00Z \
+    --project AI_Hell-.worklog-worktrees --json
+
+# "After": the post-fix window (name the sibling fixes in effect).
+python3 scripts/measure_finish_contention.py session \
+    --since 2026-11-14T00:00:00Z --project .worklog-worktrees --json
+
+# The 6-way fan-out: six concurrent finishes through the real lock.
+python3 scripts/measure_finish_contention.py fanout --count 6 --json
+```
+
+The session mode reuses the parsing helpers in `scripts/measure_slot_wait.py`
+(SA-0MW7C69KU008ZT5K) — one definition of a wait sample, no second analyser.
+A session counts when its **first** record falls in the window and it ran an
+implement command (`--all-sessions` lifts that filter).
+
+### Metric definitions (identical before and after)
+
+| Metric | Definition |
+|---|---|
+| wall-clock span | `max(last record) - min(first record)` over the selected sessions |
+| summed session time | sum of each session's own span; effective parallelism = summed / wall-clock spans; peak concurrency = maximum overlapping spans |
+| bash-wait share | summed `bash` tool-call duration / summed session time |
+| buckets | each bash call classified once: `wait_for_job` → `own_finish` → `scoped_tests` → `polling` → `other` |
+| lock refusals | `Another run holds the repository lock` in a *run-source* result (`implement.py`, `wait_for_job.py`, `git push`); echoes from `grep`/`cat`/probes are filtered out |
+| lock-wait sample | reported `waited_seconds` / `Acquired the repository lock … after N s` (bounded-wait era), else a retry loop's duration, else the gap from a fail-fast refusal to an **immediately** retried finish (work done in between is not a wait) |
+| rebase event | a `non-fast-forward` marker in a run-source push result |
+| full-suite gate run | a distinct `run_tests: gate-subject pushed=<sha>` (de-duplicated by sha) |
+| no-op session | a session shorter than 120 s with no bash call — the drive retry that spawned and immediately gave up (visible when `--all-sessions` includes it) |
+
+The verdict evaluates the parent's three thresholds; a window with fewer than
+`--min-samples` (default 3) lock-wait samples is reported `inconclusive`, never
+as a hard pass or failure.
+
+### The synthetic fan-out
+
+Natural sessions only reach the target concurrency intermittently, and after
+the four sibling fixes landed the post-fix corpus is still thin — so the
+fan-out is made reproducible instead of hoped for. `fanout` drives the **real**
+`phase_finish` in N concurrent threads against one main checkout: the
+per-repository `flock`, the bounded wait and the whole finish ordering are the
+production ones. Only the external boundaries are stubbed — the pre-lock full
+suite to the recorded baseline duration (326 s, so each session is genuinely
+inside its expensive phase at the same moment, synchronised on a barrier) and
+the locked mutating window to 15 s (deliberately conservative; a real push
+completes in seconds). Each session's lock wait and measured lock hold are
+reported, and the same three thresholds decide `pass`/`fail`.
+
+### Recorded evidence
+
+The measurement is committed as
+[`docs/dev/finish-contention-measurement.json`](finish-contention-measurement.json)
+(`before`, `after`, `after_all_fixes` and `fanout` sections plus the findings).
+It is reproduced with the commands above and pinned by
+`tests/test_measure_finish_contention.py`.
+
+| Metric | Before (2026-11-13) | After (2026-11-14 onward) |
+|---|---|---|
+| implement sessions measured | 38 | 109 |
+| summed session minutes / wall-clock minutes | 1210 / 519 (2.33x) | 4042 / 6580 (0.61x) |
+| bash-wait share | 72% | 62% |
+| `wait_for_job` bucket | 418 min (34%) | 816 min (20%) |
+| lock refusals | 47 | 2 |
+| lock-wait samples (median / max) | 8 (70 s / 2142 s) | 2 (0 s / 0 s) |
+| sessions majority-blocked on the lock | 2 | 0 |
+| non-fast-forward rebase events | 28 | 23 |
+| full-suite gate runs | 2 | 4 |
+| 6-way fan-out lock wait (median / max) | — | 37.5 s / 75.2 s |
+| fan-out effective parallelism | — | 5.46x |
+
+**Which sibling fixes were in effect for the "after" window:**
+SA-0MWFJS3820032YB4 (dev-push full suite resolved before the lock, landed
+2026-11-13T23:57) covers the whole window; SA-0MWFJS9OL001ZTTC (lost-push-race
+change-set verdict, 2026-11-18T04:42), SA-0MWFJSCPT005BO2R (no no-op drive
+spawn, 2026-11-18T10:51) and SA-0MWFJS65O005JMJF (one bounded internal finish
+wait, 2026-11-18T13:02) cover only its tail. The `after_all_fixes` window
+(2026-11-18T13:03 onward) has one session, so the fan-out — not the natural
+corpus — is what evidences AC1.
+
+The absolute "before" totals differ from the ad hoc 2026-11-13 figure
+(668 min summed over 388 min for 36 sessions) because this harness fixes the
+window on a session's first record and spans the whole UTC day; its own
+re-measured before numbers are the apples-to-apples comparison point. The
+sessions-before-the-bounded-wait refusals (2) in the "after" window are from
+runs that started before that fix landed — they are recorded, not hidden. No
+follow-up work item is needed for the epic's outcome ACs; a later re-run of the
+`session` mode on a real post-fix corpus would strengthen the natural-session
+evidence.
 
 ## Verified reversible local-dev sync and post-push ancestry assertion (SA-0MVPZG7A0000N66U)
 
@@ -2301,64 +2591,131 @@ run). Without it, pushing from the worktree would lose the pushed commit's
 green `scope: full` tree-kind entry as far as the main checkout's post-push
 verification and the audit skill (F3) are concerned.
 
-The pre-push fast-forward of the main checkout's local parent branch is
+## A lost push race does not re-run the full suite (SA-0MWFJS9OL001ZTTC)
+
+`dev` is a shared ref, so concurrent finishes lose the non-fast-forward race
+routinely. `finish` then fetches, rebases the feature branch onto the advanced
+`origin/dev` and retries the push. That rebase rewrites the commit, and the
+rebased commit has a **new tree** — which missed the tree-keyed gate verdict
+and re-executed the whole suite *inside* the main-checkout lock, once per lost
+round (observed: 21 rebase events in one batch; ~5.4 min per round on AI_Hell,
+~18 min on tce-the-rising).
+
+The test cache therefore carries a second namespace,
+`fingerprint_kind="change_set"`: the SHA-256 of the **complete patch** the
+change set contributes (`skill/test_cache.py`,
+`compute_change_set_state()`). Every tree-keyed run also stores its verdict
+under that key, and a tree-keyed lookup that misses is retried under it — so
+the post-rebase gate run serves the verdict measured before the race
+(`verdict=cached fingerprint_kind=change_set reused_from_tree=<measured tree>`)
+and a lost race costs seconds.
+
+What makes the reuse *evidence* rather than a guess:
+
+- The patch is computed **tree-to-tree** (`git diff --full-index <base>…<target>`)
+  with pinned diff flags, so it records every changed path, the pre-image and
+  post-image object ids and every hunk — a change in our own work, or an
+  upstream change to a file the patch touches, changes one of those ids and
+  therefore the key. Two identical keys describe the same patch applied to the
+  same pre-image content; only *other* files may differ between the two trees,
+  and those come from a base that was itself gate-green when it was pushed.
+- The base is `merge-base(HEAD, <parent ref>)` — the parent the patch was
+  applied to — independent of whether `HEAD` is the pushed commit (the gate's
+  case) or the parent branch holding the uncommitted change set (the pre-lock
+  case), which is why both sides derive the same key.
+- An **empty** change set (tree equals base) is never keyed: one shared empty
+  key would serve one verdict for every no-op change set.
+- A tree-bound entry is never written *silently* for a tree the suite did not
+  measure. A change-set hit mirrors the verdict under the pushed tree's key
+  (so post-push verification and the audit find it), stamped
+  `verdict_origin="change_set_reuse"` with `measured_tree` — the tree the
+  suite actually ran against — and the original `completed_at`, so its
+  lifetime is not extended and it is never read as directly executed
+  evidence.
+- Consumers that look for the gate's evidence follow the same order —
+  tree-kind, then change-set kind, then the legacy loose-worktree key — so
+  `_resolve_post_push_verification` (which refuses the terminal transition on
+  `missing`) and `_full_suite_cache_present` (executed-vs-cached
+  classification) accept a change-set-served push instead of misreporting it.
+
+Regression pins: `tests/test_test_cache.py` (`test_change_set_fingerprint_*`,
+`test_run_cached_serves_a_change_set_verdict_after_a_rebase`,
+`test_run_cached_never_serves_a_change_set_verdict_for_a_different_patch`,
+`test_empty_change_set_is_never_keyed`) and
+`tests/test_pre_push_gate_reuse.py`
+(`test_rebased_push_is_served_from_the_change_set_verdict`,
+`test_rebased_push_with_a_content_change_still_executes`,
+`test_post_push_verification_accepts_a_change_set_served_push`).
+
+The post-push fast-forward of the main checkout's local parent branch is
 **main-checkout hygiene only** (it keeps the next worktree's base up to date),
 never the gate subject, and may be skipped safely while the push and the
-ancestry assertion remain authoritative. That advance is inherently
-unverified — the commit is by definition not on `origin/dev` yet — so
-`phase_finish` decomposes it into three cooperating guarantees, all inside
-the per-repository lock above:
+ancestry assertion remain authoritative. Crucially (WL-0MWFKDH78002T2CR
+AC1/AC2) it runs **only after ``git push`` reports success**: advancing local
+``dev`` to an about-to-be-pushed commit opened a write-then-restore window in
+which a concurrent ``start`` resolved ``dev`` to the unpushed tip and
+permanently grafted another item's commit onto its branch. The advance is
+deferred until the commit is a known ``refs/remotes/origin/dev`` tip, so a
+failed/refused push leaves local ``dev`` **provably unchanged** from its
+pre-finish value (``restore` reasons report ``no_advance_to_undo``), and
+``phase_start`` independently refuses to branch from a ``dev`` that is not a
+pushed tip (`_resolve_start_base`). The three cooperating guarantees, all
+inside the per-repository lock where the push runs:
 
 | Step | Helper | Report key | Guarantee |
 |---|---|---|---|
-| Pre-push advance | `_fast_forward_local_dev_for_push` | `report["steps"]["local_dev_fast_forward"]` | `git merge --ff-only` only (never a rewrite); records `pre_advance_tip`; refuses loudly when the advance would be unsafe |
-| Push-failure restore | `_restore_local_dev_after_failed_push` | `report["steps"]["local_dev_restore"]` | Local `dev` returns to `refs/remotes/origin/dev`; uncommitted work survives (no `reset --hard`) |
+| Pre-push deferral | *(no git call)* | `report["steps"]["local_dev_fast_forward"]` = `method: deferred`, `advanced: False` | Local `dev` is never touched while a push is in flight; the restore paths find nothing to undo (`no_advance_to_undo`) |
+| Post-push advance | `_fast_forward_local_dev_for_push` | `report["steps"]["local_dev_fast_forward"]` | `git merge --ff-only` only (never a rewrite), after push success; records `pre_advance_tip`; refuses loudly when the advance would be unsafe |
+| Push-failure state | `_restore_local_dev_after_failed_push` | `report["steps"]["local_dev_restore"]` | Reports `no_advance_to_undo` on every failed push — local `dev` never moved |
 | Post-push verification | `_assert_commit_on_origin_dev` | `report["steps"]["ancestry_assertion"]` | Finish succeeds only when the pushed commit is an ancestor of `refs/remotes/origin/dev` |
 
-### The advance is verified and reversible
+### The advance is verified and deferred
 
 - **Fast-forward only, never a rewrite.** Local `dev` is moved with `git merge
   --ff-only` (first onto `refs/remotes/origin/dev`, then onto the finish
   commit); no local commit is discarded and no history is rewritten.
-- **Refuse rather than silently skip.** The previous broad `except` could
-  disable the whole fast-forward without a trace. Every unsafe precondition
-  now returns `method="refused"`, a loud warning naming the refs and hashes,
-  and a machine-readable `reason`: `fetch_failed`,
+- **Deferred until after the push succeeds.** Step 5 of the run records a
+  deferral (`method: "deferred"`, `advanced: False`) instead of touching
+  local `dev`; the advance executes in the post-push step (Step 6a.5) — after
+  `git push` reported success, the ancestry assertion and the read-only
+  verification passed (WL-0MWFKDH78002T2CR AC1). A non-fast-forward recovery
+  records the same deferral on its `retry` entry rather than advancing
+  mid-push.
+- **Refuse rather than silently skip** (post-push). The previous broad
+  `except` could disable the whole fast-forward without a trace. Every unsafe
+  precondition now returns `method="refused"`, a loud warning naming the refs
+  and hashes, and a machine-readable `reason`: `fetch_failed`,
   `no_remote_tracking_ref`, `checkout_failed`, `local_dev_diverged` (local
   `dev` carries commits the remote does not have, or cannot fast-forward to
   the remote tip) and `commit_not_based_on_remote_tip` (a sibling landed
-  first). A refusal never fails the finish: the push (with its rebase-and-retry
-  recovery) and the post-push ancestry assertion remain authoritative.
-- **Retried after the recovery rebase (SA-0MW3H07A8004Q54C AC1).** When Step 5
-  refused (`local_dev_diverged` / `commit_not_based_on_remote_tip`) because a
-  sibling moved `dev`, the non-fast-forward recovery rebases the feature branch
-  onto `origin/dev` and then **retries** the fast-forward for the rebased
-  commit, recorded as `report["steps"]["local_dev_fast_forward"]["retry"]`.
-  The main checkout's `dev` (and its `HEAD` when `dev` is checked out)
-  therefore tracks the pushed commit before the retry push. A second refusal is
-  recorded and never fails the finish, and the retry's own file churn is added
-  to the main-checkout guard's `own_churn` so it is never misreported as a
-  foreign mutation.
-- **Reversal on a failed push.** Every push-failure path (`PushTimeoutError`,
-  `PushNonFastForwardError`, a plain push failure) calls
-  `_restore_local_dev_after_failed_push`, so the shared local `dev` is never
-  left pointing at an unpushed finish commit — the state that made the
-  2026-10-25 orphan possible. The restore is deliberately conservative:
-  - the target is `refs/remotes/origin/dev`, a commit known to be published;
-  - only finish's **own** advance is undone — when the branch moved since
-    (`branch_moved_since_advance`) another actor owns that move and nothing is
-    touched;
-  - checked out → `git reset --merge` (uncommitted work in the shared checkout
-    survives; an overlapping local modification is reported as
-    `reset_conflict` and never clobbered — `reset --hard` is never used);
-  - not checked out → atomic compare-and-swap `git update-ref`.
-- **Own churn is still attributed — narrowly.** The fast-forward's file churn
-  is recorded as `own_churn` so the main-checkout guard never aborts on it
+  first). A refusal never fails the finish: the post-push ancestry assertion
+  remains authoritative, and the Step-8 parent-branch sync is a safe-skip
+  backstop.
+- **Deferred after the recovery rebase (WL-0MWFKDH78002T2CR AC1).** When a
+  sibling moved `dev`, the non-fast-forward recovery rebases the feature
+  branch onto `origin/dev`; its fast-forward for the rebased commit is
+  **deferred** (recorded as `report["steps"]["local_dev_fast_forward"]["retry"]`
+  with `advanced: False`) — the retry push may still fail, so the single
+  post-push advance in `phase_finish` owns the movement. The deferral is
+  recorded and never fails the finish.
+- **Nothing to reverse on a failed push.** Every push-failure path
+  (`PushTimeoutError`, `PushNonFastForwardError`, a plain push failure)
+  calls `_restore_local_dev_after_failed_push`, which reports
+  `no_advance_to_undo`: local `dev` was never moved, so there is no
+  write-then-restore window for a concurrent `start` to observe — the 2026-10-25
+  orphan and the 2026-11-13 graft are both structurally impossible.
+  The restore helper is retained (and still reachable as the failure-path
+  record surface) for any future write that would need an undo.
+- **Own churn is still attributed — narrowly, and post-push.** The post-push
+  fast-forward's file churn is recorded as `own_churn` so the main-checkout
+  guard's pre-worktree-removal verify never aborts on it
   (WL-0MVPADZ1Z000FOSG AC3/AC4), but only paths *observed dirty in this
   checkout* qualify: unobserved diff paths are reported as `not_observed`
   diagnostics, a non-main-checkout root allow-lists nothing, and a deletion is
   never allow-listed (see
-  [the attribution contract](#attribution-contract-own_churn)).
+  [the attribution contract](#attribution-contract-own_churn)). The pre-push
+  verify sees an untouched checkout (own churn empty — the advance is
+  deferred), so a foreign mutation there still aborts.
 
 ### The post-push ancestry assertion fails closed
 
@@ -3943,6 +4300,11 @@ Guards (deterministic, in `phase_parent`):
   of the same repository holds changes** (SA-0MW5FIJNQ002Z24I) — has written
   outside its own worktree; the phase fails closed with the offending
   surfaces (and does not advance the parent) instead of silently proceeding.
+  A child whose last session died before producing any work is exempt: the
+  driver's recorded spawn-failure evidence
+  (`<worktree>/.worklog/spawn-failure.json`) makes the foreign dirt
+  pre-existing and unrelated, so the child is reported startable again and
+  the next `drive` re-spawns it (SA-0MWGZ8NWP009QD8G).
 - A parent with no children or all-terminal children behaves as today.
 
 Worktree isolation per child is preserved: every child is implemented in
@@ -4143,6 +4505,20 @@ parent itself gets no worktree.
     successful push and auto-file a spurious
     `[test-failure] post-push full-suite verification` item.
 
+  - **No moving-checkout execution (WL-0MVSPZ1FH000RWET).** Verification is
+    purely read-only: the verdict comes from the per-repo cache, so a sibling
+    `finish` fast-forwarding the main checkout's `dev` mid-run can never swap
+    files under a suite and produce phantom failures. Whenever a full suite
+    *does* execute — the audit skill's F3 cache-miss auto-execution — it runs
+    in a fresh **detached** worktree pinned at `origin/dev`
+    (`_create_execution_worktree` → `ctx.execution_root`), not in the audited
+    main checkout, and its entries are grafted into the main checkout's
+    `.worklog/cache` (`mirror_cache_entries`, never overwriting an existing
+    entry). A run that observes its checkout move mid-execution is quarantined
+    (`state_changed_during_run`, exit `75`) and is never triaged into a
+    `test-failure` item. See
+    [worktree isolation — the mid-run fast-forward race](worktree-isolation.md#the-mid-run-fast-forward-race-full-suite-verification).
+
   - **If `finish` refused on the verification**, generate the evidence through
     the test skill and re-run `finish` (idempotent — the no-diff path
     converges):
@@ -4173,13 +4549,20 @@ interleave moves of the shared local `dev` ref — the 2026-10-25 shape where
 finish A's commit became reachable only from its feature branch while both
 runs reported success.
 
-- **Bounded wait, never a hang.** A second `finish` fails fast by default
-  (`IMPLEMENT_FINISH_LOCK_TIMEOUT=0`); a positive value waits at most that many
-  seconds and then refuses with the lock path, the holder (work item, pid,
-  start time, repo, host) and the recovery step. `start` waits at most
+- **One bounded internal wait, never a retry loop.** A second `finish` waits
+  **inside the call** for the lock (default **900 s / 15 min**,
+  `IMPLEMENT_FINISH_LOCK_TIMEOUT`; `0` = fail fast). While waiting it reports
+  the lock path and the **current holder** (work item, pid, start time, repo,
+  host) as progress — immediately on contention, then a heartbeat at most every
+  30 s — and proceeds automatically the moment the holder releases. Only when
+  the bound expires does it refuse, with the lock path, the holder and the
+  recovery step. Run `finish` **once**: do not script `for attempt …;
+  finish; wait_for_job.py` retry loops around it. `start` waits at most
   `IMPLEMENT_START_LOCK_TIMEOUT` (default 30 s) and then **skips** the refresh
   fail-open (`reason: "lock_held"`) — a start is never blocked by a finish.
-  An indefinite wait is rejected outright, so no code path blocks forever.
+  An indefinite wait is rejected outright, so no code path blocks forever; a
+  `SIGINT`/`SIGTERM` during the wait releases the child lock, resets the claim
+  and exits cleanly without leaving an orphaned lock.
 - **The full suite runs before the lock.** The dev-push hook executes the
   `--scope full` gate while the pusher holds this lock, so `finish` resolves
   the gate's tree-keyed verdict for the would-be-commit tree *before*
@@ -4192,17 +4575,31 @@ runs reported success.
   dies — `SIGKILL`, an exception or a hard crash included. The metadata in the
   lock file is for the refusal message only and never decides ownership, so a
   **stale lock file cannot block a later finish**.
-- **Verified fast-forward.** Local `dev` only ever advances with `git merge
+- **Verified fast-forward — deferred until after the push succeeds.**
+  Local `dev` only ever advances with `git merge
   --ff-only` (its history is never rewritten) and the pre-advance tip is
-  recorded. When local `dev` moved since the worktree base, the commit is not
-  based on the current `origin/dev`, the fetch fails or the checkout cannot
-  switch, the helper **refuses loudly** (`local_dev_diverged`,
-  `commit_not_based_on_remote_tip`, `fetch_failed`, `checkout_failed`) instead
-  of silently skipping — so an unsafe advance is never taken and the refusal
-  is reported rather than swallowed.
-- **Reversible on push failure.** A failed push restores local `dev` to
-  `refs/remotes/origin/dev`: `git reset --merge` when `dev` is checked out
-  (uncommitted work in the shared checkout survives; an overlapping local
+  recorded. The advance runs **only after** `git push` reports success
+  (WL-0MWFKDH78002T2CR AC1): while the push is in flight, finish's Step-5
+  record is a `method: deferred` marker and local `dev` is never touched, so
+  a concurrent `start` can never fork a worktree from an unpushed commit.
+  When, post-push, local `dev` moved since the worktree base, the commit is
+  not based on the current `origin/dev`, the fetch fails or the checkout
+  cannot switch, the helper **refuses loudly** (`local_dev_diverged`,
+  `commit_not_based_on_remote_tip`, `fetch_failed`, `checkout_failed`)
+  instead of silently skipping — so an unsafe advance is never taken and the
+  refusal is reported rather than swallowed. `start` independently refuses to
+  branch from a `dev` that is not a known pushed tip (`_resolve_start_base`,
+  `local_dev_not_a_pushed_tip`).
+- **Nothing to reverse on a failed push.** Because the advance is deferred
+  until after the push succeeds, a failed/refused push finds nothing to undo:
+  `_restore_local_dev_after_failed_push` reports `no_advance_to_undo` and
+  local `dev` is **provably unchanged** from its pre-finish value — there is
+  no write-then-restore window. The conservative restore machinery is
+  retained as the failure-path record surface and safety net: it targets
+  `refs/remotes/origin/dev`, undoes only finish's **own** advance (when the
+  branch moved since, `branch_moved_since_advance`, another actor owns that
+  move and nothing is touched), uses `git reset --merge` when `dev` is checked
+  out (uncommitted work in the shared checkout survives; an overlapping local
   modification is reported, never clobbered — `reset --hard` is never used),
   otherwise an atomic compare-and-swap `git update-ref`. An unpushed commit is
   therefore never left as the next worktree's base.
@@ -4282,20 +4679,24 @@ idempotent — it re-verifies commit → ancestry → status and marks the item
 
 **When a manual merge is needed.** Only in two cases. First, when the rebase
 conflicts: resolve them, commit, push, and re-run `finish`. Second, when the
-pre-push fast-forward reports `local_dev_diverged` because the **main
-checkout's local `dev` carries commits `origin/dev` does not have**:
+post-push fast-forward reports `local_dev_diverged` because the **main
+checkout's local `dev` carries commits `origin/dev` does not have** (the
+defect family of WL-0MWFKDH78002T2CR — a concurrent `start` now refuses to
+branch from such a `dev` via `_resolve_start_base`, and `finish` never
+advances an unpushed commit):
 
 ```bash
 git -C <main-checkout> log --oneline origin/dev..dev   # what is local-only
 ```
 
-Those commits are someone's unpublished work, so `finish` neither discards nor
+those commits are someone's unpublished work, so `finish` neither discards nor
 merges them for you. If they are intended, publish them (push `dev`, or merge
 them into `origin/dev`) and re-run `finish`; if they are stale, restore local
 `dev` deliberately with `git -C <main-checkout> reset --merge origin/dev` —
 `--merge`, never `--hard`, because the shared checkout may hold uncommitted
-work from another session. `finish` has already restored its **own** advance
-after the failed push, so this is the residual case of a pre-existing local
+work from another session. `finish` never advanced its **own** local `dev`
+before the push (the advance is deferred until after push success), so this is
+the residual case of a pre-existing local
 divergence.
 
 **Runtime copy.** These behaviours live in the installed skill copy

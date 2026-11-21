@@ -87,6 +87,7 @@ After Producer sets stage to `intake_complete` or `plan_complete`.
 - CLI wrapper: `$(skill_path effort-and-risk)/scripts/run_skill.py`
 - Calculators: `calc_effort.py`, `calc_risk.py`, `calc_effort_with_risk.py`
 - Formatters: `assemble_json.py`, `json_to_human.py`
+- Tool output: follow the shared [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result
 
 ### Policy
 

@@ -6,6 +6,10 @@ operational brief; this document preserves the full implementation reference
 for maintainers and for debugging runner behavior. Workflow semantics are
 unchanged — every command/flag documented here is still valid.
 
+> **Tool output:** when this reference tells you to read or search context,
+> follow the shared [tool-output budget](../../skill/shared/tool-output-budget.md)
+> — `jq` over `cat`, capped searches, ~10 KB per result.
+
 ## Monitored Run Execution
 
 Audits invoked via the canonical runner (`python3 ./scripts/audit_runner.py
@@ -263,7 +267,7 @@ The stale-audit-base guard above only flags the **behind** case (delivered on `o
 
 Two complementary mechanisms (both in `audit_runner.py`) close the gap:
 
-1. **Fresh origin/dev execution worktree (AC1)** — before F3 suite execution, `_phase_gate` calls `_create_execution_worktree(owning_root, runner, issue_id)`: it fetches `origin/dev`, creates a **detached** worktree at the latest `origin/dev` (`<owning>/.worklog/worktrees/audit-exec-<id>`), initialises git submodules *before* symlinking the shared `node_modules` (ordering hazard SA-0MVTOR53E003IIEQ; conventions SA-0MSN52GGN002B0AZ / SA-0MSGS763C006SM1B), and sets `ctx.execution_worktree`. Both F3 `_run_tests_via_test_skill` calls use `ctx.execution_root` (the worktree, else `per_audit_root`), so **the suite never executes from the launch checkout**. The worktree is removed by `cmd_issue`'s finally block (`_remove_execution_worktree`). The green-cache query (`_auto_green_run_outcome`) stays at `per_audit_root`, so a clean launch with a populated cache still skips execution (AC5); a cache miss executes fresh at the clean base — a cold worktree cache is **expected**, not a regression (cache keys are cwd-scoped, `test_cache.py`; SA-0MVCTZRZD004CE3L). A mocked/garbage runner that answers git with a JSON blob is rejected: `_looks_like_sha` validates `origin/dev` and ahead-commit output, and the worktree path must exist with a `.git` file, so unit-test fakes fail open rather than fabricating a worktree.
+1. **Fresh origin/dev execution worktree (AC1)** — before F3 suite execution, `_phase_gate` calls `_create_execution_worktree(owning_root, runner, issue_id, code_root=…)`: it fetches `origin/dev`, creates a **detached** worktree at the latest `origin/dev` (`<host>/.worklog/worktrees/audit-exec-<id>`), initialises git submodules *before* symlinking the shared `node_modules` (ordering hazard SA-0MVTOR53E003IIEQ; conventions SA-0MSN52GGN002B0AZ / SA-0MSGS763C006SM1B), and sets `ctx.execution_worktree`. The worktree is hosted on `_execution_worktree_host(code_root, owning_root)` — the **code root** for a `--code-root` audit (a worktree of the code repository belongs inside it; hosting it under the worklog owner made in-suite repo-root/`wl` resolution reach the wrong project, SA-0MWO59J9T002IQ63) and the owning root otherwise; the shared `node_modules` symlink follows the same host root. Both F3 `_run_tests_via_test_skill` calls use `ctx.execution_root` (the worktree, else `per_audit_root`), so **the suite never executes from the launch checkout**. The worktree is removed by `cmd_issue`'s finally block (`_remove_execution_worktree`). The green-cache query (`_auto_green_run_outcome`) stays at `per_audit_root`, so a clean launch with a populated cache still skips execution (AC5); a cache miss executes fresh at the clean base — a cold worktree cache is **expected**, not a regression (cache keys are cwd-scoped, `test_cache.py`; SA-0MVCTZRZD004CE3L). A mocked/garbage runner that answers git with a JSON blob is rejected: `_looks_like_sha` validates `origin/dev` and ahead-commit output, and the worktree path must exist with a `.git` file, so unit-test fakes fail open rather than fabricating a worktree.
 2. **Ahead/divergent guard (AC2)** — `_launch_checkout_divergence(owning_root, runner, launch_root)` returns divergent when `git rev-list origin/dev..HEAD` is non-empty, i.e. local `HEAD` contains commits absent from `origin/dev`. `_phase_gate` evaluates it **right after owning-root resolution and before F3 auto-execution**, so a contaminated suite never runs (and never triages spurious `test-failure` children). It is also applied belt-and-braces inside `_audit_base_freshness` (the merge-gate evidence), marking the base stale. **Scope (AC5):** only fires when the launch checkout IS the owning repo's main checkout (`launch_root.resolve() == owning_root.resolve()`); a feature-worktree launch legitimately sits ahead of `origin/dev` and is unaffected. Fail-open on any git error or an unresolvable `origin/dev`.
 
 **File-scope base (AC3).** The Phase 1/2 file-scope manifest's repository index resolves against `ctx.execution_root` (the fresh worktree) so evidence never reflects a stale/dirty layout; changed-file and touched-file resolution retain the guard-protected owning runner (after AC2, an ahead/divergent main checkout is refused, and a clean launch's tree is identical).
@@ -455,6 +459,7 @@ reviewed?"*. This section defines exactly when the audit runner writes it.
 | `No` | top-level, independent | either | **`yes`** |
 | `No` | top-level, cascade-demotion-suppressed | either | **untouched** (producer decision Q2) |
 | `No` | child (has a parent) | either | **untouched** (SA-0MSSVKYEW008PJ9H) |
+| `Yes` / `No` | top-level, ship-triggered (`--ship-triggered`) | either | **untouched** — reason "ship-triggered audit - flag untouched" (SA-0MW92TODX00064XQ) |
 | any | any | infrastructure failure / unparseable verdict / tainted `No` | **untouched** (producer decision Q3) |
 
 The runner **never** writes `--needs-producer-review no` on any path: it may
@@ -509,6 +514,33 @@ prior non-passing audit, a legacy/fingerprint-less report, or a failed
 `wl audit-show`. A spurious review request is a nuisance; a silently discarded
 review gate is a release-safety defect.
 
+### Ship-triggered runs (SA-0MW92TODX00064XQ)
+
+A ship-triggered audit — the ship skill's Step-2 audit readiness gate, Step-6
+final-validation sweep, and pre-flight `--refresh-audits`, all of which invoke
+`audit_runner.py issue <id> --strict --ship-triggered` — is a release-gate
+**verification re-audit**, not an independent review. `_resolve_producer_review_decision`
+therefore resolves `PRODUCER_REVIEW_UNTOUCHED` with the reason
+`"ship-triggered audit - flag untouched"` for a top-level `Yes` *or* `No`
+verdict: the release's own verification never arms the producer queue and never
+clears a stored flag. Only the flag write is suppressed — `Yes` still advances
+to `completed`/`in_review`; `No` still demotes to `open`/`plan_complete`
+(subject to cascade-demotion suppression); the persisted report still records
+the verdict plus a `Producer review: untouched (ship-triggered audit - flag
+untouched)` metadata line (see *Recording the decision*). Marker-free
+(independent) runs are unchanged: an independent top-level `Yes` with a
+producer decision required still flags, and an independent top-level `No`
+still flags (parent AC2).
+
+The marker is set **only** by ship-automated invocations. Surfaced manual
+remediation commands (operator-invoked) — `buildRemediationCommand()`
+(`audit_runner.py issue <id> --strict`), the offline refresh hint
+(`audit_runner.py batch --strict`), and `check-freshness` probes — carry **no**
+`--ship-triggered`, so an operator-run audit keeps exactly the independent
+flagging behaviour above. It cannot leak: the flag is accepted only by the
+`issue` subcommand (never `batch` / `check-freshness`), and the runner never
+writes `--needs-producer-review no`.
+
 ### Cost
 
 No new `wl` invocation on the hot path: the non-forced path reuses the
@@ -527,6 +559,7 @@ persisted carries an explicit metadata line:
 Producer review: preserved (content fingerprint <sha256>)
 Producer review: required (<reason>; previous content fingerprint <sha256>)
 Producer review: untouched (<reason>)
+Producer review: untouched (ship-triggered audit - flag untouched)
 ```
 
 Inspect it with `wl audit-show <id> --json` (the line is inside the stored
@@ -819,7 +852,7 @@ release summary never claims blanket success. The step remains non-blocking.
 
 ## Scripts
 
-- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--pi-bin] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--checkpoint-dir DIR] [--no-checkpoint]`
+- **Runner:** `./scripts/audit_runner.py` — `python3 ./scripts/audit_runner.py issue|project <id> [--do-not-persist] [--timeout SECONDS] [--parent-timeout SECONDS] [--batch-phase2] [--child-in-main-slot] [--no-child-in-main-slot] [--max-concurrency N] [--green-run SHA|HEAD] [--run-tests] [--audit-children] [--max-child-audits N] [--ship-triggered] [--pi-bin] [--model-source] [--debug-log] [--json] [--force] [--worklog-dir DIR] [--code-root DIR] [--checkpoint-dir DIR] [--no-checkpoint]` — `--code-root` (env `AUDIT_CODE_ROOT`) supplies an explicit code-repository root for the git-derived evidence, independent of the worklog (LP-0MVZ6R5H8007NYLR; see *Explicit code-repository root for cross-repo items*)
 - **Persister:** `./scripts/persist_audit.py` — persist from stdin, file, or CLI string
 
 **Cwd-independence (`--worklog-dir`):** every `wl` invocation made by the runner
@@ -875,11 +908,82 @@ pi/model call) the runner verifies:
    manifest must reference the item repository's files; a manifest built
    from the audit skill's own tree (or lacking the item repo) aborts with
    `Error: Audit scope error:` and a non-zero exit instead of emitting
-   misleading "unmet" verdicts.
+   misleading "unmet" verdicts. The manifest is validated against the root
+   it was **built** from — the per-audit target root, i.e. the code root
+   when `--code-root` is set — never the worklog owner
+   (`_scope_validation_root`, SA-0MWO59IMN000RUHM). The Phase 1 scope error
+   is **fatal**: `_phase1_parent_screening` raises `AuditScopeError`, so the
+   run exits non-zero, persists **no** report, and restores the pre-audit
+   status/stage. Before this, Phase 1 printed the error and continued,
+   persisting a `Ready to close: No` report whose acceptance-criteria table
+   was empty.
 4. **Child persistence** — a child audit that cannot be persisted
    (`wl audit-set` rc!=0, e.g. "Work item not found") aborts the run with a
    non-zero exit; `PERSIST_CONTENT_INVALID` (fallback notice persisted)
    remains a warning (the child audit is usable).
+
+### Explicit code-repository root for cross-repo items (LP-0MVZ6R5H8007NYLR)
+
+The rules above scope the audit to the **worklog-owning** project. A
+**cross-repo** item breaks that assumption: it is tracked in one project's
+worklog while its delivered code lands in another project's repository
+(recorded precedent: `LP-0MVVYQ1U3006GDWT`, `LP-0MVSB0E7W003IMH4` — item in
+the `llm-manager`/`LP` worklog, code in `~/projects/SorraAgents`). Auditing
+such an item against the worklog owner looks for its commits in the wrong
+repository (the merge gate fail-opens), resolves an empty/wrong code-quality
+file set, and builds a Phase 2 FILE SCOPE manifest from Key Files that do
+not exist in the target repo — a correct model judgement would then mark
+every AC `unmet`/`partial`.
+
+**`--code-root DIR`** (env **`AUDIT_CODE_ROOT`**) decouples the git-derived
+content from the worklog by supplying an explicit **code-repository root**:
+
+- **Scoped by the option** — the Phase 1 merge gate, the file-scope manifest
+  (changed files + repo index) **and its validation root**, the audited HEAD
+  attestation, `--green-run` evidence, the code-quality scan and the Phase 2
+  cwd all resolve against `DIR`. Internally the value becomes `per_audit_root`
+  (`git_root`), is wrapped into the runner via `git -C <DIR>`, and is published
+  as `_AuditContext.per_audit_project_root` so every residual consumer follows
+  it.
+- **Default — owning project.** With neither the flag nor the env var the
+  behaviour is today's: the worklog-derived owning root (or a worktree of
+  it). Precedence is `--code-root` flag > `AUDIT_CODE_ROOT` env > owning
+  project.
+- **`wl` routing is untouched.** `--code-root` never leaks into
+  `_run_wl`/`resolve_worklog_flags`; `--worklog-dir` (and the
+  prefix-to-sibling scan) keeps governing every worklog read/write, so the
+  two axes — code root and worklog — are independent. The option never
+  changes `_verify_launch_context`'s ownership verdict.
+- **Fail closed on a bad value.** A non-existent directory or a non-git
+  directory is a hard `Error: Audit scope error: ...` with a non-zero exit
+  and **zero** `pi` calls, matching the other scope errors.
+- **Fail closed without the option (cross-repo detection).** When no code
+  root is supplied and the item's resolved touched-file set is **entirely
+  absent** from the owning repo while present in a sibling project, the run
+  aborts with an `Audit scope error` naming the sibling repository, before
+  any Phase 1 model call. When the touched set is empty/undeterminable the
+  check is skipped (fail open) and the FILE SCOPE manifest coverage check
+  remains the backstop.
+- **Read-only.** The option only *selects* a scope for read-only git queries
+  and test-cache reads; the runner never fetches, checks out or mutates the
+  code repository. The read-only audit mandate is preserved.
+- **Same-repo no-op.** For an item whose code lives in the owning repo,
+  passing `--code-root <owning-root>` (or the worktree checkout) is a strict
+  no-op: identical manifest, HEAD attestation and verdict — the git command
+  stream is byte-identical.
+
+Cross-repo invocation:
+
+```bash
+python3 <framework>/skill/audit/scripts/audit_runner.py issue LP-XXXX \
+    --worklog-dir /path/to/worklog-owner/.worklog \
+    --code-root /path/to/code-repo
+```
+
+Every persisted report states the resolved scope in a **`## Audit Scope`**
+section (code root + worklog root) — see *Audit Scope in the report* below —
+so a reader can tell which repository the evidence came from without
+remembering which flags were passed.
 
 To audit an item, cd into its owning project root and launch from there:
 
@@ -1026,6 +1130,40 @@ python3 ./scripts/audit_runner.py issue SA-123 --run-tests
 - **Failures are triaged, never silently ignored (AC4):** each structured failure record from the executed run is passed to the triage helper (`check_or_create.py`), which links/creates a critical `test-failure` work item for the failing test — exactly the test skill's run → triage discipline. The audit then completes fail-closed with no green evidence.
 - **Fail-closed:** a non-green executed run (failures, non-zero exit, timeout, missing binary) yields NO evidence — execution-dependent ACs stay `partial` and the audit completes normally (never crashes, never fabricates a green verdict).
 - A green cache hit at the audited state short-circuits the invocation entirely (the suite is only executed when the cache cannot satisfy the evidence).
+
+**Audit Scope in the report (LP-0MVZ6R5H8007NYLR):** every persisted
+report carries a `## Audit Scope` section in its header-metadata block
+(alongside the green-run evidence lines, before `## Summary`) naming **both**
+the resolved **code root** and the **worklog root**:
+
+```text
+## Audit Scope
+
+Code root: /path/to/code-repository
+Worklog root: /path/to/worklog-owner
+```
+
+- **Code root** is `_AuditContext.per_audit_project_root` — the explicit
+  `--code-root` / `AUDIT_CODE_ROOT` value when given, else the default
+  owning-project root (the launch checkout when it is the same git
+  repository). **Worklog root** is the parent of the resolved worklog store
+  (`.worklog`), i.e. the project whose worklog holds the item; it is
+  independent of the code root.
+- **Emitted on every persisted report**, including default (owning-root)
+  audits — a reader must be able to tell which repository the evidence came
+  from, and a cross-repo run is exactly the case where nobody remembers to
+  check for a flag.
+- **Emitted before `persist_audit()`** (assembly-time), so it lands in the
+  persisted report — not merely in stdout. The section is the single intended
+  report delta for a same-repo run; the file-scope manifest, HEAD attestation
+  and verdict are byte-for-byte unchanged (`TestSameRepoCodeRootByteForByte`).
+- **Diagnostic, not a verdict:** the section records scope; it never affects
+  the `Ready to close:` header or any AC verdict. A cross-repo report whose
+  scope names the code repository is distinguishable from a mis-scoped one
+  whose scope names only the worklog owner.
+- Parsed by the report-format contract test
+  `skill/audit/tests/test_audit_report_audit_scope.py`
+  (`TestPersistedReportAuditScope`).
 
 **Concurrency:** `--max-concurrency N` bounds the number of concurrent pi/audit subprocesses host-wide. Precedence: `--max-concurrency` flag > `AUDIT_MAX_CONCURRENCY` env var > live proxy slot status > 6 static default. When no explicit request is present the ceiling is **derived from the live proxy slot capacity** (`/llama/local/status` → `max(1, min(available_slots, total_slots))`) so a 2-slot proxy never queues six pi sessions behind two slots (SA-0MVF1NKZQ009P3ZG AC3): six concurrent pi sessions used to queue behind two slots and the queue wait was charged against each call's own timeout budget, inflating p90 and pushing calls onto their 600 s/1,800 s caps. The derivation is fail-open and logged once per run (`Audit ceiling: ceiling=<N> source=<cli|env|slots|static> available_slots=<N> total_slots=<N>`) so the decision is observable in the audit log. An explicit `--max-concurrency` or `AUDIT_MAX_CONCURRENCY` is authoritative and is never silently overridden by slot discovery; an invalid env value warns and falls back to the static ceiling. The host-wide `issue` ingress cap (`AUDIT_MAX_HOST_AUDITS`, default 6) separately bounds independently launched `audit_runner.py issue` processes. Both defaults were right-sized to the host's measured audit-slot capacity (SA-0MUSZJRB9006ZCHE): the F7 harness (`skill/shared/validate_fanout.py`) showed the old ingress cap of 3 was the binding constraint on concurrent audits, and 6 (= 2x the 3-slot local LLM proxy pool) drains bursts with a batch-attributable load delta <= 1.63 and no swap growth on the 16-core host. Each pi launch holds one audit slot; when the ceiling is saturated the launch **waits on a shared bounded priority queue** (SA-0MTG5RYH8005RQNM) instead of failing fast: it enqueues a ticket at its work item's priority (critical > high > medium > low; missing/unknown priority defaults to medium), and is admitted in priority order (FIFO within a tier) as slots free up. The total wait for admission + slot is bounded by `AUDIT_QUEUE_TIMEOUT` (default 90s); `AUDIT_LOCK_TIMEOUT` now bounds only each individual semaphore attempt inside the admission poll (default 0s = immediate retry). Log lines (`Audit slot acquired: queued_at=<ts> priority=<level> queue_position=<N> dequeued_at=<ts> wait_seconds=<N> ticket=<id>`) make queue behaviour observable from stderr (AC4). If the bound is exhausted the audit still completes gracefully with the `unmet` evidence "Audit concurrency limit reached" (bounded, never fail-fast). Queue/admission and downtime-gate metrics are collected read-only by [`skill/shared/audit_gate_metrics.py`](../../skill/shared/audit_gate_metrics.py) (a pure-Python metrics collector); its host measurements and the keep-the-gate recommendation are recorded in [`downtime-idle-gate-evaluation.md`](downtime-idle-gate-evaluation.md) (SA-0MTG5UPBR0028K50).
 

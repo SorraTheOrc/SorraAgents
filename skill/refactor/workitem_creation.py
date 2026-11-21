@@ -13,6 +13,8 @@ Provides:
   - build_finding_key() / parse_finding_key(): Build and parse the exact
     ``<code>:<repo-relative-path>`` identity carried in each item.
   - compute_content_fingerprint(): sha256 of the target file content + rule.
+  - build_verification_command(): exact linter command that reproduces a
+    finding (recorded so a later sweep can re-verify it).
   - severity_to_priority(): Map smell severity to work item priority.
   - build_smell_title(): Generate a work item title from a smell.
   - build_smell_description(): Generate a work item description from a smell.
@@ -82,6 +84,18 @@ REFACTOR_COMMENT_PATTERN = re.compile(
 FINDING_KEY_MARKER = "Refactor-Finding-Key:"
 FINGERPRINT_MARKER = "Refactor-Fingerprint:"
 AFFECTED_LINES_MARKER = "Refactor-Affected-Lines:"
+
+# Exact linter command that reproduces the finding, recorded so a later
+# re-verification sweep can re-run it verbatim instead of guessing
+# (SA-0MW7Z1JCE009G6J3 AC1). Only linter-derived findings carry one.
+VERIFICATION_CMD_MARKER = "Refactor-Verification-Command:"
+
+# Ruff rule codes are an upper-case letter prefix followed by digits
+# (e.g. ``S112``, ``SIM117``, ``PLW1510``). Only a code in this shape can be
+# turned into a ``ruff check --select <RULE>`` command; anything else (an
+# eslint kebab-case rule, an LLM smell type) is left without one so the
+# sweep reports it ``unverifiable`` rather than guessing wrong.
+_RUFF_CODE_RE = re.compile(r"^[A-Z]{1,6}[0-9]{1,4}$")
 
 # Local parser for the identity marker, mirroring the audit-side
 # ``CFP-Chore-Key`` precedent: one ``wl list`` call, then a regex parse here.
@@ -243,6 +257,48 @@ def compute_content_fingerprint(
     return digest.hexdigest()
 
 
+def build_verification_command(
+    smell: dict[str, Any], repo_root: str | None = None
+) -> str:
+    """Build the exact linter command that reproduces a finding.
+
+    The command is the one a re-verification sweep re-runs to decide whether
+    the finding still reproduces (SA-0MW7Z1JCE009G6J3 AC1). It is recorded
+    verbatim on the work item so the sweep never has to guess the rule/path
+    from a title.
+
+    Only ruff diagnostics are supported: the rule code must look like a ruff
+    code (``S112``/``SIM117``/``PLW1510``) and the smell must be linter-derived
+    (``source == "linter"`` or an explicit ``linter`` field). Anything else
+    returns an empty string so the item is reported ``unverifiable`` rather
+    than closed on a command that cannot reproduce the finding.
+
+    Args:
+        smell: A smell finding dict with ``code`` and ``file`` keys.
+        repo_root: Optional repository root used to normalise an absolute
+            ``file`` path to a repository-relative one.
+
+    Returns:
+        A command string such as ``ruff check --isolated --select S112
+        skill/x.py``, or ``""`` when no safe command can be built.
+    """
+    code = str(smell.get("code") or "").strip()
+    if not code or not _RUFF_CODE_RE.match(code):
+        return ""
+
+    linter = str(smell.get("linter") or "").strip().lower()
+    source = str(smell.get("source") or "").strip().lower()
+    if not linter and source != "linter":
+        return ""
+    if linter and linter != "ruff":
+        return ""
+
+    path = _repo_relative_path(smell.get("file", ""), repo_root)
+    if not path:
+        return ""
+    return f"ruff check --isolated --select {code} {path}"
+
+
 def _parse_audit_fp_title(title: str) -> dict[str, str] | None:
     """Parse an audit false-positive chore title into ``{code, path}``.
 
@@ -350,6 +406,7 @@ def build_smell_description(
 
     finding_key = build_finding_key(smell, repo_root)
     fingerprint = compute_content_fingerprint(smell, repo_root)
+    verification_command = build_verification_command(smell, repo_root)
     affected_lines = _affected_lines(smell)
 
     # Identity markers sit immediately below the heading so that title
@@ -361,6 +418,8 @@ def build_smell_description(
     ]
     if fingerprint:
         parts.append(f"{FINGERPRINT_MARKER} {fingerprint}")
+    if verification_command:
+        parts.append(f"{VERIFICATION_CMD_MARKER} {verification_command}")
     if affected_lines:
         rendered_lines = ", ".join(str(n) for n in affected_lines)
         parts.append(f"{AFFECTED_LINES_MARKER} {rendered_lines}")

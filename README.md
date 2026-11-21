@@ -86,7 +86,14 @@ the pushed commit's **tree** SHA (`fingerprint_kind="tree"`), so a green
 checkout's own `HEAD` plus its dirty `.worklog/` churn, or a loose worktree
 entry — cannot satisfy the gate, while a tree-keyed verdict recorded for the
 same tree by another consumer (the finish gate) is reused instead of re-running
-the suite. If no clean checkout holds the commit, or the pushed tree SHA cannot
+the suite. A push that loses the non-fast-forward race and is rebased onto the
+advanced `dev` gets a new tree but the **same patch**, so the runner also keys
+the verdict on the change set
+(`fingerprint_kind="change_set"`, SA-0MWFJS9OL001ZTTC): the rebased push
+serves the pre-race verdict (`reused_from_tree=<measured tree>`) instead of
+paying for another full suite, while any content difference — ours or an
+upstream change to a file the patch touches — is a miss and really runs. If no
+clean checkout holds the commit, or the pushed tree SHA cannot
 be computed, the push is refused and the message names the commit, the remote
 ref, the remedy and the `TEST_SCOPE_SKIP=1` escape hatch. The gate prints the
 tree it validated and the cache verdict (`gate-subject` / `gate-root` /

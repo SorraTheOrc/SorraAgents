@@ -97,6 +97,32 @@ class TestFinishLockAndVerifiedSyncDocs:
         assert "stale lock file cannot block a later finish" in section
         assert "indefinite wait is rejected" in section
 
+    def test_documents_a_single_bounded_wait_instead_of_a_retry_loop(self) -> None:
+        """The finish-lock guidance is one call that waits internally.
+
+        Regression for the 2026-11-13 AI_Hell shape: an agent hand-rolled
+        ``for attempt in 1..8; finish …; wait_for_job.py`` and spent 45
+        minutes absorbing five lock holders (SA-0MWFJS65O005JMJF). The skill
+        must teach the single bounded internal wait and must not contain a
+        bespoke finish retry loop.
+        """
+        skill = _normalised(_SKILL_MD)
+        assert "never a retry loop" in skill
+        assert "IMPLEMENT_FINISH_LOCK_TIMEOUT" in skill
+        assert "15 minutes" in skill
+        # No *executable* bespoke finish retry loop: the guidance may describe
+        # the anti-pattern it forbids, but never as runnable code.
+        assert not re.search(
+            r"for attempt in (?:range\(|\d)", _skill_content()
+        ), "the implement skill must not teach a bespoke finish retry loop"
+
+        section = _finish_refusal_section()
+        assert "bounded internal wait" in section
+        assert "IMPLEMENT_FINISH_LOCK_TIMEOUT" in section
+        assert "retry loops" in section
+        assert "current holder" in section
+        assert "SIGINT" in section and "SIGTERM" in section
+
     def test_documents_the_verified_reversible_advance(self) -> None:
         section = _finish_refusal_section()
         assert "git merge --ff-only" in section

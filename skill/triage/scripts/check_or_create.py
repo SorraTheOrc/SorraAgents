@@ -33,6 +33,61 @@ from scripts.failure_notice import FailureNotice
 from test_runner import canonicalize_quiet_pytest_command
 
 # ---------------------------------------------------------------------------
+# Phantom-verdict suppression (WL-0MVSPZ1FH000RWET)
+# ---------------------------------------------------------------------------
+
+#: Runner notice codes that identify a **phantom** verdict: the suite's
+#: failures exist in no single commit because the executing checkout moved
+#: while it ran (a sibling ``implement.py finish`` fast-forwarded local
+#: ``dev``), so minting a critical ``test-failure`` item from that output is
+#: noise (WL-0MVSPZ1FH000RWET AC3).
+PHANTOM_NOTICE_CODES = frozenset({"state_changed_during_run"})
+
+
+def detect_phantom(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return suppression facts when *payload* is a known phantom verdict.
+
+    Deliberately conservative (WL-0MVSPZ1FH000RWET AC3): suppression fires
+    only on an **explicit** signal supplied by the runner, never on inferred
+    similarity between outputs, so a genuine failure on a stable checkout can
+    never be swallowed. Recognised signals, in order:
+
+    * ``phantom: true`` — an explicit flag from a caller that already proved
+      the verdict is mixed-tree (``phantom_reason`` is optional detail);
+    * ``notice_code`` in :data:`PHANTOM_NOTICE_CODES`;
+    * a truthy ``state_changed_during_run`` notice emitted by
+      :func:`test_cache.run_cached` / the test skill's aggregate.
+
+    Args:
+        payload: The triage request payload.
+
+    Returns:
+        ``{"reason": <str>, "notice_code": <str>}`` when the payload is a
+        known phantom, or ``None`` to continue with normal triage.
+    """
+    if payload.get("phantom") is True:
+        return {
+            "reason": payload.get("phantom_reason")
+            or "explicit phantom flag supplied by the caller",
+            "notice_code": payload.get("notice_code") or "explicit_phantom",
+        }
+    notice_code = payload.get("notice_code")
+    if notice_code in PHANTOM_NOTICE_CODES:
+        return {
+            "reason": f"runner notice {notice_code} (mixed-tree verdict)",
+            "notice_code": notice_code,
+        }
+    if payload.get("state_changed_during_run"):
+        return {
+            "reason": (
+                "the executing checkout moved mid-run "
+                "(state_changed_during_run); the failures exist in no single tree"
+            ),
+            "notice_code": "state_changed_during_run",
+        }
+    return None
+
+# ---------------------------------------------------------------------------
 # WL CLI helpers
 # ---------------------------------------------------------------------------
 
@@ -364,6 +419,29 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
 
     Supports parent_work_item_id to create child work items for test failures.
     """
+    # Phantom suppression runs before any lookup or creation: a mixed-tree
+    # verdict must never mint (or enhance) a critical test-failure item, and
+    # the suppression reason is returned so the caller can record it
+    # (WL-0MVSPZ1FH000RWET AC3).
+    phantom = detect_phantom(payload)
+    if phantom is not None:
+        emit_event(
+            "triage.issue.suppressed",
+            {
+                "testName": payload.get("test_name"),
+                "reason": phantom["reason"],
+                "noticeCode": phantom["notice_code"],
+            },
+        )
+        return {
+            "suppressed": True,
+            "created": False,
+            "issueId": None,
+            "matchedId": None,
+            "reason": f"suppressed_phantom ({phantom['reason']})",
+            "notice_code": phantom["notice_code"],
+        }
+
     # Parse input — support both flat and nested failure_signature formats
     sig = payload.get("failure_signature", {})
     test_name = payload.get("test_name") or sig.get("test_name")

@@ -11,11 +11,15 @@ Covers the promotion of the audit runner's prefix-to-sibling scan into
   - ``resolve_worklog_flags`` precedence: explicit ``--worklog-dir`` >
     prefix-to-sibling scan > cwd-chain (``worklog_dir_flag``) > no flag.
   - ``run_wl`` injects the resolved flags from a non-project cwd.
+  - ``_detect_worklog_dir`` / ``worklog_dir_flag`` ancestor walk under the
+    implement-worktree layout (initialised-only candidates, no
+    ``.worklog/.worklog`` nesting; SA-0MW0JHMJE006GWQB).
 """  # noqa: EXE001
 from __future__ import annotations
 
 import json
 import sys
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -378,3 +382,130 @@ class TestRunWlInjection:
             )
 
         assert recorded[0] == ["wl", "show", "SA-0MSABC7SB001NVUN", "--json"]
+
+
+# ===========================================================================
+# Worklog-dir ancestor walk under the implement-worktree layout
+# (SA-0MW0JHMJE006GWQB)
+# ===========================================================================
+
+
+def _mk_initialized_store(tmp_path: Path, name: str = "main") -> Path:
+    """Create an initialized ``<tmp>/<name>/.worklog`` store; return it."""
+    store = tmp_path / name / ".worklog"
+    store.mkdir(parents=True)
+    (store / "initialized").write_text("{}", encoding="utf-8")
+    return store
+
+
+class TestWorklogDirAncestorWalk:
+    """AC4: hermetic regression tests for the ancestor-walk rule.
+
+    A cwd inside ``<main>/.worklog/worktrees/wl-<id>-<slug>`` must resolve
+    the main checkout's initialised store — never ``<main>/.worklog``
+    extended to ``<main>/.worklog/.worklog``, and never a worktree's
+    committed ``config.yaml``-only copy. All layouts use ``tmp_path`` +
+    mocks: no real ``git worktree``, no network.
+    """
+
+    def _point_cwd(self, monkeypatch, path: Path) -> None:
+        """Point ``Path.cwd`` at *path* (no real chdir; hermetic)."""
+        monkeypatch.setattr(
+            status_lifecycle.Path,
+            "cwd",
+            classmethod(lambda cls: path),
+        )
+
+    def _git_toplevel(self, fake_stdout: str = "", returncode: int = 1):
+        """Mock ``subprocess.run`` for the git-toplevel resolution."""
+        return mock.patch.object(
+            status_lifecycle.subprocess,
+            "run",
+            return_value=SimpleNamespace(
+                returncode=returncode,
+                stdout=fake_stdout,
+                stderr="",
+            ),
+        )
+
+    def test_worktree_root_with_stale_nested_worklog(self, monkeypatch, tmp_path):
+        """AC1+AC2: worktree root + stale <main>/.worklog/.worklog.
+
+        cwd = ``<main>/.worklog/worktrees/wl-<id>-<slug>`` with no
+        ``.worklog`` inside the worktree; a stale
+        ``<main>/.worklog/.worklog`` (only ``worktrees/`` inside) exists.
+        The walk must resolve the initialised ``<main>/.worklog`` — it must
+        never build the ``.worklog/.worklog`` double suffix.
+        """
+        store = _mk_initialized_store(tmp_path)  # <main>/.worklog (init)
+        stale = store / ".worklog" / "worktrees"
+        (stale / "wl-STALE").mkdir(parents=True)  # stale nested copy
+        wt = store / "worktrees" / "wl-ITEM-abc"
+        wt.mkdir(parents=True)  # no .worklog inside the worktree
+
+        self._point_cwd(monkeypatch, wt)
+        with self._git_toplevel(fake_stdout=str(wt) + "\n", returncode=0):
+            assert status_lifecycle._detect_worklog_dir() == store
+            assert status_lifecycle.worklog_dir_flag() == [
+                "--worklog-dir", str(store),
+            ]
+
+    def test_worktree_subdir_skips_uninitialized_committed_copy(self, monkeypatch, tmp_path):
+        """AC3: worktree subdir with a config.yaml-only committed .worklog.
+
+        cwd = ``<wt>/skill``; the worktree root carries a committed
+        ``.worklog/`` holding only ``config.yaml`` (never initialised) and
+        ``git rev-parse --show-toplevel`` returns the worktree root. The
+        uninitialised candidate must be skipped and the walk must continue
+        to the nearest initialised ancestor (the main checkout's store).
+        """
+        store = _mk_initialized_store(tmp_path)  # <main>/.worklog (init)
+        wt = store / "worktrees" / "wl-ITEM"
+        (wt / ".worklog").mkdir(parents=True)
+        (wt / ".worklog" / "config.yaml").write_text(
+            "projectName: Some Project\nprefix: XYZ\n", encoding="utf-8"
+        )
+        cwd = wt / "skill"
+        cwd.mkdir(parents=True)
+
+        self._point_cwd(monkeypatch, cwd)
+        with self._git_toplevel(fake_stdout=str(wt) + "\n", returncode=0):
+            assert status_lifecycle._detect_worklog_dir() == store
+            assert status_lifecycle.worklog_dir_flag() == [
+                "--worklog-dir", str(store),
+            ]
+
+    def test_plain_nested_project_still_resolves(self, monkeypatch, tmp_path):
+        """AC4(c): plain nested project cwd resolves exactly as before.
+
+        No ``.worklog`` between cwd and the project root; git toplevel is
+        the project root. The initialised store at the git root is returned
+        (no regression).
+        """
+        store = _mk_initialized_store(tmp_path, name="proj")  # <proj>/.worklog
+        cwd = store.parent / "a" / "b"
+        cwd.mkdir(parents=True)
+
+        self._point_cwd(monkeypatch, cwd)
+        with self._git_toplevel(fake_stdout=str(store.parent) + "\n", returncode=0):
+            assert status_lifecycle._detect_worklog_dir() == store
+            assert status_lifecycle.worklog_dir_flag() == [
+                "--worklog-dir", str(store),
+            ]
+
+    def test_no_initialized_store_returns_no_flag(self, monkeypatch):
+        """AC3: nothing initialised anywhere -> [] / None (fail closed)."""
+        clean_cwd = Path(f"/__no-wl-{uuid.uuid4().hex}__/a/b")
+        self._point_cwd(monkeypatch, clean_cwd)
+        with self._git_toplevel(returncode=1):
+            assert status_lifecycle._detect_worklog_dir() is None
+            assert status_lifecycle.worklog_dir_flag() == []
+
+    def test_candidate_helper_never_double_suffixes(self, tmp_path):
+        """AC2: a ``.worklog``-named path is its own candidate."""
+        main = tmp_path / "main"
+        store = main / ".worklog"
+        store.mkdir(parents=True)
+        assert status_lifecycle._worklog_candidate(store) == store
+        assert status_lifecycle._worklog_candidate(main) == main / ".worklog"
+        assert status_lifecycle._worklog_candidate(main / "sub") == main / "sub" / ".worklog"

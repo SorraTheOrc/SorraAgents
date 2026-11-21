@@ -834,6 +834,13 @@ class TestChildPersistFailureFatal:
                     "Repository index (top-level layout):\n- src/ (42 files)"
                 ),
             ),
+            # The scope guards are out of scope for these child-persist tests:
+            # a Phase 1 scope error is now FATAL (SA-0MWO59IMN000RUHM) and would
+            # abort before the child is ever audited, hiding the behaviour under
+            # test. An empty touched set keeps both guards fail-open.
+            mock.patch.object(
+                audit_runner, "_resolve_touched_files", return_value=[]
+            ),
             mock.patch.object(
                 audit_runner, "_call_pi_and_maybe_log", side_effect=_fake_pi
             ),
@@ -1373,4 +1380,594 @@ class TestStaleSiblingIsolation:
         assert (
             audit_runner._resolve_owning_project_root("TEST-1")
             == audit_runner.TARGET_PROJECT_ROOT
+        )
+
+
+# ===========================================================================
+# AC1 (LP-0MWDDRTHE00981PK): cross-repo code-root — a work item tracked in
+# worklog repo A whose code lives in repo B is audited with the explicit
+# ``--code-root <repo-B>`` so every git-derived surface (merge gate,
+# file-scope manifest, changed files, green-run evidence, code-quality
+# scope) resolves against B while all wl reads/writes stay on A's worklog.
+#
+# TEST-FIRST CONTRACT — expected red until the implementation items land
+# (LP-0MWDDRVQ7005KOHN ``--code-root``/per-audit-root wiring, LP-0MWDDRWBG0013CS1
+# cross-repo detection). The markers were removed once the production
+# change landed (LP-0MWDDRVQ7005KOHN --code-root / AUDIT_CODE_ROOT wiring).
+# ===========================================================================
+
+#: Item description used by the cross-repo fixture: Key Files live in code
+#: repo B (``src/codeb/feature.py``); no Acceptance Criteria heading, so the
+#: Phase 1 parent screen is skipped (no pi invocation — the flow stays
+#: hermetic while the git-derived scope is still exercised).
+_CROSS_REPO_DESCRIPTION = (
+    "## Key Files (predicted)\n"
+    "- `src/codeb/feature.py`\n"
+)
+
+
+def _make_cross_repo_pair(tmp_path: Path, prefix: str = "OSL"):
+    """Create TWO real temp git repos: worklog repo A + code repo B.
+
+    Layout::
+
+        <tmp>/projects/llm/                  (repo A — worklog owner)
+            .worklog/config.yaml             (prefix: OSL)
+            .gitignore                       (ignores .worklog/)
+            admin/registry.txt               (A-only distinctive marker)
+        <tmp>/projects/code/                 (repo B — code repo)
+            src/codeb/feature.py             (Key File; commit msg: OSL-1)
+            src/codeb/wip.py                 (uncommitted working-tree change)
+
+    Creates real git repositories for BOTH A and B (the AC1 contract demands
+    two real temp git repos). The ``wl-OSL-1-feature`` branch in B gives the
+    merge gate resolvable integration evidence inside B; B has no ``dev``
+    baseline, so the gate fails open and never attempts a push.
+
+    Returns ``(worklog_dir, repo_a_root, repo_b_root)``.
+    """
+    projects = tmp_path / "projects"
+    # Repo A — the worklog-owning project (real git repo).
+    repo_a = projects / "llm"
+    (repo_a / "admin").mkdir(parents=True)
+    (repo_a / "admin" / "registry.txt").write_text("a-registry\n")
+    (repo_a / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    worklog_dir = repo_a / ".worklog"
+    worklog_dir.mkdir()
+    (worklog_dir / "config.yaml").write_text(
+        f"projectName: LLM\nprefix: {prefix}\n", encoding="utf-8"
+    )
+    init_repo(repo_a, default_branch="main", sandbox_root=tmp_path)
+    commit_all(repo_a, "worklog repo initial")
+
+    # Repo B — the code repository the item's delivered files live in.
+    repo_b = projects / "code"
+    (repo_b / "src" / "codeb").mkdir(parents=True)
+    (repo_b / "src" / "codeb" / "feature.py").write_text("x = 1\n")
+    init_repo(repo_b, default_branch="main", sandbox_root=tmp_path)
+    commit_all(repo_b, "OSL-1: add codeb feature")
+    # Merge-gate integration evidence lives in B (a wl-<id>-* branch).
+    run_git(repo_b, ["branch", "wl-OSL-1-feature"], check=True)
+    # Uncommitted working-tree change so changed-files resolution is exercised.
+    (repo_b / "src" / "codeb" / "wip.py").write_text("y = 2\n")
+
+    return worklog_dir, repo_a, repo_b
+
+
+class TestCrossRepoCodeRoot:
+    """AC1 (LP-0MWDDRTHE00981PK): ``--code-root`` decouples the git-derived
+    audit scope from the worklog-owning repository.
+
+    Work item ``OSL-1`` is tracked in worklog repo A; its delivered code
+    lives in repo B. Audited with the explicit code root, every git-derived
+    surface (merge gate, file-scope manifest, changed files, green-run
+    evidence, code-quality scope) must resolve against B while all wl
+    reads/writes still target A's worklog — the two roots are independent.
+    """
+
+    def test_cross_repo_code_root_resolves_git_scope_to_code_repo(
+        self, tmp_path,
+    ):
+        """AC1: with ``--code-root <B>`` the merge gate, file-scope manifest,
+        changed files, green-run evidence and code-quality scope all resolve
+        against repo B, while every wl read/write stays on worklog repo A.
+        """
+        worklog_a, repo_a, repo_b = _make_cross_repo_pair(tmp_path)
+        repo_b_head = run_git(
+            repo_b, ["rev-parse", "HEAD"], check=True
+        ).stdout.strip()
+        recorded: list[list[str]] = []
+        runner = _make_minimal_runner(
+            recorded, description=_CROSS_REPO_DESCRIPTION, git_cwd=repo_b,
+        )
+        mock_cq = mock.MagicMock(
+            return_value={"success": True, "findings": [], "fixes_applied": 0}
+        )
+
+        with (
+            # Launch from the worklog owner (repo A); code root is repo B.
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", repo_a),
+            mock.patch.object(
+                audit_runner, "_auto_green_run_outcome",
+                wraps=audit_runner._auto_green_run_outcome,
+            ) as auto_spy,
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality", mock_cq
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True, runner=runner,
+                worklog_dir=str(worklog_a), code_root=str(repo_b),
+            )
+
+        assert rc == 0, "cross-repo audit with --code-root must exit green"
+
+        # -- Merge gate, changed files, manifest, HEAD: every git command
+        # issued by the runner resolves against code repo B (never A / the
+        # launch root).
+        git_cmds = [c for c in recorded if c and c[0] == "git"]
+        assert git_cmds, "expected the cross-repo audit to run git commands"
+        for git_cmd in git_cmds:
+            assert git_cmd[1] == "-C", f"git command lacks -C: {git_cmd}"
+            assert Path(git_cmd[2]).resolve() == repo_b.resolve(), (
+                f"git command must resolve against code repo B: {git_cmd}"
+            )
+        # The merge gate's ref scan runs against B.
+        assert any(
+            "for-each-ref" in " ".join(cmd) for cmd in git_cmds
+        ), "merge gate must run for-each-ref against code repo B"
+        # Audited HEAD is code repo B's HEAD.
+        assert audit_runner._resolve_audited_head(runner) == repo_b_head
+
+        # -- Green-run evidence resolves the test-cache cwd to B.
+        assert auto_spy.called, "expected the automatic green-run path to run"
+        assert Path(
+            auto_spy.call_args.kwargs["cwd"]
+        ).resolve() == repo_b.resolve(), (
+            "green-run evidence must resolve against code repo B"
+        )
+
+        # -- Code-quality scope resolves to B and references B's files
+        # (either the changed-files path or the touched/Key-Files path —
+        # both must stay inside code repo B).
+        mock_cq.assert_called_once()
+        assert Path(
+            mock_cq.call_args.kwargs["project_root"]
+        ).resolve() == repo_b.resolve(), (
+            "code-quality scope must target code repo B"
+        )
+        assert any(
+            "src/codeb/" in str(f)
+            for f in mock_cq.call_args.kwargs.get("files", [])
+        ), "code-quality scope must reference code repo B's files"
+
+        # -- File-scope manifest resolves to B: B's Key File and B's repo
+        # index appear; worklog repo A's marker never does.
+        with mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", repo_b):
+            manifest = audit_runner._build_file_scope_manifest(
+                {"id": "OSL-1", "description": _CROSS_REPO_DESCRIPTION},
+                [], runner=runner, project_root=repo_b,
+            )
+        assert "src/codeb/feature.py" in manifest, manifest
+        assert "src/" in manifest, f"manifest lacks code repo B's index: {manifest}"
+        assert "admin" not in manifest, (
+            f"manifest must not leak worklog repo A's marker: {manifest}"
+        )
+
+        # -- Changed files resolve to B's working tree.
+        with mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", repo_b):
+            changed = audit_runner._git_changed_files(runner)
+        assert "src/codeb/wip.py" in changed, (
+            f"changed files must reflect code repo B: {changed}"
+        )
+
+        # -- wl reads/writes all target worklog repo A — never repo B.
+        wl_cmds = [c for c in recorded if c and c[0] == "wl"]
+        assert wl_cmds, "expected wl commands from the cross-repo audit"
+        for wl_cmd in wl_cmds:
+            assert "--worklog-dir" in wl_cmd, wl_cmd
+            assert str(worklog_a) in wl_cmd, (
+                f"wl command must target worklog repo A: {wl_cmd}"
+            )
+            assert str(repo_b) not in " ".join(wl_cmd), (
+                f"wl command must never reference the code repo: {wl_cmd}"
+            )
+
+    def test_cli_exposes_code_root_flag(self, tmp_path):
+        """The ``issue`` subcommand parses ``--code-root <dir>`` into a
+        ``code_root`` value (the CLI surface AC1 invokes).
+        """
+        _worklog_a, _repo_a, repo_b = _make_cross_repo_pair(tmp_path)
+        args = audit_runner.build_parser().parse_args([
+            "issue", "OSL-1", "--code-root", str(repo_b),
+        ])
+        assert args.code_root == str(repo_b)
+
+
+# ===========================================================================
+# AC2 (LP-0MWDDRU1P0067SUV): cross-repo DETECTION — without an explicit code
+# root, a work item whose delivered files live only in a SIBLING project's
+# repository must fail CLOSED with a scope error that names the sibling
+# repo, before any Phase 1 model call (zero pi invocations), with a non-zero
+# exit and no persisted report.
+#
+# This is the sibling of the AC1 cross-repo ``--code-root`` test above: AC1
+# proves the explicit code root works; AC2 proves the *absence* of one is
+# refused loudly rather than silently mis-scoped.
+#
+# TEST-FIRST CONTRACT — implemented by LP-0MWDDRWBG0013CS1 "Implement
+# cross-repo detection: fail closed naming sibling candidates". The markers
+# were removed when the production change landed (precedent: LP-0MWDDRTHE00981PK).
+# ===========================================================================
+
+
+#: Item description for the detection fixture: the Key Files exist ONLY in
+#: the sibling code repo. An ``## Acceptance Criteria`` section keeps the
+#: Phase 1 parent screen live (so "zero pi invocations" is a real assertion —
+#: pre-fix the run *would* reach Phase 1 and call pi).
+_CROSS_REPO_DETECTION_DESCRIPTION = (
+    "## Acceptance Criteria\n"
+    "- AC1: the delivered feature behaves as specified.\n"
+    "\n"
+    "## Key Files (predicted)\n"
+    "- `src/codeb/feature.py`\n"
+)
+
+#: Same-repo control description: the Key File lives in the OWNING repo, so
+#: the cross-repo guard must not fire (no false abort).
+_SAME_REPO_DESCRIPTION = (
+    "## Acceptance Criteria\n"
+    "- AC1: the delivered feature behaves as specified.\n"
+    "\n"
+    "## Key Files (predicted)\n"
+    "- `src/app/main.py`\n"
+)
+
+
+def _make_cross_repo_detection_fixture(tmp_path: Path, prefix: str = "OSL"):
+    """Two real temp git repos plus a discoverable sibling scan root.
+
+    Layout::
+
+        <tmp>/projects/
+            llm/                               (repo A — worklog owner)
+                .worklog/config.yaml           (prefix: OSL)
+                .gitignore                     (ignores .worklog/)
+                src/app/main.py                (A's OWN marker; distinctive)
+            code/                              (repo B — sibling code repo)
+                .worklog/config.yaml           (prefix: CODE — scanable)
+                src/codeb/feature.py           (the item's Key File)
+
+    Both are real git repositories on ``main`` (no ``dev`` baseline ⇒ the
+    Phase 1 merge gate fails open, never attempting integration). Repo A
+    carries a ``src/`` marker so its FILE SCOPE manifest is *valid* — the
+    fail-closed assertion therefore cannot be satisfied by the pre-existing
+    manifest scope error; it must come from the new cross-repo detection.
+
+    Returns ``(worklog_a, repo_a, repo_b, patcher)``.
+    """
+    projects = tmp_path / "projects"
+
+    # Repo A — the worklog-owning project (real git repo).
+    repo_a = projects / "llm"
+    (repo_a / "src" / "app").mkdir(parents=True)
+    (repo_a / "src" / "app" / "main.py").write_text("app = 1\n")
+    (repo_a / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    worklog_a = repo_a / ".worklog"
+    worklog_a.mkdir()
+    (worklog_a / "config.yaml").write_text(
+        f"projectName: LLM\nprefix: {prefix}\n", encoding="utf-8"
+    )
+    init_repo(repo_a, default_branch="main", sandbox_root=tmp_path)
+    commit_all(repo_a, "worklog repo initial")
+
+    # Repo B — a SIBLING project whose repository holds the item's files.
+    # Its own .worklog/config.yaml makes it part of the scan population.
+    repo_b = projects / "code"
+    (repo_b / "src" / "codeb").mkdir(parents=True)
+    (repo_b / "src" / "codeb" / "feature.py").write_text("x = 1\n")
+    sibling_worklog = repo_b / ".worklog"
+    sibling_worklog.mkdir()
+    (sibling_worklog / "config.yaml").write_text(
+        "projectName: Code\nprefix: CODE\n", encoding="utf-8"
+    )
+    init_repo(repo_b, default_branch="main", sandbox_root=tmp_path)
+    commit_all(repo_b, "add codeb feature")
+
+    patcher = mock.patch(
+        "shared.status_lifecycle.SIBLING_SCAN_ROOT", projects
+    )
+    return worklog_a, repo_a, repo_b, patcher
+
+
+def _fake_pi_met(issue_id, context, prompt, **kwargs):
+    """Canned Phase 1/2 pi response (met) so a pre-fix run completes."""
+    return {
+        "extracted_text": json.dumps([
+            {"index": 0, "verdict": "met", "evidence": "src/codeb/feature.py:1"},
+        ]),
+    }
+
+
+class TestCrossRepoDetectionFailsClosed:
+    """AC2 (LP-0MWDDRU1P0067SUV): absent an explicit code root, a cross-repo
+    item is refused loudly — naming the sibling repo — before any model call.
+    """
+
+    def _run(self, tmp_path, *, description, recorded=None):
+        worklog_a, repo_a, repo_b, patcher = (
+            _make_cross_repo_detection_fixture(tmp_path)
+        )
+        recorded = [] if recorded is None else recorded
+        pi_mock = mock.MagicMock(side_effect=_fake_pi_met)
+        persist_mock = mock.MagicMock(return_value=0)
+        with (
+            patcher,
+            # Launch from the owning project (repo A), no --code-root.
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", repo_a),
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log", pi_mock,
+            ),
+            mock.patch.object(audit_runner, "persist_audit", persist_mock),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue(
+                "OSL-1", persist=False, force=True,
+                runner=_make_minimal_runner(
+                    recorded=recorded, description=description, git_cwd=repo_a,
+                ),
+                worklog_dir=str(worklog_a),
+            )
+        return rc, pi_mock, persist_mock, repo_b
+
+    def test_cross_repo_item_without_code_root_fails_closed(self, tmp_path,
+                                                            capsys):
+        """AC2/AC3/AC5: no ``--code-root`` on a cross-repo item aborts with a
+        non-zero exit and a scope error that NAMES the sibling repo holding
+        the item's touched files, and no report is emitted.
+        """
+        rc, _pi, persist_mock, repo_b = self._run(
+            tmp_path, description=_CROSS_REPO_DETECTION_DESCRIPTION,
+        )
+        captured = capsys.readouterr()
+        err = captured.err
+
+        assert rc == 1, "a cross-repo item without --code-root must fail closed"
+        # Same style as the existing "Audit scope error" paths.
+        assert "Audit scope error" in err, err
+        # The error names the SIBLING repository that holds the files — the
+        # discriminating signal that this is the cross-repo detection, not the
+        # pre-existing manifest scope error (which names the owning root).
+        assert str(repo_b) in err, (
+            f"scope error must name the sibling code repo {repo_b}: {err}"
+        )
+        # No persisted report, no report text at all (the abort happens
+        # before report assembly).
+        persist_mock.assert_not_called()
+        assert "Ready to close" not in captured.out + err, captured.out
+
+    def test_fail_closed_before_phase1_zero_pi_invocations(self, tmp_path):
+        """AC4: the abort happens BEFORE any Phase 1 model call — zero pi
+        invocations (fail closed, fail fast).
+        """
+        _rc, pi_mock, _persist, _repo_b = self._run(
+            tmp_path, description=_CROSS_REPO_DETECTION_DESCRIPTION,
+        )
+        pi_mock.assert_not_called()
+
+    # -- Controls (must stay green before AND after the change) -------------
+
+    def test_same_repo_item_is_not_rejected(self, tmp_path, capsys):
+        """Guard is not over-eager: an item whose Key Files live in the owning
+        repo proceeds to Phase 1 (pi is called) with no cross-repo abort.
+        """
+        rc, pi_mock, _persist, _repo_b = self._run(
+            tmp_path, description=_SAME_REPO_DESCRIPTION,
+        )
+        err = capsys.readouterr().err
+        assert rc == 0, err
+        assert pi_mock.called, "same-repo item must still reach Phase 1"
+        assert "cross-repo" not in err, err
+
+    def test_undeterminable_touched_set_fails_open(self, tmp_path, capsys):
+        """An undeterminable touched set (no Key Files, no item commits) skips
+        the detection (fail open) — never a false abort.
+        """
+        rc, pi_mock, _persist, _repo_b = self._run(
+            tmp_path,
+            description="## Acceptance Criteria\n- AC1: the thing works.\n",
+        )
+        err = capsys.readouterr().err
+        assert rc == 0, err
+        assert pi_mock.called, "undeterminable scope must not fail closed"
+
+
+# ===========================================================================
+# AC3 (LP-0MWDDRUMH002LRZR): same-repo byte-for-byte contract — a same-repo
+# item (worklog owner IS the code repo) audited WITH an explicit
+# ``--code-root`` pointing at the owning repo must behave byte-for-byte
+# identically to one audited WITHOUT it (identical file-scope manifest, HEAD
+# attestation and verdict); with the flag absent, the resolved code root is
+# the owning project root (default unchanged).
+#
+# This is the control for the AC1/AC2 cross-repo contract: the new option
+# must be a strict no-op when its value equals the default resolution.
+#
+# TEST-FIRST CONTRACT — expected red until the implementation item lands
+# (LP-0MWDDRVQ7005KOHN ``--code-root``/per-audit-root wiring). Marked
+# ``xfail(strict=False)`` so the suite stays green while the contract is
+# documented; the markers were removed once the production change landed
+# (LP-0MWDDRVQ7005KOHN --code-root / AUDIT_CODE_ROOT).
+# ===========================================================================
+
+
+def _make_same_repo_fixture(tmp_path: Path, prefix: str = "OSL"):
+    """One real git repo where the worklog owner IS the code repo.
+
+    Layout::
+
+        <tmp>/projects/llm/                  (repo — worklog owner + code)
+            .worklog/config.yaml             (prefix: OSL)
+            .gitignore                       (ignores .worklog/)
+            src/app/main.py                  (Key File; commit msg: OSL-1)
+            src/app/wip.py                   (uncommitted working-tree change)
+
+    Returns ``(worklog_dir, repo_root)``. ``main`` has no ``dev`` baseline,
+    so the merge gate fails open and never attempts an integration push.
+    """
+    projects = tmp_path / "projects"
+    repo = projects / "llm"
+    (repo / "src" / "app").mkdir(parents=True)
+    (repo / "src" / "app" / "main.py").write_text("app = 1\n")
+    (repo / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    worklog_dir = repo / ".worklog"
+    worklog_dir.mkdir()
+    (worklog_dir / "config.yaml").write_text(
+        f"projectName: LLM\nprefix: {prefix}\n", encoding="utf-8"
+    )
+    init_repo(repo, default_branch="main", sandbox_root=tmp_path)
+    commit_all(repo, "OSL-1: add app main")
+    # Merge-gate integration evidence lives in the owning repo itself.
+    run_git(repo, ["branch", "wl-OSL-1-feature"], check=True)
+    # Uncommitted working-tree change so changed-files + code-quality scope
+    # resolution are exercised (deterministic across both runs).
+    (repo / "src" / "app" / "wip.py").write_text("wip = 2\n")
+    return worklog_dir, repo
+
+
+class TestSameRepoCodeRootByteForByte:
+    """AC3 (LP-0MWDDRUMH002LRZR): a same-repo item's behaviour is
+    byte-for-byte unchanged with and without the new ``--code-root`` option.
+    """
+
+    def _capture_run(
+        self, worklog_dir: Path, repo: Path, *, code_root: str | None,
+    ) -> dict:
+        """Run the same-repo item once, capturing the run's artefacts.
+
+        Returns ``{"rc", "manifests", "heads", "pi_calls", "git_cmds"}``:
+        the exit code, every file-scope manifest built, every HEAD sha
+        resolved, every pi ``(context, prompt)`` pair sent (the deterministic
+        verdict inputs), and the git command stream the runner executed.
+        """
+        manifests: list[str] = []
+        heads: list[str] = []
+        pi_calls: list[tuple[str, str]] = []
+        recorded: list[list[str]] = []
+        real_build = audit_runner._build_file_scope_manifest
+        real_head = audit_runner._resolve_audited_head
+
+        def recording_build(*args, **kwargs):
+            manifest = real_build(*args, **kwargs)
+            manifests.append(manifest)
+            return manifest
+
+        def recording_head(runner):
+            head = real_head(runner)
+            heads.append(head)
+            return head
+
+        def recording_pi(issue_id, context, prompt, **kwargs):
+            pi_calls.append((context, prompt))
+            return _fake_pi_met(issue_id, context, prompt, **kwargs)
+
+        cmd_kwargs = {
+            "persist": False, "force": True,
+            "runner": _make_minimal_runner(
+                recorded, description=_SAME_REPO_DESCRIPTION,
+                git_cwd=repo,
+            ),
+            "worklog_dir": str(worklog_dir),
+        }
+        if code_root is not None:
+            cmd_kwargs["code_root"] = code_root
+        with (
+            # Launch from the owning project root; the item's Key Files live
+            # in this same repo (the same-repo case).
+            mock.patch.object(audit_runner, "TARGET_PROJECT_ROOT", repo),
+            mock.patch.object(
+                audit_runner, "_build_file_scope_manifest",
+                side_effect=recording_build,
+            ),
+            mock.patch.object(
+                audit_runner, "_resolve_audited_head",
+                side_effect=recording_head,
+            ),
+            mock.patch.object(
+                audit_runner, "_call_pi_and_maybe_log",
+                side_effect=recording_pi,
+            ),
+            mock.patch(
+                "code_review.scripts.code_quality.run_code_quality",
+                return_value={"success": True, "findings": [],
+                              "fixes_applied": 0},
+            ),
+        ):
+            rc = audit_runner.cmd_issue("OSL-1", **cmd_kwargs)
+        return {
+            "rc": rc,
+            "manifests": manifests,
+            "heads": heads,
+            "pi_calls": pi_calls,
+            "git_cmds": [c for c in recorded if c and c[0] == "git"],
+        }
+
+    def test_same_repo_byte_for_byte_with_and_without_code_root(self, tmp_path):
+        """AC3: the SAME same-repo item run twice — once with an explicit
+        ``--code-root <owning-root>``, once without — yields byte-for-byte
+        identical file-scope manifests, HEAD attestations, verdict inputs
+        (the pi context/prompt stream) and git command streams.
+        """
+        worklog_dir, repo = _make_same_repo_fixture(tmp_path)
+        with_flag = self._capture_run(
+            worklog_dir, repo, code_root=str(repo),
+        )
+        without_flag = self._capture_run(worklog_dir, repo, code_root=None)
+
+        assert with_flag["rc"] == 0, (
+            "same-repo audit with --code-root must exit green"
+        )
+        assert without_flag["rc"] == 0, (
+            "same-repo audit without --code-root must exit green"
+        )
+        # Byte-for-byte: identical file-scope manifest(s), HEAD attestation(s)
+        # and pi (context, prompt) stream — identical verdict inputs produce
+        # the identical verdict.
+        assert with_flag["manifests"] == without_flag["manifests"], (
+            "file-scope manifest must be byte-for-byte identical"
+        )
+        assert with_flag["heads"] == without_flag["heads"], (
+            "HEAD attestation must be byte-for-byte identical"
+        )
+        assert with_flag["pi_calls"] == without_flag["pi_calls"], (
+            "verdict inputs (pi context/prompt stream) must be identical"
+        )
+        # The git command stream is unchanged too — the option is a strict
+        # no-op when it equals the default resolution.
+        assert with_flag["git_cmds"] == without_flag["git_cmds"], (
+            "git command stream must be byte-for-byte identical"
+        )
+
+    def test_default_code_root_is_owning_project_root(self, tmp_path):
+        """AC3: with the flag ABSENT the resolved code root is the owning
+        project root (default unchanged) — every HEAD resolved during the
+        run attests the owning repo, never a foreign repository.
+        """
+        worklog_dir, repo = _make_same_repo_fixture(tmp_path)
+        repo_head = run_git(
+            repo, ["rev-parse", "HEAD"], check=True
+        ).stdout.strip()
+        result = self._capture_run(worklog_dir, repo, code_root=None)
+
+        assert result["rc"] == 0
+        assert result["heads"], (
+            "expected at least one HEAD attestation during the run"
+        )
+        assert all(head == repo_head for head in result["heads"]), (
+            f"default code root must be the owning project root "
+            f"({repo_head}): {result['heads']}"
         )

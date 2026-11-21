@@ -472,6 +472,264 @@ def test_merge_agent_config_end_to_end(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Retired-id prune (SA-0MWL5AL4B004X0FN)
+# ---------------------------------------------------------------------------
+
+RETIRED_MODELS = {
+    "LocalProxy": ["qwen3", "gpt120"],
+    "opencode-go": ["qwen3.6-plus", "qwen3.7-max"],
+}
+
+RETIRED_ENABLED = ["MunitoAI/*"]
+
+TRACKED_MODELS_RETIRED = {
+    "providers": {
+        "LocalProxy": {"models": [{"id": "plan"}, {"id": "code"}]},
+        "opencode-go": {
+            "modelOverrides": {
+                "qwen3.7-plus": {"thinkingLevelMap": {"high": "high"}},
+                "qwen3.8-max": {"thinkingLevelMap": {"high": "high"}},
+            }
+        },
+    }
+}
+
+DEST_MODELS_RETIRED = {
+    "providers": {
+        "LocalProxy": {
+            "models": [
+                {"id": "plan"},
+                {"id": "qwen3"},
+                {"id": "gpt120"},
+                {"id": "local-keep", "name": "keep me"},
+            ]
+        },
+        "opencode-go": {
+            "modelOverrides": {
+                "qwen3.6-plus": {"stale": True},
+                "qwen3.7-max": {"stale": True},
+                "local-only": {"thinkingLevelMap": {"high": "max"}},
+            }
+        },
+        "LocalOnly": {
+            "api": "openai-completions",
+            "models": [{"id": "private-model"}],
+        },
+    }
+}
+
+
+def test_prune_retired_models_removes_ids_and_override_keys() -> None:
+    merged, report = merge_models_document(
+        TRACKED_MODELS_RETIRED, DEST_MODELS_RETIRED, RETIRED_MODELS
+    )
+
+    local_ids = [m["id"] for m in merged["providers"]["LocalProxy"]["models"]]
+    assert "qwen3" not in local_ids
+    assert "gpt120" not in local_ids
+    overrides = merged["providers"]["opencode-go"]["modelOverrides"]
+    assert "qwen3.6-plus" not in overrides
+    assert "qwen3.7-max" not in overrides
+    # The merge summary reports exactly what was pruned.
+    assert report["pruned"]["LocalProxy"] == ["gpt120", "qwen3"]
+    assert report["pruned"]["opencode-go"] == ["qwen3.6-plus", "qwen3.7-max"]
+
+
+def test_prune_retired_models_preserves_unlisted_local_only_entries() -> None:
+    merged, _ = merge_models_document(
+        TRACKED_MODELS_RETIRED, DEST_MODELS_RETIRED, RETIRED_MODELS
+    )
+
+    # An unlisted local-only provider, model and override survive verbatim.
+    assert merged["providers"]["LocalOnly"] == DEST_MODELS_RETIRED["providers"]["LocalOnly"]
+    local_models = {
+        m["id"]: m for m in merged["providers"]["LocalProxy"]["models"]
+    }
+    assert local_models["local-keep"] == {"id": "local-keep", "name": "keep me"}
+    overrides = merged["providers"]["opencode-go"]["modelOverrides"]
+    assert overrides["local-only"] == {"thinkingLevelMap": {"high": "max"}}
+    # Retained tracked overrides are present.
+    assert "qwen3.7-plus" in overrides
+    assert "qwen3.8-max" in overrides
+
+
+def test_prune_retired_id_absent_from_dest_is_noop() -> None:
+    tracked = {"providers": {"LocalProxy": {"models": [{"id": "plan"}]}}}
+    dest = {"providers": {"LocalProxy": {"models": [{"id": "plan"}]}}}
+
+    merged, report = merge_models_document(
+        tracked, dest, {"LocalProxy": ["qwen3"]}
+    )
+
+    assert merged == dest
+    assert report["pruned"] == {}
+
+
+def test_merge_models_file_prune_is_idempotent_no_second_backup(
+    tmp_path: Path,
+) -> None:
+    tracked = tmp_path / "tracked_models.json"
+    dest = tmp_path / "models.json"
+    _write(tracked, TRACKED_MODELS_RETIRED)
+    _write(dest, DEST_MODELS_RETIRED)
+
+    first = merge_models_file(
+        tracked,
+        dest,
+        backup_stamp="20260101T000000Z",
+        retired=RETIRED_MODELS,
+    )
+    assert first["changed"] is True
+    assert first["pruned"]["LocalProxy"] == ["gpt120", "qwen3"]
+    first_bytes = dest.read_bytes()
+
+    # A retired id absent from the destination is a no-op, and the re-run does
+    # not duplicate entries or write a second backup.
+    second = merge_models_file(
+        tracked,
+        dest,
+        backup_stamp="20260102T000000Z",
+        retired=RETIRED_MODELS,
+    )
+    assert second["status"] == "unchanged"
+    assert second["changed"] is False
+    assert second["backup"] is None
+    assert second["pruned"] == {}
+    assert dest.read_bytes() == first_bytes
+    assert [b.name for b in tmp_path.glob("models.json.bak.*")] == [
+        "models.json.bak.20260101T000000Z"
+    ]
+
+    # No duplicated model ids after the prune + idempotent re-run.
+    merged = json.loads(dest.read_text(encoding="utf-8"))
+    local_ids = [m["id"] for m in merged["providers"]["LocalProxy"]["models"]]
+    assert len(local_ids) == len(set(local_ids))
+
+
+def test_merge_settings_prunes_retired_pattern_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    tracked = tmp_path / "tracked_settings.json"
+    dest = tmp_path / "settings.json"
+    _write(
+        tracked,
+        {"enabledModels": ["Local Proxy/plan", "deepseek/deepseek*"]},
+    )
+    _write(
+        dest,
+        {
+            "enabledModels": [
+                "Local Proxy/plan",
+                "MunitoAI/deepseek-ai/deepseek-v4-flash",
+                "MunitoAI/*",
+                "deepseek/deepseek*",
+            ],
+            "theme": "dark",
+        },
+    )
+
+    first = merge_settings_file(
+        tracked,
+        dest,
+        backup_stamp="20260101T000000Z",
+        retired=RETIRED_ENABLED,
+    )
+    assert first["changed"] is True
+    assert first["pruned"] == ["MunitoAI/*"]
+
+    merged = json.loads(dest.read_text(encoding="utf-8"))
+    # The glob is removed; the explicit named entry is retained unchanged.
+    assert "MunitoAI/*" not in merged["enabledModels"]
+    assert "MunitoAI/deepseek-ai/deepseek-v4-flash" in merged["enabledModels"]
+    assert merged["theme"] == "dark"
+
+    # Re-running does not re-add the glob (union + prune is idempotent).
+    second = merge_settings_file(
+        tracked,
+        dest,
+        backup_stamp="20260102T000000Z",
+        retired=RETIRED_ENABLED,
+    )
+    assert second["status"] == "unchanged"
+    assert second["changed"] is False
+    assert "MunitoAI/*" not in json.loads(
+        dest.read_text(encoding="utf-8")
+    )["enabledModels"]
+
+
+def test_merge_agent_config_loads_retired_and_reports_prunes(
+    tmp_path: Path,
+) -> None:
+    tracked_dir = tmp_path / "tracked"
+    dest_dir = tmp_path / "dest"
+    tracked_dir.mkdir()
+    dest_dir.mkdir()
+    _write(tracked_dir / "models.json", TRACKED_MODELS_RETIRED)
+    _write(
+        tracked_dir / "settings.json",
+        {"enabledModels": ["Local Proxy/plan", "deepseek/deepseek*"]},
+    )
+    _write(
+        tracked_dir / "retired-models.json",
+        {
+            "retiredModels": RETIRED_MODELS,
+            "retiredEnabledModels": RETIRED_ENABLED,
+        },
+    )
+    _write(dest_dir / "models.json", DEST_MODELS_RETIRED)
+    _write(
+        dest_dir / "settings.json",
+        {"enabledModels": ["Local Proxy/plan", "MunitoAI/*"]},
+    )
+
+    report = merge_agent_config(
+        tracked_dir, dest_dir, backup_stamp="20260101T000000Z"
+    )
+
+    assert report["models"]["pruned"]["LocalProxy"] == ["gpt120", "qwen3"]
+    assert report["settings"]["pruned"] == ["MunitoAI/*"]
+
+    merged_models = json.loads((dest_dir / "models.json").read_text(encoding="utf-8"))
+    assert "qwen3" not in [
+        m["id"] for m in merged_models["providers"]["LocalProxy"]["models"]
+    ]
+    merged_settings = json.loads(
+        (dest_dir / "settings.json").read_text(encoding="utf-8")
+    )
+    assert "MunitoAI/*" not in merged_settings["enabledModels"]
+
+
+def test_cli_reports_pruned_ids(tmp_path: Path) -> None:
+    tracked_dir = tmp_path / "tracked"
+    dest_dir = tmp_path / "dest"
+    tracked_dir.mkdir()
+    dest_dir.mkdir()
+    _write(tracked_dir / "models.json", TRACKED_MODELS_RETIRED)
+    _write(
+        tracked_dir / "settings.json",
+        {"enabledModels": ["Local Proxy/plan"]},
+    )
+    _write(
+        tracked_dir / "retired-models.json",
+        {
+            "retiredModels": RETIRED_MODELS,
+            "retiredEnabledModels": RETIRED_ENABLED,
+        },
+    )
+    _write(dest_dir / "models.json", DEST_MODELS_RETIRED)
+    _write(
+        dest_dir / "settings.json",
+        {"enabledModels": ["Local Proxy/plan", "MunitoAI/*"]},
+    )
+
+    result = _run_cli(tracked_dir, dest_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert "Pruned retired model: LocalProxy/qwen3" in result.stdout
+    assert "Pruned retired enabledModels: MunitoAI/*" in result.stdout
+
+
+# ---------------------------------------------------------------------------
 # CLI: non-interactive-safe, positional args, exit codes
 # ---------------------------------------------------------------------------
 

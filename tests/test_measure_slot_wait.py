@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MWNX9VBA0050IPG
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 """Behavioural tests for the slot-wait re-measurement harness.
 
 Covers **SA-0MW7C69KU008ZT5K** (AC1, AC2, AC3, AC4, AC5, AC6):
@@ -21,6 +27,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -500,3 +508,76 @@ def test_harness_is_read_only(harness, tmp_path):
         ["--sessions-root", str(tmp_path / "sessions"), "--json"]
     )
     assert snapshot() == before
+
+
+# ---------------------------------------------------------------------------
+# Summary rendering (SA-0MWNPTFRT000JYSK)
+# ---------------------------------------------------------------------------
+
+
+def test_render_summary_keeps_each_statement_on_its_own_line(harness):
+    """Implicitly concatenated f-strings stay one element, never merge.
+
+    ``render_summary`` builds its output from a list literal whose elements are
+    written as multi-line implicit string concatenation.  A missing comma in
+    that literal would silently fuse two statements into a single line, so this
+    test pins the exact line structure: the window line and the corpus line are
+    separate, and every check plus the verdict gets its own line.
+    """
+    report = {
+        "window_start": "2026-11-01T00:00:00+00:00",
+        "window_end": "2026-11-05T00:00:00+00:00",
+        "post_fix_commit": "abc1234",
+        "sessions_root": "/tmp/sessions",
+        "files_scanned": 7,
+        "files_with_samples": 3,
+        "records_in_window": 12,
+        "total_samples": 5,
+        "checks": [
+            {"id": "p50_under_120s", "detail": "p50=1.00s", "passed": True},
+            {"id": "no_queued_notice_30s", "detail": "no notices", "passed": None},
+        ],
+        "verdict": "pass",
+    }
+
+    lines = harness.render_summary(report).splitlines()
+
+    assert lines == [
+        "window: 2026-11-01T00:00:00+00:00 .. 2026-11-05T00:00:00+00:00 "
+        "(since post-fix abc1234)",
+        "corpus: root=/tmp/sessions files_scanned=7 files_with_samples=3 "
+        "records_in_window=12 samples=5",
+        "  [PASS] p50_under_120s: p50=1.00s",
+        "  [N/A ] no_queued_notice_30s: no notices",
+        "verdict: PASS",
+    ]
+
+
+@pytest.mark.skipif(
+    shutil.which("ruff") is None, reason="ruff is not installed"
+)
+def test_harness_is_free_of_unparenthesised_implicit_concatenation():
+    """Regression guard for ISC004 (SA-0MWNPTFRT000JYSK).
+
+    Implicit string concatenation inside a collection literal is flagged by
+    ruff's ISC004 because a missing comma would silently merge elements.  The
+    list literal in :func:`render_summary` deliberately concatenates across
+    lines, so each group must be parenthesised — never left bare.
+    """
+    result = subprocess.run(
+        [
+            shutil.which("ruff") or "ruff",
+            "check",
+            "--isolated",
+            "--select",
+            "ISC004",
+            str(SCRIPT),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, (
+        f"ISC004 findings remain in {SCRIPT}:\n{result.stdout}{result.stderr}"
+    )
+    assert "ISC004" not in result.stdout + result.stderr

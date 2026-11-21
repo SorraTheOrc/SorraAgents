@@ -13,6 +13,8 @@ EXECUTE immediately when invoked via /skill:audit. Do NOT ask permission or offe
 
 Provide a concise, human-friendly summary of project status or a specific work item. Exposes a canonical runner for automated use and a structured markdown report format consumed by orchestrators.
 
+> **Tool output:** follow the shared [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result.
+
 ## When To Use
 
 1. **Scan for a work item ID** — `[A-Z]{2}-[A-Z0-9]+`; found → item-level (step 3), not found → project-level (step 2).
@@ -33,9 +35,10 @@ The runner manages the item's `status`/`stage` during execution to prevent concu
 
 - Capture original status+stage at `cmd_issue()` start; set `in_progress`. A completed/`done` item is already terminal and cannot accept the `in-progress` claim (the worklog rejects `in-progress`/`done` as an incompatible status/stage pair), so the claim is skipped for it — the verdict-driven terminal lifecycle below keeps/restores `done` (SA-0MUWKGW9W004QXQZ).
 - `Ready to close: Yes` → `completed`/`in_review` (keep `done` if terminal); `No` → `open`/`plan_complete`. A top-level item (no parent) with a `Yes` verdict also gets `needsProducerReview: true` (via `--needs-producer-review yes`) so the release gate (`closeWorkItemsAfterRelease`) blocks until the producer reviews it; child items (with a parent) are **not** flagged — their parent's review covers the subtree (SA-0MSSVKYEW008PJ9H).
-- **Candidate-false-positive chores never re-arm the gate (SA-0MVZNECSD005XB42):** a top-level `Yes` whose only findings are medium/low candidate false positives already tracked by a live chore (or accepted by a waiver) writes **no** flag when this run created no new chore, and an audit of an audit-generated candidate-false-positive tracking chore never flags it. A new tracking chore still surfaces the producer once. Medium/low tracking chores are **deduplicated** on `linter:rule:file:line` (a `CFP-Chore-Key:` marker in the chore description; a later run reuses the existing chore — `chores_reused`), and a finding the producer accepted once is recorded with `python3 $(skill_path audit)/scripts/audit_waiver.py add <id> --rule <code> --file <path> [--line <n>] --justification "<why>"` (an `AUDIT-FP-WAIVER:` comment marker) and never creates a chore or blocks again.
+- **Candidate-false-positive chores never re-arm the gate (SA-0MVZNECSD005XB42):** a top-level `Yes` whose only findings are medium/low candidate false positives already tracked by a live chore (or accepted by a waiver) writes **no** flag when this run created no new chore, and an audit of an audit-generated candidate-false-positive tracking chore never flags it. A new tracking chore still surfaces the producer once. Medium/low tracking chores are **deduplicated** on `linter:rule:file:line` (a `CFP-Chore-Key:` marker in the chore description; a later run reuses the existing chore — `chores_reused`), and each chore also records `Audit-Verification-Command:` (the exact `ruff check --isolated --select <RULE> <path>` that reproduces the finding) and `Audit-Fingerprint:` (file hash + rule) so the re-verification sweep can re-run it and close the chore once the finding stops reproducing (SA-0MW7Z1JCE009G6J3). A finding the producer accepted once is recorded with `python3 $(skill_path audit)/scripts/audit_waiver.py add <id> --rule <code> --file <path> [--line <n>] --justification "<why>"` (an `AUDIT-FP-WAIVER:` comment marker) and never creates a chore or blocks again.
 - **Producer review is content-scoped (SA-0MVR9B1UH002BUST, Option B+):** a top-level `Yes` does **not** re-flag an item whose producer review is still valid. At audit start the runner captures the stored audit record (`wl audit-show`: `readyToClose`, v2 content fingerprint); a prior **passing** audit whose fingerprint equals the current content fingerprint, together with `needsProducerReview == false`, means a producer cleared the review over unchanged content — the stored `false` is **preserved** (no flag write). Every ambiguous case (no prior audit, prior non-passing audit, legacy/fingerprint-less report, `wl audit-show` unavailable) **fails safe and flags**. The runner never writes `--needs-producer-review no` (it never clears a review), and it records the decision in the persisted report as a `Producer review: preserved|required|untouched (<reason>)` metadata line. Because the v2 fingerprint hashes only the item's own title + description, a comment or lifecycle flip never invalidates a review; a material content change does (a fresh review is then required).
 - **Independent failures always surface (SA-0MVR9B1UH002BUST AC3):** a `No` verdict from an **independent** audit of a top-level item also writes `--needs-producer-review yes`, with or without a merge-gate blocker. The exception is the cascade-demotion-suppressed branch below (producer decision Q2): a parent-triggered re-audit of an already-`in_review`/`done` item leaves the flag untouched (it is not an independent review).
+- **Ship-triggered audits leave the flag untouched (SA-0MW92TODX00064XQ):** a release-gate **verification re-audit** — the ship skill's Step-2 audit readiness gate, Step-6 final-validation sweep, and pre-flight `--refresh-audits` — invokes `audit_runner.py issue <id> --strict --ship-triggered`; the marker resolves `PRODUCER_REVIEW_UNTOUCHED` (reason `"ship-triggered audit - flag untouched"`) for a top-level `Yes` **or** `No` verdict, so the release's own verification never arms the producer queue and never clears a stored flag. Only the flag write is suppressed: `Yes` still advances to `completed`/`in_review`; `No` still demotes to `open`/`plan_complete` (subject to cascade-demotion suppression); the persisted report still records the verdict plus a `Producer review: untouched (ship-triggered audit - flag untouched)` metadata line. The marker is set **only** by ship-automated invocations — surfaced manual remediation commands (operator-invoked: `audit_runner.py issue <id> --strict`, the offline `batch --strict` refresh, `check-freshness` probes) stay marker-free and keep exactly the independent flagging behaviour above.
 - **No side-effect demotion (SA-0MUJAPC680078396 AC2):** when the audit was auto-triggered by a parent's `--audit-children` cascade (`AUDIT_CASCADE_AUDIT` marker in the child subprocess env) **and** the item was already `in_review`/`done` at audit start, a `No` verdict **restores** the pre-audit status/stage (assignee cleared) instead of demoting to `open`/`plan_complete`. A parent-triggered re-screen must never silently push completed/in-review work back into the actionable queue or cascade `blocked` states through the dependency chain. An explicit, independent audit of the same item keeps the normal `No` → `open`/`plan_complete` demotion, and a cascade re-audit of an already-pre-review child still demotes (genuine blocking is preserved).
 - A completed `Yes` verdict advances **even when AC evidence was fallback-tainted** (e.g. a read-only test skip with a variance note) — a fallback on some ACs does not invalidate an explicit model `Yes` (WL-0MSN7XAUS008WOPQ). The fallback flag only forces the restore path for a `No` verdict (an infra-fallback `No` is not an explicit model assessment).
 - Failure/timeout/unparseable → restore captured pre-audit status/stage (fallback only if undeterminable) and **clear the assignee** (per the [assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant); canonical wording, cross-referenced rather than restated). If the captured (status, stage) pair is invalid (e.g. `blocked` + `in_review`), the runner coerces the stage to a valid default (`plan_complete`) while preserving the captured status, so the item is never left unrecoverable (SA-0MUIVCJLW000RUC1). Only an explicit `No` moves to `open` — a transient timeout never demotes an `in_review` item. If a completed `Yes` run is ever restored (script failure during the run), a visible warning is printed — never a silent divergence.
@@ -158,6 +161,48 @@ path, and the F3 suite-execution cwd) now read the **per-audit target
 root** (SA-0MULGDABC001T11L), so a foreign-cwd launch never scopes them to
 the launch directory. The module-level `TARGET_PROJECT_ROOT` is retained
 only as the cwd-derived fallback for direct/unit callers.
+
+**Explicit code-repository root (`--code-root` / `AUDIT_CODE_ROOT`,
+LP-0MVZ6R5H8007NYLR).** Some work items are tracked in one project's
+worklog while their delivered code lands in **another** project's
+repository (a *cross-repo* item — recorded precedent: `LP-0MVVYQ1U3006GDWT`,
+`LP-0MVSB0E7W003IMH4`). For those items the worklog-derived owning root is
+the worklog owner, whose repository contains none of the delivered files, so
+every git-derived surface would be mis-scoped (the merge gate looks for the
+item's commits in the wrong repo, the code-quality scan resolves an empty
+file set, and the Phase 2 FILE SCOPE manifest lists files absent from the
+target repo). `--code-root DIR` (env `AUDIT_CODE_ROOT`) supplies the
+**code-repository root** so the git-derived content resolves independently
+of the worklog:
+
+- **What it scopes:** the merge gate, the file-scope manifest, changed
+  files, green-run evidence, the code-quality scan, and the Phase 2 cwd —
+  all resolve against `DIR` (exported as `_AuditContext.per_audit_project_root`).
+- **Default:** the owning-project root (exactly today's behaviour). The
+  two axes are independent — `--worklog-dir` still governs **every** `wl`
+  read/write (it never leaks into `_run_wl`/`resolve_worklog_flags`), and
+  `--code-root` never changes the launch-context ownership verdict.
+- **Precedence:** `--code-root` flag > `AUDIT_CODE_ROOT` env > owning
+  project. A non-existent or non-git directory is a hard `Error: Audit scope
+  error: ...` (non-zero exit, **zero** pi calls) — the same fail-closed style
+  as the other scope errors.
+- **Read-only:** the option only *selects* a scope for read-only git queries
+  and test-cache reads; the runner never fetches, checks out or otherwise
+  mutates the code repository. The read-only audit mandate is preserved.
+- **Recorded in the report:** every persisted report carries a `## Audit
+  Scope` section naming both the resolved **code root** and the **worklog
+  root**, so a reader can tell which repository the evidence came from —
+  and can distinguish a genuine `Ready to close: No` from a mis-scoped one —
+  without remembering which flags were passed. The section is emitted on
+  **every** persisted report, including default (owning-root) audits.
+
+Without `--code-root`, a cross-repo item fails closed with an `Audit scope
+error` naming the sibling project whose repository holds the item's touched
+files, rather than proceeding to a mis-scoped Phase 1/2.
+
+A same-repo item is unaffected: passing `--code-root <owning-root>` (or the
+worktree checkout) is a strict no-op — identical manifest, HEAD attestation
+and verdict, byte for byte.
 
 ## Monitored Run Execution
 
@@ -349,7 +394,7 @@ Synonym for "Acceptance Criteria"; **Acceptance Criteria** is canonical.
 
 ## Scripts
 
-- **Runner:** `$(skill_path audit)/scripts/audit_runner.py` — `audit_runner.py issue <id>` / `audit_runner.py project` / `audit_runner.py batch`; flags: `--do-not-persist`, `--timeout`, `--parent-timeout`, `--batch-phase2`, `--batch-phase1`, `--phase1-model`, `--child-in-main-slot` / `--no-child-in-main-slot`, `--max-concurrency N`, `--green-run` (SHA|HEAD), `--run-tests`, `--no-execute`, `--audit-children`, `--max-child-audits N`, `--max-citations-per-ac N`, `--pi-bin`, `--model-source`, `--debug-log`, `--json`, `--force`, `--worklog-dir DIR`, `--checkpoint-dir DIR`, `--no-checkpoint`, `--batch-drain` / `--no-batch-drain` (issue), `--max-items N` / `--timeout S` (batch).
+- **Runner:** `$(skill_path audit)/scripts/audit_runner.py` — `audit_runner.py issue <id>` / `audit_runner.py project` / `audit_runner.py batch`; flags: `--do-not-persist`, `--timeout`, `--parent-timeout`, `--batch-phase2`, `--batch-phase1`, `--phase1-model`, `--child-in-main-slot` / `--no-child-in-main-slot`, `--max-concurrency N`, `--green-run` (SHA|HEAD), `--run-tests`, `--no-execute`, `--audit-children`, `--max-child-audits N`, `--max-citations-per-ac N`, `--pi-bin`, `--model-source`, `--debug-log`, `--json`, `--force`, `--worklog-dir DIR`, `--checkpoint-dir DIR`, `--no-checkpoint`, `--batch-drain` / `--no-batch-drain` (issue), `--ship-triggered` (issue), `--max-items N` / `--timeout S` (batch).
 - **Persister:** `$(skill_path audit)/scripts/persist_audit.py` — persist from stdin, file, or CLI string; cwd-independent — the worklog store is auto-resolved from the work-item id prefix (prefix-to-sibling scan, cwd-chain fallback) when `--worklog-dir` is omitted, so it persists to the item's own store from any cwd (SA-0MSKQERKH002IBLG).
 
 Flag semantics and env-var overrides (timeouts, concurrency, retry, green-run, test-cache auto-verification, `--run-tests`, batch/parallel Phase 2, tools-enabled invocation, bounded scanning, debug logs, file-scope manifest, child verdict reuse, phase-1/2 performance, phase checkpoints) are fully documented in [docs/dev/audit-skill-reference.md](../../docs/dev/audit-skill-reference.md). Execution-dependent ACs can also be verified via the [test skill](../test/SKILL.md) (`/skill:test`).

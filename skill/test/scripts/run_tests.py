@@ -270,6 +270,15 @@ NOTICE_UNPARSED_FAILURE = "unparsed_failure"
 #: after an accepted retry. The discarded records also live on the structured
 #: ``discarded_failures`` field of the suite result.
 NOTICE_RETRY_DISCARDED = "retry_discarded_failures"
+#: Zero detected suites (SA-0MWNZLB07007S8QU): the resolved command set is
+#: empty — a greenfield checkout with no pytest configuration, no node package
+#: ``test`` script, no node suite dirs and no ``.pi/test-config.json``. Nothing
+#: could fail, so the suite reports a clean verdict with this code rather than
+#: executing an empty command set (which used to raise ``UnboundLocalError`` on
+#: ``state_changed_flag``). It is a PASS with an explanation — never a crash and
+#: never an infrastructure failure — so callers can distinguish "no suites to
+#: run" from "the suites ran and passed" without parsing prose.
+NOTICE_NO_SUITES_DETECTED = "no_suites_detected"
 
 #: Prefix of the no-free-slot notice produced by :func:`_test_concurrency_slot`.
 #: Exposed as a stable constant so a consumer handling a legacy result that
@@ -2898,6 +2907,11 @@ def _cache_entry_metadata(
     consumer — the finish gate's report, a completion comment, an auditor —
     can state *what* was reused rather than only that something was
     (SA-0MVQHVJEX0071R7G, SA-0MW7C6BMZ00931JG).
+
+    A change-set hit (``fingerprint_kind="change_set"``) also reports
+    ``reused_via_change_set`` and the tree the verdict was measured on
+    (``change_set_target_tree``), so a rebased push never looks like fresh
+    evidence about the pushed tree (SA-0MWFJS9OL001ZTTC).
     """
     return {
         "command": run.get("command") or command,
@@ -2906,6 +2920,17 @@ def _cache_entry_metadata(
         "git_state": run.get("git_state", ""),
         "scope": run.get("scope", "full"),
         "fingerprint_kind": run.get("fingerprint_kind", ""),
+        # Change-set provenance (SA-0MWFJS9OL001ZTTC): a verdict reused for a
+        # rebased commit was measured on ``change_set_target_tree``, never on
+        # the pushed tree itself — say so rather than implying tree evidence.
+        "reused_via_change_set": bool(run.get("reused_via_change_set", False)),
+        "change_set_target_tree": run.get("change_set_target_tree", ""),
+        "change_set_base_tree": run.get("change_set_base_tree", ""),
+        # A tree-kind entry inherited from a change-set hit (so a later gate
+        # run served it under the tree key) states its origin and the tree it
+        # was measured on rather than looking like direct tree evidence.
+        "verdict_origin": run.get("verdict_origin", ""),
+        "measured_tree": run.get("measured_tree", ""),
     }
 
 
@@ -2985,6 +3010,14 @@ def run_suite(
     The CLI's ``--fingerprint`` is the fail-closed surface for this parameter
     (an unusable value or a mode that cannot bind it is rejected with exit 2,
     never degraded to a worktree key — SA-0MW7C6AYO0062GJB).
+
+    A tree-keyed run is additionally keyed on the **change set** it measures
+    (:func:`test_cache.compute_change_set_state`, ``fingerprint_kind=
+    "change_set"``, SA-0MWFJS9OL001ZTTC): a verdict recorded for the identical
+    patch is served when *fingerprint*'s own entry is missing, which is what
+    keeps a lost push race (rebase onto a concurrently advanced ``dev``)
+    from re-executing the full suite. *base_ref* names the parent ref that
+    change set is computed against.
 
     Returns a dict with ``success``, ``returncode``, ``failures``, ``command``,
     ``cached``, ``scope``, ``type``; on a failure WITHOUT structured failures a
@@ -3180,12 +3213,42 @@ def run_suite(
         result.update(overrides)
         return result
 
+    # Zero detected suites (SA-0MWNZLB07007S8QU): return the defined no-suites
+    # verdict BEFORE the execution loop. A repo with nothing to detect (no
+    # pytest config, no node test script, no ``.pi/test-config.json``) has no
+    # command that could fail, so the run is green with an explicit
+    # ``no_suites_detected`` notice instead of a crash. Without this guard the
+    # loop body never executes and the post-loop read of
+    # ``state_changed_flag`` — bound only inside the loop — raised
+    # ``UnboundLocalError``, which broke the dev-push gate for every greenfield
+    # repository (CUR-0MWIBGLIL00774EU).
+    if not commands:
+        return _result(
+            success=True,
+            returncode=0,
+            command="",
+            cached=False,
+            notice=(
+                f"no test suites detected for suite '{name}' — nothing to run "
+                "(no pytest config, no node test script, no "
+                ".pi/test-config.json)"
+            ),
+            notice_code=NOTICE_NO_SUITES_DETECTED,
+        )
+
+    # Bound before the loop so the post-loop read below is defined even when a
+    # future path skips execution entirely (belt-and-braces for the zero-suite
+    # guard above — SA-0MWNZLB07007S8QU).
+    state_changed_flag: dict[str, Any] | None = None
+
     for cmd in commands:
         command_waits: list[float] = []
         command_elapsed: list[float] = []
         # Set when run_cached reports the guarded checkout moved while this
-        # command executed (SA-0MW3FF18I003KGZE).
-        state_changed_flag: dict[str, Any] | None = None
+        # command executed (SA-0MW3FF18I003KGZE). Reset per command; the
+        # pre-loop binding (SA-0MWNZLB07007S8QU) keeps the post-loop read
+        # defined when no command runs at all.
+        state_changed_flag = None
 
         def _record_wait(
             _queued_at: float,
@@ -3216,6 +3279,7 @@ def run_suite(
                     scope=resolvable_scope,
                     test_type=test_type,
                     fingerprint=fingerprint,
+                    change_set_base_ref=base_ref,
                 )
                 proc = SimpleNamespace(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
@@ -3794,6 +3858,10 @@ def _emit_gate_subject(evidence: dict[str, Any]) -> None:
     The gate is tree-keyed (SA-0MW7C6BMZ00931JG): it reports the pushed
     commit's ``tree`` and ``fingerprint_kind=tree`` so the pusher can see the
     verdict belongs to the pushed tree, not the loose checkout it resolved.
+    The *verdict* may still be served for the identical change set of a
+    rebased commit (SA-0MWFJS9OL001ZTTC); that is reported separately on the
+    ``gate-verdict`` line, so the subject binding below stays exactly what it
+    claims to be.
     """
     print(
         f"{GATE_SUBJECT_PREFIX}pushed={evidence['pushed']} "
@@ -3815,6 +3883,12 @@ def _gate_verdict_facts(
     (SA-0MW7C6BMZ00931JG AC3). ``cache_age_seconds`` is ``None`` on a miss
     (nothing was reused) and the age of the **oldest** reused entry on a hit —
     the weakest evidence in the aggregate.
+
+    ``reused_from_tree`` is set when the verdict was served for the identical
+    **change set** rather than for the pushed tree itself — a rebase rewrote
+    the tree, not the patch (SA-0MWFJS9OL001ZTTC). It names the tree the
+    verdict was actually measured on, so a change-set reuse is never mistaken
+    for fresh tree evidence.
     """
     entries = result.get("cache_entries") or []
     kinds = sorted({entry.get("fingerprint_kind") or "" for entry in entries} - {""})
@@ -3824,6 +3898,17 @@ def _gate_verdict_facts(
         for entry in entries
         if isinstance(entry.get("cache_age_seconds"), (int, float))
     ]
+    reused_candidates = {
+        str(entry.get("change_set_target_tree") or "")
+        for entry in entries
+        if entry.get("reused_via_change_set")
+    }
+    reused_candidates |= {
+        str(entry.get("measured_tree") or "")
+        for entry in entries
+        if entry.get("verdict_origin") == "change_set_reuse"
+    }
+    reused_trees = sorted(reused_candidates - {""})
     return {
         "verdict": "cached" if cache_hit else "executed",
         "cache_hit": cache_hit,
@@ -3832,6 +3917,7 @@ def _gate_verdict_facts(
         "entries": len(entries),
         "pushed": evidence["pushed"],
         "tree": evidence["tree"],
+        "reused_from_tree": ",".join(reused_trees) or None,
     }
 
 
@@ -3842,8 +3928,13 @@ def _emit_gate_verdict(evidence: dict[str, Any], result: dict[str, Any]) -> None
     echoes, whether the verdict was served from the cache (``cache_hit``), the
     age in seconds of the reused entry (``cache_age_seconds`` — ``n/a`` on a
     miss) and that the verdict is bound to the pushed tree
-    (``fingerprint_kind=tree``, ``tree=<sha>``). This makes a reused verdict
-    visible and attributable to the pusher (SA-0MW7C6BMZ00931JG AC3).
+    (``fingerprint_kind=tree``, ``tree=<sha>``). When the reuse happened for
+    the identical **change set** of a rebased commit
+    (SA-0MWFJS9OL001ZTTC) the line also names the tree the verdict was
+    measured on (``reused_from_tree=``) and reports
+    ``fingerprint_kind=change_set`` — a reused verdict is visible and
+    attributable, and never presented as fresh evidence about the pushed tree
+    (SA-0MW7C6BMZ00931JG AC3).
     """
     facts = _gate_verdict_facts(evidence, result)
     age = (
@@ -3851,12 +3942,17 @@ def _emit_gate_verdict(evidence: dict[str, Any], result: dict[str, Any]) -> None
         if facts["cache_age_seconds"] is None
         else f"{facts['cache_age_seconds']:.1f}"
     )
+    reused = (
+        f" reused_from_tree={facts['reused_from_tree']}"
+        if facts["reused_from_tree"]
+        else ""
+    )
     print(
         f"{GATE_VERDICT_PREFIX}verdict={facts['verdict']} "
         f"sha={evidence['pushed']} tree={evidence['tree']} "
         f"fingerprint_kind={facts['fingerprint_kind']} "
         f"cache_hit={'true' if facts['cache_hit'] else 'false'} "
-        f"cache_age_seconds={age} entries={facts['entries']}",
+        f"cache_age_seconds={age} entries={facts['entries']}{reused}",
         file=sys.stderr,
     )
 
@@ -4066,8 +4162,11 @@ def build_parser() -> argparse.ArgumentParser:
         "commit's tree SHA (`git rev-parse SHA^{tree}`) and stored/looked up "
         "with fingerprint_kind=\"tree\" (SA-0MW7C6BMZ00931JG), so a tree-keyed "
         "verdict from another consumer (e.g. the finish gate) is reused for the "
-        "same tree. Refuses (exit 2) when no clean checkout holds SHA or its "
-        "tree cannot be computed. Omitted: historical behaviour, unchanged.",
+        "same tree. When the exact tree has no verdict, a verdict stored for "
+        "the identical change set (patch content) is served instead — a pure "
+        "rebase rewrites the tree but not the change (SA-0MWFJS9OL001ZTTC). "
+        "Refuses (exit 2) when no clean checkout holds SHA or its tree cannot "
+        "be computed. Omitted: historical behaviour, unchanged.",
     )
     parser.add_argument(
         "--fingerprint",

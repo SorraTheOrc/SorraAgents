@@ -19,6 +19,10 @@ Covered here:
 - ``phase_finish`` behaviour: refusal exits non-zero without touching the
   work item or commenting; a successful finish acquires and releases (a second
   finish can immediately re-acquire),
+- the **single bounded internal wait** (SA-0MWFJS65O005JMJF): one `finish`
+  call waits out a holder (reporting it as progress) and proceeds when the
+  holder releases, the default is a positive but finite bound, and a signal
+  during the wait exits cleanly without leaving an orphaned lock,
 - the dev-push full-suite gate runs **outside** the lock (SA-0MWFJS3820032YB4):
   the lock is free while the suite runs, the verdict is keyed on the
   would-be-commit tree, a red verdict aborts before the lock, and two
@@ -367,6 +371,188 @@ def test_finish_success_acquires_and_releases_lock(tmp_path):
     implement._release_main_checkout_lock(fd)
 
 
+def test_finish_lock_default_is_a_positive_bounded_wait(monkeypatch):
+    """``finish`` waits inside the call by default — positive, finite, generous.
+
+    The default is a **bounded internal wait** (never fail-fast, never
+    indefinite): a concurrent finish is absorbed by one call, so an agent has
+    no reason to script retry loops around ``finish``. The bound is generous
+    enough to cover the short locked window (the full-suite verdict is
+    resolved before the lock) while still finite so an unattended batch can
+    never be wedged by a stuck holder (SA-0MWFJS65O005JMJF).
+    """
+    monkeypatch.delenv(implement.ENV_FINISH_LOCK_TIMEOUT, raising=False)
+
+    default = implement._finish_lock_timeout()
+    assert default == implement.DEFAULT_FINISH_LOCK_TIMEOUT
+    assert default > 0, "finish must wait internally instead of failing fast"
+    assert default <= 3600, "the default wait must stay bounded (never indefinite)"
+
+    # An explicit override still wins in both directions.
+    monkeypatch.setenv(implement.ENV_FINISH_LOCK_TIMEOUT, "0")
+    assert implement._finish_lock_timeout() == 0.0
+    monkeypatch.setenv(implement.ENV_FINISH_LOCK_TIMEOUT, "42.5")
+    assert implement._finish_lock_timeout() == 42.5
+
+
+def test_finish_waits_internally_and_proceeds_when_the_holder_releases(
+    tmp_path, monkeypatch
+):
+    """One ``finish`` call waits out a holder, then proceeds — no retry loop.
+
+    Regression for the 2026-11-13 AI_Hell shape: the agent used to re-enter
+    ``finish`` up to eight times with ``wait_for_job`` waits between attempts,
+    producing a 45-minute tool call. A single bounded internal wait must
+    absorb the contention: exactly **one** lock acquisition attempt, progress
+    naming the holder, and a successful finish once the holder releases
+    (SA-0MWFJS65O005JMJF).
+    """
+    monkeypatch.setenv(implement.ENV_FINISH_LOCK_TIMEOUT, "10")
+    repo = str(tmp_path / "main")
+    lock_path = implement._main_checkout_lock_path(repo)
+
+    holding_fd, holder = implement.acquire_main_checkout_lock(repo, "WL-OTHER")
+    assert holding_fd is not None, holder
+
+    attempts: list[float] = []
+    releasers: list[threading.Timer] = []
+    real_acquire = implement.acquire_main_checkout_lock
+
+    def _counting_acquire(repo_root, work_item_id, timeout=0.0, **kwargs):
+        attempts.append(timeout)
+        # Release the holder only once the finish is *inside* its bounded wait:
+        # a timer armed at test start can expire before ``phase_finish`` reaches
+        # the lock, which would make the wait (and its progress) vacuously
+        # instant on a loaded machine.
+        if len(attempts) == 1:
+            timer = threading.Timer(
+                0.2, implement._release_main_checkout_lock, args=(holding_fd,)
+            )
+            releasers.append(timer)
+            timer.start()
+        return real_acquire(repo_root, work_item_id, timeout=timeout, **kwargs)
+
+    try:
+        with _finish_harness(tmp_path, repo_root=repo), patch.object(
+            implement, "acquire_main_checkout_lock", side_effect=_counting_acquire
+        ):
+            started = time.monotonic()
+            report = implement.phase_finish(
+                "WL-TEST", json_output=True, no_refactor=True
+            )
+            elapsed = time.monotonic() - started
+    finally:
+        for timer in releasers:
+            timer.cancel()
+        implement._release_main_checkout_lock(holding_fd)
+
+    assert report["success"] is True, report["message"]
+    assert elapsed >= 0.1, "the finish did not actually wait for the holder"
+    assert elapsed < 10, f"the internal wait overran its bound: {elapsed}s"
+    assert attempts == [10.0], (
+        "finish must make exactly one bounded lock attempt, not a retry loop; "
+        f"observed {attempts!r}"
+    )
+
+    lock_step = report["steps"]["main_checkout_lock"]
+    assert lock_step["acquired"] is True
+    assert lock_step["waited_seconds"] >= 0.1
+    assert str(lock_path) in lock_step["progress"][0]
+    assert "WL-OTHER" in lock_step["progress"][0], (
+        "progress must name who holds the lock so a waiting operator knows why"
+    )
+    assert any(
+        line.startswith("Acquired the repository lock")
+        for line in lock_step["progress"]
+    ), lock_step["progress"]
+
+
+def test_finish_lock_wait_is_signal_safe(tmp_path):
+    """A signal while ``finish`` waits exits cleanly and leaves no lock behind.
+
+    ``SIGTERM`` must be handled by ``implement.py``'s handler between retries:
+    the process exits with the documented abort code, the waiting descriptor is
+    released, and a later run can acquire the lock immediately — no orphaned
+    lock and no half-acquired state (SA-0MWFJS65O005JMJF signal-safety AC).
+    """
+    repo = str(tmp_path / "main")
+    ready = tmp_path / "ready"
+    go = tmp_path / "go"
+    waiting = tmp_path / "waiting"
+
+    waiter_pid = os.fork()
+    if waiter_pid == 0:  # pragma: no cover - child process
+        try:
+            # The forked child inherits this module's globals from whichever
+            # test ran last; clear them so the signal cleanup touches no
+            # work item or worktree and stays deterministic.
+            implement._store_signal_globals("", "", "")
+            implement._register_signal_handlers()
+            ready.write_text("ready", encoding="utf-8")
+            deadline = time.monotonic() + 30
+            while not go.exists():
+                if time.monotonic() > deadline:
+                    os._exit(5)
+                time.sleep(0.02)
+
+            def _progress(_message: str) -> None:
+                waiting.write_text("waiting", encoding="utf-8")
+
+            fd, _refusal = implement.acquire_main_checkout_lock(
+                repo, "WL-WAITER", timeout=120.0, progress=_progress
+            )
+            # Reaching here means the lock was acquired (the parent holds it,
+            # so this only happens after the signal handler was bypassed).
+            os._exit(0 if fd is not None else 9)
+        except BaseException:  # noqa: BLE001 - child teardown
+            os._exit(7)
+
+    holder_fd = None
+    try:
+        deadline = time.monotonic() + 15
+        while not ready.exists():
+            if time.monotonic() > deadline:
+                raise AssertionError("waiter child never signalled readiness")
+            time.sleep(0.02)
+
+        holder_fd, holder = implement.acquire_main_checkout_lock(repo, "WL-HOLDER")
+        assert holder_fd is not None, holder
+        go.write_text("go", encoding="utf-8")
+
+        # The child reports progress at its first contention, i.e. once it is
+        # inside the bounded wait; only then is the signal delivered.
+        deadline = time.monotonic() + 15
+        while not waiting.exists():
+            if time.monotonic() > deadline:
+                raise AssertionError("waiter child never entered the lock wait")
+            time.sleep(0.02)
+
+        os.kill(waiter_pid, signal.SIGTERM)
+        _, status = os.waitpid(waiter_pid, 0)
+        waiter_pid = 0  # reaped
+        assert os.waitstatus_to_exitcode(status) == 2, (
+            f"a signalled finish wait must exit with the abort code 2; "
+            f"got {os.waitstatus_to_exitcode(status)}"
+        )
+    finally:
+        if holder_fd is not None:
+            implement._release_main_checkout_lock(holder_fd)
+        if waiter_pid:
+            try:
+                os.kill(waiter_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(waiter_pid, 0)
+            except ChildProcessError:
+                pass
+
+    # No orphaned lock: the interrupted waiter left the lock free.
+    fd, refusal = implement.acquire_main_checkout_lock(repo, "WL-AFTER")
+    assert fd is not None, f"the interrupted wait left the lock held: {refusal}"
+    implement._release_main_checkout_lock(fd)
+
+
 # ---------------------------------------------------------------------------
 # The full-suite gate runs OUTSIDE the lock (SA-0MWFJS3820032YB4)
 # ---------------------------------------------------------------------------
@@ -450,9 +636,10 @@ def test_prelock_verdict_is_bound_to_the_would_be_commit_tree(tmp_path):
         )
         return {**_tests_result(), "scope": scope}
 
-    with _finish_harness(tmp_path, repo_root=repo):
-        with patch.object(implement, "run_tests", side_effect=_fake):
-            report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
+    with _finish_harness(tmp_path, repo_root=repo), patch.object(
+        implement, "run_tests", side_effect=_fake
+    ):
+        report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
 
     assert report["success"] is True, report["message"]
     full_runs = [call for call in calls if call["scope"] == "full"]
@@ -485,8 +672,8 @@ def test_green_finish_lock_window_excludes_the_full_suite(tmp_path):
         events.append(("suite", "end"))
         return {**_tests_result(), "scope": "full"}
 
-    def _acquire(repo_root, work_item_id, timeout=0.0):
-        outcome = real_acquire(repo_root, work_item_id, timeout=timeout)
+    def _acquire(repo_root, work_item_id, timeout=0.0, **kwargs):
+        outcome = real_acquire(repo_root, work_item_id, timeout=timeout, **kwargs)
         events.append(("lock", "acquired"))
         return outcome
 
@@ -529,9 +716,9 @@ def test_red_prelock_verdict_aborts_before_taking_the_lock(tmp_path):
     def _fake_run_tests(cwd, scope="changed", base_ref=None, fingerprint=None):
         return red if scope == "full" else _tests_result()
 
-    def _acquire(repo_root, work_item_id, timeout=0.0):
+    def _acquire(repo_root, work_item_id, timeout=0.0, **kwargs):
         lock_calls.append(work_item_id)
-        return real_acquire(repo_root, work_item_id, timeout=timeout)
+        return real_acquire(repo_root, work_item_id, timeout=timeout, **kwargs)
 
     with _finish_harness(tmp_path, repo_root=repo) as mocks, patch.object(
         implement, "run_tests", side_effect=_fake_run_tests
@@ -607,9 +794,10 @@ def test_prelock_skipped_when_the_dev_push_gate_is_bypassed(tmp_path, monkeypatc
         ran.append(scope)
         return _tests_result()
 
-    with _finish_harness(tmp_path, repo_root=repo):
-        with patch.object(implement, "run_tests", side_effect=_fake_run_tests):
-            report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
+    with _finish_harness(tmp_path, repo_root=repo), patch.object(
+        implement, "run_tests", side_effect=_fake_run_tests
+    ):
+        report = implement.phase_finish("WL-TEST", json_output=True, no_refactor=True)
 
     assert report["success"] is True, report["message"]
     prelock = report["steps"]["full_suite_prelock"]
@@ -659,7 +847,15 @@ def test_concurrent_finishes_overlap_their_full_suite_runs(tmp_path, monkeypatch
     def _fake_run_tests(cwd, scope="changed", base_ref=None, fingerprint=None):
         if scope != "full":
             return _tests_result()
-        fd, _holder = implement.acquire_main_checkout_lock(repo, "WL-PROBE")
+        # The probe is fail-fast; retry briefly so a *sibling's momentary
+        # probe hold* (its own acquire/release) is never mistaken for a
+        # finish holding the lock during the suite. A real finish hold lasts
+        # the whole mutating window, so it is observed on every retry.
+        fd, _holder = None, None
+        for _attempt in range(5):
+            fd, _holder = implement.acquire_main_checkout_lock(repo, "WL-PROBE")
+            if fd is not None:
+                break
         with observed_lock:
             observed.append(("full_suite", fd is not None))
         if fd is not None:
@@ -674,20 +870,21 @@ def test_concurrent_finishes_overlap_their_full_suite_runs(tmp_path, monkeypatch
             "WL-TEST", json_output=True, no_refactor=True
         )
 
-    with _finish_harness(tmp_path, repo_root=repo):
-        with patch.object(implement, "run_tests", side_effect=_fake_run_tests):
-            threads = [
-                threading.Thread(target=_finish, args=(label,), daemon=True)
-                for label in ("a", "b")
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=60)
-            assert not any(t.is_alive() for t in threads), (
-                "a concurrent finish did not complete — the full-suite runs "
-                "were serialised on the main-checkout lock"
-            )
+    with _finish_harness(tmp_path, repo_root=repo), patch.object(
+        implement, "run_tests", side_effect=_fake_run_tests
+    ):
+        threads = [
+            threading.Thread(target=_finish, args=(label,), daemon=True)
+            for label in ("a", "b")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        assert not any(t.is_alive() for t in threads), (
+            "a concurrent finish did not complete — the full-suite runs "
+            "were serialised on the main-checkout lock"
+        )
 
     assert set(reports) == {"a", "b"}
     for label, report in reports.items():

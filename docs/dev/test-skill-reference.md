@@ -132,9 +132,10 @@ worktree fingerprint (that fallback would reintroduce the unattributable
 verdict it exists to prevent). The implement finish gate calls it through its
 temporary index and passes the SHA in as the verdict's fingerprint.
 
-**Provenance kinds.** `FINGERPRINT_KIND_WORKTREE` (`"worktree"`) and
-`FINGERPRINT_KIND_TREE` (`"tree"`) are recorded as `fingerprint_kind` in each
-entry's `metadata.json`. Entries predating the field read as `"worktree"` —
+**Provenance kinds.** `FINGERPRINT_KIND_WORKTREE` (`"worktree"`),
+`FINGERPRINT_KIND_TREE` (`"tree"`) and `FINGERPRINT_KIND_CHANGE_SET`
+(`"change_set"`) are recorded as `fingerprint_kind` in each entry's
+`metadata.json`. Entries predating the field read as `"worktree"` —
 the historical default — so existing consumers keep their historical hits.
 
 **Explicit-fingerprint override.** `run_cached(..., fingerprint=<sha>)` binds
@@ -159,6 +160,37 @@ expose the same distinction to callers that manage execution themselves.
 `run_suite()` / `run_all()` / `guarded_run_all()` thread an optional
 `fingerprint` through to the cache, so the finish gate reaches it through the
 same canonical runner as every other consumer.
+
+**Change-set override for a rebased push (SA-0MWFJS9OL001ZTTC).** A
+`fingerprint`-keyed run is *also* keyed on the change set's **patch content**
+when `track_change_set=True` (the default):
+
+- `compute_change_set_state(cwd, target_tree=<tree>, base_ref="origin/dev")`
+  returns `{fingerprint, base_commit, base_tree, target_tree, paths}`, where
+  `fingerprint` is the SHA-256 of `git diff --full-index <base_tree>
+  <target_tree>` with pinned diff flags and the base is
+  `merge-base(HEAD, base_ref)` (falling back to `HEAD` when the target is a
+  would-be commit tree, or `HEAD^` when `HEAD` *is* the pushed commit).
+  Tree-to-tree diffs never read the index, so the finish gate's temporary
+  `GIT_INDEX_FILE` cannot skew it.
+- The verdict is stored under that key with `fingerprint_kind="change_set"`
+  and `change_set_base_tree` / `change_set_target_tree` /
+  `change_set_paths` metadata, in addition to the tree-keyed entry.
+- On a **tree-keyed miss** the lookup is retried under the change-set key, so
+  a rebased commit whose patch is unchanged is served instead of re-executed.
+  The result reports `fingerprint_kind="change_set"`,
+  `reused_via_change_set: true` and `change_set_target_tree` — the tree the
+  verdict was actually measured on. The inherited verdict is also mirrored
+  under the pushed tree's key, stamped `verdict_origin="change_set_reuse"`
+  with `measured_tree` (the tree the suite really ran against) and the
+  original `completed_at`, so tree-keyed consumers find it without its being
+  presented as directly executed evidence and without extending its lifetime.
+- Reuse is provable, not heuristic: the patch records every changed path with
+  its pre- and post-image object ids, so any content difference — ours or an
+  upstream change to a file the patch touches — changes the key and misses.
+  An empty change set (target tree == base tree) is never keyed.
+- `run_suite()` threads `base_ref` in as `change_set_base_ref`;
+  `track_change_set=False` restores the pre-change behaviour byte for byte.
 
 **CLI surface — `run_tests.py --scope full --fingerprint <sha>`**
 (SA-0MW7C6AYO0062GJB). The flag binds a full-suite run to an explicit
@@ -253,15 +285,19 @@ prefixes; the hook echoes them to the pusher):
 ```text
 run_tests: gate-subject pushed=<sha> checkout=<in-place|worktree> fingerprint_kind=tree tree=<tree sha>
 run_tests: gate-root <absolute path of the resolved checkout>
-run_tests: gate-verdict verdict=<cached|executed> sha=<sha> tree=<tree sha> fingerprint_kind=tree cache_hit=<true|false> cache_age_seconds=<age|n/a> entries=<n>
+run_tests: gate-verdict verdict=<cached|executed> sha=<sha> tree=<tree sha> fingerprint_kind=<tree|change_set> cache_hit=<true|false> cache_age_seconds=<age|n/a> entries=<n>[ reused_from_tree=<tree sha>]
 run_tests: gate-refused <actionable message including TEST_SCOPE_SKIP=1>
 ```
 
 `cache_hit` is `true` when the verdict was served from the cache, and
 `cache_age_seconds` is the age of the oldest reused entry (`n/a` on a miss —
-nothing was reused). The same facts appear in the JSON report under `gate`
+nothing was reused). `fingerprint_kind=change_set` plus `reused_from_tree=`
+means the verdict was recorded for the identical **change set** of a rebased
+commit and measured on that tree, not on the pushed tree
+(SA-0MWFJS9OL001ZTTC). The same facts appear in the JSON report under `gate`
 (`cache_hit`, `cache_age_seconds`, `fingerprint_kind`, `tree`, `pushed`,
-`entries`) and in each `cache_entries[]` item (`git_state`, `cache_age_seconds`).
+`entries`, `reused_from_tree`) and in each `cache_entries[]` item (`git_state`,
+`cache_age_seconds`, `reused_via_change_set`, `change_set_target_tree`).
 
 Every refusal path fails closed — a pushed-commit guard failure (`HEAD !=
 local_sha` with no clean checkout holding the commit, a dirty checkout) or an
@@ -548,6 +584,7 @@ executable, wrapper error) keeps its `unparsed`/infrastructure classification.
 | `unparsed_failure` | The child exited non-zero and no structured test failure could be parsed from its output (bad flag, unloadable config, wrapper error). Vitest's default reporter — including browser mode — **is** parsed (see *Failure parsing* above), so a failing Vitest test is a structured failure, never this code. |
 | `state_changed_during_run` | The guarded checkout moved while a command executed (HEAD and/or the tracked tree it resolves to changed mid-run, e.g. a concurrent `implement.py finish` fast-forward); the mixed-tree verdict is quarantined (no cache entry under either state), the command's parsed failures are dropped and the suite is reported non-green with the distinct exit status 75 (`EX_TEMPFAIL`). The result carries the detail (checkout path + before/after commits) on `state_changed_during_run` — a non-empty dict for the suite, a list under the `run_all` aggregate; the human output prints a `notice: [state_changed_during_run] …` line naming the checkout movement and the required re-run. Runs whose only difference is churn attributable to another session (start-of-run-dirty → end-clean resolutions) are never flagged (SA-0MW3FF18I003KGZE AC3). |
 | `retry_discarded_failures` | **Non-fatal** (CG-0MWEHG69O005VM17): the runner accepted a stage (`status=0` + `retry-clean`/`accepted-transient`), so the FAIL records from its superseded attempt(s) were discarded as diagnostics — the suite stays **green** and the exit status is unchanged. The discarded records also appear on the structured `discarded_failures` field of the suite result / `run_all` aggregate, and the notice names the flaked file(s). A release gate consuming this output must NOT block on it. |
+| `no_suites_detected` | **Non-fatal** (SA-0MWNZLB07007S8QU): the resolved command set is empty — a greenfield repo with no pytest config, no node `test` script, no node suite dirs and no `.pi/test-config.json`. Nothing could fail, so the suite is reported **green** (`success=True`, `returncode=0`, `cached=False`, empty `failures`) with this code and a `no test suites detected for suite '<name>'` notice; the CLI exits 0 and the dev-push gate passes without `TEST_SCOPE_SKIP=1`. The code lets a consumer tell "nothing to run" from "the suites ran and passed" without parsing prose. |
 
 **Precedence.** Structured (parsable) test failures always win: `killed` and
 `unparsed_failure` are set only when `failures` is empty, so a genuine code
@@ -848,9 +885,18 @@ runner's auto-execution path, and its read-only cache classification):
    `test` script (TCE-like layouts).
 
 An empty resolved set (no extension file, no pytest suite, no hidden skill
-tests, no node dirs, no npm test script) is NOT an error: `run_tests.py`
-reports zero commands and the audit skill treats the repo as
-execution-impossible — fail-open partial, never blocks (F4 AC2).
+tests, no node dirs, no npm test script) is NOT an error and no longer an
+empty execution: `run_suite` returns **before** the execution loop with the
+defined no-suites verdict (`success=True`, `returncode=0`, `notice_code`
+`no_suites_detected`, empty `failures`) when the resolved command set is empty
+(SA-0MWNZLB07007S8QU, code half of `CUR-0MWIBGLIL00774EU`). So a greenfield
+checkout — e.g. a freshly initialised repo whose only content is `.githooks` —
+exits 0 and passes the dev-push gate with no `TEST_SCOPE_SKIP=1` bypass, and
+repos with one or more suites are unaffected (the guard is the empty-set path
+only). Previously the loop never bound `state_changed_flag`, so the post-loop
+read raised `UnboundLocalError` and the gate crashed instead of passing. The
+audit skill still treats such a repo as execution-impossible — fail-open
+partial, never blocks (F4 AC2).
 
 ### 1.1. Hidden project-local skill tests (SA-0MVQJSGLY0098DVB)
 

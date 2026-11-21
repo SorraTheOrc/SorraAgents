@@ -1514,6 +1514,46 @@ def _exercise_implement_orphaned_claim_release(store: FakeWorklogStore) -> None:
     assert store.show("SA-MATRIXIMPL")["status"] == "in-progress"
 
 
+def _exercise_implement_provider_failed_release(
+    store: FakeWorklogStore,
+) -> None:
+    """A provider-failed child is released to ``open`` (SA-0MWLDZFL4006I9YY).
+
+    Unlike the timeout-kill release, a session that never started has nothing
+    to finish or finalise, so the child is written ``open`` with an empty
+    assignee and is immediately reclaimable by the next sweep or ``drive``.
+    """
+    with (
+        _inject_store_runner(store),
+        patch.object(implement, "wl_show", side_effect=store.show),
+        patch.object(implement, "wl_add_comment", return_value=True),
+    ):
+        release = implement._release_provider_failed_child(
+            "SA-MATRIXIMPL",
+            {
+                "kind": "infrastructure",
+                "reason": 'No models match pattern "MunitoAI/*"',
+                "provider": "MunitoAI",
+                "remedy": "Remove the unservable model pattern …",
+            },
+        )
+
+    assert release["released"] is True, release
+    assert store.show("SA-MATRIXIMPL")["status"] == "open"
+
+
+def _verify_implement_provider_failed_release(
+    store: FakeWorklogStore,
+) -> None:
+    """The provider-failed release persists both ``open`` and no assignee."""
+    item = store.show("SA-MATRIXIMPL")
+    assert item["assignee"] == ""
+    assert item["status"] == "open"
+    assert any(
+        "SA-MATRIXIMPL" in command for command in store.update_commands
+    ), "the release never reached the item"
+
+
 RELEASE_EXERCISES: tuple[ReleaseExercise, ...] = (
     ReleaseExercise(
         name="audit pre-audit-state restore (failed terminal transition)",
@@ -1533,6 +1573,14 @@ RELEASE_EXERCISES: tuple[ReleaseExercise, ...] = (
         source="implement/scripts/implement.py",
         entry_points=("_release_orphaned_child_claim",),
         exercise=_exercise_implement_orphaned_claim_release,
+        target_id="SA-MATRIXIMPL",
+    ),
+    ReleaseExercise(
+        name="implement provider-failed release (session never started)",
+        source="implement/scripts/implement.py",
+        entry_points=("_release_provider_failed_child",),
+        exercise=_exercise_implement_provider_failed_release,
+        verify=_verify_implement_provider_failed_release,
         target_id="SA-MATRIXIMPL",
     ),
 )
