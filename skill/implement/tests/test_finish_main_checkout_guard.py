@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MWI3MT6L004K1L7
+# smell: unused_import
+# severity: critical
+# description: Local variable `mocks` is assigned to but never used
+# -->
 """Finish main-checkout guard regression tests (WL-0MVPADZ1Z000FOSG AC3).
 
 ``implement.py finish`` runs from a linked worktree but operates on the main
@@ -413,12 +419,19 @@ def test_finish_aborts_on_foreign_deletion_naming_path(tmp_path):
 
 
 def test_finish_own_fast_forward_churn_does_not_abort(tmp_path):
-    """Finish's own Step-5 fast-forward churn is classified as expected."""
+    """Finish's post-push fast-forward churn is classified as expected.
+
+    The local-``dev`` advance now runs only **after** the push reports
+    success (WL-0MWFKDH78002T2CR AC1), so the pre-push guard verify sees a
+    clean checkout; the pre-worktree-removal verify sees the post-push
+    advance's churn, attributed to finish via ``own_churn`` so it is never
+    misreported as a foreign mutation.
+    """
     with _finish_harness(tmp_path) as mocks:
         fake = _snapshots([
             {},  # baseline
-            {"docs/dev/implement-skill-reference.md": " M"},  # pre-push (ff churn)
-            {"docs/dev/implement-skill-reference.md": " M"},  # pre-removal
+            {},  # pre-push (no advance yet — the fix)
+            {"docs/dev/implement-skill-reference.md": " M"},  # pre-removal (post-push ff churn)
         ])
         with (
             patch.object(implement, "_snapshot_main_checkout", side_effect=fake),
@@ -441,6 +454,31 @@ def test_finish_own_fast_forward_churn_does_not_abort(tmp_path):
         if c.kwargs.get("status") == "completed"
     ]
     assert terminal, "a clean finish must reach the terminal transition"
+
+
+def test_finish_never_advances_local_dev_pre_push(tmp_path):
+    """AC1: the pre-push guard verify never sees finish's own churn.
+
+    A pre-existing foreign dirty path still aborts pre-push: with no advance
+    to attribute, nothing can excuse a main-checkout mutation, and the item
+    is released to open instead of silently finishing.
+    """
+    with _finish_harness(tmp_path) as mocks:
+        fake = _snapshots([
+            {},  # baseline
+            {"docs/dev/implement-skill-reference.md": " M"},  # pre-push foreign dirt
+            {"docs/dev/implement-skill-reference.md": " M"},
+        ])
+        with patch.object(implement, "_snapshot_main_checkout", side_effect=fake):
+            report = implement.phase_finish(
+                "WL-TEST", json_output=True, no_refactor=True
+            )
+
+    assert report["success"] is False, report["message"]
+    guard = report["steps"]["main_checkout_guard"]
+    assert guard["verdict"] == "fail"
+    failing = [v for v in guard["verifies"] if v["verdict"] == "fail"]
+    assert failing and failing[0]["stage"] == "pre_push", guard
 
 
 def test_finish_clean_run_reports_guard_step(tmp_path):

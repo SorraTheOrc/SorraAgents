@@ -8,6 +8,8 @@ description: "Find related work for a Worklog item; generate an auditable report
 
 Discover related work for a work item via Worklog search, file inspection, and optionally generate a "Related work (automated report)" section.
 
+> **Tool output:** follow the shared [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result.
+
 ## When to use
 
 - Before planning or implementing: gather evidence of related/precedent work

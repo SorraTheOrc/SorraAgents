@@ -251,6 +251,7 @@ def test_cli_reports_a_clean_pass_offline(tmp_path):
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
     payload = json.loads(result.stdout)
     assert result.returncode == 0
@@ -271,6 +272,7 @@ def test_cli_fails_loudly_and_names_the_offending_template(tmp_path):
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
     payload = json.loads(result.stdout)
     assert result.returncode == 1

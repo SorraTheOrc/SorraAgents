@@ -427,13 +427,19 @@ class TestProducerReviewLifecycle:
 # ---------------------------------------------------------------------------
 
 def _make_ctx(*, merge_gate_blocker="", original_stage="in_review",
-              runner=None):
-    """Build a minimal ``_AuditContext`` for lifecycle unit tests."""
+              runner=None, ship_triggered=False):
+    """Build a minimal ``_AuditContext`` for lifecycle unit tests.
+
+    ``ship_triggered`` mirrors the resolved ``--ship-triggered`` CLI flag
+    (SA-0MW92TODX00064XQ): the field does not exist on the dataclass yet
+    (the implementing child adds it), so it is set as an instance attribute
+    — the same shape the implementation child assigns from the parser.
+    """
     if runner is None:
         runner = lambda cmd: SimpleNamespace(
             returncode=0, stdout=json.dumps({"success": True}), stderr="",
         )
-    return audit_runner._AuditContext(
+    ctx = audit_runner._AuditContext(
         issue_id="TEST-1", persist=False, timeout=None, parent_timeout=None,
         pi_bin="pi", model=None, model_source="local", runner=runner,
         json_mode=False, debug_log=None, force=True, worklog_dir=None,
@@ -442,6 +448,32 @@ def _make_ctx(*, merge_gate_blocker="", original_stage="in_review",
         original_status="completed", original_stage=original_stage,
         merge_gate_blocker=merge_gate_blocker,
     )
+    ctx.ship_triggered = ship_triggered
+    return ctx
+
+
+def _decision_ctx(*, wi=None, prior_audit=None, ship_triggered=False):
+    """Minimal ``_AuditContext`` for direct decision-predicate tests.
+
+    Exercises ``_resolve_producer_review_decision()`` hermetically (AC6):
+    no live ``wl``/audit-runner calls. ``wi`` defaults to a top-level item
+    (no ``parentId``); ``ship_triggered`` defaults to unset so a marker-less
+    run is the default shape, exactly as today.
+    """
+    ctx = audit_runner._AuditContext(
+        issue_id="TEST-1", persist=False, timeout=None, parent_timeout=None,
+        pi_bin="pi", model=None, model_source="local",
+        runner=lambda cmd: SimpleNamespace(
+            returncode=0, stdout=json.dumps({"success": True}), stderr="",
+        ),
+        json_mode=False, debug_log=None, force=True, worklog_dir=None,
+        batch_phase2=False, green_run=None, audit_children=False,
+        max_child_audits=None, run_tests=False,
+    )
+    ctx.wi = dict(_ITEM) if wi is None else wi
+    ctx.prior_audit = prior_audit
+    ctx.ship_triggered = ship_triggered
+    return ctx
 
 
 def _lifecycle_runner(calls):
@@ -575,3 +607,235 @@ class TestProducerReviewReportMetadata:
         twice = audit_runner._append_producer_review_metadata(once, decision)
         assert twice == once
         assert once.count(audit_runner.PRODUCER_REVIEW_REPORT_PREFIX) == 1
+
+
+# ---------------------------------------------------------------------------
+# Ship-triggered runs (SA-0MW92TODX00064XQ AC1-AC4)
+# ---------------------------------------------------------------------------
+#
+# A ``--ship-triggered`` audit is a release-automation verification run, NOT
+# an independent review: it must never write ``--needs-producer-review`` for
+# either a top-level 'Yes' or a top-level 'No' verdict (the flag is left
+# untouched, neither set nor cleared; ``SA-0MW92TODX00064XQ`` AC1/AC2/AC3).
+# Everything the ACs pin here is exercised against PRODUCTION code — the
+# decision predicate ``_resolve_producer_review_decision()`` with a
+# controlled ``_AuditContext`` (AC6 hermetic: no live ``wl``/audit-runner
+# calls, no re-implemented truth tables) and the terminal lifecycle's flag
+# write decision.
+#
+# Red-first convention: the implementing child SA-0MWJ7K962006646G adds the
+# flag to the ``issue`` parser and wires ``ctx.ship_triggered`` into
+# ``_resolve_producer_review_decision()``. Until it lands, the planned
+# ship-triggered assertions are guarded with an imperative ``pytest.xfail``
+# naming that child — the marker fires only while the suppression is absent
+# and disappears on its own once the implementation lands (established
+# red-first convention, cf. test_persist_audit_resilience.py). The
+# marker-absence assertions below are ORDINARY tests: they pin that an
+# unmarked run behaves exactly as today and that the marker cannot leak.
+
+_SHIP_TRIGGERED_REASON = "ship-triggered audit - flag untouched"
+_IMPLEMENT_SHIP_TRIGGERED = "SA-0MWJ7K962006646G"
+
+
+class TestShipTriggeredReviewDecision:
+    """AC1/AC2/AC3: the marker suppresses only the flag write, at the
+    decision predicate (hermetic — controlled ``_AuditContext`` objects)."""
+
+    def test_ship_triggered_yes_never_reviewed_untouched(self):
+        """AC2: a ship-triggered top-level 'Yes' never requires a producer
+        decision — the flag is untouched instead of armed."""
+        ctx = _decision_ctx(ship_triggered=True)
+        decision = audit_runner._resolve_producer_review_decision(ctx, "yes")
+        if decision["action"] != audit_runner.PRODUCER_REVIEW_UNTOUCHED:
+            pytest.xfail(
+                "--ship-triggered suppression not implemented "
+                f"({_IMPLEMENT_SHIP_TRIGGERED})"
+            )
+        assert decision["action"] == audit_runner.PRODUCER_REVIEW_UNTOUCHED
+        assert decision["reason"] == _SHIP_TRIGGERED_REASON
+
+    def test_ship_triggered_yes_reviewed_unchanged_untouched(self):
+        """AC1/AC2: even a would-be-preserved review is untouched under the
+        marker — the ship run is a verification, not a re-review."""
+        prior = {
+            "readyToClose": True,
+            "fingerprint": _FINGERPRINT,
+            "currentFingerprint": _FINGERPRINT,
+        }
+        ctx = _decision_ctx(prior_audit=prior, ship_triggered=True)
+        decision = audit_runner._resolve_producer_review_decision(ctx, "yes")
+        if decision["action"] != audit_runner.PRODUCER_REVIEW_UNTOUCHED:
+            pytest.xfail(
+                "--ship-triggered suppression not implemented "
+                f"({_IMPLEMENT_SHIP_TRIGGERED})"
+            )
+        assert decision["action"] == audit_runner.PRODUCER_REVIEW_UNTOUCHED
+        assert decision["reason"] == _SHIP_TRIGGERED_REASON
+
+    def test_ship_triggered_no_top_level_untouched(self):
+        """AC3: a ship-triggered independent top-level 'No' also leaves the
+        flag untouched — only the write is suppressed, never the demotion."""
+        ctx = _decision_ctx(ship_triggered=True)
+        decision = audit_runner._resolve_producer_review_decision(ctx, "no")
+        if decision["action"] != audit_runner.PRODUCER_REVIEW_UNTOUCHED:
+            pytest.xfail(
+                "--ship-triggered suppression not implemented "
+                f"({_IMPLEMENT_SHIP_TRIGGERED})"
+            )
+        assert decision["action"] == audit_runner.PRODUCER_REVIEW_UNTOUCHED
+        assert decision["reason"] == _SHIP_TRIGGERED_REASON
+
+    def test_marker_absence_yes_never_reviewed_requires(self):
+        """AC1/AC4: WITHOUT the marker a top-level 'Yes' behaves exactly as
+        today — a never-reviewed pass still arms the producer queue."""
+        ctx = _decision_ctx(ship_triggered=False)
+        decision = audit_runner._resolve_producer_review_decision(ctx, "yes")
+        assert decision["action"] == audit_runner.PRODUCER_REVIEW_REQUIRED
+
+    def test_marker_absence_no_flags(self):
+        """AC3/AC4: an unmarked independent top-level 'No' still flags."""
+        ctx = _decision_ctx(ship_triggered=False)
+        decision = audit_runner._resolve_producer_review_decision(ctx, "no")
+        assert decision["action"] == audit_runner.PRODUCER_REVIEW_REQUIRED
+
+    def test_marker_absence_preserved_unchanged(self):
+        """AC4: unmarked reviewed-unchanged 'Yes' still preserves the
+        review (SA-0MVR9B1UH002BUST carve-out is untouched by the marker)."""
+        prior = {
+            "readyToClose": True,
+            "fingerprint": _FINGERPRINT,
+            "currentFingerprint": _FINGERPRINT,
+        }
+        ctx = _decision_ctx(prior_audit=prior, ship_triggered=False)
+        decision = audit_runner._resolve_producer_review_decision(ctx, "yes")
+        assert decision["action"] == audit_runner.PRODUCER_REVIEW_PRESERVED
+
+    def test_marker_cannot_leak_into_unmarked_runs(self):
+        """AC1: a run without the marker never suppresses — the ship-triggered
+        reason is unreachable without the flag, for either verdict."""
+        for verdict in ("yes", "no"):
+            ctx = _decision_ctx(ship_triggered=False)
+            decision = audit_runner._resolve_producer_review_decision(
+                ctx, verdict,
+            )
+            assert decision["reason"] != _SHIP_TRIGGERED_REASON
+
+
+class TestShipTriggeredReportMetadata:
+    """AC2: the persisted report records the untouched decision with the
+    ship-triggered reason verbatim."""
+
+    def test_report_line_records_ship_triggered_untouched(self):
+        decision = {
+            "action": audit_runner.PRODUCER_REVIEW_UNTOUCHED,
+            "reason": _SHIP_TRIGGERED_REASON,
+            "fingerprint": None,
+        }
+        line = audit_runner._format_producer_review_line(decision)
+        assert line == (
+            f"{audit_runner.PRODUCER_REVIEW_REPORT_PREFIX}untouched "
+            f"({_SHIP_TRIGGERED_REASON})"
+        )
+        report = audit_runner._append_producer_review_metadata(
+            _YES_REPORT, decision,
+        )
+        assert _SHIP_TRIGGERED_REASON in report
+        assert audit_runner.PRODUCER_REVIEW_REPORT_PREFIX in report
+
+
+class TestShipTriggeredTerminalLifecycle:
+    """AC1/AC3: the terminal write follows the ship-triggered decision —
+    'Yes' still advances, 'No' still demotes, and neither writes the flag."""
+
+    def _apply(self, ctx, verdict):
+        ctx.audit_verdict = verdict
+        ctx.audit_completed = True
+        ctx.runner = _lifecycle_runner(ctx._calls)
+        audit_runner._apply_terminal_lifecycle(ctx)
+        updates = [c for c in ctx._calls if "update" in " ".join(c)]
+        assert updates, "expected a lifecycle wl update"
+        return updates[-1]
+
+    def test_ship_triggered_yes_advances_without_flag(self):
+        """AC1: ship-triggered 'Yes' still advances to completed/in_review
+        but never writes --needs-producer-review."""
+        ctx = _make_ctx(ship_triggered=True)
+        ctx._calls = []
+        cmd = self._apply(ctx, "yes")
+        if _flag_written(cmd):
+            pytest.xfail(
+                "--ship-triggered suppression not implemented "
+                f"({_IMPLEMENT_SHIP_TRIGGERED})"
+            )
+        assert not _flag_written(cmd)
+        assert cmd[cmd.index("--status") + 1] == "completed"
+        assert cmd[cmd.index("--stage") + 1] == "in_review"
+
+    def test_ship_triggered_no_demotes_without_flag(self):
+        """AC3: ship-triggered 'No' still demotes to open/plan_complete but
+        never writes --needs-producer-review."""
+        ctx = _make_ctx(ship_triggered=True)
+        ctx._calls = []
+        cmd = self._apply(ctx, "no")
+        if _flag_written(cmd):
+            pytest.xfail(
+                "--ship-triggered suppression not implemented "
+                f"({_IMPLEMENT_SHIP_TRIGGERED})"
+            )
+        assert not _flag_written(cmd)
+        assert cmd[cmd.index("--status") + 1] == "open"
+        assert cmd[cmd.index("--stage") + 1] == "plan_complete"
+
+    def test_marker_absence_yes_advance_still_flags(self):
+        """AC1/AC4: an unmarked never-reviewed 'Yes' still arms the producer
+        queue at the write site — the marker never leaks into unmarked runs."""
+        ctx = _make_ctx(ship_triggered=False)
+        ctx._calls = []
+        cmd = self._apply(ctx, "yes")
+        assert _flag_written(cmd)
+
+    def test_marker_absence_no_demotes_and_flags(self):
+        """AC3/AC4: an unmarked independent 'No' still demotes AND flags."""
+        ctx = _make_ctx(ship_triggered=False)
+        ctx._calls = []
+        cmd = self._apply(ctx, "no")
+        assert cmd[cmd.index("--status") + 1] == "open"
+        assert cmd[cmd.index("--stage") + 1] == "plan_complete"
+        assert _flag_written(cmd)
+
+
+class TestShipTriggeredParser:
+    """AC5: the marker is parsed as an ``issue``-subcommand boolean and must
+    never be added to the ``batch`` or ``check-freshness`` subparsers."""
+
+    def test_ship_triggered_flag_parses_on_issue(self):
+        """AC5: ``--ship-triggered`` is accepted by the issue subparser."""
+        try:
+            args = audit_runner.build_parser().parse_args(
+                ["issue", "TEST-1", "--ship-triggered"]
+            )
+        except SystemExit:
+            pytest.xfail(
+                "--ship-triggered flag not yet accepted on the issue "
+                f"subparser ({_IMPLEMENT_SHIP_TRIGGERED})"
+            )
+        assert args.command == "issue"
+        assert args.issue_id == "TEST-1"
+        assert args.ship_triggered is True
+
+    def test_ship_triggered_flag_rejected_on_batch(self):
+        """AC5: the marker is NOT added to the batch subparser — a
+        ship-triggered batch drain must fail loudly, never silently treat
+        drained items as ship-verification runs."""
+        with pytest.raises(SystemExit):
+            audit_runner.build_parser().parse_args(
+                ["batch", "--ship-triggered"]
+            )
+
+    def test_ship_triggered_flag_rejected_on_check_freshness(self):
+        """AC5: the marker is NOT added to the check-freshness subparser —
+        the read-only probe stays marker-free."""
+        with pytest.raises(SystemExit):
+            audit_runner.build_parser().parse_args(
+                ["check-freshness", "TEST-1", "--ship-triggered"]
+            )

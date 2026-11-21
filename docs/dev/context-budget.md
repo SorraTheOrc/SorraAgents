@@ -6,6 +6,34 @@ documents how to re-measure it. The reduction target is tracked by the epic
 [SA-0MSJI53RX006E2PS — Reduce initial LLM context from skills and
 skill-related startup files](https://github.com/SorraTheOrc/SorraAgents).
 
+## Static vs dynamic context: two complementary budgets
+
+This document — together with the committed
+`docs/dev/context-budget.thresholds.json` and the pre-push gate that enforces
+it — measures the **static startup** surface only: `AGENTS_GLOBAL.md`, the
+project `AGENTS.md`, the skills description prose and
+`skill/implement/SKILL.md`. It says nothing about what a session *adds* while
+it works.
+
+That runtime growth is a **second, separate budget**: the bytes a session
+accumulates from tool results — whole-file reads, unbounded searches, `cat`
+over generated artefacts. Measured on one live `implement` session (AI_Hell
+`AH-0MWH4F375000X08G`, 2026-11-16), tool results were **409 KB — 83% of the
+session context** after 8 min 34 s, against **51 KB — 10%** for the static
+startup surface.
+
+Canonical guidance for that **dynamic runtime** surface is
+[`skill/shared/tool-output-budget.md`](../../skill/shared/tool-output-budget.md):
+`jq` projections instead of `cat` over a generated artefact, capped `rg`
+searches (`-m`, `-c`, `-l` before widening), and `read` with
+`offset`/`limit` around a symbol a `rg -n` has already located.
+
+They are **complementary, not substitutes** — neither replaces the other. This
+document and its gate bound what a session *starts* with; the shared guidance
+bounds what *each tool call adds*. Auditing session logs for tool-output waste
+(and auto-filing improvement items from it) is deliberately out of scope here
+and tracked separately under `SA-0MWJWJ1HV000EBKP`.
+
 ## Measurement tool
 
 Canonical tool: `skill/context-audit/scripts/measure_context.py`.
@@ -319,6 +347,30 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > red-gate note was accommodated by trimming duplicated prose, not by raising
 > the threshold. (The cap was later revised to 22,500 B by
 > SA-0MUUI6ZCX001RO8V for the mandatory report AC-semantics note.)
+>
+> **Tool-output budget rollout bump (2026-11-17, SA-0MWJYHX6D008ZYE6 /
+> SA-0MWJYIKGC004XHW5):** rolling the shared
+> [tool-output budget](../../skill/shared/tool-output-budget.md) guidance out to
+> the 20 skills, the four dev skill-reference docs and the global rule list
+> added 232 B to `AGENTS_GLOBAL.md` (`global_agents 16159` → `16391`;
+> `total 22769` → `23001`; `project_agents` and `skills_prose` unchanged). The
+> growth is deliberate agent-efficiency guidance applied to every project, so
+> the thresholds were regenerated to the new measured surface rather than
+> compacting the rule. `skill_implement_md` moved 22343 → 22425 B, still under
+> its 22,500 B cap.
+>
+> **Tool-output budget rollout verification (2026-11-17,
+> SA-0MWJYIKGC004XHW5):** a fresh `measure_context.py --include-hidden`
+> re-measurement matched the committed thresholds exactly — `global_agents
+> 16391`, `project_agents 4271`, `skill_implement_md 22425`, `skills_prose
+> 2339`, `total 23001` — so the revision above is current rather than stale.
+> The rollout guard was then shown to fail when it should: deleting the
+> `skill/audit/SKILL.md` reference line turned
+> `TestSkillInventoryReferences::test_skill_md_references_shared_doc[audit]`
+> red, and removing `skill/shared/tool-output-budget.md` turned
+> `TestSharedDocExists::test_shared_doc_exists` plus the document-content class
+> red. Both mutations were reverted. No `CONTEXT_BUDGET_SKIP=1` bypass was
+> used at any point.
 >
 > ### Enforcement (committed gate)
 >

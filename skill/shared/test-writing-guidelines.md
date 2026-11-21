@@ -189,6 +189,37 @@ with mock.patch.object(audit_runner.subprocess, "run",
     ...
 ```
 
+### 11. Wall-Clock TTL Windows
+
+**What it looks like:** A test proves expiry by sleeping for a fraction of the
+configured TTL — e.g. `ttl_seconds=0.2` with `time.sleep(0.15)` between
+enqueues, asserting that the middle entry is still "fresh" while the first has
+expired.
+
+**Why it's bad:** The margin between "fresh" and "expired" is the sleep
+budget, and real elapsed time is always **sleep + test-harness overhead**
+(flock acquisition, directory glob, JSON write). On a loaded host that overhead
+passes the margin, the "fresh" entry is legitimately pruned by production code,
+and the test fails with a phantom product bug
+(`skill/shared/tests/test_queue.py::test_ttl_cleanup_preserves_order`,
+SA-0MWMJTL77006JX4N). Long sleeps also inflate the suite runtime.
+
+**Fix:** Inject ages through the API's testing hook instead of waiting. If the
+module accepts an explicit timestamp (`PriorityQueue.enqueue(...,
+timestamp=...)`), compute ages from `time.monotonic()` so no sleep is needed and
+the boundary has seconds of margin, not milliseconds:
+
+```python
+now = time.monotonic()
+pq = PriorityQueue("unit-ttl-order", ttl_seconds=60.0)
+pq.enqueue("old1", Priority.LOW, timestamp=now - 300.0)     # expired
+pq.enqueue("new1", Priority.HIGH, timestamp=now - 30.0)    # fresh
+```
+
+When no injection hook exists, add one to the production API rather than
+sleeping — a TTL that can only be tested by waiting is untestable at its
+boundary.
+
 ## Positive Guidance
 
 1. **Every test must assert observable behaviour of production code:** input →

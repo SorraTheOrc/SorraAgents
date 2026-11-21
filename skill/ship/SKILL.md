@@ -333,6 +333,8 @@ Cached results are valid for the same git state within the 2-hour TTL; a changed
 
 The implement workflow uses `pushToDev()` internally; the ship `release` action promotes `dev` to `main`. See [AGENTS.md](../../AGENTS.md) and [[concepts/git-worktree-best-practices-for-agent-workflows]].
 
+When inspecting release artefacts (logs, manifests, thresholds), follow the shared [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result.
+
 ## Outputs
 
 GitHub PR `release/dev-to-main-<timestamp>` → `main`; worklog audit comment (merge hash + PR URL); operator notification summarising the merge.

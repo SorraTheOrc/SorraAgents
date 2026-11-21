@@ -40,6 +40,7 @@ References
 
 - Runner: `$(skill_path test)/scripts/run_tests.py` · Usefulness: `$(skill_path test)/scripts/evaluate_usefulness.py` · Triage: `$(skill_path triage)/scripts/check_or_create.py`
 - Canonicalization: `../test_runner.py` · Anti-patterns: [Test Writing Guidelines](../shared/test-writing-guidelines.md)
+- Tool output: [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result
 
 Workflow
 --------
@@ -60,7 +61,7 @@ python3 $(skill_path test)/scripts/run_tests.py --json
 4. **Node suite dirs** — `node --test "tests/node/**/*.mjs" "tests/cli/**/*.mjs" "tests/unit/**/*.mjs"` (or `npm --silent test` per suite dir). Glob patterns required — node v22.22.1 rejects a bare dir (SA-0MSF8KNE3003JDVD). Only suite dirs that **exist** under the target repo are included — missing dirs are skipped (SA-0MSJELL44009XYIL), so a repo without `tests/node` never gets a guaranteed-failing phantom command.
 5. **npm-test convention** — `npm --silent test` for repos whose `package.json` declares a `test` script (TCE-like layouts), emitted ONLY when nothing above resolved (no pinned list, no pytest suite, no hidden skill-test candidates, no node suite dirs).
 
-An empty resolved set (no extension file, no pytest suite, no hidden skill tests, no node dirs, no npm test script) is NOT an error — the runner reports zero commands and the audit skill treats the repo as execution-impossible (fail-open partial, never blocks — F4 AC2).
+An empty resolved set (no extension file, no pytest suite, no hidden skill tests, no node dirs, no npm test script) is NOT an error — the runner reports zero commands with the stable `no_suites_detected` notice code, exits 0, and the dev-push gate passes without `TEST_SCOPE_SKIP=1` (SA-0MWNZLB07007S8QU); the audit skill treats such a repo as execution-impossible (fail-open partial, never blocks — F4 AC2).
 
 **Hidden project-local skill tests (SA-0MVQJSGLY0098DVB).** Pytest's default `norecursedirs` includes `.*`, so a recursive `pytest` run from the repository root never traverses `.pi/` — the tests a project ships with its *project-local* skills (`<root>/.pi/skills/<name>/tests` or `.../test`) are silently absent from the "full" suite (measured on the llm repo: 5 264 collected recursively vs 529 in the skill's own test directory — SA-0MVOBJGB4001TQ8X). pytest's `pytest_ignore_collect` hook only affects *explicit* initial paths, so naming a directory on the command line collects it even though the default recursive run prunes it. The resolver scans exactly that hidden root — a candidate is a directory that exists and contains at least one `*.py` (recursive); candidates are sorted, de-duplicated and `shlex`-quoted for deterministic command strings; no other hidden root (`.claude/`, `.git/`, `.worklog/`) is ever scanned. When at least one candidate exists the resolver emits **exactly one** additional quiet pytest command listing every candidate, immediately after the canonical pytest command and before any node command. One command (not one per directory) keeps a single cache entry, a single timeout budget and the existing semaphore accounting. Emission is independent of `repo_has_pytest_suite()` — a project shipping only skill tests still gets the command; no candidates → the command is not emitted and resolution is byte-identical to today.
 

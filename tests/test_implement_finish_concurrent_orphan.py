@@ -31,9 +31,12 @@ regression contract the sibling features must satisfy —
   lock file left by a crashed run never blocks a later ``finish``. The
   adjacent ``start`` parent-branch refresh — which moves the same shared ref —
   takes the same lock and skips the refresh (fail-open) when it is held.
-- **Verified sync + ancestry** (SA-0MVPZG7A0000N66U): a failed push restores
-  local ``dev`` to ``refs/remotes/origin/dev``, and a ``finish`` whose commit
-  did not reach ``origin/dev`` fails loudly instead of reporting success.
+- **Deferred sync + ancestry** (SA-0MVPZG7A0000N66U; re-contracted by
+  WL-0MWFKDH78002T2CR AC1/AC2): local ``dev`` is **never moved while a push
+  is in flight** — the fast-forward is deferred until after the push reports
+  success, so a failed push leaves local ``dev`` provably unchanged
+  (``no_advance_to_undo``), and a ``finish`` whose commit did not reach
+  ``origin/dev`` fails loudly instead of reporting success.
 
 Assertions for behaviour that is not implemented yet are marked with an
 imperative ``pytest.xfail`` naming the blocking work item. The marker fires
@@ -321,17 +324,21 @@ def test_published_commit_survives_a_sibling_finish_from_the_older_base(
     """The incident shape, end to end: A lands, then B finishes from the base.
 
     A's push actually reached ``origin/dev`` but was *reported* failed (the
-    false negative tracked by SA-0MUOOXH17004ZEFX). B, forked from the older
-    base, must not drop A: A stays an ancestor of both local ``dev`` and
-    ``refs/remotes/origin/dev``, and local ``dev`` never diverges from the
-    remote.
-
-    This is a hard regression guard (green before and after the fixes): it
-    pins the invariant, not the implementation, so a refusal to fast-forward
-    and a rebase-then-succeed outcome both satisfy it.
+    false negative tracked by SA-0MUOOXH17004ZEFX). Under the AC2 contract of
+    WL-0MWFKDH78002T2CR the failed push leaves local ``dev`` **provably
+    unchanged** (``no_advance_to_undo`` — the advance is deferred until after
+    a successful push, so there is no write-then-restore window for a
+    concurrent ``start`` to fork from), and A's commit is never dropped from
+    ``origin/dev``. Local ``dev`` converges to the published tip through the
+    framework's sync helper — the same ``_sync_parent_branch`` a later
+    successful finish's post-push step and a later ``start`` refresh use —
+    after which A stays an ancestor of both local ``dev`` and
+    ``origin/dev`` and local ``dev`` never diverges.
     """
     work = sandbox["work"]
     wt_a, wt_b = sandbox["wt_a"], sandbox["wt_b"]
+
+    pre_finish_dev = _local_dev(sandbox)
 
     (wt_a / "feature_a.txt").write_text("a\n", encoding="utf-8")
     report_a = _run_finish(
@@ -343,29 +350,42 @@ def test_published_commit_survives_a_sibling_finish_from_the_older_base(
     )
     commit_a = _rev(wt_a, "HEAD")
 
-    # Preconditions of the incident: A is published but finish reported
-    # failure, and the pre-push fast-forward already moved local dev.
+    # A is published but finish reported failure, and the failed push
+    # provably left local dev untouched (AC2 — no write-then-restore window).
     assert report_a["success"] is False, report_a
     assert _is_ancestor(work, commit_a, "refs/remotes/origin/dev"), (
         "scenario precondition: the ambiguous push must have landed"
     )
+    restore = report_a["steps"]["local_dev_restore"]
+    assert restore["reason"] == "no_advance_to_undo", restore
+    assert _local_dev(sandbox) == pre_finish_dev, (
+        "AC2: a failed push must leave local dev at its pre-finish tip "
+        f"(now={_local_dev(sandbox)[:7]}, "
+        f"pre_finish={pre_finish_dev[:7]})"
+    )
 
+    # The sibling finish, forked from the older base, never drops A.
     (wt_b / "feature_b.txt").write_text("b\n", encoding="utf-8")
-    report_b = _run_finish(implement_mod, sandbox, wt_b, _ITEM_B)
-
-    final_dev = _local_dev(sandbox)
-    final_origin = _origin_dev(sandbox)
+    _run_finish(implement_mod, sandbox, wt_b, _ITEM_B)
 
     assert _is_ancestor(work, commit_a, "refs/remotes/origin/dev"), (
         "the published first commit must never be dropped from origin/dev"
     )
+
+    # Convergence comes from the framework's sync (a later successful
+    # finish's post-push step / a later start refresh), never from a
+    # failed-push write: after the sync A stays reachable from local dev and
+    # local dev equals origin/dev.
+    sync = implement_mod._sync_parent_branch(str(work), "dev")
+    assert sync["method"] == "synced", sync
+    final_dev = _local_dev(sandbox)
+    final_origin = _origin_dev(sandbox)
     assert _is_ancestor(work, commit_a, "refs/heads/dev"), (
         "the first commit must stay reachable from local dev"
     )
     assert final_dev == final_origin, (
-        "local dev must never diverge from origin/dev after a finish "
-        f"(local={final_dev[:7]}, origin={final_origin[:7]}, "
-        f"report_b={report_b.get('message')!r})"
+        "local dev must never diverge from origin/dev after the sync "
+        f"(local={final_dev[:7]}, origin={final_origin[:7]}, sync={sync!r})"
     )
     assert _BRANCH_A in _branches_containing(sandbox, commit_a), (
         "the first commit must remain reachable for recovery"
@@ -377,25 +397,25 @@ def test_published_commit_survives_a_sibling_finish_from_the_older_base(
 # ---------------------------------------------------------------------------
 
 
-def test_failed_push_restores_local_dev_and_keeps_commit_on_its_branch(
+def test_failed_push_leaves_local_dev_unchanged_and_keeps_commit_on_branch(
     implement_mod, sandbox
 ):
-    """A failed push must not leave local ``dev`` on an unpushed commit.
+    """A failed push must not move local ``dev``; the commit stays on its branch.
 
-    Contract (parent AC1, SA-0MVPZG7A0000N66U): after a push failure local
-    ``dev`` points at ``refs/remotes/origin/dev`` (or a commit already on it)
-    and the unpushed commit stays reachable from its feature branch. Without
-    that restore, the next finish (forked from the older base) either skips
-    its pre-push fast-forward or pins local ``dev`` off the remote entirely —
-    the orphan observed on 2026-10-25.
-
-    While the feature is absent the restore assertion is marked ``xfail`` with
-    the defect it observes; the sibling finish still runs (so the whole
-    two-finish scenario is exercised) and its outcome is asserted after the
-    marker.
+    Contract (parent AC1/AC2, WL-0MWFKDH78002T2CR): the fast-forward is
+    deferred until after a successful push, so on a failed push local ``dev``
+    is **provably unchanged** from its pre-finish value — the restore reports
+    ``no_advance_to_undo`` and there is no write-then-restore window for a
+    concurrent ``start`` to fork from (the orphan observed on 2026-10-25 and
+    the graft observed on 2026-11-13). The unpushed commit stays reachable
+    from its feature branch. The sibling finish (from the same base) still
+    runs; because nothing landed it fast-forwards cleanly and the shared refs
+    converge.
     """
     work = sandbox["work"]
     wt_a, wt_b = sandbox["wt_a"], sandbox["wt_b"]
+
+    pre_finish_dev = _local_dev(sandbox)
 
     (wt_a / "feature_a.txt").write_text("a\n", encoding="utf-8")
     report_a = _run_finish(
@@ -403,7 +423,6 @@ def test_failed_push_restores_local_dev_and_keeps_commit_on_its_branch(
     )
     commit_a = _rev(work, "refs/heads/" + _BRANCH_A)
     after_failed_push_dev = _local_dev(sandbox)
-    after_failed_push_origin = _origin_dev(sandbox)
 
     # Invariants that hold with or without the verified-sync feature.
     assert report_a["success"] is False, report_a
@@ -412,37 +431,28 @@ def test_failed_push_restores_local_dev_and_keeps_commit_on_its_branch(
     assert _BRANCH_A in _branches_containing(sandbox, commit_a), (
         "the unpushed commit must stay reachable from its feature branch"
     )
+    # AC2: a failed push leaves local dev provably unchanged — nothing to undo.
+    assert after_failed_push_dev == pre_finish_dev, (
+        "AC2: local dev must be provably unchanged from its pre-finish value "
+        f"(now={after_failed_push_dev[:7]}, "
+        f"pre_finish={pre_finish_dev[:7]})"
+    )
+    restore = report_a["steps"]["local_dev_restore"]
+    assert restore["reason"] == "no_advance_to_undo", restore
 
-    # The second finish, forked from the *older* base (before A's commit).
+    # The second finish, forked from the same base: nothing landed, so it
+    # fast-forwards cleanly and converges the shared refs.
     (wt_b / "feature_b.txt").write_text("b\n", encoding="utf-8")
     report_b = _run_finish(implement_mod, sandbox, wt_b, _ITEM_B)
 
     final_dev = _local_dev(sandbox)
     final_origin = _origin_dev(sandbox)
-
-    # The failed push must record that it undid its own advance, and local dev
-    # must be back on the remote tip, not on the unpushed commit
-    # (SA-0MVPZG7A0000N66U AC1).
-    restore = report_a["steps"]["local_dev_restore"]
-    assert restore["restored"] is True, restore
-
-    if after_failed_push_dev != after_failed_push_origin:
-        pytest.xfail(
-            "verified/reversible local-dev sync not implemented "
-            "(SA-0MVPZG7A0000N66U): the failed push left local dev at the "
-            f"unpushed commit {after_failed_push_dev[:7]}, so the next finish "
-            "from the older base skips its fast-forward and local dev ends at "
-            f"{final_dev[:7]} while origin/dev is at {final_origin[:7]}"
-        )
-
-    assert after_failed_push_dev == after_failed_push_origin, (
-        "local dev must be restored to refs/remotes/origin/dev after a "
-        "failed push"
-    )
     assert report_b["success"] is True, report_b.get("message")
     assert final_dev == final_origin, (
-        "the sibling finish must leave local dev == origin/dev"
+        "the sibling finish must leave local dev == origin/dev "
+        f"(local={final_dev[:7]}, origin={final_origin[:7]})"
     )
+    # A's commit never landed: it must not be claimed as published.
     assert not _is_ancestor(work, commit_a, "refs/remotes/origin/dev"), (
         "the unpublished commit must never be claimed as published"
     )
@@ -606,12 +616,12 @@ def test_concurrent_finish_fails_fast_with_an_actionable_message(
 def test_successful_finish_records_verified_ancestry_and_local_dev_advance(
     implement_mod, sandbox
 ):
-    """A landed finish records the verified advance and the ancestry verdict.
+    """A landed finish records the post-push advance and the ancestry verdict.
 
     ``finish`` may only claim success when its own commit is verifiably on
-    ``origin/dev``; both the reversible pre-push advance and the post-push
-    ancestry verdict are observable in the JSON report so an operator can see
-    *why* it succeeded.
+    ``origin/dev``; the post-push fast-forward (never a pre-push one) and the
+    post-push ancestry verdict are observable in the JSON report so an
+    operator can see *why* it succeeded (WL-0MWFKDH78002T2CR AC1).
     """
     work = sandbox["work"]
     wt_a = sandbox["wt_a"]
@@ -636,7 +646,7 @@ def test_successful_finish_records_verified_ancestry_and_local_dev_advance(
 def test_failed_push_report_names_the_local_dev_restore(
     implement_mod, sandbox
 ):
-    """A failed push records the restore back to ``origin/dev``."""
+    """A failed push records that there was nothing to undo (AC2)."""
     work = sandbox["work"]
     wt_a = sandbox["wt_a"]
     (wt_a / "feature_a.txt").write_text("a\n", encoding="utf-8")
@@ -650,8 +660,10 @@ def test_failed_push_report_names_the_local_dev_restore(
     assert report["steps"]["push"]["success"] is False
     assert report["steps"]["push"]["reason"] == "push_failed"
     restore = report["steps"]["local_dev_restore"]
-    assert restore["restored"] is True, restore
-    assert _local_dev(sandbox) == _origin_dev(sandbox) == sandbox["base"]
+    assert restore["reason"] == "no_advance_to_undo", restore
+    assert _local_dev(sandbox) == _origin_dev(sandbox) == sandbox["base"], (
+        "a failed push must leave local dev provably unchanged (AC2)"
+    )
     # The unpushed commit is retained on its feature branch for recovery.
     assert _rev(wt_a, "HEAD") == commit_a
 

@@ -1,4 +1,9 @@
-#!/usr/bin/env python3
+
+# <!-- REFACTOR-SA-0MWMBFPKY0059F54
+# smell: formatting
+# severity: low
+# description: The file is executable but no shebang is present
+# -->
 """
 Machine-hygiene config loader.
 

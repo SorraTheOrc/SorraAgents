@@ -29,11 +29,19 @@ kernel's exclusive advisory ``flock`` on that file's **open file description**:
   (work item id, pid, ISO start time, repo root, host) exists **only** to make
   a refusal actionable. A lock file left behind by a dead holder is never
   consulted to decide ownership, so it cannot block a later run.
-- **Bounded wait.** ``timeout=0`` (the default) is a single non-blocking
-  attempt: the caller fails fast. ``timeout > 0`` retries until the deadline
-  and then returns an actionable timeout message naming the lock path, the
-  holder and the recovery step. An indefinite wait is rejected outright
+- **Bounded wait with progress.** ``timeout=0`` (the default here) is a
+  single non-blocking attempt: the caller fails fast. ``timeout > 0`` waits
+  until the deadline, optionally reporting progress as it goes: an initial
+  message naming the lock path, the bound and the current holder, then a
+  heartbeat at most once per ``progress_interval`` (30 s by default). The
+  wait ends the moment the holder releases; if the deadline expires first, it
+  returns an actionable timeout message naming the lock path, the holder and
+  the recovery step. An indefinite wait is rejected outright
   (``timeout=None`` raises ``ValueError``) so no caller can hang forever.
+- **Signal-safe.** A ``SIGINT``/``SIGTERM`` delivered while waiting is handed
+  to the caller's handler between retries and the loop's descriptor is closed
+  on any exception, so a signal never leaks a lock descriptor or leaves a
+  half-acquired lock behind.
 - **Per-repository scope.** The lock file lives inside the checkout, so runs in
   different repositories on the same host never contend.
 
@@ -61,11 +69,13 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import socket
 import sys
 import time
 import types
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -87,6 +97,13 @@ DEFAULT_LOCK_RELPATH = os.path.join(".worklog", "locks", "main-checkout.lock")
 
 #: Poll cadence while waiting for a held lock (seconds).
 RETRY_DELAY_SECONDS = 0.05
+
+#: Default cadence for lock-wait progress messages (seconds). The first
+#: contention reports immediately; later heartbeats are throttled to this
+#: interval so a long wait stays visible without flooding the log.
+DEFAULT_PROGRESS_INTERVAL_SECONDS = 30.0
+
+LOG = logging.getLogger(__name__)
 
 
 class RepoLockTimeout(RuntimeError):
@@ -196,7 +213,12 @@ class RepoLock:
         )
 
     def acquire(
-        self, holder_id: str, timeout: float = 0.0
+        self,
+        holder_id: str,
+        timeout: float = 0.0,
+        *,
+        progress: Callable[[str], None] | None = None,
+        progress_interval: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
     ) -> tuple[int | None, str | None]:
         """Try to take the exclusive lock.
 
@@ -205,6 +227,15 @@ class RepoLock:
                 refusal message (e.g. the work item id).
             timeout: Bounded wait in seconds. ``0`` (default) fails fast with a
                 single non-blocking attempt; ``> 0`` retries until the deadline.
+            progress: Optional callback that receives human-readable progress
+                messages while a positive *timeout* is waited out: one as soon
+                as contention is detected (naming the lock path, the bound and
+                the current holder), a throttled heartbeat thereafter, and a
+                final line when the lock is acquired. A failing callback never
+                breaks the wait — progress is diagnostic only.
+            progress_interval: Minimum seconds between heartbeat messages
+                (default :data:`DEFAULT_PROGRESS_INTERVAL_SECONDS`). The first
+                contention message is always emitted immediately.
 
         Returns:
             ``(fd, None)`` when acquired — the caller releases with
@@ -238,28 +269,74 @@ class RepoLock:
         except OSError as exc:
             return None, f"cannot open lock file {self.path}: {exc}"
 
-        deadline = time.monotonic() + timeout
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except (OSError, AttributeError) as exc:
-                busy = isinstance(exc, OSError) and exc.errno in (
-                    errno.EACCES,
-                    errno.EAGAIN,
-                )
-                if not busy:
-                    os.close(fd)
-                    return None, f"flock failed on {self.path}: {exc}"
-                if time.monotonic() >= deadline:
-                    os.close(fd)
-                    return None, self.refusal_message(
-                        holder_id, describe_holder(self.read_holder()), timeout
+        started_at = time.monotonic()
+        deadline = started_at + timeout
+        interval = max(0.0, float(progress_interval))
+        next_progress_at = started_at
+        reported_contention = False
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (OSError, AttributeError) as exc:
+                    busy = isinstance(exc, OSError) and exc.errno in (
+                        errno.EACCES,
+                        errno.EAGAIN,
                     )
-                time.sleep(RETRY_DELAY_SECONDS)
+                    if not busy:
+                        os.close(fd)
+                        return None, f"flock failed on {self.path}: {exc}"
+                    now = time.monotonic()
+                    if now >= deadline:
+                        # The deadline check precedes the heartbeat so an
+                        # expiring wait refuses instead of emitting a final
+                        # "still waiting" line and then failing.
+                        os.close(fd)
+                        return None, self.refusal_message(
+                            holder_id,
+                            describe_holder(self.read_holder()),
+                            timeout,
+                        )
+                    if progress is not None and now >= next_progress_at:
+                        if not reported_contention:
+                            message = (
+                                f"Waiting for the repository lock {self.path} "
+                                f"(holder: "
+                                f"{describe_holder(self.read_holder())}); "
+                                f"will wait up to {timeout:g}s"
+                            )
+                            reported_contention = True
+                        else:
+                            elapsed = now - started_at
+                            message = (
+                                f"Still waiting for the repository lock "
+                                f"{self.path} after {elapsed:.0f}s of "
+                                f"{timeout:g}s (holder: "
+                                f"{describe_holder(self.read_holder())})"
+                            )
+                        _emit_progress(progress, message)
+                        next_progress_at = now + interval
+                    time.sleep(RETRY_DELAY_SECONDS)
+        except BaseException:
+            # A signal (``KeyboardInterrupt``/``SystemExit``) or any other
+            # escape must not leak the descriptor opened for this attempt.
+            # The ``flock`` was never taken, so closing it leaves no lock
+            # behind and the next run can acquire immediately.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
 
         self._held_fd = fd
         self._write_holder(fd, holder_id)
+        if progress is not None and timeout > 0:
+            _emit_progress(
+                progress,
+                f"Acquired the repository lock {self.path} after "
+                f"{time.monotonic() - started_at:.1f}s",
+            )
         return fd, None
 
     def _write_holder(self, fd: int, holder_id: str) -> None:
@@ -314,11 +391,26 @@ class RepoLock:
         self.release()
 
 
+def _emit_progress(callback: Callable[[str], None], message: str) -> None:
+    """Invoke a lock-wait progress callback, never letting it break the wait.
+
+    Progress is diagnostic only: a callback that raises (a broken logger, a
+    closed stream) must not turn a successful acquisition into a failure.
+    """
+    try:
+        callback(message)
+    except Exception as exc:  # noqa: BLE001 - diagnostic callback, by design
+        LOG.debug("lock-wait progress callback failed: %s", exc)
+
+
 def acquire_repo_lock(
     repo_root: str | os.PathLike[str],
     holder_id: str,
     timeout: float = 0.0,
     relpath: str = DEFAULT_LOCK_RELPATH,
+    *,
+    progress: Callable[[str], None] | None = None,
+    progress_interval: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
 ) -> tuple[int | None, str | None]:
     """Functional form of :meth:`RepoLock.acquire`.
 
@@ -326,7 +418,12 @@ def acquire_repo_lock(
     lock is held. The returned descriptor is released with
     :func:`release_repo_lock`.
     """
-    return RepoLock(repo_root, relpath=relpath).acquire(holder_id, timeout=timeout)
+    return RepoLock(repo_root, relpath=relpath).acquire(
+        holder_id,
+        timeout=timeout,
+        progress=progress,
+        progress_interval=progress_interval,
+    )
 
 
 def release_repo_lock(fd: int | None) -> None:

@@ -9,7 +9,6 @@
   "enabledModels": [
     "Local Proxy/plan",
     "Local Proxy/code",
-    "MunitoAI/*",
     "deepseek/deepseek*"
   ],
   "theme": "dark",

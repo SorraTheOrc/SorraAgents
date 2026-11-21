@@ -857,7 +857,7 @@ export async function checkAuditReadyToClose(options = {}) {
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
     runAuditCommand = (runnerPath, workItemId, timeoutMs) => execSync(
-      `python3 "${runnerPath}" issue ${workItemId} --strict`,
+      `python3 "${runnerPath}" issue ${workItemId} --strict --ship-triggered`,
       // Per-item timeout guard (SA-0MSUT8GQP004WSYN AC6 / R1): a hung audit
       // runner must not stall the whole release gate. The default audit
       // runner hard-times-out internally, so this is a belt-and-braces cap.

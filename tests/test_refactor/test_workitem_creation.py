@@ -1603,3 +1603,96 @@ class TestIdentityDedupeScenarios:
             f"a terminal audit chore must not suppress, got {result!r}"
         )
         assert len(created) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: re-verification metadata (SA-0MW7Z1JCE009G6J3 AC1)
+# ---------------------------------------------------------------------------
+
+
+class TestReverificationMetadata:
+    """Every linter-derived item records an exact verification command."""
+
+    def test_build_verification_command_for_ruff_smell(self, tmp_path: Path):
+        """A ruff-derived smell yields the exact reproduce command."""
+        from refactor.workitem_creation import build_verification_command
+
+        file_path = tmp_path / "skill" / "x.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("a = 1\n")
+        smell = {
+            "file": str(file_path),
+            "line": 1,
+            "severity": "medium",
+            "message": "m",
+            "source": "linter",
+            "smell_type": "lint",
+            "code": "S112",
+        }
+
+        command = build_verification_command(smell, repo_root=str(tmp_path))
+
+        assert command == (
+            "ruff check --isolated --select S112 skill/x.py"
+        )
+
+    def test_llm_smell_has_no_verification_command(self, tmp_path: Path):
+        """An LLM (non-linter) smell cannot be re-run, so it records none."""
+        from refactor.workitem_creation import build_verification_command
+
+        file_path = tmp_path / "x.py"
+        file_path.write_text("a = 1\n")
+        smell = {
+            "file": str(file_path),
+            "line": 1,
+            "severity": "medium",
+            "message": "m",
+            "source": "llm",
+            "smell_type": "complex_function",
+            "code": "CC001",
+        }
+
+        assert build_verification_command(smell, repo_root=str(tmp_path)) == ""
+
+    def test_non_ruff_code_has_no_verification_command(self, tmp_path: Path):
+        """An eslint-style rule cannot be expressed as a ruff command."""
+        from refactor.workitem_creation import build_verification_command
+
+        file_path = tmp_path / "x.js"
+        file_path.write_text("const a = 1\n")
+        smell = {
+            "file": str(file_path),
+            "line": 1,
+            "severity": "medium",
+            "message": "m",
+            "source": "linter",
+            "smell_type": "lint",
+            "code": "no-unused-vars",
+        }
+
+        assert build_verification_command(smell, repo_root=str(tmp_path)) == ""
+
+    def test_description_records_verification_marker(self, tmp_path: Path):
+        """The description carries the marker the sweep later re-reads."""
+        from refactor.workitem_creation import (
+            VERIFICATION_CMD_MARKER,
+            build_smell_description,
+        )
+
+        file_path = tmp_path / "skill" / "x.py"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("a = 1\n")
+        smell = {
+            "file": str(file_path),
+            "line": 3,
+            "severity": "medium",
+            "message": "m",
+            "source": "linter",
+            "smell_type": "lint",
+            "code": "SIM117",
+        }
+
+        desc = build_smell_description(smell, repo_root=str(tmp_path))
+
+        assert VERIFICATION_CMD_MARKER in desc
+        assert "ruff check --isolated --select SIM117 skill/x.py" in desc

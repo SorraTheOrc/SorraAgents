@@ -132,7 +132,12 @@ when items still need attention. `--dry-run` reports the plan (`fresh` /
 `toRefresh` / `failing`) without invoking the audit runner. The refresh reuses
 `planAuditRefresh()` / `refreshAudits()` and the bounded `RemediationBudget`, so
 it can never run unbounded. `--refresh-audits` is a wrapper-only flag (never
-forwarded to the merge script).
+forwarded to the merge script). The refresh's re-audits are **ship-triggered**
+(`audit_runner.py issue <id> --strict --ship-triggered`), so a pre-flight
+refresh — like the in-gate remediation, see Step 2 — never arms
+`needsProducerReview` on the very items the release is about to ship
+(SA-0MW92TODX00064XQ). The surfaced offline-refresh hint stays marker-free
+(operator-invoked).
 
 ### Step 2: Audit readiness gate (exit 6)
 
@@ -141,7 +146,8 @@ forwarded to the merge script).
 covered by their parent's audit and never block.
 
 Missing, **stale**, and transient audits are auto-remediated conservatively:
-the gate re-runs `audit_runner.py issue <id>` and re-checks `wl audit-show`,
+the gate re-runs `audit_runner.py issue <id> --strict --ship-triggered` and
+re-checks `wl audit-show`,
 blocking only if the item still fails after the re-run. A **stale** verdict is
 one whose `auditedAt` predates the item's last update (per the shared freshness
 buffer/tolerance in `audit-freshness.js`) — the verdict is not trustworthy, so
@@ -178,6 +184,19 @@ batch`), never as "not ready to close". `classifyRemediationError()` labels a
 runner failure `timeout` / `concurrency` / `provider` / `error`, so an
 infrastructure failure is distinguishable from a work verdict (surfaced as the
 `category` field on the blocking entry and in the reason text).
+
+**Ship-triggered marker (SA-0MW92TODX00064XQ):** every in-gate remediation
+re-audit includes `--ship-triggered`, so a release-gate verification re-audit —
+unlike an operator-invoked run — leaves `needsProducerReview` untouched for
+both `Yes` and `No` verdicts (the release never arms the producer queue it is
+itself gated on). The surfaced **manual remediation commands stay marker-free
+and independent**: `buildRemediationCommand()` emits `audit_runner.py issue
+<id> --strict` (no marker), the budget-exhausted/offline-refresh hint emits
+`audit_runner.py batch --strict` (no marker), and the content-freshness probe
+`audit_runner.py check-freshness <id> --json` accepts no marker — an
+operator-invoked remediation re-audit therefore flags independently exactly as
+an interactive audit would. The same contract applies to the pre-flight
+`--refresh-audits` re-audits and the Step-3.7 final-validation sweep below.
 
 **The per-item timeout is clamped to the remaining budget
 (WL-0MW32YZP7005LZ5B).** Every attempt gets
@@ -266,7 +285,8 @@ conservatively (`uncovered`).
 
 Covered and excluded children are reported in `coveredChildren` /
 `excludedChildren` and never block. Missing, stale, and transient audits are
-auto-remediated conservatively by re-running `audit_runner.py issue <id>` and
+auto-remediated conservatively by re-running `audit_runner.py issue <id>
+--strict --ship-triggered` and
 re-checking `wl audit-show`; successfully-remediated items are unblocked and
 reported separately. Remediation is bounded by the same
 `SHIP_AUDIT_REMEDIATION_*` budget as Step 2 (SA-0MUOO5V0P00461X8): once

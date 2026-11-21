@@ -25,6 +25,8 @@ path; never run `./scripts/...` relative to the project repo.
 
 You are authoring a new Worklog work item for a feature or bug fix, following an interview-driven approach to gather requirements, constraints, Acceptance Criteria (synonym: Success Criteria), and related work — ensuring sufficient detail for a developer to complete the work.
 
+> **Tool output:** follow the shared [tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result.
+
 ## Inputs
 
 - `$1` — The work-item-id (`<prefix>-<hash>`). If valid, fetch and use it; if missing/invalid, treat `$ARGUMENTS` as seed intent and create a new item as needed; if the user meant an existing item, ask for a valid id.

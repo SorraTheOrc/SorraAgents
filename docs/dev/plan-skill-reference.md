@@ -5,6 +5,10 @@ Deep implementation-reference detail relocated from `skill/plan/SKILL.md`
 operational brief; this document preserves the full implementation reference
 for maintainers. Workflow semantics are unchanged.
 
+> **Tool output:** when this reference tells you to read or search context,
+> follow the shared [tool-output budget](../../skill/shared/tool-output-budget.md)
+> — `jq` over `cat`, capped searches, ~10 KB per result.
+
 ## Interview conduct
 
 Interview conduct is defined once in the canonical shared interview skill

@@ -11,7 +11,7 @@ through code, tests, and docs.
 ## Inputs
 
 - work-item id: required; validate `<prefix>-<hash>`, prompt if missing.
-- Optional freeform guidance in the arguments may shape the approach.
+- Optional freeform guidance may shape the approach.
 
 ## Outputs
 
@@ -20,7 +20,7 @@ through code, tests, and docs.
 
 ## References to Bundled Resources
 
-- Deep implementation reference (relocated detail, tables, guard matrices):
+- Deep reference (relocated detail, tables, guard matrices):
   [docs/dev/implement-skill-reference.md](../../docs/dev/implement-skill-reference.md).
 - Intake/interview helpers: `intake`, `plan`, `interview`.
 - [Test writing guidelines](../shared/test-writing-guidelines.md),
@@ -28,6 +28,7 @@ through code, tests, and docs.
   [status lifecycle](../shared/status_lifecycle.py),
   [handling assets](../../docs/dev/implement-skill-reference.md#relocated-handling-assets),
   [timeouts](../../docs/dev/implement-skill-reference.md#relocated-test-timeout-configuration).
+- [Tool output budget](../shared/tool-output-budget.md) — size before you read.
 
 Security note — **protected branches** (`main`/`master`/`HEAD`) and **creating
 PRs** require explicit operator permission: never push to them or open PRs
@@ -38,8 +39,7 @@ passes and the test gate is green. `implement.py finish` validates with
 **changed scope only**; the **full suite first runs at the dev-push
 integration gate** (`run_tests.py --scope full` in the pre-push hook), and the
 ship release gate re-runs it on the merged dev→main tree
-(SA-0MVECQUGF0064U81, SA-0MT6BYQHB008DOGC). `finish` resolves that verdict
-before taking the main-checkout lock (SA-0MWFJS3820032YB4).
+(SA-0MVECQUGF0064U81, SA-0MT6BYQHB008DOGC, SA-0MWFJS3820032YB4).
 
 Privacy note: avoid secrets/tokens/PII in comments or PR bodies; mask/redact
 sensitive values.
@@ -244,8 +244,8 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 > `git submodule update --init --recursive`. Failures produce a **WARNING**
 > but do not abort (best-effort); repos without `.gitmodules` are unaffected.
 
-`implement.py start` handles the rest: idempotent resume from either `cwd`,
-and the stale-shared-resolution fail-closed gate.
+`implement.py start` handles the rest (idempotent resume, stale-resolution
+gate).
 
 6. Implement
 
@@ -261,10 +261,9 @@ and the stale-shared-resolution fail-closed gate.
 - Discovered additional work →
   `wl create "<title>" --deps discovered-from:<work-item-id> --json`.
 - Once all ACs are met: **build** (no errors), then validate via `/skill:test`
-  ([test skill](../test/SKILL.md)). `implement.py finish` runs a **changed-scope**
-  validation; the **full suite** is the dev-push gate's, resolved pre-lock.
-  `run_tests.py` must go through the test-skill runner — only it records the
-  per-repo cache the audit reads. Update docs (except `CHANGELOG.md`).
+  ([test skill](../test/SKILL.md)). `run_tests.py` must go through the
+  test-skill runner — only it records the per-repo cache the audit reads.
+  Update docs (except `CHANGELOG.md`).
 
 6.1. Parent recursion (epic/parent items only)
 
@@ -289,7 +288,8 @@ child is re-checked each run against its `wl dep` edges and explicit
 `skip-blocked` with `blocking_ids`, never started; all blockers terminal ⇒
 the block is stale and the child starts. Precedence: `skip-terminal` →
 `skipped-held` → `skip-in-progress` → `skip-blocked` → `implement`. `drive`
-never spawns a `skip-blocked` child. Vocabulary (`blocking_ids`,
+never spawns a `skip-blocked` or already-terminal child. Vocabulary
+(`blocking_ids`,
 `blocker_details`, `stale_blocks`, `unvalidated_blocks`,
 `unresolved_blockers`, extended `blocked_children` entries) and parsing rule:
 [reference](../../docs/dev/implement-skill-reference.md).
@@ -312,9 +312,9 @@ failure recovery:
 
 7. Automated self-review
 
-Build and lint; fix issues. Sequential passes: completeness, dependencies &
-safety, scope & regression, tests & acceptance, polish & handoff. Small,
-goal-aligned edits; intent changes → Open Question and stop.
+Build and lint; fix issues. Passes: completeness, dependencies & safety,
+scope & regression, tests & acceptance, polish & handoff. Small, goal-aligned
+edits; intent changes → stop.
 
 8. Optional refactor step
 
@@ -340,6 +340,12 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   `--keep-worktree` (or
   `IMPLEMENT_KEEP_WORKTREE=1`) defers worktree removal; driven children never
   pass it (`IMPLEMENT_DRIVE_ACTIVE=1` defers).
+
+  **One bounded wait — never a retry loop.** `finish` waits **inside the
+  call** for the main-checkout lock (default 15 minutes,
+  `IMPLEMENT_FINISH_LOCK_TIMEOUT`; `0` = fail-fast), reports the holder and
+  proceeds when released. Run it **once** — never in a `for attempt …;
+  finish; wait_for_job.py` retry loop.
 
   **Retry taxonomy (SA-0MW22SEMV00230O5):** § Bounded push loop.
 - Follow the mandatory **build → test → commit** order.
@@ -384,8 +390,7 @@ every abort/failure → `open` with `assignee=""`.
 
 ## Scripts (canonical runner & modules)
 
-No single orchestrator — follow the steps above and invoke project-local
-build/test and linters
+No single orchestrator; use project-local build/test/linters
 ([reference](../../docs/dev/implement-skill-reference.md)).
 
 ## Final cleanup (belt-and-suspenders)
@@ -411,8 +416,8 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
 > work item's feature ACs (shown in Use Cases; SA-0MTQY7YM5009J6QR).
 
 Then paste it verbatim into your final response and close with
-`<work-item-id>: <one-line summary>`. End with `</end_session>` on its own line
-when the session ends with no open questions.
+`<work-item-id>: <one-line summary>`. End with `</end_session>` when the
+session ends with no open questions.
 
 ## Final cleanup step: remove the retained worktree (plain leaf sessions)
 

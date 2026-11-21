@@ -406,7 +406,13 @@ Where `wl` stores live: worklog state is kept per repository at
 `<project-root>/.worklog/worklog-data.jsonl` (plus `sessions/`,
 `worktrees/`); worktree derives resolve the store from the worklog-dir
 detection in `skill/shared/status_lifecycle.py` (`--worklog-dir` flags for
-`wl` subprocesses). The global skills install does **not** hold worklog data.
+`wl` subprocesses). That detection accepts **initialised** `.worklog`
+directories only and never extends a `.worklog`-named ancestor to
+`.worklog/.worklog`, so a cwd inside `<main>/.worklog/worktrees/…` resolves
+the main checkout's store rather than the worktree's committed
+`config.yaml`-only copy or a stale `<main>/.worklog/.worklog`
+(SA-0MW0JHMJE006GWQB). The global skills install does **not** hold worklog
+data.
 
 ## Project-Local Skill Extensions
 

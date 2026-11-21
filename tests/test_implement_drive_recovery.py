@@ -1393,9 +1393,15 @@ class TestFinishFailureTerminalReconciliation:
         assert report["failed_child"] == "SA-C1"
         assert report["children_driven"] == []
 
-    def test_happy_path_never_re_fetches_children(self, drive_harness):
-        """Reconciliation fetches happen only on the slow finish-failure
-        path (AC6) — a clean drive re-fetches no child."""
+    def test_happy_path_fetches_each_child_once_for_revalidation(
+        self, drive_harness,
+    ):
+        """Reconciliation fetches stay on the slow finish-failure path (AC6).
+
+        Since SA-0MWFJSCPT005BO2R a clean drive pays exactly **one** child
+        fetch per spawned session — the pre-spawn re-validation — and never
+        the failure-only reconciliation fetch.
+        """
         child = _child("SA-C1")
         harness = drive_harness(
             children=[child],
@@ -1409,7 +1415,8 @@ class TestFinishFailureTerminalReconciliation:
         report = harness.run()
 
         assert report["success"] is True
-        assert report["_show_calls"] == [PARENT]
+        assert report["_show_calls"] == [PARENT, "SA-C1"]
+        assert report["revalidated_children"][0]["startable"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -3081,3 +3088,633 @@ class TestDriveTermination:
         assert harness.spawner.calls == []
         assert "tests: tests_failed" in report["message"]
         assert "exceeded its iteration bound" not in report["message"]
+
+
+# ---------------------------------------------------------------------------
+# Spawn-failure provider classification (F1, SA-0MWLDZ8ZN0030T15)
+# ---------------------------------------------------------------------------
+
+#: The exact headless reason shape ``_default_session_spawner`` emits for a
+#: non-zero child exit: the provider text arrives inside the 5-line tail.
+HEADLESS_PROVIDER_REASON = (
+    'Child session for SA-C1 exited with code 1: Error: No models match '
+    'pattern "MunitoAI/*"'
+)
+
+#: The pane flavours — both embed the same provider text after the colon.
+PANE_START_PROVIDER_REASON = (
+    'Failed to start the pane agent for SA-C1: agent start failed: '
+    'Error: No models match pattern "MunitoAI/*"'
+)
+PANE_INCOMPLETE_PROVIDER_REASON = (
+    'Pane agent for SA-C1 did not complete: Error: No models match pattern '
+    '"MunitoAI/*"'
+)
+
+
+class TestSpawnFailureClassifier:
+    """Pin the spawn-failure classifier's vocabulary and fail-safe (F1).
+
+    The drive loop may only ever spend its infrastructure-retry budget on a
+    genuine provider/model-resolution failure, so the classifier is driven by
+    an explicit allow-list (:data:`SPAWN_INFRA_REASONS`) and everything
+    unrecognised — including ``None``/``""`` — is ``unknown`` (never retried).
+    These tests land before F2 consumes the classifier.
+    """
+
+    @staticmethod
+    def _classify(reason):
+        return _production_implement_mod().classify_spawn_failure(reason)
+
+    def test_headless_exit_with_model_resolution_failure_is_infrastructure(
+        self,
+    ):
+        """AC1 (headless flavour): a child exiting on ``No models match
+        pattern "MunitoAI/*"`` classifies as infrastructure, names the
+        provider, and carries a remedy that names the concrete action."""
+        result = self._classify(HEADLESS_PROVIDER_REASON)
+
+        assert result["kind"] == "infrastructure"
+        assert result["provider"] == "MunitoAI"
+        # The classifier never rewrites the spawner's reason.
+        assert result["reason"] == HEADLESS_PROVIDER_REASON
+        assert "enabledModels" in result["remedy"]
+
+    @pytest.mark.parametrize(
+        "reason",
+        [PANE_START_PROVIDER_REASON, PANE_INCOMPLETE_PROVIDER_REASON],
+        ids=["pane-start", "pane-incomplete"],
+    )
+    def test_pane_flavours_carrying_provider_text_are_infrastructure(
+        self, reason,
+    ):
+        """AC1 (pane flavours): both pane reasons carrying the provider text
+        classify as infrastructure and name the same provider."""
+        result = self._classify(reason)
+
+        assert result["kind"] == "infrastructure"
+        assert result["provider"] == "MunitoAI"
+        assert "enabledModels" in result["remedy"]
+
+    def test_missing_api_key_is_infrastructure_with_api_key_remedy(self):
+        """AC1/AC4: the other provider-resolution failure — a missing
+        credential — is infrastructure and the remedy names the concrete
+        credential action."""
+        result = self._classify("No API key found for MunitoAI.")
+
+        assert result["kind"] == "infrastructure"
+        assert result["provider"] == "MunitoAI"
+        assert "API key" in result["remedy"]
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            # A Python traceback tail: a real defect, never retried.
+            (
+                "Child session for SA-C1 exited with code 1: Traceback "
+                "(most recent call last):\n  File \"x.py\", line 3\n"
+                "AssertionError"
+            ),
+            # An arbitrary message carrying no allow-listed fragment.
+            "Child session for SA-C1 exited with code 1: something went wrong",
+            # The "ambiguous pattern" diagnostic is a config ambiguity, not a
+            # retryable provider failure (retrying cannot disambiguate it).
+            (
+                'Pattern "sonnet" matches several providers: A, B. Use '
+                "provider/id to choose one."
+            ),
+            "",
+            None,
+        ],
+        ids=["traceback", "arbitrary", "ambiguous-pattern", "empty", "none"],
+    )
+    def test_unclassified_reasons_are_unknown(self, reason):
+        """AC3 (fail-safe): anything outside the allow-list is ``unknown`` —
+        never ``infrastructure`` — so a real defect still hard-stops."""
+        result = self._classify(reason)
+
+        assert result["kind"] == "unknown"
+        assert result["kind"] != "infrastructure"
+        assert result["provider"] is None
+        assert result["remedy"] == ""
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            # Headless timeout (no provider text).
+            "Child session for SA-C1 timed out after 1800s.",
+            # Pane timeout whose embedded herdr reason carries provider text:
+            # the timeout keeps its own reconciliation semantics.
+            (
+                "Pane agent for SA-C1 timed out after 1800s: Error: No "
+                'models match pattern "MunitoAI/*"'
+            ),
+        ],
+        ids=["headless-timeout", "pane-timeout-with-provider-text"],
+    )
+    def test_timeout_is_never_reclassified_as_infrastructure(self, reason):
+        """AC3: a ``timed out`` reason is not provider-infrastructure — the
+        timeout path keeps its own reconciliation semantics."""
+        result = self._classify(reason)
+
+        assert result["kind"] == "unknown"
+        assert result["provider"] is None
+
+    def test_classifier_is_allow_list_driven(self):
+        """AC1: the vocabulary is an explicit table — every allow-listed
+        fragment classifies as infrastructure when present in a reason, so a
+        new vocabulary entry is a data change, never prose sniffing."""
+        mod = _production_implement_mod()
+        fragments = [entry[0] for entry in mod.SPAWN_INFRA_REASONS]
+
+        assert fragments, "SPAWN_INFRA_REASONS must not be empty"
+        for fragment in fragments:
+            result = mod.classify_spawn_failure(
+                f"Child session for SA-C1 exited with code 1: {fragment} …"
+            )
+            assert result["kind"] == "infrastructure", fragment
+            assert result["remedy"], fragment
+
+    def test_result_shape_is_stable(self):
+        """AC1: the helper returns exactly ``{kind, reason, provider,
+        remedy}`` so F2 can consume it without re-deriving anything."""
+        result = self._classify(HEADLESS_PROVIDER_REASON)
+
+        assert set(result) == {"kind", "reason", "provider", "remedy"}
+
+
+# ---------------------------------------------------------------------------
+# F2: spawn-time provider failures are retried on the infra budget
+# (SA-0MWLDZBTF004LJFP)
+# ---------------------------------------------------------------------------
+
+
+def _spawn_report(child_id: str, worktree_path: str | None = None) -> dict:
+    """A parent report offering *child_id* as the next startable child."""
+    report = {"success": True, "next_child": child_id}
+    if worktree_path is not None:
+        report["worktree_path"] = worktree_path
+    return report
+
+
+def _provider_failure(child_id: str, model: str = "MunitoAI/*") -> dict:
+    """Spawner result for a child session that died at model resolution.
+
+    Mirrors ``_default_session_spawner``'s non-zero-exit shape: the provider
+    text arrives inside the reason's stderr tail.
+    """
+    return {
+        "success": False,
+        "returncode": 1,
+        "reason": (
+            f"Child session for {child_id} exited with code 1: Error: "
+            f'No models match pattern "{model}"'
+        ),
+    }
+
+
+class _FakeChildLock:
+    """Recording per-child lock that fails any overlapping acquisition.
+
+    The real lock is a kernel ``flock``; a retry that re-acquired it while the
+    first acquisition was still held would deadlock or self-block. This stand-in
+    makes that violation loud (an ``AssertionError`` escapes ``acquire``'s
+    ``(OSError, RuntimeError)`` guard) and records every acquire/release so a
+    test can prove the hold is never duplicated (F2 AC7).
+    """
+
+    held = False
+
+    def __init__(self, child_id: str):
+        self.child_id = child_id
+        self.token = "fake-token"
+        self.acquired = 0
+        self.released = 0
+
+    def acquire(self):
+        assert not _FakeChildLock.held, (
+            "the per-child lock was re-acquired while still held"
+        )
+        _FakeChildLock.held = True
+        self.acquired += 1
+
+        class _Result:
+            acquired = True
+            reentrant = False
+            reclaimed = False
+            held_by = ""
+            path = None
+
+        return _Result()
+
+    def release(self):
+        _FakeChildLock.held = False
+        self.released += 1
+
+
+class TestSpawnInfraRetry:
+    """A spawn-time provider failure is retried inside the same drive run.
+
+    F1 pinned the classifier vocabulary; these tests pin the retry contract:
+    one bounded infra budget shared with ``finish`` retries, the additive
+    ``children_driven`` reporting shape, no duplicated side effects and a
+    fail-safe hard stop for anything unclassified (SA-0MWLDZBTF004LJFP).
+    """
+
+    def _harness(self, drive_harness, *, reports, spawn_results,
+                 child_states=None):
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent(reports),
+            spawn_results=spawn_results,
+            child_states=child_states or {"SA-C1": _child("SA-C1")},
+            worktree_path="/wt/SA-C1",
+        )
+        # Never touch the real store from the retry evidence/write paths;
+        # a list recorder (not a mock) so the count is asserted directly.
+        recorded: list[tuple] = []
+        harness.patch(
+            "record_spawn_failure",
+            side_effect=lambda *args, **kwargs: recorded.append(
+                (args, kwargs)
+            ) or None,
+        )
+        locks: list[_FakeChildLock] = []
+        harness.patch(
+            "_new_child_lock",
+            side_effect=lambda cid: locks.append(_FakeChildLock(cid))
+            or locks[-1],
+        )
+        return harness, recorded, locks
+
+    def test_provider_failure_is_retried_twice_then_succeeds(
+        self, drive_harness,
+    ):
+        """AC1/AC2/AC6/AC7: two provider failures then a success — all inside
+        one invocation on the default 5-slot budget (and the default single
+        child-session slot), with the retry entries naming step/reason/
+        attempt/provider/model and no duplicated side effects."""
+        delays: list[int] = []
+        harness, recorded, locks = self._harness(
+            drive_harness,
+            reports=[
+                _spawn_report("SA-C1"),
+                _spawn_report("SA-C1"),
+                _spawn_report("SA-C1"),
+                {"success": True, "parent_advanced": True,
+                 "message": "advanced"},
+            ],
+            spawn_results=[
+                _provider_failure("SA-C1"),
+                _provider_failure("SA-C1"),
+                {"success": True, "returncode": 0, "reason": ""},
+            ],
+        )
+
+        report = harness.run(infra_retry_limit=5, delay=delays.append)
+
+        # The chain survived: the same child was re-spawned twice and finished.
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert [c["id"] for c in harness.spawner.calls] == ["SA-C1"] * 3
+        # No second worktree: every attempt used the same pre-created tree.
+        assert {
+            c["worktree_path"] for c in harness.spawner.calls
+        } == {"/wt/SA-C1"}
+
+        # The additive reporting shape mirrors the finish infra-retry entry.
+        results = [e["result"] for e in report["children_driven"]]
+        assert results == [
+            "failed", "infra-retry", "failed", "infra-retry", "finished",
+        ]
+        retries = [
+            e for e in report["children_driven"]
+            if e["result"] == "infra-retry"
+        ]
+        assert [e["attempt"] for e in retries] == [1, 2]
+        for entry in retries:
+            assert entry["step"] == "spawn"
+            assert "No models match pattern" in entry["reason"]
+            assert entry["provider"] == "MunitoAI"
+            assert "MunitoAI/*" in entry["message"]
+            assert "MunitoAI" in entry["message"]
+
+        # One shared counter on the shared budget, with the bound reported.
+        assert report["infra_retries"] == {"SA-C1": 2}
+        assert report["infra_retry_limit"] == 5
+        # Bounded exponential backoff, attempt-indexed.
+        assert delays == [
+            harness.mod._drive_infra_backoff_delay(1),
+            harness.mod._drive_infra_backoff_delay(2),
+        ]
+
+        # AC7: no spawn-failure evidence for an attempt that never produced
+        # work (the retry owns the attempt), and the hold is never duplicated.
+        assert recorded == []
+        assert [lock.acquired for lock in locks] == [1, 1, 1]
+        assert [lock.released for lock in locks] == [1, 1, 1]
+        # The retries were charged to the infra budget, not the session bound.
+        assert "did not reach a terminal state" not in report["message"]
+
+        # The retry verdict is durable: the child carries a comment naming the
+        # provider so a producer can see why it was retried.
+        retry_comments = [
+            text for cid, text in harness.comments if cid == "SA-C1"
+        ]
+        assert any("MunitoAI" in text for text in retry_comments)
+
+    def test_finish_and_spawn_retries_share_one_counter(self, drive_harness):
+        """AC6: ``infra_retries[child_id]`` is one counter across a finish
+        refusal and a later spawn retry — the second consumes slot 2."""
+        harness, _recorded, _locks = self._harness(
+            drive_harness,
+            reports=[
+                infra_refusal_report("SA-C1"),
+                _spawn_report("SA-C1"),
+                _spawn_report("SA-C1"),
+                {"success": True, "parent_advanced": True},
+            ],
+            spawn_results=[
+                _provider_failure("SA-C1"),
+                {"success": True, "returncode": 0, "reason": ""},
+            ],
+        )
+
+        report = harness.run(
+            infra_retry_limit=5, delay=lambda _s: None,
+        )
+
+        assert report["success"] is True
+        assert report["infra_retries"] == {"SA-C1": 2}
+        entries = report["children_driven"]
+        assert [e["result"] for e in entries] == [
+            "infra-retry", "failed", "infra-retry", "finished",
+        ]
+        # The first slot was the finish refusal, the second the spawn retry.
+        assert entries[0]["step"] == "local_dev_fast_forward"
+        assert entries[0]["attempt"] == 1
+        assert entries[2]["step"] == "spawn"
+        assert entries[2]["attempt"] == 2
+
+    def test_exhausted_budget_names_provider_and_remedy(self, drive_harness):
+        """AC3: when the budget is spent the chain-stop message names the
+        provider/model and an actionable remedy — never the bare Pi text."""
+        harness, recorded, _locks = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1") for _ in range(6)],
+            spawn_results=[_provider_failure("SA-C1") for _ in range(6)],
+        )
+
+        report = harness.run(infra_retry_limit=5, delay=lambda _s: None)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["infra_retries"] == {"SA-C1": 5}
+        assert len(harness.spawner.calls) == 6
+        assert "MunitoAI" in report["message"]
+        assert "MunitoAI/*" in report["message"]
+        # The actionable remedy directive is present, not just the Pi error.
+        assert "enabledModels" in report["message"]
+        assert "infra-retry budget of 5" in report["message"]
+        # Only the exhausted (last) attempt records spawn-failure evidence.
+        assert len(recorded) == 1
+
+    @pytest.mark.parametrize(
+        "spawn_result",
+        [
+            {
+                "success": False,
+                "returncode": 1,
+                "reason": (
+                    "Child session for SA-C1 exited with code 1: Traceback "
+                    '(most recent call last):\n  File "x.py", line 3\n'
+                    "AssertionError"
+                ),
+            },
+            {
+                "success": False,
+                "returncode": None,
+                "reason": "Child session for SA-C1 timed out after 1800s.",
+            },
+        ],
+        ids=["unclassified", "timeout"],
+    )
+    def test_unclassified_spawn_failure_still_hard_stops(
+        self, drive_harness, spawn_result,
+    ):
+        """AC5: an unclassified (or timed-out) spawn failure is never retried
+        — the chain hard-stops with ``failed_child`` exactly as before."""
+        harness, _recorded, _locks = self._harness(
+            drive_harness,
+            reports=[
+                _spawn_report("SA-C1"),
+                _spawn_report("SA-C1"),
+            ],
+            spawn_results=[spawn_result],
+        )
+
+        report = harness.run(infra_retry_limit=5, delay=lambda _s: None)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+        assert report["infra_retries"] == {}
+        assert len(harness.spawner.calls) == 1
+        assert [
+            e["result"] for e in report["children_driven"]
+        ] == ["failed"]
+        assert not any(
+            e.get("result") == "infra-retry" for e in report["children_driven"]
+        )
+
+
+# ---------------------------------------------------------------------------
+# F3: the exhausted provider-failure path releases the child to `open`
+# (SA-0MWLDZFL4006I9YY)
+# ---------------------------------------------------------------------------
+
+
+class TestProviderFailedChildRelease:
+    """A child whose session never started is released to ``open``.
+
+    The timeout/signal path deliberately keeps ``in-progress`` with the
+    assignee cleared (a killed session may have produced work that ``finish``
+    / ``--finalise-stranded`` can recover). A provider failure is different:
+    the session never started, so the child is written ``open`` and is
+    immediately reclaimable by the next sweep or ``drive``
+    (SA-0MWLDZFL4006I9YY).
+    """
+
+    _RELEASE_PHRASE = "released this child to ``open``"
+
+    def _harness(
+        self, drive_harness, *, reports, spawn_results, child_state,
+    ):
+        harness = drive_harness(
+            children=[_child("SA-C1")],
+            runner=RecordingParent(reports),
+            spawn_results=spawn_results,
+            child_states={"SA-C1": child_state},
+            worktree_path="/wt/SA-C1",
+        )
+        # Never touch the real store from the spawn-failure evidence path.
+        harness.patch(
+            "record_spawn_failure",
+            side_effect=lambda *args, **kwargs: None,
+        )
+        return harness
+
+    def _claimed_child(self) -> dict:
+        return _child("SA-C1", status="in-progress", assignee="Map")
+
+    def _release_comments(self, harness) -> list[str]:
+        return [
+            text for wid, text in harness.comments
+            if wid == "SA-C1" and self._RELEASE_PHRASE in text
+        ]
+
+    def _status_updates_for(self, harness, child_id: str = "SA-C1") -> list[dict]:
+        return [
+            update for update in harness.status_updates
+            if update.get("id") == child_id
+        ]
+
+    def test_exhausted_provider_failure_releases_child_to_open(
+        self, drive_harness,
+    ):
+        """AC1/AC6: an exhausted provider failure writes the child ``open``
+        with an empty assignee and records the release in the report."""
+        harness = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1") for _ in range(6)],
+            spawn_results=[_provider_failure("SA-C1") for _ in range(6)],
+            child_state=self._claimed_child(),
+        )
+
+        report = harness.run(infra_retry_limit=5, delay=lambda _s: None)
+
+        assert report["success"] is False
+        assert report["failed_child"] == "SA-C1"
+
+        release = report.get("child_release")
+        assert release is not None, report
+        assert release["released"] is True
+        assert release["previous_status"] == "in-progress"
+        assert release["previous_assignee"] == "Map"
+        # The entry carries the same release outcome (AC6).
+        entry = report["children_driven"][-1]
+        assert entry.get("child_release") == release
+        assert "claim_release" not in entry
+
+        # The durable write moves the item to `open` with no assignee.
+        updates = self._status_updates_for(harness)
+        assert updates[-1]["status"] == "open"
+        assert updates[-1]["assignee"] == ""
+        # Every earlier (retry) write kept the child claimed in-progress.
+        assert all(
+            update["status"] == "in-progress"
+            for update in updates[:-1]
+        )
+
+    def test_provider_failed_comment_names_provider_model_and_remedy(
+        self, drive_harness,
+    ):
+        """AC3: the release comment names provider/model, says the session
+        never started, and gives the actionable remedy."""
+        harness = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1") for _ in range(6)],
+            spawn_results=[_provider_failure("SA-C1") for _ in range(6)],
+            child_state=self._claimed_child(),
+        )
+
+        harness.run(infra_retry_limit=5, delay=lambda _s: None)
+
+        comments = self._release_comments(harness)
+        assert len(comments) == 1, harness.comments
+        text = comments[0]
+        assert "MunitoAI" in text
+        assert "MunitoAI/*" in text
+        assert "never started" in text
+        # The actionable remedy, not the bare Pi error.
+        assert "enabledModels" in text
+
+    def test_no_release_before_budget_is_exhausted(self, drive_harness):
+        """AC2: between retry attempts the child stays ``in-progress`` (a
+        sweep cannot reclaim it mid-retry); only the exhausted attempt moves
+        it to ``open``."""
+        harness = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1") for _ in range(6)],
+            spawn_results=[_provider_failure("SA-C1") for _ in range(6)],
+            child_state=self._claimed_child(),
+        )
+
+        report = harness.run(infra_retry_limit=2, delay=lambda _s: None)
+
+        retries = [
+            e for e in report["children_driven"]
+            if e.get("result") == "infra-retry"
+        ]
+        assert len(retries) == 2
+        for entry in retries:
+            # No retry entry marks the child as released-to-open mid-retry.
+            assert "child_release" not in entry
+
+        # The child is re-claimed in-progress on each retry; only the
+        # exhausted attempt moves it to `open`. No sweep can reclaim it
+        # between attempts because it never leaves `in-progress`.
+        updates = self._status_updates_for(harness)
+        retry_updates = [
+            update for update in updates if update["status"] == "in-progress"
+        ]
+        assert len(retry_updates) == 2
+        assert updates[-1]["status"] == "open"
+        assert updates[-1]["assignee"] == ""
+
+    def test_timeout_path_still_keeps_in_progress(self, drive_harness):
+        """AC4: a timed-out (``unknown``) spawn failure still uses the
+        timeout release — assignee cleared, status left ``in-progress``."""
+        harness = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1")],
+            spawn_results=[
+                {
+                    "success": False,
+                    "returncode": None,
+                    "reason": (
+                        "Child session for SA-C1 timed out after 1800s."
+                    ),
+                },
+            ],
+            child_state=self._claimed_child(),
+        )
+
+        report = harness.run(infra_retry_limit=5, delay=lambda _s: None)
+
+        entry = report["children_driven"][-1]
+        assert entry["claim_release"]["released"] is True
+        assert "child_release" not in entry
+        updates = self._status_updates_for(harness)
+        assert updates[-1]["status"] == "in-progress"
+        assert updates[-1]["assignee"] == ""
+        assert self._release_comments(harness) == []
+
+    def test_release_is_idempotent_on_already_open_child(self, drive_harness):
+        """AC5: releasing an already-``open`` child is a no-op — no write, no
+        duplicate comment."""
+        harness = self._harness(
+            drive_harness,
+            reports=[_spawn_report("SA-C1") for _ in range(2)],
+            spawn_results=[_provider_failure("SA-C1") for _ in range(2)],
+            child_state=_child("SA-C1", status="open", assignee=""),
+        )
+
+        report = harness.run(infra_retry_limit=1, delay=lambda _s: None)
+
+        release = report.get("child_release")
+        assert release is not None, report
+        assert release["released"] is True
+        assert "no-op" in release["reason"]
+        # No write touched the already-open child and no comment was posted.
+        assert self._status_updates_for(harness) == []
+        assert self._release_comments(harness) == []

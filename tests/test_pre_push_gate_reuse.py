@@ -423,3 +423,205 @@ def test_gate_executes_when_no_prelock_verdict_exists(
     assert executed, "the gate must execute the suite when no verdict exists"
     assert payload.get("cached") is False
     assert payload["gate"]["cache_hit"] is False
+
+
+# ── SA-0MWFJS9OL001ZTTC: a lost push race must not re-run the full suite ─────
+#
+# ``dev`` is a shared ref, so concurrent finishes frequently lose the
+# non-fast-forward race. ``finish`` rebases and retries; the rebased commit has
+# a **new tree** but the **same patch**, and today that new tree misses the
+# tree-keyed gate cache and re-executes the whole suite inside the
+# main-checkout lock (observed at ~5-18 min per rebase round). The runner now
+# also keys the verdict on the change set's patch content, so the post-rebase
+# gate run serves the verdict measured before the race instead of re-running.
+
+
+def _rev(repo: Path, rev: str) -> str:
+    """Full commit sha of *rev* in *repo*."""
+    return gs.run_git(repo, ["rev-parse", rev], check=True).stdout.strip()
+
+
+def _advance_dev(repo: Path, path: str, content: str, message: str) -> None:
+    """Commit a concurrent dev advance at *path*; leave ``feature`` checked out."""
+    git(repo, "checkout", "-q", "dev")
+    (repo / path).write_text(content, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", message)
+    git(repo, "checkout", "-q", "feature")
+
+
+def test_rebased_push_is_served_from_the_change_set_verdict(
+    gate_repo: Path,
+    pushed_sha: str,
+    executed: list[dict[str, str]],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """A pure rebase re-serves the pre-race verdict instead of re-running.
+
+    Sequence (the observed lost-race path): the pre-lock verdict is recorded
+    for the would-be-commit tree while the worktree still sits on ``dev``; a
+    concurrent push advances ``dev``; the feature branch is rebased and the
+    pushed commit is rewritten with a new tree; the dev-push gate then runs for
+    the rebased commit. The suite must not execute a second time — the patch,
+    and therefore the evidence, is unchanged.
+    """
+    repo = gate_repo
+    would_be_tree = tree_of(repo, pushed_sha)
+    git(repo, "checkout", "-q", "dev")
+    record_tree_verdict(repo, would_be_tree)  # the pre-lock verdict
+    assert not executed
+
+    _advance_dev(repo, "unrelated.txt", "unrelated\n", "concurrent dev advance")
+    pre_rebase = _rev(repo, "feature")
+    git(repo, "rebase", "-q", "dev")
+    rebased_sha = _rev(repo, "feature")
+    rebased_tree = tree_of(repo, rebased_sha)
+
+    assert rebased_sha != pre_rebase, "the fixture must rewrite the commit"
+    assert rebased_tree != would_be_tree, "the rebase must produce a new tree"
+
+    code, payload, stderr = run_gate(capsys, repo, rebased_sha)
+
+    assert code == 0, stderr
+    assert executed == [], (
+        "the rebased push must be served from the identical change set — a "
+        "second suite run per rebase round is the cost this item removes "
+        f"(executions: {executed})"
+    )
+    assert payload.get("cached") is True
+    assert payload["gate"]["cache_hit"] is True
+    assert payload["gate"]["fingerprint_kind"] == tc.FINGERPRINT_KIND_CHANGE_SET
+    assert payload["gate"]["tree"] == rebased_tree
+    assert payload["gate"]["reused_from_tree"] == would_be_tree, (
+        "the served verdict was measured on the pre-race tree and must say so"
+    )
+    verdict = [
+        line
+        for line in stderr.splitlines()
+        if line.startswith("run_tests: gate-verdict")
+    ]
+    assert verdict, stderr
+    assert "verdict=cached" in verdict[0]
+    assert "cache_hit=true" in verdict[0]
+    assert f"fingerprint_kind={tc.FINGERPRINT_KIND_CHANGE_SET}" in verdict[0]
+    assert f"reused_from_tree={would_be_tree}" in verdict[0]
+    # The inherited verdict is mirrored under the pushed tree's key for
+    # tree-keyed consumers, stamped with its origin and the tree it was
+    # actually measured on — never presented as direct tree evidence.
+    mirrored = tc.lookup(
+        rt.pytest_command(),
+        rebased_tree,
+        cwd=str(repo),
+        fingerprint_kind=tc.FINGERPRINT_KIND_TREE,
+    )
+    assert mirrored is not None
+    assert mirrored["verdict_origin"] == "change_set_reuse"
+    assert mirrored["measured_tree"] == would_be_tree
+
+
+def test_rebased_push_with_a_content_change_still_executes(
+    gate_repo: Path,
+    pushed_sha: str,
+    executed: list[dict[str, str]],
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Negative: a genuinely different patch is never served from the cache.
+
+    The reuse is only ever for provably identical content. Here the rebased
+    commit carries an extra content edit, so the patch differs and the suite
+    must execute — the safety half of the change-set key.
+    """
+    repo = gate_repo
+    would_be_tree = tree_of(repo, pushed_sha)
+    git(repo, "checkout", "-q", "dev")
+    record_tree_verdict(repo, would_be_tree)
+    assert not executed
+
+    _advance_dev(repo, "unrelated.txt", "unrelated\n", "concurrent dev advance")
+    (repo / "file.txt").write_text("three\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "change the content")
+    git(repo, "rebase", "-q", "dev")
+    rebased_sha = _rev(repo, "feature")
+    rebased_tree = tree_of(repo, rebased_sha)
+    assert rebased_tree != would_be_tree
+
+    code, payload, stderr = run_gate(capsys, repo, rebased_sha)
+
+    assert code == 0, stderr
+    assert executed, "a different patch must never reuse the recorded verdict"
+    assert payload.get("cached") is False
+    assert payload["gate"]["cache_hit"] is False
+    assert payload["gate"].get("reused_from_tree") is None
+
+
+def test_post_push_verification_accepts_a_change_set_served_push(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """The finish path's read-only verification also honours the change-set key.
+
+    ``phase_finish`` refuses the terminal transition unless the just-pushed
+    commit has green full-suite evidence. A change-set-served push deliberately
+    writes no tree-bound entry, so the verification must look under the
+    change-set key too — otherwise this optimisation would turn a green push
+    into ``missing`` and refuse to finalise.
+    """
+    from skill.implement.scripts import implement
+
+    repo = gs.init_repo(tmp_path / "repo")
+    # A declared suite is committed on the parent branch so it is present both
+    # before and after the rebase (the verification resolves it from the
+    # pushed-commit checkout).
+    (repo / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_sample.py").write_text(
+        "def test_ok():\n    assert True\n", encoding="utf-8"
+    )
+    (repo / "file.txt").write_text("one\n", encoding="utf-8")
+    gs.commit_all(repo, "A")
+    git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "file.txt").write_text("two\n", encoding="utf-8")
+    gs.commit_all(repo, "B")
+
+    monkeypatch.setattr(rt, "REPO_ROOT", repo)
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(rt.nested_semaphore_dir(tmp_path)))
+    monkeypatch.delenv("IMPLEMENT_TEST_COMMAND", raising=False)
+
+    would_be_tree = tree_of(repo, "feature")
+    monkeypatch.setattr(rt, "_run_cmd", lambda cmd, **kw: SimpleNamespace(
+        returncode=0, stdout=SUMMARY_OUTPUT, stderr=""
+    ))
+
+    # The pre-lock run: HEAD is the parent branch, the verdict is bound to the
+    # would-be-commit tree of the change set.
+    git(repo, "checkout", "-q", "dev")
+    verdict = implement.run_tests(str(repo), scope="full", fingerprint=would_be_tree)
+    assert verdict["success"] is True, verdict
+    assert verdict["skipped"] is False, verdict
+
+    _advance_dev(repo, "unrelated.txt", "unrelated\n", "concurrent dev advance")
+    git(repo, "rebase", "-q", "dev")
+    rebased_sha = _rev(repo, "feature")
+    assert tree_of(repo, rebased_sha) != would_be_tree
+
+    code, payload, stderr = run_gate(capsys, repo, rebased_sha)
+    assert code == 0, stderr
+    assert payload["gate"]["fingerprint_kind"] == tc.FINGERPRINT_KIND_CHANGE_SET
+
+    verification = implement._resolve_post_push_verification(
+        str(repo), str(repo), rebased_sha
+    )
+
+    assert verification["verdict"] == implement.POST_PUSH_VERDICT_GREEN, verification
+    assert verification["success"] is True
+    entry = verification["entries"][0]
+    assert entry["fingerprint_kind"] in {
+        tc.FINGERPRINT_KIND_TREE,
+        tc.FINGERPRINT_KIND_CHANGE_SET,
+    }
+    # The served verdict names the tree it was actually measured on, whichever
+    # key it was read from (the change-set hit mirrors a flagged tree entry).
+    measured = entry["change_set_target_tree"] or entry["measured_tree"]
+    assert measured == would_be_tree

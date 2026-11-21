@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -124,6 +125,175 @@ def test_bounded_wait_times_out_with_actionable_message(repo_root: Path):
         assert "re-run" in refusal.lower()
     finally:
         holder.release()
+
+
+def test_bounded_wait_reports_progress_naming_the_holder(repo_root: Path):
+    """A positive timeout emits progress naming the lock, the bound and holder.
+
+    The first contention message is immediate (an agent watching a long
+    ``finish`` call sees who it is waiting for), heartbeats are throttled by
+    ``progress_interval`` and a final line records the acquisition
+    (SA-0MWFJS65O005JMJF).
+    """
+    holder = RepoLock(repo_root)
+    fd, _ = holder.acquire("WL-HOLDER")
+    assert fd is not None
+
+    releaser = threading.Timer(0.3, holder.release)
+    releaser.start()
+    messages: list[str] = []
+    try:
+        contender = RepoLock(repo_root)
+        fd2, refusal = contender.acquire(
+            "WL-CONTENDER",
+            timeout=10,
+            progress=messages.append,
+            progress_interval=0.05,
+        )
+        assert fd2 is not None, refusal
+        contender.release()
+    finally:
+        releaser.cancel()
+        holder.release()
+
+    assert messages, "a waiting acquire must report progress"
+    first = messages[0]
+    assert "Waiting for the repository lock" in first
+    assert str(RepoLock(repo_root).path) in first
+    assert "up to 10s" in first
+    assert "WL-HOLDER" in first, "progress must name the current holder"
+    assert any("Still waiting" in m for m in messages), messages
+    assert messages[-1].startswith("Acquired the repository lock"), messages
+
+
+def test_progress_is_not_emitted_without_a_wait(repo_root: Path):
+    """A fail-fast acquisition never reports wait progress."""
+    messages: list[str] = []
+    lock = RepoLock(repo_root)
+    fd, refusal = lock.acquire("WL-FIRST", progress=messages.append)
+    assert fd is not None, refusal
+    try:
+        # A contended *fail-fast* attempt has no positive bound to wait out.
+        fd2, refusal2 = RepoLock(repo_root).acquire(
+            "WL-SECOND", timeout=0, progress=messages.append
+        )
+        assert fd2 is None and refusal2 is not None
+    finally:
+        lock.release()
+    assert messages == [], messages
+
+
+def test_a_failing_progress_callback_never_breaks_the_wait(repo_root: Path):
+    """Progress is diagnostic: a raising callback must not fail the acquire."""
+    holder = RepoLock(repo_root)
+    fd, _ = holder.acquire("WL-HOLDER")
+    assert fd is not None
+
+    def _broken(_message: str) -> None:
+        raise RuntimeError("logger exploded")
+
+    releaser = threading.Timer(0.2, holder.release)
+    releaser.start()
+    try:
+        contender = RepoLock(repo_root)
+        fd2, refusal = contender.acquire(
+            "WL-CONTENDER",
+            timeout=10,
+            progress=_broken,
+            progress_interval=0.05,
+        )
+        assert fd2 is not None, refusal
+        contender.release()
+    finally:
+        releaser.cancel()
+        holder.release()
+
+
+def test_wait_is_interruptible_and_leaks_no_descriptor(repo_root: Path):
+    """An interrupt during the wait propagates and leaves no lock behind.
+
+    ``SIGINT``/``SIGTERM`` handlers (and a plain ``KeyboardInterrupt``) run
+    between retries. The wait must surface the interrupt instead of swallowing
+    it, close the descriptor it opened for the attempt, and leave the lock
+    acquirable once the holder releases — never an orphaned file descriptor or
+    a half-taken lock (SA-0MWFJS65O005JMJF signal-safety AC).
+
+    The interrupt is raised in a **forked child**, never in the pytest main
+    thread: an asynchronous ``KeyboardInterrupt`` in the test process could
+    be delivered between tests and abort the whole suite.
+    """
+    holder = RepoLock(repo_root)
+    fd, _ = holder.acquire("WL-HOLDER")
+    assert fd is not None
+
+    child_pid = os.fork()
+    if child_pid == 0:  # pragma: no cover - child process
+        try:
+            # The forked child inherits whatever SIGINT/SIGTERM handlers the
+            # host pytest process has installed — several implement-skill
+            # tests install ``implement._signal_handler``, which calls
+            # ``os._exit(2)`` instead of raising. ``_thread.interrupt_main()``
+            # *invokes a Python SIGINT handler* when one is registered, so
+            # restore the default handler to model a plain caller receiving a
+            # KeyboardInterrupt.
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            interrupted = False
+
+            def _start_interrupt(_message: str) -> None:
+                """Arm the interrupt only once the wait is really running.
+
+                Starting it before ``acquire`` races a loaded machine: the
+                timer could fire while the child is still being scheduled and
+                abort it outside the wait.
+                """
+                nonlocal interrupted
+                if not interrupted:
+                    interrupted = True
+                    threading.Timer(0.2, _interrupt_main).start()
+
+            contender = RepoLock(repo_root)
+            try:
+                contender.acquire(
+                    "WL-INTERRUPTED", timeout=30, progress=_start_interrupt
+                )
+            except KeyboardInterrupt:
+                # The wait surfaced the interrupt (it must not swallow it).
+                os._exit(0)
+            os._exit(9)  # the wait completed — the interrupt was swallowed
+        except BaseException:  # noqa: BLE001 - child teardown
+            os._exit(7)
+
+    try:
+        started = time.monotonic()
+        _, status = os.waitpid(child_pid, 0)
+        elapsed = time.monotonic() - started
+        assert os.waitstatus_to_exitcode(status) == 0, (
+            "the interrupted wait did not surface the KeyboardInterrupt "
+            f"(exit {os.waitstatus_to_exitcode(status)})"
+        )
+        assert elapsed < 10, f"the interrupt must abort the wait; took {elapsed}s"
+    finally:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(child_pid, 0)
+        except ChildProcessError:
+            pass
+        holder.release()
+
+    fd2, refusal = RepoLock(repo_root).acquire("WL-AFTER")
+    assert fd2 is not None, refusal
+    release_repo_lock(fd2)
+
+
+def _interrupt_main() -> None:
+    """Raise ``KeyboardInterrupt`` in the main thread (signal-equivalent)."""
+    import _thread
+
+    _thread.interrupt_main()
 
 
 def test_indefinite_wait_is_rejected(repo_root: Path):

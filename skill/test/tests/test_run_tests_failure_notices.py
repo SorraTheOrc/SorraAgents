@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MWMBFRTG00793NN
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 """Failure-notice and output diagnostics on suite results.
 
 Covers WL-0MVGUT787000LNDG: when a suite fails WITHOUT structured test

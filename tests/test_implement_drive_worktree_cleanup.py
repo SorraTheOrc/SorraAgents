@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MWLZFOA7002CR96
+# smell: ruff_specific
+# severity: medium
+# description: Unpacked variable `mocks` is never used
+# -->
 """Driver-side worktree removal for driven children (SA-0MVTE8XAJ002IUDR).
 
 A driven child's ``finish`` defers worktree removal: the worktree **is** the
@@ -130,7 +136,13 @@ def _run_drive(
     def _show(work_item_id):
         if work_item_id == PARENT:
             return {"id": PARENT}
-        return child_states.get(work_item_id, {})
+        state = child_states.get(work_item_id, {})
+        if isinstance(state, list):
+            # Successive states: the pre-spawn re-validation reads the first,
+            # a later re-fetch (spawn-failure reconciliation) the next, and the
+            # last entry repeats.
+            return state.pop(0) if len(state) > 1 else (state[0] if state else {})
+        return state
 
     removal_kwargs: dict = {"return_value": True}
     if removal_side_effect is not None:
@@ -208,7 +220,7 @@ def test_driver_removes_terminal_child_worktree(tmp_path):
         tmp_path,
         reports=[_child_report("SA-C1", wt), _advanced([_processed("SA-C1")])],
         children=[{"id": "SA-C1", "status": "completed"}],
-        child_states={"SA-C1": TERMINAL},
+        child_states={"SA-C1": NON_TERMINAL},
     )
 
     assert report["success"] is True
@@ -252,7 +264,7 @@ def test_driver_never_removes_a_dirty_worktree(tmp_path):
         tmp_path,
         reports=[_child_report("SA-C1", wt), _advanced([_processed("SA-C1")])],
         children=[{"id": "SA-C1", "status": "completed"}],
-        child_states={"SA-C1": TERMINAL},
+        child_states={"SA-C1": NON_TERMINAL},
         dirty={wt},
     )
 
@@ -283,7 +295,9 @@ def test_driver_removes_worktree_on_the_completed_late_path(tmp_path):
         tmp_path,
         reports=[_child_report("SA-C1", wt), _advanced()],
         children=[{"id": "SA-C1", "status": "completed"}],
-        child_states={"SA-C1": TERMINAL},
+        # Startable at the spawn decision, terminal by reconciliation — the
+        # exact shape of the recorded incident (killed after its push).
+        child_states={"SA-C1": [dict(NON_TERMINAL), dict(TERMINAL)]},
         spawner=spawner,
     )
 
@@ -307,7 +321,7 @@ def test_already_absent_worktree_is_a_reported_no_op(tmp_path):
         tmp_path,
         reports=[_child_report("SA-C1", missing), _advanced([_processed("SA-C1")])],
         children=[{"id": "SA-C1", "status": "completed"}],
-        child_states={"SA-C1": TERMINAL},
+        child_states={"SA-C1": NON_TERMINAL},
     )
 
     assert mocks["removal"].call_count == 0
@@ -325,7 +339,7 @@ def test_failing_removal_does_not_fail_the_drive(tmp_path):
         tmp_path,
         reports=[_child_report("SA-C1", wt), _advanced([_processed("SA-C1")])],
         children=[{"id": "SA-C1", "status": "completed"}],
-        child_states={"SA-C1": TERMINAL},
+        child_states={"SA-C1": NON_TERMINAL},
         removal_side_effect=RuntimeError("REFUSE to remove the repository root"),
     )
 

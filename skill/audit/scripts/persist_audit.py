@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# <!-- REFACTOR-SA-0MWMBFKK8000CT58
+# smell: formatting
+# severity: low
+# description: Shebang is present but file is not executable
+# -->
 # <!-- REFACTOR-SA-0MWDKRD8G008Z164
 # smell: unknown
 # severity: low
@@ -152,16 +157,20 @@ def _classify_rejection(stderr: str) -> tuple[str, str, str]:
         return (
             _REJECTION_KIND_E2BIG,
             "argument list too long (E2BIG)",
-            "The report exceeded the OS per-argument limit before wl could "
-            "store it; retry with the large-report --audit-file path "
-            "(lower AUDIT_PERSIST_INLINE_SIZE_LIMIT) or a smaller report.",
+            (
+                "The report exceeded the OS per-argument limit before wl could "
+                "store it; retry with the large-report --audit-file path "
+                "(lower AUDIT_PERSIST_INLINE_SIZE_LIMIT) or a smaller report."
+            ),
         )
     if "audit-invalid-first-line" in lowered:
         return (
             _REJECTION_KIND_INVALID_FIRST_LINE,
             "invalid first line (audit-invalid-first-line)",
-            "The report's first non-empty line was not 'Ready to close: "
-            "Yes' or 'Ready to close: No'; resubmit header-first.",
+            (
+                "The report's first non-empty line was not 'Ready to close: "
+                "Yes' or 'Ready to close: No'; resubmit header-first."
+            ),
         )
     if (
         "json" in lowered
@@ -172,8 +181,10 @@ def _classify_rejection(stderr: str) -> tuple[str, str, str]:
         return (
             _REJECTION_KIND_MALFORMED_JSON,
             "malformed JSON / validation error",
-            "A re-audit may be required if the verdict data is needed in "
-            "this field.",
+            (
+                "A re-audit may be required if the verdict data is needed in "
+                "this field."
+            ),
         )
     detail = (stderr or "").strip()
     if not detail:

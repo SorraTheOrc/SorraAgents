@@ -288,6 +288,7 @@ listing truncation cannot hide it:
 ```
 Refactor-Finding-Key: <code>:<repository-relative path>
 Refactor-Fingerprint: <sha256>
+Refactor-Verification-Command: <exact linter command>
 Refactor-Affected-Lines: <n>, <m>
 ```
 
@@ -297,6 +298,11 @@ Refactor-Affected-Lines: <n>, <m>
   changes and is stable otherwise; the path is not hashed, so worktree and
   main-checkout scans agree. Re-verification (SA-0MW7Z1JCE009G6J3) consumes
   this value to decide whether a finding still reproduces.
+- `Refactor-Verification-Command` is the exact command a later sweep re-runs
+  to reproduce the finding, e.g.
+  `ruff check --isolated --select S112 src/x.py`. It is recorded only for
+  ruff-derived findings; an LLM smell or an eslint rule cannot be re-run, so
+  it records none and the sweep reports it `unverifiable` (never guesses).
 - `Refactor-Affected-Lines` is the full, deduplicated, sorted list of observed
   lines. It is preserved when duplicates are consolidated so line-level
   reporting survives grouping.
@@ -340,6 +346,47 @@ finding (SA-0MWE1EGLM002KE7Z):
   fingerprint are **never touched** by a repeat. The occurrence record lives
   in comments so re-verification (SA-0MW7Z1JCE009G6J3) can rely on a stable
   record.
+
+### Re-verifying stale findings (SA-0MW7Z1JCE009G6J3)
+
+A filed finding does not stay valid forever: the target file can be deleted,
+or the diagnostic can stop firing after a refactor. The re-verification sweep
+re-checks every linter-derived item against the current tree and closes only
+the ones it can prove are stale — so the backlog means "work that still needs
+doing".
+
+```bash
+python3 $(skill_path refactor)/scripts/reverify.py          # dry run (default)
+python3 $(skill_path refactor)/scripts/reverify.py --apply  # close stale items
+python3 $(skill_path refactor)/scripts/reverify.py --json   # machine output
+```
+
+Per item it re-runs the recorded `Refactor-Verification-Command`
+(`Audit-Verification-Command` for audit chores, or a derived
+`ruff check --isolated --select <RULE> <path>`) and classifies it:
+
+| Classification | Meaning | `--apply` action |
+|---|---|---|
+| `still-reproduces` | the diagnostic still fires | **untouched** |
+| `no-longer-reproduces` | 0 findings from the command | comment + close |
+| `target-gone` | the target file no longer exists | comment + close |
+| `unverifiable` | no safe command / non-ruff rule | untouched (reported) |
+
+Safety:
+
+- **Dry-run is the default**: without `--apply` the sweep makes ZERO worklog
+  mutations and only reports what it would do.
+- **Attribution only**: it touches items carrying a `Refactor-Finding-Key` /
+  `Refactor: … in <path>` identity, a `[SEVERITY] <path>:<line> — … (<RULE>)`
+  quality title, or an audit `CFP-Chore-Key` / `ruff <RULE> in <path>` title.
+  Human-authored `bug`/`feature`/`epic` items are never touched.
+- **Never silent**: each closure records a `Reverify-Evidence:` comment and a
+  close rationale; a failed comment blocks the close.
+- **Idempotent**: closed items are terminal and skipped on the next run.
+
+**Scheduling:** the command is cron-safe (dry-run by default). Add it to the
+scheduled maintenance job, or run it ad hoc before a backlog review. Only add
+`--apply` where automated closure of proven-stale findings is intended.
 
 ### Consolidating the historical duplicate backlog
 
@@ -418,6 +465,7 @@ Comment delimiters vary by file type — `#` for Python, `//` for JS/TS, `<!-- -
 
 - [Implement](../implement/SKILL.md) — Integrated refactor step
 - [Code Review](../code-review/SKILL.md) — Complementary code quality skill
+- [Tool-output budget](../shared/tool-output-budget.md) — `jq` over `cat`, ~10 KB per result
 
 
 ## Final step: standardized end-of-session report

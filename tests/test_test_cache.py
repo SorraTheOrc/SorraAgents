@@ -27,6 +27,7 @@ from test_cache import (
     _default_runner,
     cache_dir,
     cache_key,
+    compute_change_set_state,
     compute_git_state,
     compute_tree_state,
     lookup,
@@ -1520,3 +1521,292 @@ class TestStateChangedDuringRun:
         assert lookup("pytest", post_state, cwd=str(movable_checkout)) is None
         assert not _entry_dir(movable_checkout, pre_state).exists()
         assert not _entry_dir(movable_checkout, post_state).exists()
+
+
+# ---------------------------------------------------------------------------
+# Change-set keying (SA-0MWFJS9OL001ZTTC)
+#
+# A lost dev-push race rebases the commit onto a concurrently advanced parent:
+# the commit and its tree are rewritten, the patch is not. These tests pin the
+# key that survives that rebase and the safety property that keeps it from ever
+# reusing a verdict for genuinely different content.
+# ---------------------------------------------------------------------------
+
+
+def _rev(repo: Path, rev: str) -> str:
+    """Full commit sha of *rev* in *repo*."""
+    return gs.run_git(repo, ["rev-parse", rev], check=True).stdout.strip()
+
+
+def _tree_of(repo: Path, rev: str) -> str:
+    """Tree sha of *rev* in *repo*."""
+    return gs.run_git(repo, ["rev-parse", f"{rev}^{{tree}}"], check=True).stdout.strip()
+
+
+@pytest.fixture
+def change_set_repo(tmp_path: Path) -> Path:
+    """*dev* = A (``file.txt`` two lines); *feature* = B (appends a line).
+
+    The feature patch appends to ``file.txt``, so a later upstream edit that
+    prepends to the same file still applies cleanly — the case where a rebase
+    succeeds but the base content the patch applies to has changed.
+    """
+    repo = gs.init_repo(tmp_path / "change-set-repo")
+    (repo / "file.txt").write_text("a\nb\n", encoding="utf-8")
+    gs.commit_all(repo, "A")
+    git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "file.txt").write_text("a\nb\nc\n", encoding="utf-8")
+    gs.commit_all(repo, "B")
+    return repo
+
+
+def _advance_dev(repo: Path, path: str, content: str, message: str) -> str:
+    """Commit *content* at *path* on ``dev`` (feature branch left checked out)."""
+    git(repo, "checkout", "-q", "dev")
+    (repo / path).write_text(content, encoding="utf-8")
+    sha = gs.commit_all(repo, message)
+    git(repo, "checkout", "-q", "feature")
+    return sha
+
+
+def test_change_set_fingerprint_survives_a_rebase(change_set_repo: Path) -> None:
+    """A rebase onto an advanced dev keeps the patch's fingerprint.
+
+    The pre-lock case (HEAD is ``dev``, the target is the would-be commit tree)
+    and the dev-push gate's case (HEAD *is* the pushed commit) must derive the
+    same key for a pure rebase — that is what makes the lost-race verdict
+    reusable. The base trees provably differ, so the equality comes from the
+    patch, not from an unchanged tree.
+    """
+    repo = change_set_repo
+    would_be_tree = _tree_of(repo, "feature")
+    git(repo, "checkout", "-q", "dev")
+    before = compute_change_set_state(
+        repo, target_tree=would_be_tree, base_ref="dev"
+    )
+    assert before is not None
+    assert before["base_tree"] == _tree_of(repo, "dev")
+
+    _advance_dev(repo, "unrelated.txt", "unrelated\n", "A2 (unrelated file)")
+    pre_rebase = _rev(repo, "feature")
+    git(repo, "rebase", "-q", "dev")
+    rebased = _rev(repo, "feature")
+    rebased_tree = _tree_of(repo, "feature")
+
+    assert rebased != pre_rebase, "the fixture must actually rewrite the commit"
+    assert rebased_tree != would_be_tree, "the rebase must produce a new tree"
+    after = compute_change_set_state(repo, target_tree=rebased_tree, base_ref="dev")
+    assert after is not None
+    assert after["base_tree"] != before["base_tree"], (
+        "the base really advanced — the hit comes from the patch, not the tree"
+    )
+    assert after["fingerprint"] == before["fingerprint"]
+    assert after["paths"] == before["paths"] == ["file.txt"]
+
+
+def test_change_set_fingerprint_survives_the_push_landing(
+    change_set_repo: Path,
+) -> None:
+    """The key is unchanged once the pushed ref advances to the commit.
+
+    The dev-push gate records its verdict *before* the ref moves
+    (``origin/dev`` is the parent). Post-push verification runs *after* the
+    push updated ``origin/dev`` to the pushed commit, so the change set must
+    still resolve — against the commit's first parent — or finish's own
+    read-only verification would report ``missing`` and refuse the terminal
+    transition.
+    """
+    repo = change_set_repo
+    git(repo, "update-ref", "refs/remotes/origin/dev", _rev(repo, "dev"))
+    pushed_tree = _tree_of(repo, "feature")
+    at_gate = compute_change_set_state(repo, target_tree=pushed_tree)
+    assert at_gate is not None
+    assert at_gate["base_commit"] == _rev(repo, "dev")
+
+    # The push lands: origin/dev now names the pushed commit itself.
+    git(repo, "update-ref", "refs/remotes/origin/dev", _rev(repo, "feature"))
+    after_push = compute_change_set_state(repo, target_tree=pushed_tree)
+
+    assert after_push is not None, (
+        "a landed commit must still have a change set (measured against its "
+        "first parent), or post-push verification cannot find the verdict"
+    )
+    assert after_push["fingerprint"] == at_gate["fingerprint"]
+
+
+def test_change_set_fingerprint_binds_the_patch_pre_image(
+    change_set_repo: Path,
+) -> None:
+    """An upstream edit to a touched file changes the key (safety property).
+
+    The rebase succeeds — the appended hunk still applies — but the content it
+    now applies to differs. The `--full-index` pre-image object id differs, so
+    the fingerprint differs and no verdict measured against the old base can
+    be reused. This is the negative half of the reuse contract.
+    """
+    repo = change_set_repo
+    would_be_tree = _tree_of(repo, "feature")
+    git(repo, "checkout", "-q", "dev")
+    before = compute_change_set_state(
+        repo, target_tree=would_be_tree, base_ref="dev"
+    )
+    assert before is not None
+
+    _advance_dev(repo, "file.txt", "z\na\nb\n", "A2 edits the touched file")
+    git(repo, "checkout", "-q", "feature")
+    git(repo, "rebase", "-q", "dev")  # applies cleanly: the hunk is at the end
+    rebased_tree = _tree_of(repo, "feature")
+
+    after = compute_change_set_state(repo, target_tree=rebased_tree, base_ref="dev")
+    assert after is not None
+    assert after["paths"] == ["file.txt"]
+    assert after["fingerprint"] != before["fingerprint"], (
+        "the patch applies to different pre-image content, so its verdict "
+        "must not be reused"
+    )
+
+
+def test_empty_change_set_is_never_keyed(git_repo: Path) -> None:
+    """A tree identical to its base has no patch: no (shared) empty key."""
+    head_tree = _head_tree(git_repo)
+
+    assert compute_change_set_state(git_repo, target_tree=head_tree) is None, (
+        "an empty change set must not become a cache key shared by every "
+        "other empty change set"
+    )
+    assert compute_change_set_state(git_repo, target_tree="not-a-sha") is None
+
+
+def test_run_cached_serves_a_change_set_verdict_after_a_rebase(
+    change_set_repo: Path,
+) -> None:
+    """The rebased push is served from the identical patch — no second run."""
+    repo = change_set_repo
+    would_be_tree = _tree_of(repo, "feature")
+    git(repo, "checkout", "-q", "dev")
+
+    calls: list[str] = []
+    first = run_cached(
+        "pytest",
+        cwd=str(repo),
+        fingerprint=would_be_tree,
+        runner=make_runner(calls),
+        change_set_base_ref="dev",
+    )
+    assert first["cached"] is False
+    assert len(calls) == 1
+    pre_lock = compute_change_set_state(
+        repo, target_tree=would_be_tree, base_ref="dev"
+    )
+    assert pre_lock is not None
+    assert lookup(
+        "pytest",
+        pre_lock["fingerprint"],
+        cwd=str(repo),
+        fingerprint_kind=test_cache.FINGERPRINT_KIND_CHANGE_SET,
+    ) is not None, "the run must also record the change-set verdict"
+
+    _advance_dev(repo, "unrelated.txt", "unrelated\n", "A2 (unrelated file)")
+    git(repo, "rebase", "-q", "dev")
+    rebased_tree = _tree_of(repo, "feature")
+    assert rebased_tree != would_be_tree
+
+    second_calls: list[str] = []
+    second = run_cached(
+        "pytest",
+        cwd=str(repo),
+        fingerprint=rebased_tree,
+        runner=make_runner(second_calls),
+        change_set_base_ref="dev",
+    )
+
+    assert second_calls == [], (
+        "a rebased commit with the identical patch must not re-execute the "
+        "suite — that is the cost this change removes"
+    )
+    assert second["cached"] is True
+    assert second["fingerprint_kind"] == test_cache.FINGERPRINT_KIND_CHANGE_SET
+    assert second["reused_via_change_set"] is True
+    assert second["change_set_target_tree"] == would_be_tree, (
+        "the hit must say which tree the verdict was actually measured on"
+    )
+    # The inherited verdict is mirrored under the pushed tree's key so
+    # tree-keyed consumers (post-push verification, audit) find it — but it
+    # states its origin and the tree it was measured on, so it is never read
+    # as directly executed tree evidence.
+    mirrored = lookup(
+        "pytest",
+        rebased_tree,
+        cwd=str(repo),
+        fingerprint_kind=FINGERPRINT_KIND_TREE,
+    )
+    assert mirrored is not None
+    assert mirrored["verdict_origin"] == "change_set_reuse"
+    assert mirrored["measured_tree"] == would_be_tree
+    assert mirrored["completed_at"] == second["completed_at"], (
+        "mirroring must not extend the verdict's lifetime"
+    )
+
+
+def test_run_cached_never_serves_a_change_set_verdict_for_a_different_patch(
+    change_set_repo: Path,
+) -> None:
+    """A genuine content change on the rebased commit still executes."""
+    repo = change_set_repo
+    would_be_tree = _tree_of(repo, "feature")
+    git(repo, "checkout", "-q", "dev")
+
+    calls: list[str] = []
+    run_cached(
+        "pytest",
+        cwd=str(repo),
+        fingerprint=would_be_tree,
+        runner=make_runner(calls),
+        change_set_base_ref="dev",
+    )
+    assert len(calls) == 1
+
+    # The change itself is different: the rebased patch is not the measured one.
+    _advance_dev(repo, "unrelated.txt", "unrelated\n", "A2 (unrelated file)")
+    (repo / "file.txt").write_text("a\nb\nc\nd\n", encoding="utf-8")
+    gs.commit_all(repo, "B2 changes the content")
+    git(repo, "rebase", "-q", "dev")
+    rebased_tree = _tree_of(repo, "feature")
+
+    second_calls: list[str] = []
+    second = run_cached(
+        "pytest",
+        cwd=str(repo),
+        fingerprint=rebased_tree,
+        runner=make_runner(second_calls),
+        change_set_base_ref="dev",
+    )
+
+    assert len(second_calls) == 1, "a different patch must miss the cache"
+    assert second["cached"] is False
+    assert second["fingerprint_kind"] == FINGERPRINT_KIND_TREE
+
+
+def test_change_set_tracking_can_be_disabled(change_set_repo: Path) -> None:
+    """``track_change_set=False`` keeps the pre-change behaviour byte for byte."""
+    repo = change_set_repo
+    tree = _tree_of(repo, "feature")
+    git(repo, "checkout", "-q", "dev")
+    change_set = compute_change_set_state(
+        repo, target_tree=tree, base_ref="dev"
+    )
+    assert change_set is not None
+    calls: list[str] = []
+    run_cached(
+        "pytest",
+        cwd=str(repo),
+        fingerprint=tree,
+        runner=make_runner(calls),
+        track_change_set=False,
+    )
+    assert lookup(
+        "pytest",
+        change_set["fingerprint"],
+        cwd=str(repo),
+        fingerprint_kind=test_cache.FINGERPRINT_KIND_CHANGE_SET,
+    ) is None, "no change-set entry may be written when tracking is off"

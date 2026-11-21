@@ -168,11 +168,11 @@ def test_runbook_is_complete_and_consistent() -> None:
 def test_template_parses_with_systemd_tmpfiles() -> None:
     """Live syntax check: the committed template must produce no parse errors.
 
-    Runs ``systemd-tmpfiles --clean --dry-run`` against the template.  The
-    dry-run never modifies the filesystem.  Parse failures surface as
-    ``Invalid …`` diagnostics on stderr (e.g. a mistyped age or missing
-    field); the exit code alone is not asserted because unprivileged runs
-    report unrelated permission errors (e.g. root-owned private dirs).
+    Runs ``systemd-tmpfiles --root=/tmp/pi-probe-root --dry-run`` against the
+    template.  The dry-run never modifies the filesystem.  Parse failures
+    surface as ``Invalid …`` diagnostics on stderr (e.g. a mistyped age or
+    missing field); the exit code alone is not asserted because unprivileged
+    runs report unrelated permission errors (e.g. root-owned private dirs).
 
     Skipped when the binary is unavailable (e.g. non-systemd hosts).
     """
@@ -182,10 +182,13 @@ def test_template_parses_with_systemd_tmpfiles() -> None:
 
         pytest.skip("systemd-tmpfiles not available on this host")
 
+    probe_root = Path("/tmp/pi-probe-root")
+    probe_root.mkdir(parents=True, exist_ok=True)
+
     proc = subprocess.run(
         [
             binary,
-            "--clean",
+            "--root=/tmp/pi-probe-root",
             "--dry-run",
             "--graceful",
             "--exclude-prefix=/tmp/snap-private-tmp",
