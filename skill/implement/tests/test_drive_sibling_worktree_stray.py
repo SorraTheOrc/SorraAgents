@@ -35,6 +35,7 @@ guards are never re-implemented.
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from unittest import mock
@@ -940,3 +941,91 @@ class TestPhaseParentIgnoresStaleDebris:
         assert report["success"] is True
         assert report.get("placement_violation") is not True
         assert report["next_child"] == CHILD_ID
+
+
+class TestDebrisSkipIsReported:
+    """AC6: skipping stale debris is reported, never silent.
+
+    An operator who saw a tree block a run yesterday needs one log line saying
+    why it no longer blocks, or the guard looks like it simply stopped working
+    (WL-0MWQLHDOS006CAIH).
+    """
+
+    LOGGER_NAME = "implement.scripts.implement"
+
+    def _skip_messages(
+        self,
+        rooted_repo: Path,
+        canonical_child: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> list[str]:
+        with caplog.at_level(logging.INFO, logger=self.LOGGER_NAME):
+            implement._child_main_checkout_violation(
+                CHILD_ID,
+                str(canonical_child),
+                PARENT_BRANCH,
+                repo_root=str(rooted_repo),
+            )
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == self.LOGGER_NAME
+        ]
+
+    def test_outside_root_skip_is_reported(
+        self,
+        rooted_repo: Path,
+        canonical_child: Path,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        scratch = gs.add_worktree(
+            rooted_repo,
+            tmp_path / "scratch" / f"wl-{LIVE_ITEM}-scratch",
+            f"wl-{LIVE_ITEM}-scratch",
+            base=PARENT_BRANCH,
+        )
+        (scratch / "scratch-marker.js").write_text("x = 1\n", encoding="utf-8")
+
+        messages = self._skip_messages(rooted_repo, canonical_child, caplog)
+
+        assert any(
+            "outside the repository's worktree root" in message
+            and str(scratch) in message
+            for message in messages
+        ), messages
+
+    def test_terminal_owner_skip_is_reported(
+        self,
+        rooted_repo: Path,
+        canonical_child: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        leftover = _canonical_worktree(rooted_repo, DEBRIS_ITEM)
+        (leftover / "index.ts").write_text("deleted-item work\n", encoding="utf-8")
+
+        with _patch_wl_show(
+            {DEBRIS_ITEM: {"id": DEBRIS_ITEM, "status": "completed"}}
+        ):
+            messages = self._skip_messages(
+                rooted_repo, canonical_child, caplog
+            )
+
+        assert any(
+            "is terminal" in message and str(leftover) in message
+            for message in messages
+        ), messages
+
+    def test_a_live_dirty_sibling_reports_no_skip(
+        self,
+        rooted_repo: Path,
+        canonical_child: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "stray.py").write_text("x = 1\n", encoding="utf-8")
+
+        with _patch_wl_show({LIVE_ITEM: {"id": LIVE_ITEM, "status": "in-progress"}}):
+            messages = self._skip_messages(rooted_repo, canonical_child, caplog)
+
+        assert not any("Ignoring registered worktree" in m for m in messages)
