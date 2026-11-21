@@ -1268,3 +1268,185 @@ class TestIntegrateNoBuildScript:
         assert ok is False
         assert "Integration failed: build failed" in evidence
         assert any("npm run build" in " ".join(c) for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# _integrate_into_dev — integration-worktree submodule population
+# (SA-0MW7Z6WRO00242Z3)
+# ---------------------------------------------------------------------------
+
+
+def _make_submodule_repo(tmp_path: Path, *,
+                         build_requires_submodule: bool = True,
+                         issue_id: str = "WL-0MSI4TAT70058921",
+                         ) -> tuple[Path, str]:
+    """Owning repo whose ``dev`` tracks a local-path submodule.
+
+    Layout (all under *tmp_path*, hermetically isolated)::
+
+        submodule-src/        local-path submodule source (``core.py``)
+        projects/ctxhub/      owning repo; ``dev`` tracks ``core/`` gitlink
+        origin.git/           bare remote "origin" with ``dev`` pushed
+
+    ``dev`` carries a ``package.json`` whose build script only succeeds when
+    the tracked submodule is populated (``test -f core/core.py``), so a fresh
+    ``git worktree add`` with an empty ``core/`` makes the build fail exactly
+    as in the 2026-11-08 tce-the-rising incident. With
+    *build_requires_submodule* false the build script is ``true``.
+
+    Returns ``(owning_root, feature_branch)``; the branch holds one unmerged
+    commit ready for ``_integrate_into_dev``.
+    """
+    sub_src = init_repo(tmp_path / "submodule-src", sandbox_root=tmp_path)
+    (sub_src / "core.py").write_text(
+        "# submodule core\nVALUE = 1\n", encoding="utf-8"
+    )
+    commit_all(sub_src, "submodule: initial core")
+
+    owning = tmp_path / "projects" / "ctxhub"
+    (owning / "src").mkdir(parents=True)
+    (owning / "src" / "main.py").write_text("print('dev1')\n", encoding="utf-8")
+    (owning / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    (owning / ".worklog").mkdir(parents=True, exist_ok=True)
+
+    origin = tmp_path / "origin.git"
+    init_bare_remote(origin, sandbox_root=tmp_path)
+    init_repo(owning, sandbox_root=tmp_path)
+    run_git(owning, ["remote", "add", "origin", str(origin)], check=True)
+
+    # Track the local-path submodule. ``protocol.file.allow=always`` mirrors
+    # the production helper: git >= 2.38 blocks the ``file`` transport by
+    # default, which would break every local-path submodule fixture.
+    subprocess.run(
+        ["git", "-c", "protocol.file.allow=always", "submodule", "add",
+         str(sub_src), "core"],
+        cwd=str(owning), check=True, capture_output=True, text=True,
+        env=fixture_git_env(),
+    )
+    build = "test -f core/core.py" if build_requires_submodule else "true"
+    (owning / "package.json").write_text(
+        json.dumps({"name": "ctxhub", "scripts": {"build": build}}),
+        encoding="utf-8",
+    )
+    commit_all(owning, "dev: track submodule + build script")
+    run_git(owning, ["push", "origin", "dev"], check=True)
+
+    branch = f"wl-{issue_id}-add-tab"
+    run_git(owning, ["checkout", "-b", branch], check=True)
+    (owning / "src" / "tab.py").write_text(
+        "tab = 'Worklog'\n", encoding="utf-8"
+    )
+    commit_all(owning, "rename podcast tab to Worklog")
+    run_git(owning, ["checkout", "dev"], check=True)
+    return owning, branch
+
+
+_GREEN_SUITE = {"success": True, "returncode": 0}
+
+
+class TestIntegrateInitialisesSubmodules:
+    """The merge-gate integration worktree populates tracked submodules before
+    the build (SA-0MW7Z6WRO00242Z3).
+
+    A ``git worktree add`` never populates a tracked gitlink, so a repo that
+    vendors a submodule builds against an empty directory and reports a
+    false-negative build failure. These tests exercise the real
+    ``_integrate_into_dev`` against an offline, local-path submodule fixture.
+    """
+
+    def test_integration_worktree_populates_submodule_before_build(
+        self, tmp_path: Path,
+    ) -> None:
+        """AC1/AC2 regression: the build (``test -f core/core.py``) only
+        succeeds when the integration worktree's submodule is populated.
+
+        Red before the fix (empty ``core/`` → build exits non-zero →
+        integration blocked) and green after it.
+        """
+        owning, branch = _make_submodule_repo(tmp_path)
+        ctx = _make_ctx(
+            owning_root=str(owning), runner=_git_runner(owning),
+        )
+        with mock.patch(
+            "test.scripts.run_tests.run_suite",
+            return_value=_GREEN_SUITE,
+        ):
+            ok, evidence = audit_runner._integrate_into_dev(ctx, [], branch)
+        assert ok is True, evidence
+        assert "submodules initialised in integration worktree" in evidence
+        # The build ran and passed only because core/core.py was populated.
+        assert "npm run build -> rc=0" in evidence
+
+    def test_no_submodule_repo_is_unaffected(self, tmp_path: Path) -> None:
+        """AC3 fail-open: a repo without ``.gitmodules`` is unaffected — the
+        integration worktree still initialises (a no-op) and integrates."""
+        _wl, owning, _shas = _make_real_repo(tmp_path)
+        ctx = _make_ctx(owning_root=str(owning), runner=_git_runner(owning))
+        branch = "wl-WL-0MSI4TAT70058921-rename-tab"
+        with mock.patch(
+            "test.scripts.run_tests.run_suite",
+            return_value=_GREEN_SUITE,
+        ):
+            ok, evidence = audit_runner._integrate_into_dev(ctx, [], branch)
+        assert ok is True, evidence
+        assert "submodules initialised in integration worktree" in evidence
+        assert "No build script" in evidence
+
+    def test_submodule_init_failure_is_fail_open(self, tmp_path: Path) -> None:
+        """AC3 fail-open: a failed submodule init logs a warning but never
+        aborts the audit — integration still succeeds."""
+        _wl, owning, _shas = _make_real_repo(tmp_path)
+        ctx = _make_ctx(owning_root=str(owning), runner=_git_runner(owning))
+        branch = "wl-WL-0MSI4TAT70058921-rename-tab"
+        with (
+            mock.patch.object(
+                audit_runner, "_ensure_worktree_submodules",
+                return_value=False,
+            ),
+            mock.patch(
+                "test.scripts.run_tests.run_suite",
+                return_value=_GREEN_SUITE,
+            ),
+        ):
+            ok, evidence = audit_runner._integrate_into_dev(ctx, [], branch)
+        assert ok is True, evidence
+        assert "submodule initialisation skipped/failed (best-effort)" in evidence
+
+
+class TestEnsureWorktreeSubmodules:
+    """Unit behaviour of the shared submodule-population helper."""
+
+    def test_no_gitmodules_returns_true(self, tmp_path: Path) -> None:
+        """No ``.gitmodules`` → no-op, and the helper reports success."""
+        assert audit_runner._ensure_worktree_submodules(tmp_path) is True
+
+    def test_submodule_init_failure_returns_false(
+        self, tmp_path: Path,
+    ) -> None:
+        """A non-zero ``git submodule update`` result returns ``False``
+        (never raises) so the caller stays fail-open."""
+        (tmp_path / ".gitmodules").write_text(
+            '[submodule "vendored"]\n\tpath = vendored\n'
+            "\turl = /nonexistent/submodule\n",
+            encoding="utf-8",
+        )
+        failed = SimpleNamespace(returncode=1, stdout="", stderr="")
+        with mock.patch.object(
+            audit_runner.subprocess, "run", return_value=failed,
+        ):
+            assert audit_runner._ensure_worktree_submodules(tmp_path) is False
+
+    def test_submodule_init_success_returns_true(
+        self, tmp_path: Path,
+    ) -> None:
+        """A zero ``git submodule update`` result returns ``True``."""
+        (tmp_path / ".gitmodules").write_text(
+            '[submodule "vendored"]\n\tpath = vendored\n'
+            "\turl = /nonexistent/submodule\n",
+            encoding="utf-8",
+        )
+        ok = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+            audit_runner.subprocess, "run", return_value=ok,
+        ):
+            assert audit_runner._ensure_worktree_submodules(tmp_path) is True

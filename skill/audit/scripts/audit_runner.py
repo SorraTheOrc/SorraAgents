@@ -12279,6 +12279,19 @@ def _integrate_into_dev(ctx: _AuditContext,
                     evidence.append(proc.stderr.strip())
                     return False, "\n".join(evidence) + "\nIntegration failed: cherry-pick conflicts."
 
+        # Populate tracked submodules BEFORE the node_modules symlink and the
+        # build (ordering hazard SA-0MVTOR53E003IIEQ; SA-0MW7Z6WRO00242Z3).
+        # ``git worktree add`` never populates a tracked gitlink, so a repo
+        # that vendors a submodule (e.g. tce-the-rising's ``core/``) would
+        # build against an empty directory and fail — marking
+        # execution-dependent ACs ``partial`` on a tree that is green in the
+        # real, populated checkout. Fail-open: a repo without ``.gitmodules``
+        # is unaffected and a failed init never aborts the audit.
+        if _ensure_worktree_submodules(worktree_path):
+            evidence.append("submodules initialised in integration worktree")
+        else:
+            evidence.append("submodule initialisation skipped/failed (best-effort)")
+
         # Build + test (build → test → commit order per AGENTS.md).
         # node_modules is shared via symlink (implement-skill convention,
         # SA-0MSGS763C006SM1B): never npm-install inside a worktree.
@@ -12412,19 +12425,22 @@ def _looks_like_sha(value: str) -> bool:
     return bool(_SHA_LIKE_RE.match((value or "").strip()))
 
 
-def _ensure_execution_worktree_submodules(worktree_path: Path) -> bool:
-    """Initialise git submodules inside a fresh execution worktree.
+def _ensure_worktree_submodules(worktree_path: Path) -> bool:
+    """Initialise git submodules inside a fresh audit worktree.
 
+    Shared by both audit worktrees: the F3 **execution** worktree
+    (``audit-exec-<id>``, SA-0MW4ZRLSI005PHL6) and the merge-gate
+    **integration** worktree (``audit-merge-<id>``, SA-0MW7Z6WRO00242Z3).
     Mirrors ``implement.py::_ensure_submodules`` (SA-0MSN52GGN002B0AZ): a
     ``git worktree add`` leaves a tracked gitlink's submodule directory
-    empty, so a project whose suite imports a submodule (e.g.
-    tce-the-rising's ``core/``) fails every suite command at startup. Run
-    **before** the ``node_modules`` symlink (ordering hazard
-    SA-0MVTOR53E003IIEQ).
+    empty, so a project whose build or suite imports a submodule (e.g.
+    tce-the-rising's ``core/``) fails at startup — a false negative on a
+    tree that builds green in the populated checkout. Run **before** the
+    ``node_modules`` symlink (ordering hazard SA-0MVTOR53E003IIEQ).
 
-    Best-effort: a failure never aborts the audit — the execution worktree
-    is then no worse than the launch checkout. Returns ``True`` when
-    submodules were initialised (or there are none).
+    Best-effort: a failure never aborts the audit — the worktree is then
+    no worse than the launch checkout. Returns ``True`` when submodules
+    were initialised (or there are none).
     """
     if not (worktree_path / ".gitmodules").is_file():
         return True
@@ -12536,7 +12552,7 @@ def _create_execution_worktree(owning_root: Path, runner: Runner,
             f"(detached at origin/dev {dev_sha[:10]})"
         )
         # Submodules BEFORE the node_modules symlink (SA-0MVTOR53E003IIEQ).
-        if _ensure_execution_worktree_submodules(worktree_path):
+        if _ensure_worktree_submodules(worktree_path):
             evidence.append("submodules initialised in execution worktree")
         else:
             evidence.append("submodule initialisation skipped/failed (best-effort)")

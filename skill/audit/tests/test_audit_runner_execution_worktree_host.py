@@ -117,7 +117,7 @@ class TestCreateExecutionWorktree:
         calls: list[list[str]] = []
 
         with mock.patch.object(
-            audit_runner, "_ensure_execution_worktree_submodules",
+            audit_runner, "_ensure_worktree_submodules",
             return_value=True,
         ):
             path, evidence = audit_runner._create_execution_worktree(
@@ -145,7 +145,7 @@ class TestCreateExecutionWorktree:
         calls: list[list[str]] = []
 
         with mock.patch.object(
-            audit_runner, "_ensure_execution_worktree_submodules",
+            audit_runner, "_ensure_worktree_submodules",
             return_value=True,
         ):
             path, evidence = audit_runner._create_execution_worktree(
@@ -167,7 +167,7 @@ class TestCreateExecutionWorktree:
         calls: list[list[str]] = []
 
         with mock.patch.object(
-            audit_runner, "_ensure_execution_worktree_submodules",
+            audit_runner, "_ensure_worktree_submodules",
             return_value=True,
         ):
             path, evidence = audit_runner._create_execution_worktree(
