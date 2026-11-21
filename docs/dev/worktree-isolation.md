@@ -379,11 +379,32 @@ behind after unrelated commits landed on `dev` — on the "no work" side of the
 guard and on the "implement next" side of `phase_parent`
 (SA-0MVRN5Q67005H3M5).
 
+The guard only counts **live foreign surfaces**. A dirty sibling is evidence
+only when it could belong to a live session, so two classes are filtered out
+(`_is_live_foreign_surface`, WL-0MWQLHDOS006CAIH): a tree **outside** the
+repository's worktree root (`.worklog/worktrees/` — `/tmp` scratch trees,
+ad-hoc manual checks) when the child's own worktree lives inside that root,
+and a tree whose **owning work item is terminal** (`completed`, `in_review`,
+`done`, `deleted`), wherever it lives. Stale debris therefore never refuses a
+clean child again, while a child that really wrote into another **live** item's
+worktree still fails closed with the same message (the sibling root and its
+paths). Ownership is read from the worktree directory name (`wl-<ID>-<slug>`,
+`audit-exec-<ID>`) and resolved with one `wl show` per *dirty* sibling — the
+fast paths (the child's own worktree holds the work; no dirty siblings) never
+spawn one. Unresolvable ownership — an untagged directory name, `wl`
+unavailable, or an id that does not resolve — stays **fail-closed**, and every
+skipped surface is reported by one informational log line so an operator can
+see why a previously-blocking tree no longer blocks. Nothing is ever pruned
+here: the tree is still the operator's to remove (see
+[the prune remedy](#stale-worktree-debris-the-prune-remedy)).
+
 The finish-phase gate (`_worktree_placement_violation`) is cwd-sensitive and
 symmetric: when `finish` runs from a cwd that resolves into a registered
 sibling worktree, that sibling's changes are checked as its own write surface
 (own worktree with no work + dirty sibling ⇒ refusal naming both roots), with
-the main-checkout scan unchanged for every other cwd.
+the main-checkout scan unchanged for every other cwd — and the same live-surface
+filter applies, after the child's own worktree and the sibling's dirt have been
+checked.
 
 ### Driven-child red-gate stop rule
 

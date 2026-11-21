@@ -47,20 +47,18 @@ sensitive values.
 ## StatusLifecycle Integration
 
 All status transitions go through the shared `StatusLifecycle` context manager
-([../shared/status_lifecycle.py](../shared/status_lifecycle.py)) — never
-ad-hoc status writes (`wl update --status`): always `StatusLifecycle`.
-`implement.py` uses it automatically (`phase_start` claims `in_progress`,
-`phase_finish` lands `completed`/`in_review`, `phase_abort` resets to `open`);
-manual: `StatusLifecycle.update_status(id, status, stage=…)`.
+([../shared/status_lifecycle.py](../shared/status_lifecycle.py)); never ad-hoc
+`wl update --status` (StatusLifecycle is the only path). `implement.py`
+uses it automatically (`phase_start` claims `in_progress`, `phase_finish` lands
+`completed`/`in_review`, `phase_abort` resets to `open`); manual:
+`StatusLifecycle.update_status(id, status, stage=…)`.
 
-- **Actively worked ⇒ `in_progress`** — guard with
-  `StatusLifecycle.require_claimed(<id>)`, resume with `ensure_claimed(<id>)`.
-- **Assignee release on every terminal outcome** — `finish` clears it with the
-  `completed`/`in_review` transition; every abort reset to `open` passes
-  `assignee=""`
-  ([assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)).
-- **Terminal status on both finish paths** — both persist it, then read back
-  and fail loudly if lost (`tests/test_finish_no_diff_status.py`).
+- **Actively worked ⇒ `in_progress`** — `require_claimed` / `ensure_claimed`.
+- **Assignee release on every terminal outcome** — `finish` clears it; every
+  abort reset to `open` passes `assignee=""`
+  ([invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)).
+- **Terminal status on both finish paths** — persisted, read back, loud on loss
+  (`tests/test_finish_no_diff_status.py`).
 
 Deep detail:
 [reference — StatusLifecycle](../../docs/dev/implement-skill-reference.md#relocated-statuslifecycle-integration).
@@ -180,6 +178,12 @@ restore-and-commit via a proper work item, or delete if stale — never delete a
 stash without explicit permission. `scripts/hygiene_check.sh` runs the same
 check periodically. Recovery playbook:
 [reference — dirty main-checkout recovery](../../docs/dev/implement-skill-reference.md#relocated-dirty-main-checkout-recovery-playbook).
+
+That run also reports **stale worktree debris** (trees outside
+`.worklog/worktrees/`, or owned by a terminal item) with the operator-only
+remedy `git worktree remove <path> && git worktree prune`. It is a notice,
+never an exit-code change: [rationale + placement-guard
+rule](../../docs/dev/worktree-isolation.md#stale-worktree-debris-the-prune-remedy).
 
 4. Understand the work item
 
@@ -347,7 +351,6 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   proceeds when released. Run it **once** — never in a `for attempt …;
   finish; wait_for_job.py` retry loop.
 
-  **Retry taxonomy (SA-0MW22SEMV00230O5):** § Bounded push loop.
 - Follow the mandatory **build → test → commit** order.
 - **Add the `## Impact` sentence before finishing.** A newly completed item's
   description must carry an `## Impact` section: one sentence describing the user-experience impact — not a technical summary.
@@ -392,10 +395,6 @@ every abort/failure → `open` with `assignee=""`.
 
 No single orchestrator; use project-local build/test/linters
 ([reference](../../docs/dev/implement-skill-reference.md)).
-
-## Final cleanup (belt-and-suspenders)
-
-See [relocated detail](../../docs/dev/implement-skill-reference.md#relocated-final-cleanup-belt-and-suspenders).
 
 ## Final step: standardized end-of-session report
 

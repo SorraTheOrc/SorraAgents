@@ -405,6 +405,77 @@ records *why* the suite must be deterministic under either ambient state — the
 parent-driven full-suite gate is exactly where a real driven chain's audit
 verdict is computed.
 
+## Stale worktree debris is never evidence (WL-0MWQLHDOS006CAIH)
+
+The placement guards above scan **every** registered sibling worktree, which
+is what caught the stray child of SA-0MW5FIJNQ002Z24I — but a checkout also
+accumulates debris that never changes: `/tmp/wl-*` scratch trees from old
+manual checks, and the leftover trees of work items that are already
+`completed`/`deleted`. Because that debris is dirty forever, **every**
+subsequent clean child in that checkout was refused until an operator pruned
+the trees by hand (observed on the epic drive `WL-0MW50EHZ6007QBPB`: four
+unrelated surfaces named for a clean child).
+
+### What counts as a live foreign surface
+
+`_is_live_foreign_surface(sibling, worktree_path, repo_root)` decides, in this
+order, and is applied at both `_child_main_checkout_violation` and
+`_worktree_placement_violation` (via `_sibling_worktree_containing`'s caller):
+
+1. **Out of scope ⇒ never evidence.** A sibling outside the repository's
+   worktree root (`.worklog/worktrees/`, `DEFAULT_WORKTREE_DIR`) is scratch
+   debris. The comparison is only meaningful when the child's own worktree
+   lives inside that root; a child working elsewhere (a custom
+   `--worktree-path`, an ad-hoc tree — as in the regression fixtures) leaves
+   the scope unknown, so nothing is filtered and the pre-fix fail-closed
+   behaviour is kept.
+2. **Terminal owner ⇒ never evidence.** The owning work item is read from the
+   directory name (`_worktree_path_to_item_id`: `wl-<ID>-<slug>`,
+   `audit-exec-<ID>`) and resolved with `wl_show` in
+   `_worktree_owner_is_terminal`, which answers live / terminal / unresolved. A
+   `completed`/`in_review`/`done`/`deleted` owner has no live session to race,
+   so its dirt predates the run — wherever the tree lives.
+3. **Everything else is evidence.** A dirty, in-scope sibling of a
+   **non-terminal** item still fails the run closed with the unchanged
+   message naming the sibling and its paths.
+
+Unresolved ownership is **fail-closed**: an untagged directory name
+(`wl-test-ff`), an unavailable `wl`, or a lookup that returns another item
+keeps the surface as evidence and logs a warning. Each skipped surface emits
+one `LOG.info` line naming the tree and the reason, so an operator can see why
+a previously-blocking tree no longer blocks. Nothing is ever removed
+programmatically — the tree stays the operator's decision.
+
+**Bounded cost.** The filter runs only for a sibling that is already known to
+be dirty, and the worklog lookup only for an in-scope dirty sibling: the
+child's own worktree carrying work, or a registry with no dirty trees, still
+costs no `wl` subprocess.
+
+### The prune remedy (`scripts/hygiene_check.sh`)
+
+The hygiene script reports both debris classes — in text and in `--json`
+(`{"check":"debris_worktrees","status":"notice","outside_root":[…],
+"terminal_owner":[…],"remedy":…}`) — and prints the remedy, which only an
+operator may run:
+
+```bash
+git worktree remove <path> && git worktree prune
+```
+
+The finding is a **notice**: it never raises the script's exit code, so every
+pre-existing check keeps its exit-code and warning semantics. Owner lookups
+run on a bounded thread pool (a few dozen leftover trees resolve in about a
+second), and an unresolvable owner is never guessed — unreported here
+(fail-open), still fail-closed in the guard.
+
+Regression coverage:
+`skill/implement/tests/test_drive_sibling_worktree_stray.py`
+(`TestWorktreeItemOwnership`, `TestChildMainCheckoutViolationDebrisFilter`,
+`TestPlacementViolationDebrisFilter`, `TestPhaseParentIgnoresStaleDebris`,
+`TestDebrisSkipIsReported`) and `tests/test_implement_stash_hygiene.py`
+(`TestDebrisWorktreeReports`). Documentation of record:
+[worktree isolation](worktree-isolation.md#the-placement-guard).
+
 ## Assignee release when a kill cannot run an exit hook (SA-0MVVF75ZA007XNKB)
 
 A non-empty `assignee` is a **scheduling hold** (see the
@@ -4296,10 +4367,15 @@ Guards (deterministic, in `phase_parent`):
   blocker to continue the chain.
 - **Worktree placement guard** — a non-terminal child whose worktree holds no
   work (no dirty files, no commits ahead of the parent branch) while the main
-  checkout is dirty outside `.worklog/` — **or a registered sibling worktree
-  of the same repository holds changes** (SA-0MW5FIJNQ002Z24I) — has written
-  outside its own worktree; the phase fails closed with the offending
+  checkout is dirty outside `.worklog/` — **or a registered, live sibling
+  worktree of the same repository holds changes** (SA-0MW5FIJNQ002Z24I) — has
+  written outside its own worktree; the phase fails closed with the offending
   surfaces (and does not advance the parent) instead of silently proceeding.
+  A sibling only counts as a **live foreign surface**
+  (`_is_live_foreign_surface`, WL-0MWQLHDOS006CAIH): stale debris — a tree
+  outside the repository's worktree root, or one whose owning work item is
+  terminal — is never evidence (see
+  [stale worktree debris](#stale-worktree-debris-is-never-evidence-wl-0mwqlhdos006caih)).
   A child whose last session died before producing any work is exempt: the
   driver's recorded spawn-failure evidence
   (`<worktree>/.worklog/spawn-failure.json`) makes the foreign dirt
