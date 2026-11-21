@@ -398,6 +398,33 @@ placement guard above is its mechanical backstop — even a child that ignores
 the rule and starts the triaged item's implementation fails closed the moment
 it writes into the sibling worktree.
 
+### Stale worktree debris: the prune remedy
+
+A dirty sibling worktree is only counted as evidence when it could belong to a
+**live** session. Two classes of debris never block a clean child
+(WL-0MWQLHDOS006CAIH): a registered tree **outside** the repository's worktree
+root (`.worklog/worktrees/` — `/tmp` scratch trees, ad-hoc manual checks) and
+a tree whose **owning work item is terminal** (`completed`, `in_review`,
+`done`, `deleted`), wherever it lives. Unresolvable ownership — no work-item
+id in the directory name, or `wl show` unavailable — stays fail-closed, and the
+trees are never removed automatically.
+
+`scripts/hygiene_check.sh` reports both classes so the operator knows exactly
+what to remove, in text and in `--json`
+(`{"check":"debris_worktrees","status":"notice","outside_root":[…],"terminal_owner":[…],"remedy":…}`),
+and prints the remedy. The finding is a **notice**, not a warning: this check
+never raises the script's exit code, so every pre-existing check keeps its
+exit-code and warning semantics (a checkout may legitimately carry a registered
+tree outside the root, e.g. a manual experiment):
+
+```bash
+# Run from the main checkout; removal is an operator decision.
+git worktree remove <path> && git worktree prune
+```
+
+An owner that `wl show` cannot resolve is never guessed: such a tree is
+unreported here (fail-open) and keeps blocking the guard (fail-closed).
+
 ## The main checkout is a guarded surface
 
 A linked worktree shares one object store — and, in agent workflows, one

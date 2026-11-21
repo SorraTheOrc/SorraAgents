@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # hygiene_check.sh — Periodic stash and worktree hygiene check.
 #
-# Reports orphaned stashes (no matching open work item) and dirty main
-# checkouts. Designed to run periodically (cron, CI, or manually).
+# Reports orphaned stashes (no matching open work item), dirty main
+# checkouts, and stale (debris) worktrees — trees outside the repository's
+# worktree root or belonging to a terminal work item — with the prune remedy.
+# Designed to run periodically (cron, CI, or manually).
 #
 # Usage:
 #   scripts/hygiene_check.sh [--json] [--repo-root PATH]
@@ -271,6 +273,176 @@ check_orphaned_worktrees() {
     fi
 }
 
+# ── Check 7: Stale (debris) worktrees (WL-0MWQLHDOS006CAIH) ──────────
+#
+# `check_orphaned_worktrees` above only reports trees whose BRANCH was
+# deleted. Two further classes of debris make `implement.py`'s placement
+# guards refuse a CLEAN epic child until an operator removes them by hand:
+#
+#   1. registered worktrees OUTSIDE the repository's worktree root
+#      (`.worklog/worktrees/`) — `/tmp` scratch trees and ad-hoc manual
+#      checks that were never removed;
+#   2. worktrees whose OWNING work item is terminal (`in_review`,
+#      `completed`, `done`, `deleted`) — a finished item's session is over, so
+#      its leftover tree can never be raced.
+#
+# Reporting only, never destructive: the remedy is printed for the operator to
+# run (`git worktree remove <path> && git worktree prune`). The finding is a
+# NOTICE, not a warning: this check never raises the script's exit code, so
+# every pre-existing check keeps its exit-code and warning semantics
+# (a checkout may legitimately carry a registered tree outside the root, e.g.
+# a manual experiment). FAIL-OPEN: an unresolvable owner (untagged directory
+# name, no `wl`, unknown id) reports nothing rather than guessing.
+
+check_debris_worktrees() {
+    local json_flag=false
+    [[ "$JSON_OUTPUT" == "true" ]] && json_flag=true
+
+    # The inline python owns both the detection and the formatting, so the
+    # JSON shape lives in one place. It always exits 0: the finding is
+    # reported, never escalated (see the contract above).
+    if python3 - "$REPO_ROOT" "$json_flag" "$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)" <<'PY'
+import json
+import re
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+repo_root = Path(sys.argv[1]).resolve()
+json_flag = sys.argv[2] == "true"
+framework_root = Path(sys.argv[3])
+CHECK = "debris_worktrees"
+WORKTREE_ROOT = repo_root / ".worklog" / "worktrees"
+REMEDY = "git worktree remove <path> && git worktree prune"
+ITEM_RE = re.compile(
+    r"^(?:wl|audit-exec)-(?P<id>[A-Z][A-Z0-9]{1,9}-[A-Z0-9]{2,})(?:-|$)"
+)
+TERMINAL = {"in_review", "completed", "done", "deleted"}
+
+
+def report(status, **fields):
+    if json_flag:
+        print(json.dumps({"check": CHECK, "status": status, **fields}))
+    elif status == "ok":
+        print("✓ No stale worktrees (every registered tree belongs to a live work item).")
+    else:
+        outside = fields.get("outside_root", [])
+        terminal = fields.get("terminal_owner", [])
+        print(
+            f"ℹ {len(outside) + len(terminal)} stale worktree(s) that no longer "
+            "belong to a live work item:"
+        )
+        for entry in outside:
+            print(
+                f"  - {entry['path']} (outside the repository's worktree "
+                f"root {entry['worktree_root']})"
+            )
+        for entry in terminal:
+            print(
+                f"  - {entry['path']} (owning work item "
+                f"{entry['work_item']} is {entry['status']})"
+            )
+        print("  Prune them (operator decision, never automatic):")
+        for entry in outside + terminal:
+            print(f"    git worktree remove {entry['path']} && git worktree prune")
+
+
+def registered_worktrees():
+    """Registered worktrees of *repo_root*, excluding the one we run in."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    paths = [
+        Path(line[len("worktree "):]).resolve()
+        for line in proc.stdout.splitlines()
+        if line.startswith("worktree ")
+    ]
+    # ``git worktree list`` names the worktree in use first; the main checkout
+    # is never debris.
+    return [path for path in paths[1:] if path != repo_root]
+
+
+def wl_show(item_id):
+    """Resolve a work item; any failure yields {} so nothing is guessed."""
+    cmd = ["wl", "show", item_id, "--json"]
+    try:
+        sys.path.insert(0, str(framework_root))
+        from shared.status_lifecycle import resolve_worklog_flags
+
+        cmd[1:1] = resolve_worklog_flags(cmd)
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30, cwd=str(repo_root)
+        )
+    except Exception:
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    item = data.get("workItem", data)
+    return item if isinstance(item, dict) else {}
+
+
+outside = []
+inside = []
+for path in registered_worktrees():
+    if not (path == WORKTREE_ROOT or WORKTREE_ROOT in path.parents):
+        outside.append({"path": str(path), "worktree_root": str(WORKTREE_ROOT)})
+        continue
+    match = ITEM_RE.match(path.name)
+    if match is None:
+        continue
+    inside.append((path, match.group("id")))
+
+# The lookup is one ``wl`` subprocess per owned tree, so they run
+# concurrently: a checkout with a few dozen leftover trees must not turn a
+# hygiene check into a multi-second stall.
+terminal = []
+if inside:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        resolved = list(pool.map(lambda entry: wl_show(entry[1]), inside))
+    for (path, item_id), item in zip(inside, resolved):
+        if str(item.get("id", "")) != item_id:
+            continue
+        status = str(item.get("status", ""))
+        if status in TERMINAL:
+            terminal.append(
+                {"path": str(path), "work_item": item_id, "status": status}
+            )
+
+if outside or terminal:
+    report(
+        "notice",
+        outside_root=outside,
+        terminal_owner=terminal,
+        remedy=REMEDY,
+    )
+else:
+    report("ok", outside_root=[], terminal_owner=[], remedy=REMEDY)
+raise SystemExit(0)
+PY
+    then
+        return 0
+    fi
+    return 1
+}
+
 # ── Check 4: Main-checkout finish lock (WL-0MVPADZ1Z000FOSG AC5) ────────
 
 check_main_checkout_lock() {
@@ -491,6 +663,7 @@ overall_exit=0
 check_orphaned_stashes || overall_exit=1
 check_dirty_checkout || overall_exit=1
 check_orphaned_worktrees || overall_exit=1
+check_debris_worktrees || overall_exit=1
 check_main_checkout_lock || overall_exit=1
 check_tracked_deletions || overall_exit=1
 check_self_referential_upstream || overall_exit=1
