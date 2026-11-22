@@ -426,6 +426,18 @@ def _mocked_phase_finish(
             patch.object(implement, "wl_add_comment", add_comment)
         )
         stack.enter_context(patch.object(implement, "_surface_postfix_prose"))
+        # The main-checkout lock is shared by every finish-gate harness here:
+        # they all pin ``repo_root`` to ``/tmp/repo-root``, so two concurrent
+        # files contend on the same lock and the loser never reaches its
+        # assertions (SA-0MWS8ICOC001DZX1). Stub the boundary exactly as
+        # ``test_finish_interruption_recovery.py`` does; the lock's own
+        # behaviour is covered by ``test_finish_main_checkout_lock.py``.
+        stack.enter_context(
+            patch.object(
+                implement, "acquire_main_checkout_lock", return_value=(999, None)
+            )
+        )
+        stack.enter_context(patch.object(implement, "_release_main_checkout_lock"))
         stack.enter_context(
             patch.object(implement.StatusLifecycle, "update_status", update_status)
         )
@@ -459,6 +471,33 @@ def _reset_update(update_status: MagicMock) -> tuple | None:
         if len(call.args) >= 2 and call.args[1] == "open":
             return (call.args[0], "open")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Lock isolation — a concurrent finish on the shared lock cannot turn this
+# harness red (SA-0MWS8ICOC001DZX1)
+# ---------------------------------------------------------------------------
+
+
+def test_finish_ignores_a_held_main_checkout_lock(tmp_path, held_main_checkout_lock):
+    """A genuinely held main-checkout lock is invisible to this harness.
+
+    This harness pins ``repo_root`` to the same ``/tmp/repo-root`` as the
+    other finish-gate harnesses, so a concurrent finish contended on one lock
+    file and the loser never reached its assertions (SA-0MWS8ICOC001DZX1).
+    The lock boundary is stubbed here (its behaviour stays covered by
+    ``test_finish_main_checkout_lock.py``), so the terminal transition still
+    lands while the lock is genuinely held.
+    """
+    lifecycle = MagicMock()
+    with _mocked_phase_finish(
+        update_status=lifecycle, tmp_path=tmp_path, outcome="commit"
+    ) as mocks:
+        report = implement.phase_finish("OSL-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    assert report["steps"]["main_checkout_lock"]["acquired"] is True
+    assert _terminal_update(mocks["update_status"]) == ("OSL-TEST", "completed")
 
 
 def test_finish_no_diff_path_persists_terminal_status(tmp_path):

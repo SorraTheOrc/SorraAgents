@@ -220,6 +220,18 @@ def _mocked_phase_finish(tmp_path: Path):
             )
         )
         stack.enter_context(patch.object(implement, "_surface_postfix_prose"))
+        # The main-checkout lock is shared by every finish-gate harness here:
+        # they all pin ``repo_root`` to ``/tmp/repo-root``, so two concurrent
+        # files contend on the same lock and the loser never reaches its
+        # assertions (SA-0MWS8ICOC001DZX1). Stub the boundary exactly as
+        # ``test_finish_interruption_recovery.py`` does; the lock's own
+        # behaviour is covered by ``test_finish_main_checkout_lock.py``.
+        stack.enter_context(
+            patch.object(
+                implement, "acquire_main_checkout_lock", return_value=(999, None)
+            )
+        )
+        stack.enter_context(patch.object(implement, "_release_main_checkout_lock"))
         stack.enter_context(
             patch.object(implement.StatusLifecycle, "update_status", MagicMock())
         )
@@ -254,6 +266,31 @@ def _clean_deferral_env(monkeypatch):
     """
     monkeypatch.delenv(implement.DRIVE_RECURSION_ENV, raising=False)
     monkeypatch.delenv(implement.KEEP_WORKTREE_ENV, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Lock isolation — a concurrent finish on the shared lock cannot turn this
+# harness red (SA-0MWS8ICOC001DZX1)
+# ---------------------------------------------------------------------------
+
+
+def test_finish_ignores_a_held_main_checkout_lock(tmp_path, held_main_checkout_lock):
+    """A genuinely held main-checkout lock is invisible to this harness.
+
+    Every finish-gate harness in this package pins ``repo_root`` to
+    ``/tmp/repo-root``, so two test files running concurrently contend on the
+    same lock file and the loser used to return the lock refusal before its
+    assertions ran (SA-0MWS8ICOC001DZX1). The harness stubs the lock
+    boundary — the lock's own behaviour stays covered by
+    ``test_finish_main_checkout_lock.py`` — so the default removal path still
+    completes while the lock is held elsewhere.
+    """
+    with _mocked_phase_finish(tmp_path) as mocks:
+        report = implement.phase_finish(ITEM_ID, json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    assert report["steps"]["main_checkout_lock"]["acquired"] is True
+    assert mocks["removal"].call_count == 1, "the asserted removal path must run"
 
 
 # ---------------------------------------------------------------------------

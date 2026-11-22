@@ -63,6 +63,19 @@ a lock wait) and is unread by tests; ``TEST_LOCK_TIMEOUT`` belongs to
 suite is stubbed). Child-lock test files exercise the per-work-item child lock
 and patch ``_sync_parent_branch``, so they never contend the main-checkout lock.
 
+Shared main-checkout lock (SA-0MWS8ICOC001DZX1): the finish-gate harnesses
+(``test_finish_deferred_worktree_removal.py``,
+``test_finish_no_diff_status.py``,
+``test_finish_plain_flow_keep_worktree.py``) all pin their state's
+``repo_root`` to the shared synthetic path ``/tmp/repo-root``, so they resolve
+**one** main-checkout lock file and two files running concurrently race it —
+the loser's ``phase_finish`` returned the lock refusal before its assertions
+ran. Those harnesses now stub the lock boundary (the pattern already used by
+``test_finish_interruption_recovery.py``); the lock's own behaviour stays
+covered by ``test_finish_main_checkout_lock.py``. The
+:func:`held_main_checkout_lock` fixture manufactures the contention for a
+single test, so each harness proves it is isolated from a held lock.
+
 Where a test *does* need a specific timeout value it sets it explicitly within
 the test body, after the fixture has run. A test that needs the **production
 default** (rather than neutralisation) deletes the variable in the test body
@@ -71,11 +84,65 @@ default** (rather than neutralisation) deletes the variable in the test body
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+#: The synthetic main-checkout root the finish-gate harnesses pin their
+#: ``ImplementState.repo_root`` to (``_mocked_phase_finish`` in
+#: ``test_finish_deferred_worktree_removal.py``,
+#: ``test_finish_no_diff_status.py`` and
+#: ``test_finish_plain_flow_keep_worktree.py``). Because every harness uses the
+#: same literal path, they all resolve the *same* main-checkout lock file
+#: (SA-0MWS8ICOC001DZX1).
+MAIN_CHECKOUT_LOCK_FIXTURE_ROOT = "/tmp/repo-root"
+
+
+@pytest.fixture
+def held_main_checkout_lock():
+    """Hold the real finish lock at the shared synthetic root (SA-0MWS8ICOC001DZX1).
+
+    ``phase_finish`` takes an exclusive ``flock`` on
+    ``<repo_root>/.worklog/locks/main-checkout.lock`` and fails fast when it is
+    held (the autouse neutralisation above pins
+    ``IMPLEMENT_FINISH_LOCK_TIMEOUT=0``). The finish-gate harnesses in this
+    package all pin ``repo_root`` to :data:`MAIN_CHECKOUT_LOCK_FIXTURE_ROOT`,
+    so two test files running concurrently contend on the same lock file and
+    the loser's ``phase_finish`` returns the lock refusal before its own
+    assertions run. A test requesting this fixture manufactures exactly that
+    contention for its whole duration: a harness that isolates the lock
+    boundary passes, one that does not fails loudly.
+
+    The lock file is shared with the host, so a lock already held by someone
+    else counts as the same contention condition rather than an error; only a
+    lock this fixture acquired itself is released on teardown.
+
+    Returns:
+        The lock path held for the duration of the test.
+    """
+    from skill.implement.scripts import implement
+
+    lock_path = implement._main_checkout_lock_path(MAIN_CHECKOUT_LOCK_FIXTURE_ROOT)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            acquired = False
+        else:
+            acquired = True
+        try:
+            yield lock_path
+        finally:
+            if acquired:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 @pytest.fixture(autouse=True)
