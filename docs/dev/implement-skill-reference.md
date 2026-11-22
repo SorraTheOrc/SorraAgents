@@ -4016,12 +4016,52 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 > WL-0MQRBT8BS00355AB incident class) and is no longer needed: the link farm
 > makes the worktree's own build visible to its gate.
 
-> **Git submodules are auto-initialised:** `implement.py start` runs
-> ``git submodule update --init --recursive`` inside the new worktree (SA-0MSN52GGN002B0AZ).
+> **Git submodules are auto-initialised, before the `node_modules` passes:**
+> `implement.py start` runs ``git submodule update --init --recursive`` inside the
+> new worktree (SA-0MSN52GGN002B0AZ) **before** it materialises the root link farm
+> or any nested ``node_modules`` symlink (SA-0MVTOR53E003IIEQ). A nested
+> ``node_modules`` symlink created inside a still-empty gitlink makes the clone
+> fail ("destination path already exists and is not an empty directory"), and that
+> failure is fail-open, so the worktree silently kept an uninitialised submodule
+> and every build died on the submodule's imports. See
+> [submodule bootstrap ordering](#relocated-submodule-bootstrap-ordering-sa-0mbtor53e003iieq).
 > Failures produce a ``WARNING`` log message but **do not abort** — the worktree
 > remains usable (best-effort). Repos without ``.gitmodules`` are unaffected.
 
 See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
+
+### Relocated: Submodule bootstrap ordering (SA-0MVTOR53E003IIEQ)
+
+The start phase orders its bootstrap passes as
+``submodules → root node_modules link farm → nested node_modules symlinks``.
+The order is a correctness requirement, not a preference:
+
+- ``git worktree add`` materialises a submodule (gitlink) as an **empty**
+  directory, so a nested-symlink pass that runs first fills ``<wt>/<sub>/``
+  with ``node_modules`` and ``git submodule update --init`` then refuses to
+  clone (``destination path … already exists and is not an empty directory``).
+- The submodule step is fail-open (SA-0MSN52GGN002B0AZ AC2), so a failed clone
+  only warns: ``start`` reported success while the worktree held an
+  uninitialised submodule and every ``tsc``/build died on its imports. The
+  defect recurred four times across ``tce-the-rising`` child sessions
+  (RISE-0MVZBUE5R0026M95, RISE-0MVTOVFW2009MOLJ, RISE-0MVZDTLEH002KS29,
+  RISE-0MWRUYNTF0028CS2).
+- A nested symlink **inside** a checked-out submodule is allowed (the submodule
+  may own dependencies the root install lacks) but is covered by the
+  submodule's own ``info/exclude``: the reference ``node_modules/`` pattern has
+  a trailing slash and matches a *directory*, never a *symlink*, so without the
+  exclude entry the superproject reports ``M <sub>`` and the worktree looks
+  dirty.
+- A resumed worktree left broken by the old ordering is self-healed: a declared
+  submodule directory holding **only** ``node_modules`` symlinks and no
+  ``.git`` is cleared before the clone. Any other content is left untouched (the
+  fail-open warning then reports the genuine conflict).
+
+Implementation: ``_iter_declared_submodule_paths`` (``.gitmodules`` read with
+``configparser``, no extra subprocess), ``_enclosing_submodule_path``,
+``_ensure_worktree_local_exclude_entry`` and
+``_clear_placeholder_submodule_dirs``. Regression suite:
+``tests/test_implement_submodule_ordering.py``.
 
 ### Relocated: Step 6.1 — Parent recursion (epic/parent items only)
 

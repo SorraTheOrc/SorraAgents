@@ -5,8 +5,8 @@ description: "Write tests, docs, and code for a Worklog item via a deterministic
 
 ## Purpose
 
-Deterministic, step-by-step workflow for completing a Worklog work item
-through code, tests, and docs.
+Deterministic workflow for completing a Worklog work item through code,
+tests and docs.
 
 ## Inputs
 
@@ -244,9 +244,10 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 > writes corrupt the shared install. Deep detail:
 > [reference — worktree creation](../../docs/dev/implement-skill-reference.md#relocated-step-5--create-a-worktree-from-dev-and-branch-inside-it).
 
-> **Git submodules are auto-initialised:** `implement.py start` runs
-> `git submodule update --init --recursive`. Failures produce a **WARNING**
-> but do not abort (best-effort); repos without `.gitmodules` are unaffected.
+> **Submodules initialise before `node_modules`:** `start` runs
+> `git submodule update --init --recursive` first — a nested link in an empty
+> gitlink blocks the clone (SA-0MVTOR53E003IIEQ). Failures only **WARNING**;
+> no `.gitmodules`, no change.
 
 `implement.py start` handles the rest (idempotent resume, stale-resolution
 gate).

@@ -79,6 +79,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import configparser
 import contextlib
 import errno
 import functools
@@ -7632,6 +7633,201 @@ def _iter_nested_node_modules(repo_root: str) -> Iterator[tuple[str, str]]:
         yield rel_parent, os.path.join(rel_parent, "node_modules")
 
 
+def _iter_declared_submodule_paths(repo_root: str | None) -> tuple[str, ...]:
+    """Return the submodule paths declared by the main checkout's ``.gitmodules``.
+
+    A nested ``node_modules`` inside one of these paths belongs to a *gitlink*,
+    which is why the bootstrap ordering matters (SA-0MVTOR53E003IIEQ): a symlink
+    created there while the submodule is still unchecked makes
+    ``git submodule update --init`` refuse to clone ("destination path already
+    exists and is not an empty directory"), and a symlink created *after* the
+    init leaves the superproject reporting the submodule as modified unless the
+    path is ignored inside the submodule.
+
+    ``.gitmodules`` is read with :mod:`configparser` rather than a ``git``
+    subprocess so the callers stay subprocess-free on their hot path (the
+    submodule helper must issue exactly one ``git`` command: the update). A
+    malformed or unreadable file is logged and treated as "no submodules",
+    matching the fail-open contract.
+
+    Nested submodules are covered implicitly: a candidate path *under* a
+    declared path matches it as a prefix (:func:`_enclosing_submodule_path`).
+
+    Args:
+        repo_root: Absolute path to the main checkout, or None if unknown.
+
+    Returns:
+        Declared submodule paths in declaration order, repository-relative and
+        POSIX-normalised (e.g. ``("core",)``); empty when the repository has no
+        ``.gitmodules`` or it declares no ``path``.
+    """
+    if not repo_root:
+        return ()
+    gitmodules = Path(repo_root) / ".gitmodules"
+    if not gitmodules.is_file():
+        return ()
+
+    parser = configparser.ConfigParser(interpolation=None)
+    # Section names are quoted (``[submodule "core"]``) and git keys are
+    # case-insensitive; ``optionxform`` is left at its lowercase default.
+    try:
+        parser.read(gitmodules, encoding="utf-8")
+    except (configparser.Error, OSError, UnicodeDecodeError) as exc:
+        LOG.warning("Could not read submodule paths from %s: %s", gitmodules, exc)
+        return ()
+
+    paths: list[str] = []
+    for section in parser.sections():
+        if not section.lower().startswith("submodule "):
+            continue
+        rel = (parser.get(section, "path", fallback="") or "").strip()
+        rel = rel.replace("\\", "/").strip("/")
+        if rel and rel not in paths:
+            paths.append(rel)
+    return tuple(paths)
+
+
+def _enclosing_submodule_path(
+    rel_path: str, submodule_paths: tuple[str, ...]
+) -> str | None:
+    """Return the declared submodule path containing *rel_path*, if any.
+
+    Args:
+        rel_path: Repository-relative path to test (POSIX or OS separators).
+        submodule_paths: Declared submodule paths from
+            :func:`_iter_declared_submodule_paths`.
+
+    Returns:
+        The matching declared submodule path, or ``None`` when *rel_path* is
+        outside every submodule.
+    """
+    rel = rel_path.replace("\\", "/").strip("/")
+    for submodule_path in submodule_paths:
+        if rel == submodule_path or rel.startswith(submodule_path + "/"):
+            return submodule_path
+    return None
+
+
+def _first_unpopulated_submodule(
+    rel_path: str, submodule_paths: tuple[str, ...], worktree_root: Path
+) -> str | None:
+    """Return the first gitlink on the path to *rel_path* that has no checkout.
+
+    Every directory git clones a submodule into must be empty when
+    ``git submodule update --init`` runs, so a declared submodule path on the
+    way to *rel_path* that carries no ``.git`` entry is a clone target: nothing
+    may be created inside it (SA-0MVTOR53E003IIEQ).
+
+    Args:
+        rel_path: Repository-relative path being considered as a symlink parent.
+        submodule_paths: Declared submodule paths.
+        worktree_root: The worktree the entries would be created in.
+
+    Returns:
+        The first unpopulated declared submodule path on the way to *rel_path*,
+        or ``None`` when every declared submodule involved is checked out (or
+        none is involved).
+    """
+    rel = rel_path.replace("\\", "/").strip("/")
+    if not rel or rel == ".":
+        return None
+    parts = rel.split("/")
+    for index in range(1, len(parts) + 1):
+        prefix = "/".join(parts[:index])
+        if prefix in submodule_paths and not (
+            worktree_root / prefix / ".git"
+        ).exists():
+            return prefix
+    return None
+
+
+def _ensure_worktree_local_exclude_entry(
+    work_tree_dir: Path, entry: str
+) -> bool:
+    """Cover *entry* in *work_tree_dir*'s **own** git exclude file.
+
+    A ``.gitignore`` pattern written as ``node_modules/`` (trailing slash)
+    matches a directory but **not** a symlink, so a nested ``node_modules``
+    symlink inside a submodule surfaces as an untracked entry there and the
+    superproject then reports ``M <submodule>`` — a worktree that looks dirty
+    for no reason (SA-0MVTOR53E003IIEQ). Adding the bare name to the internal
+    exclude file hides it without touching a tracked ``.gitignore``.
+
+    Only ever call this with a **submodule** checkout: its exclude file is
+    work-tree-local (``<main>/.git/worktrees/<wt>/modules/<name>/info/exclude``
+    in a linked worktree). The superproject's ``info/exclude`` is the shared
+    main-checkout file and must never be written from a worktree.
+
+    Idempotent: an existing entry is left untouched.
+
+    Args:
+        work_tree_dir: Root of the checkout whose exclude file to update.
+        entry: The exclude entry to add (e.g. ``"node_modules"``).
+
+    Returns:
+        True when the entry is present afterwards, False on failure (logged at
+        ``WARNING``; never fatal).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-path", "info/exclude"],
+            cwd=str(work_tree_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        LOG.warning(
+            "Could not locate the exclude file for %s: %s", work_tree_dir, exc
+        )
+        return False
+    if result.returncode != 0:
+        LOG.warning(
+            "Could not locate the exclude file for %s (rc=%d): %s",
+            work_tree_dir,
+            result.returncode,
+            result.stderr.strip(),
+        )
+        return False
+
+    raw_path = result.stdout.strip()
+    if not raw_path:
+        return False
+    exclude_path = Path(raw_path)
+    if not exclude_path.is_absolute():
+        exclude_path = (work_tree_dir / exclude_path).resolve()
+
+    try:
+        existing = (
+            exclude_path.read_text(encoding="utf-8")
+            if exclude_path.is_file()
+            else ""
+        )
+    except OSError as exc:
+        LOG.warning("Could not read %s: %s", exclude_path, exc)
+        return False
+    if entry in {line.strip() for line in existing.splitlines()}:
+        return True
+
+    try:
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        with exclude_path.open("a", encoding="utf-8") as handle:
+            if existing and not existing.endswith("\n"):
+                handle.write("\n")
+            handle.write(f"{entry}\n")
+    except OSError as exc:
+        LOG.warning("Could not update %s: %s", exclude_path, exc)
+        return False
+
+    LOG.info(
+        "Excluded %r in %s so the nested symlink keeps the worktree clean.",
+        entry,
+        exclude_path,
+    )
+    return True
+
+
 def _ensure_nested_node_modules_symlinks(
     worktree_path: str, repo_root: str | None
 ) -> int:
@@ -7648,13 +7844,22 @@ def _ensure_nested_node_modules_symlinks(
     For every nested ``node_modules`` directory discovered in the main checkout
     (:func:`_iter_nested_node_modules`) this creates
     ``<worktree>/<rel>/node_modules`` as a symlink to
-    ``<main-checkout>/<rel>/node_modules`` when BOTH conditions hold:
+    ``<main-checkout>/<rel>/node_modules`` when ALL of these conditions hold:
 
     - the worktree has no entry at that path (dir or symlink) — never
       overwrite; AND
     - the parent directory ``<worktree>/<rel>`` already exists — never
       fabricate a package directory the branch removed (avoids shadowing
-      branch state).
+      branch state); AND
+    - when the parent lies inside a declared submodule
+      (:func:`_iter_declared_submodule_paths`), that submodule is **checked
+      out** (its work tree has a ``.git``). A symlink inside an uninitialised
+      gitlink blocks ``git submodule update --init`` on the next ``start`` —
+      the bootstrap-ordering defect of SA-0MVTOR53E003IIEQ.
+
+    A link created inside a checked-out submodule is covered by that
+    submodule's own exclude file (:func:`_ensure_worktree_local_exclude_entry`)
+    so the superproject does not report the parent as modified.
 
     Best-effort only: a per-candidate failure is logged at ``WARNING`` and does
     not abort; remaining candidates are still processed. Symlinks only — the
@@ -7673,22 +7878,39 @@ def _ensure_nested_node_modules_symlinks(
 
     wt_root = Path(worktree_path)
     repo = Path(repo_root)
+    submodule_paths = _iter_declared_submodule_paths(repo_root)
     created = 0
 
     for rel_parent, rel_nm in _iter_nested_node_modules(repo_root):
         wt_nm = wt_root / rel_nm
+        wt_parent = wt_root / rel_parent
+        enclosing_submodule = _enclosing_submodule_path(rel_parent, submodule_paths)
+        unpopulated = _first_unpopulated_submodule(rel_parent, submodule_paths, wt_root)
         if os.path.lexists(wt_nm):
+            if enclosing_submodule is not None and unpopulated is None:
+                # Resume path: the link is already there, but an earlier run
+                # (or the pre-fix ordering) may not have covered it — otherwise
+                # the superproject reports `M <sub>` and the tree looks dirty.
+                _ensure_worktree_local_exclude_entry(wt_parent, wt_nm.name)
             LOG.info(
                 "Worktree already has %s; skipping nested node_modules symlink.",
                 wt_nm,
             )
             continue
-        wt_parent = wt_root / rel_parent
         if not wt_parent.is_dir():
             LOG.info(
                 "Worktree has no %s; skipping nested node_modules symlink "
                 "(would fabricate a package directory).",
                 wt_parent,
+            )
+            continue
+        if unpopulated is not None:
+            LOG.info(
+                "Skipping nested node_modules symlink at %s: submodule %s is not "
+                "checked out in the worktree, and a symlink inside the empty "
+                "gitlink would block `git submodule update --init`.",
+                wt_nm,
+                unpopulated,
             )
             continue
         main_nm = repo / rel_nm
@@ -7704,10 +7926,82 @@ def _ensure_nested_node_modules_symlinks(
             continue
         LOG.info("Symlinked %s -> %s", wt_nm, main_nm)
         created += 1
+        if enclosing_submodule is not None:
+            _ensure_worktree_local_exclude_entry(wt_parent, wt_nm.name)
 
     if created:
         LOG.info("Created %d nested node_modules symlink(s).", created)
     return created
+
+
+def _clear_placeholder_submodule_dirs(
+    worktree_path: str, repo_root: str | None
+) -> int:
+    """Remove bootstrap placeholders from unpopulated submodule directories.
+
+    A worktree created before the ordering fix (SA-0MVTOR53E003IIEQ) — or one
+    whose submodule init failed after a nested ``node_modules`` symlink had been
+    created — holds ``<worktree>/<sub>`` with nothing but a ``node_modules``
+    symlink and no ``.git``. Git then refuses to clone into it on every retry
+    ("destination path already exists and is not an empty directory"), so the
+    worktree can never repair itself.
+
+    This removes such a directory when it is **provably** a placeholder: it is
+    a declared submodule path, it has no ``.git`` entry (so nothing in it is
+    part of the submodule), and every entry in it is a ``node_modules``
+    symlink. Any other content is left untouched (logged at ``INFO``) and the
+    normal fail-open warning still reports the genuine conflict.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout, or None if unknown.
+
+    Returns:
+        Number of placeholder directories removed.
+    """
+    removed = 0
+    wt_root = Path(worktree_path)
+    for rel in _iter_declared_submodule_paths(repo_root):
+        sub_dir = wt_root / rel
+        if sub_dir.is_symlink() or not sub_dir.is_dir():
+            continue
+        if os.path.lexists(sub_dir / ".git"):
+            # A real checkout — never touch it.
+            continue
+        try:
+            entries = sorted(sub_dir.iterdir())
+        except OSError as exc:  # pragma: no cover - defensive
+            LOG.warning("Could not inspect submodule path %s: %s", sub_dir, exc)
+            continue
+        is_placeholder = all(
+            entry.is_symlink() and entry.name == "node_modules" for entry in entries
+        )
+        if not is_placeholder:
+            LOG.info(
+                "Leaving %s untouched: it is not a bootstrap placeholder "
+                "(no .git and content we did not create).",
+                sub_dir,
+            )
+            continue
+        try:
+            for entry in entries:
+                entry.unlink()
+            sub_dir.rmdir()
+        except OSError as exc:
+            LOG.warning(
+                "Could not clear placeholder submodule directory %s: %s",
+                sub_dir,
+                exc,
+            )
+            continue
+        removed += 1
+        LOG.info(
+            "Cleared placeholder submodule directory %s (it held only "
+            "node_modules symlinks) so `git submodule update --init` can clone "
+            "into it.",
+            sub_dir,
+        )
+    return removed
 
 
 def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool:
@@ -7718,6 +8012,13 @@ def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool
     worktree so that downstream builds and tests see the expected submodule
     content.
 
+    It must run **before** the ``node_modules`` symlink passes
+    (SA-0MVTOR53E003IIEQ): a nested ``node_modules`` symlink created inside a
+    still-empty gitlink directory makes the clone fail, and because failures
+    are fail-open the worktree would silently keep an uninitialised submodule.
+    Any placeholder directory left by an older ordering is cleared first
+    (:func:`_clear_placeholder_submodule_dirs`).
+
     Best-effort only — submodule initialisation failure is **never fatal**.
     On failure a warning is logged and the worktree is left usable.
 
@@ -7726,8 +8027,7 @@ def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool
 
     Args:
         worktree_path: Absolute path to the worktree directory.
-        repo_root: Absolute path to the main checkout (unused but kept for
-            API symmetry with ``_ensure_node_modules_symlink``).
+        repo_root: Absolute path to the main checkout, or None if unknown.
 
     Returns:
         ``True`` if submodules were initialised (or there were none),
@@ -7738,6 +8038,10 @@ def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool
     if gitmodules and not gitmodules.is_file():
         LOG.info("No .gitmodules found at %s; skipping submodule init.", gitmodules)
         return False
+
+    # Self-heal a worktree left broken by the pre-fix ordering: a placeholder
+    # directory (only our node_modules symlink, no .git) blocks the clone.
+    _clear_placeholder_submodule_dirs(worktree_path, repo_root)
 
     try:
         result = subprocess.run(
@@ -12544,6 +12848,18 @@ def _phase_start_locked(
                 print(format_json_output(report))
             return report
 
+    # Initialise git submodules in the worktree BEFORE the node_modules
+    # passes (git worktree add does not do this automatically). Ordering is
+    # load-bearing (SA-0MVTOR53E003IIEQ): a nested `node_modules` symlink
+    # created inside a still-empty gitlink directory makes
+    # `git submodule update --init` refuse to clone into it, and since that
+    # failure is fail-open the worktree would silently keep an uninitialised
+    # submodule that cannot build. Best-effort: a warning on failure, never
+    # fatal (SA-0MSN52GGN002B0AZ).
+    report["steps"]["submodules"] = {
+        "initialised": _ensure_submodules(abs_wt_path, _get_repo_root())
+    }
+
     # Materialise the worktree-local node_modules link farm (or, for repos
     # without a workspace package consumed by path, the previous
     # whole-directory symlink) so dist-spawning tests resolve dependencies
@@ -12570,12 +12886,9 @@ def _phase_start_locked(
     # Nested/workspace packages keep their own node_modules (e.g. a pi package
     # under .pi/packages/<pkg>); symlink those too so tools run from the
     # worktree resolve dependencies. Best-effort: never fatal
-    # (OSL-0MUFG3PJA00379CT).
+    # (OSL-0MUFG3PJA00379CT). Runs after submodule init so a gitlink is never
+    # handed a symlink it cannot clone over (SA-0MVTOR53E003IIEQ).
     _ensure_nested_node_modules_symlinks(abs_wt_path, _get_repo_root())
-
-    # Initialise git submodules in the worktree (git worktree add does not
-    # do this automatically). Best-effort: a warning on failure, never fatal.
-    _ensure_submodules(abs_wt_path, _get_repo_root())
 
     # The work item was already claimed (status-only) in Step 3; the stage
     # must be left untouched here. There is deliberately no second
