@@ -275,19 +275,29 @@ class TestHygieneCheckScript:
         assert result.returncode == 0
         assert "Usage" in result.stdout or "usage" in result.stdout.lower()
 
-    def test_hygiene_script_accepts_json_flag(self):
-        """The hygiene check script should accept --json."""
-        # This should not crash (even if repo state isn't ideal)
-        result = subprocess.run(
-            ["bash", str(_HYGIENE_SCRIPT), "--json"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            cwd=str(_REPO_ROOT),
-            check=False,
-        )
-        # Script may fail if not in a git repo, but should parse args
+    def test_hygiene_script_accepts_json_flag(self, tmp_path: Path):
+        """The hygiene check script should accept --json.
+
+        Run against a bounded, seeded repository (never the live checkout) so
+        the result depends on the flag contract alone — not on this checkout's
+        stash/worktree count or on host load (SA-0MWRWM2ON008Z5YI). The
+        ``--json`` contract is one JSON object per non-blank line, each
+        carrying a ``check`` key.
+        """
+        repo = _seed_hygiene_repo(tmp_path / "repo")
+        bin_dir = _fake_wl(tmp_path / "bin", {})
+
+        result = _run_hygiene(repo, "--json", bin_dir=bin_dir)
+
+        # The script may warn (exit 1) or error (exit 2), but must parse args.
         assert result.returncode in (0, 1, 2)
+        payloads = [
+            json.loads(line) for line in result.stdout.splitlines() if line.strip()
+        ]
+        assert payloads, "expected at least one JSON line from --json output"
+        for payload in payloads:
+            assert isinstance(payload, dict), payload
+            assert "check" in payload, payload
 
 
 # ===========================================================================
