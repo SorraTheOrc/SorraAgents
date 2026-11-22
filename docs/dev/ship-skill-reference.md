@@ -29,6 +29,9 @@ All scripts below are internal implementation details — they are not exposed a
 | `./skill/ship/scripts/run-release.js` | Release wrapper (includes gating, post-release dev sync) |
 | `./skill/ship/scripts/release/merge-dev-to-main.sh` | Canonical release merge script |
 | `./skill/ship/scripts/release/changelog-merge.js` | CHANGELOG.md dev→main merge helper and post-merge release-section guard (`extractReleaseSection`, `insertReleaseSection`, `mergeReleaseSection`, `guardReleaseSection`; SA-0MVXY0VPC002B0MO) |
+| `./skill/ship/scripts/release/bump-preflight.js` | Version-bump preflight (read-only): gathers `stage: in_review` release candidates, enriches each with `## Impact`/user story, type, priority and a description excerpt, and renders the review packet with the `patch`/`minor`/`major` outcomes computed by `bump-version.js` (`gatherReleaseCandidates`, `enrichCandidate`, `renderReviewPacket`, `runBumpPreflight`; SA-0MWFVQWGN006G4KA) |
+| `./skill/ship/scripts/release/bump-decision.js` | Pure version-bump decision rules for the evaluation step (`shouldAskProducer`, `buildJustification`, `resolveApproval`, `normaliseProducerDecision`) — no subprocess, no filesystem access, no mutation (SA-0MWFVQX4W0080O86) |
+| `./skill/ship/scripts/release/bump-version.js` | Version bump arithmetic and version-source resolution (`bumpVersion`, `resolveVersionSource`, `writeResolvedVersion`) — the only semver arithmetic in the release path; reused by the preflight |
 | `./skill/ship/scripts/ship.js` | Push-to-dev helper (`pushToDev`, `pushToBranch`, `validatePushTarget`) — used by the implement workflow |
 | `./skill/ship/scripts/git-helpers.js` | Branch naming/policy (`makeBranchName`, `validateBranchName`, `isBranchBlocked`) |
 | `./skill/ship/scripts/check-unmerged-branches.js` | Unmerged branch detection |
@@ -246,15 +249,17 @@ readiness instead of blocking unconditionally:
 runs the escalation `wl update`; both are injectable.
 
 ## Release Process
-## Release Process
 
 ```bash
 node ./skill/ship/scripts/run-release.js
 ```
 
-Steps:
+**Step 0 is agent-run and precedes every script step**: the version bump
+evaluation (below) settles the bump before any git mutation. Steps 0.1–11 are
+executed by `run-release.js` / `merge-dev-to-main.sh`.
 
-0. **Locate the release script (fail-fast, SA-0MUIVIJFT0009ZNV)** — resolves the canonical release script (skill-level or repository-level) **before** the gating checks and exits 2 immediately if absent; no git or live-`wl` gate commands run.
+0. **Version bump evaluation (agent-run, in-session)** — the agent runs the read-only preflight (`release/bump-preflight.js`), judges the release from the shipped items' content, and chooses exactly one bump: `patch` proceeds automatically; `minor`/`major` require the producer's approval **in the PI session** before any merge, tag, PR or worklog close (a headless run that cannot ask stops with producer review instead of self-approving). An explicit `--bump` is an operator override. See [Version bump evaluation](#version-bump-evaluation-sa-0mw978one008wmib).
+0.1. **Locate the release script (fail-fast, SA-0MUIVIJFT0009ZNV)** — resolves the canonical release script (skill-level or repository-level) **before** the gating checks and exits 2 immediately if absent; no git or live-`wl` gate commands run.
 0.5. **Parse wrapper arguments (fail-fast, SA-0MV0PZYMI004SUFR)** — `parseReleaseArgs()` runs before the Code Freeze marker and every gate. `--help`/`-h` print usage and exit 0; an unknown flag exits 13. Nothing is executed for either path.
 1. **Unmerged branches check** — aborts with report if branches pending; `--skip-checks` bypasses.
 2. **Pre-flight checks** — verifies `gh`, `wl`, clean worktree.
@@ -275,6 +280,72 @@ Steps:
    **Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** before this step, `snapshotReleaseTags()` captures the pre-run tag list; `isNewlyCreatedTag(version, preRunTags)` requires `v<version>` to be absent from it. A stale tag (or an unreadable snapshot) aborts with **exit code 14** and runs no post-release step, so an old reachable tag read by `git describe` can never trigger a close.
 10. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 9 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
 11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures. **Close verification (SA-0MUXA5ZNZ0019QY5):** every attempted close is re-read through the injectable `getCloseStateFn` boundary (default `getItemLifecycle`); an item is counted as closed only when the persisted lifecycle is `status: completed` **and** `stage: done`. A close that exits 0 but does not persist — the concurrent-`wl sync` lost-update race (WL-0MUXA5RI2009EUTJ) — is retried exactly once and re-verified; if still not terminal (or the read throws/returns `null` — fail-safe) the item is listed in `unclosedCount`/`unclosedItems`, `success` is `false`, and the summary never claims blanket success. The step remains non-blocking.
+
+### Version bump evaluation (SA-0MW978ONE008WMIB)
+
+The release's version is chosen from what the release actually delivers, not
+always from a patch default. The evaluation is **agent-run**: it happens in the
+ship skill session, before any git mutation, and is deliberately not a
+mechanical classifier.
+
+**Ordering.** Step 0 in the Release Process above. It runs before the gating
+checks and before `run-release.js` is invoked, so a bump is settled before any
+branch, tag, PR or worklog mutation can occur.
+
+**Evidence (read-only).** `release/bump-preflight.js` gathers every release
+candidate (`getCandidateItems()` — items at `stage: in_review`) and enriches
+each with `id`, `title`, `issueType`, `priority`, the `## Impact` section (or the
+`## User Story` fallback) and a truncated description excerpt. It renders the
+current version plus the three outcomes computed by `bump-version.js`
+(`patch`, `minor`, `major` — including `z = 0` on minor and `y = z = 0` on
+major). It gathers and renders only: no judgement, no mutation, and no
+duplicated semver arithmetic. The candidate and detail boundaries are
+injectable, so tests never read the live worklog.
+
+**Fail-safe.** An empty or unreadable candidate set (or an unreadable version
+source) reports a `patch` proposal with a warning and never throws, never
+blocks a release that would otherwise succeed, and never mutates the
+repository. `bump-preflight.js` always exits 0.
+
+**Rubric (content-based).** The agent judges from the items' content — Impact,
+user story and description — never from `issueType`, a label or a score:
+
+| Bump | When the release… | Typical evidence |
+| --- | --- | --- |
+| `patch` | only fixes, documents or maintains existing behaviour | bug fixes, docs, refactors, dependency/tooling chores |
+| `minor` | adds meaningful new capability without breaking existing behaviour | new user-facing feature, command, flag, API or workflow step |
+| `major` | breaks, removes or incompatibly changes existing capability | removed/renamed command or flag, changed default behaviour, breaking API or file-format change |
+
+**Approval gate.** `bump-decision.js` holds the mechanical half of the rule
+(`shouldAskProducer`, `buildJustification`, `resolveApproval`):
+
+- `patch` → `auto-proceed`; no producer interaction, and the `patch` defaults
+  in `run-release.js` and `merge-dev-to-main.sh` are unchanged.
+- `minor`/`major` → `await-approval`: the agent prints the justification (each
+  contributing item id + title and why, the `old → new` version and the
+  evidence used) and asks the producer **in the session**. Until the answer
+  arrives, **no** git mutation, tag, PR or worklog close occurs.
+- Approved → the release runs with the approved bump
+  (`run-release.js --bump <approved>`).
+- Declined → the bump is not applied; the decision and the producer's preferred
+  bump are recorded in the session output and in a `wl comment add` on the
+  release's work item (when one exists), and the release proceeds with the
+  preferred bump.
+- **Headless** (`headless: true` — a downtime/automated dispatch with no
+  producer to ask) → `await-producer-review`: the justification is recorded,
+  `needsProducerReview` is set on the release's work item (or a comment is left
+  where there is no release item) and the run **stops** — a non-patch bump is
+  never auto-approved.
+
+**Auditability.** The proposed bump, the justification and the producer's
+decision are recorded in the session output and, for an item-linked release, in
+a work-item comment. `run-release.js` additionally echoes the bump it forwards
+(`Version bump: <type> (explicit --bump|default)`), which is log-only.
+
+**Overrides.** An explicit `--bump patch|minor|major` keeps its meaning and
+precedence — it overrides the evaluation. `--skip-checks` bypasses the
+branch/critical gates only and does **not** bypass the evaluation or its
+approval gate. `--refresh-audits` exits before any bump is evaluated.
 
 ### CHANGELOG release-section preservation (SA-0MVXY0VPC002B0MO)
 

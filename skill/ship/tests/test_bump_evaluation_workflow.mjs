@@ -301,3 +301,93 @@ describe('no-mutation contract', () => {
     assert.doesNotMatch(DECISION_SOURCE, /getCandidateItems|bumpVersion/);
   });
 });
+
+// ── Reference documentation contract (SA-0MWFVQXSZ000EN5I) ──────────────────
+//
+// The maintainer-facing reference must describe the evaluation step and the
+// in-session approval gate, list the new helpers in its scripts table, and
+// keep the `--bump` forwarding contract documented and unchanged.
+
+const REFERENCE_PATH = join(__dirname, '..', '..', '..', 'docs', 'dev', 'ship-skill-reference.md');
+const RUN_RELEASE_PATH = join(__dirname, '..', 'scripts', 'run-release.js');
+const REFERENCE_TEXT = readFileSync(REFERENCE_PATH, 'utf-8');
+const RUN_RELEASE_SOURCE = readFileSync(RUN_RELEASE_PATH, 'utf-8');
+
+const { releaseScriptForwardArgs } = await import(RUN_RELEASE_PATH);
+
+describe('ship skill reference documents the bump evaluation', () => {
+  it('has a version-bump evaluation section inside the release process', () => {
+    assert.match(REFERENCE_TEXT, /### Version bump evaluation \(SA-0MW978ONE008WMIB\)/);
+
+    const processIndex = REFERENCE_TEXT.indexOf('## Release Process');
+    const evaluationIndex = REFERENCE_TEXT.indexOf('### Version bump evaluation');
+    const changelogIndex = REFERENCE_TEXT.indexOf('### CHANGELOG release-section preservation');
+
+    assert.ok(processIndex >= 0, 'the release process section must exist');
+    assert.ok(evaluationIndex > processIndex, 'the evaluation section belongs to the release process');
+    assert.ok(
+      evaluationIndex < changelogIndex,
+      'the evaluation section must precede the downstream release-process detail',
+    );
+  });
+
+  it('orders the evaluation before the gates in the step list', () => {
+    const steps = REFERENCE_TEXT.slice(
+      REFERENCE_TEXT.indexOf('## Release Process'),
+      REFERENCE_TEXT.indexOf('### Version bump evaluation'),
+    );
+    const evaluation = steps.toLowerCase().indexOf('version bump evaluation');
+    const firstGate = steps.toLowerCase().indexOf('unmerged branches check');
+
+    assert.ok(evaluation >= 0, 'the step list must mention the evaluation');
+    assert.ok(firstGate > evaluation, 'the evaluation must be listed before the gates');
+  });
+
+  it('lists the preflight and decision helpers in the scripts table', () => {
+    assert.match(REFERENCE_TEXT, /bump-preflight\.js`\s*\|/);
+    assert.match(REFERENCE_TEXT, /bump-decision\.js`\s*\|/);
+    assert.match(REFERENCE_TEXT, /read-only/i);
+    assert.match(REFERENCE_TEXT, /no\s+judgement|no judgement/i);
+  });
+
+  it('documents the approval gate, headless fail-closed path and --bump override', () => {
+    assert.match(REFERENCE_TEXT, /auto-proceed/i);
+    assert.match(REFERENCE_TEXT, /await-approval/i);
+    assert.match(REFERENCE_TEXT, /await-producer-review/i);
+    assert.match(REFERENCE_TEXT, /headless/i);
+    assert.match(REFERENCE_TEXT, /needsProducerReview/);
+    assert.match(REFERENCE_TEXT, /`--bump patch\|minor\|major`[\s\S]{0,200}overrides the evaluation/i);
+    assert.match(REFERENCE_TEXT, /`--skip-checks`[\s\S]{0,260}does \*\*not\*\* bypass/i);
+  });
+
+  it('documents the decided-bump log line', () => {
+    assert.match(REFERENCE_TEXT, /Version bump: <type>/);
+    assert.match(REFERENCE_TEXT, /log-only/i);
+  });
+});
+
+describe('run-release.js decided-bump logging keeps forwarding unchanged', () => {
+  it('echoes the decided bump (log-only) without a new side effect', () => {
+    assert.match(RUN_RELEASE_SOURCE, /Version bump: \$\{decidedBump\}/);
+    assert.match(RUN_RELEASE_SOURCE, /explicit --bump/);
+    // The echo must not introduce git/tag/close work of its own.
+    const logBlock = RUN_RELEASE_SOURCE.slice(
+      RUN_RELEASE_SOURCE.indexOf('Decided-bump logging'),
+      RUN_RELEASE_SOURCE.indexOf('const bumpFlagIndex'),
+    );
+    assert.doesNotMatch(logBlock, /execSync|spawnSync|git |wl close/);
+  });
+
+  it('forwards --bump values unchanged (explicit override precedence)', () => {
+    assert.deepEqual(
+      releaseScriptForwardArgs(['--bump', 'minor']),
+      ['--bump', 'minor'],
+    );
+    assert.deepEqual(
+      releaseScriptForwardArgs(['--skip-checks', '--bump', 'major']),
+      ['--bump', 'major'],
+    );
+    // Still an explicitly documented wrapper flag with no filtering of its own.
+    assert.match(RUN_RELEASE_SOURCE, /'--bump': 'bump'/);
+  });
+});
