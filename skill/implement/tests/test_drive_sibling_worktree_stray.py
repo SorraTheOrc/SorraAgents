@@ -1377,7 +1377,7 @@ class TestSubmoduleNoiseIsNotASurface:
     ) -> None:
         # The fail-closed branch of the classifier: if the inner repo cannot be
         # read, the submodule entry stays a surface (reported as the bare path).
-        outer, inner, inner_sha, child, sibling = self._sandbox(tmp_path)
+        _outer, inner, inner_sha, _child, sibling = self._sandbox(tmp_path)
         _materialise_submodule(sibling, inner, inner_sha)
 
         with mock.patch.object(

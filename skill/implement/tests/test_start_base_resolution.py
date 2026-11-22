@@ -116,7 +116,7 @@ def test_base_refuses_local_dev_with_unpushed_commits(tmp_path: Path):
     remote does not have. A worktree forked from it would graft that commit
     onto the new branch. The helper never proposes a base.
     """
-    remote, main, base = _repo_on_dev(tmp_path)
+    remote, main, _base = _repo_on_dev(tmp_path)
     # Simulate a concurrent finish's write-then-restore window: local dev
     # parked on an unpushed commit (WL-0MWFKDH78002T2CR).
     _commit(main, "foreign.txt", "f\n", "foreign unpushed commit")
@@ -133,7 +133,7 @@ def test_base_refuses_local_dev_with_unpushed_commits(tmp_path: Path):
 
 def test_base_refuses_a_diverged_local_dev(tmp_path: Path):
     """local ``dev`` diverged from ``origin/dev`` (rewritten/pushed-at): REFUSE."""
-    remote, main, _base = _repo_on_dev(tmp_path)
+    _remote, main, _base = _repo_on_dev(tmp_path)
     # Sibling lands on origin/dev, then our local dev is rewritten onto the
     # pre-sibling commit with a different history: diverged, not ahead/behind.
     _commit(main, "sibling.txt", "s\n", "sibling")
@@ -320,7 +320,7 @@ def test_phase_start_refuses_a_worktree_from_unpushed_local_dev(tmp_path: Path):
     worktree is created (the foreign commit can never become a branch base),
     the item is released to ``open`` and a loud comment is posted.
     """
-    remote, main, _base = _repo_on_dev(tmp_path)
+    _remote, main, _base = _repo_on_dev(tmp_path)
     _commit(main, "foreign.txt", "f\n", "unpushed foreign commit")
 
     # The worktree path phase_start would create for this run.
@@ -380,7 +380,7 @@ def test_phase_start_bases_a_worktree_on_the_pushed_tip(tmp_path: Path):
     AC4 positive companion: with ``dev`` == ``origin/dev``, the created
     branch's base is exactly the pushed tip — never a foreign commit.
     """
-    remote, main, base = _repo_on_dev(tmp_path)
+    _remote, main, base = _repo_on_dev(tmp_path)
 
     created: list[tuple] = []
 
