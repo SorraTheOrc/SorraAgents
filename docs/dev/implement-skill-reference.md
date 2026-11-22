@@ -34,13 +34,29 @@ a delimited block in human mode.
   {"ignoreDirtyPaths": [".llm-wiki/"]}
   ```
 
-  - `git_has_dirty_files(status_output, expected_dirty=...)` skips a dirty
-    path matching a declared prefix. It defaults to no exemption, so callers
-    that do not opt in keep the original behaviour.
+  - `git_has_dirty_files(status_output, expected_dirty=..., repo_root=...)`
+    skips a dirty path matching a declared prefix. It defaults to no
+    exemption, so callers that do not opt in keep the original behaviour.
   - `phase_start` passes the project's declaration to the dirty-tree safety
     gate; `_worktree_placement_violation()` and `_child_main_checkout_violation()`
     pass it to the placement gates (via `_main_checkout_offending_paths()` and
     `_git_path_has_changes()`).
+  - **Per-surface resolution.** The placement guards resolve the declaration
+    for **each scanned surface** — `expected_dirty_paths(<surface root>)` — so
+    a linked worktree is classified with *its own*
+    `.pi/skills_extensions/implement/extension.json`, not the root repo's list
+    (RISE-0MWOIAXAG008HMK3 AC1). A declaration is additive: undeclared dirt in
+    the same tree is still reported.
+  - **Submodule-aware surfaces.** When a `repo_root` is supplied,
+    `git_has_dirty_files`/`_main_checkout_offending_paths` expand a dirty
+    submodule (gitlink) entry into its inner `git status` paths, map them to
+    outer-relative form and classify those against the same declaration
+    (`_dirty_entry_is_change_surface`). A submodule whose only changes are
+    expected-dirty paths (e.g. the `core/node_modules` worktree-bootstrap link
+    farm) is therefore not a change surface, while a genuine inner edit is
+    reported by its inner path. A moved submodule pointer, an unreadable inner
+    repo, or a clean-but-unexplained inner tree stays fail-closed
+    (RISE-0MWOIAXAG008HMK3 AC2).
   - The declaration cannot relax the `.worklog/` skip, the stash hygiene
     gate, or the build → test → commit order. Any unexpected dirty path still
     stops the workflow.

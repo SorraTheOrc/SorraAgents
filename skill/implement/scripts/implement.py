@@ -2590,9 +2590,155 @@ def _path_is_expected_dirty(file_path: str, expected_dirty: tuple[str, ...]) -> 
     return False
 
 
+def _submodule_gitlink_sha(repo_root: str | Path, path: str) -> str | None:
+    """Return the index gitlink sha for *path*, or ``None`` when not a gitlink.
+
+    A submodule is recorded in the index with mode ``160000``; the sha is the
+    pinned submodule commit. ``None`` means *path* is not a tracked submodule.
+    """
+    result = run_cmd(
+        ["git", "ls-files", "--stage", "--", path],
+        cwd=str(repo_root),
+        capture=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        meta, _sep, listed = line.partition("\t")
+        fields = meta.split()
+        if fields and fields[0] == "160000" and listed.strip() == path:
+            return fields[1]
+    return None
+
+
+def _is_gitlink_surface(repo_root: str | Path, path: str) -> bool:
+    """True when *path* is a registered submodule (gitlink) of *repo_root*.
+
+    A submodule surfaces in the outer ``git status`` as a single bare entry
+    (`` M core``), never as the inner paths that actually changed. Only a
+    tracked gitlink (index mode ``160000``) is treated as expandable: an
+    untracked nested repository stays an opaque dirty path, so the guard is
+    never loosened for a plain directory that merely happens to contain a
+    ``.git`` (RISE-0MWOIAXAG008HMK3 AC2).
+    """
+    candidate = Path(repo_root) / path
+    if not candidate.is_dir():
+        return False
+    # A gitlink worktree checkout always carries a ``.git`` entry (a file for
+    # a real submodule, a directory for a plain clone in fixtures). Cheap
+    # pre-check so a normal dirty file never pays for a git subprocess.
+    if not (candidate / ".git").exists():
+        return False
+    return _submodule_gitlink_sha(repo_root, path) is not None
+
+
+def _submodule_pointer_moved(repo_root: str | Path, submodule_path: str) -> bool:
+    """True when the submodule's checked-out HEAD differs from its gitlink.
+
+    A moved pointer (the submodule was advanced or rewound, or the inner repo
+    is unreadable) is a genuine change surface: it can never be explained by
+    framework-materialised expected-dirty noise, so the classifier fails
+    closed rather than comparing inner paths (RISE-0MWOIAXAG008HMK3 AC2).
+    """
+    gitlink_sha = _submodule_gitlink_sha(repo_root, submodule_path)
+    if gitlink_sha is None:
+        return True  # cannot resolve the pin; fail closed
+    head = run_cmd(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(Path(repo_root) / submodule_path),
+        capture=True,
+        check=False,
+    )
+    if head.returncode != 0:
+        return True  # unreadable inner repo; fail closed
+    return head.stdout.strip() != gitlink_sha
+
+
+def _submodule_inner_paths(
+    repo_root: str | Path, submodule_path: str
+) -> list[str] | None:
+    """Outer-relative change paths reported *inside* a dirty submodule.
+
+    Reads the submodule's own ``git status`` and prefixes each inner path with
+    the submodule path so the caller can classify it against the worktree's
+    expected-dirty declaration (which is always outer-relative, e.g.
+    ``core/node_modules``).
+
+    Returns:
+        The inner change paths mapped to outer-relative form, or ``None`` when
+        the inner repository cannot be read. ``None`` and an empty list are
+        both treated by the caller as **fail closed**: an unreadable submodule
+        or a moved pointer (inner tree clean, gitlink advanced) is a genuine
+        change surface, never silently clean.
+    """
+    inner_root = Path(repo_root) / submodule_path
+    result = run_cmd(
+        ["git", "status", "--porcelain=v1"],
+        cwd=str(inner_root),
+        capture=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    prefix = submodule_path.rstrip("/")
+    paths: list[str] = []
+    for line in result.stdout.splitlines():
+        if line.startswith("##") or not line.strip():
+            continue
+        inner = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in inner:
+            inner = inner.split(" -> ", 1)[1].strip()
+        if not inner:
+            continue
+        paths.append(f"{prefix}/{inner}")
+    return paths
+
+
+def _dirty_entry_is_change_surface(
+    repo_root: str | Path,
+    file_path: str,
+    expected_dirty: tuple[str, ...],
+) -> tuple[bool, list[str]]:
+    """Classify one outer ``git status`` entry against expected-dirty paths.
+
+    A plain path is a change surface unless it matches a declared
+    expected-dirty prefix. A dirty **submodule** (gitlink) entry is expanded
+    into its inner changes, mapped to outer-relative paths, and those inner
+    changes are classified instead — so a submodule whose only changes are
+    framework-materialised expected-dirty paths (``core/node_modules``) is
+    **not** a surface, while a genuine inner edit still is (and its inner
+    paths are reported for the operator).
+
+    Returns:
+        ``(is_surface, reported_paths)``. ``reported_paths`` is the outer path
+        for a plain surface, the offending inner paths for an expanded
+        submodule, and empty when the entry is not a surface.
+    """
+    if _path_is_expected_dirty(file_path, expected_dirty):
+        return False, []
+    if not _is_gitlink_surface(repo_root, file_path):
+        return True, [file_path]
+    if _submodule_pointer_moved(repo_root, file_path):
+        # The submodule's HEAD disagrees with its pin (advanced, rewound, or
+        # unreadable): a genuine change, never expected-dirty noise.
+        return True, [file_path]
+    inner = _submodule_inner_paths(repo_root, file_path)
+    if inner is None or not inner:
+        # Unreadable inner repo, or a moved submodule pointer with a clean
+        # inner tree: not explainable as expected-dirty noise, so stay
+        # fail-closed and name the bare submodule path.
+        return True, [file_path]
+    real = [p for p in inner if not _path_is_expected_dirty(p, expected_dirty)]
+    if real:
+        return True, real
+    return False, []
+
+
 def git_has_dirty_files(
     status_output: str | None = None,
     expected_dirty: tuple[str, ...] = (),
+    repo_root: str | Path | None = None,
 ) -> bool:
     """Check if there are uncommitted changes outside .worklog/.
 
@@ -2602,12 +2748,17 @@ def git_has_dirty_files(
             dirty and therefore do not count (e.g. ``.llm-wiki/``). Empty by
             default, so callers that do not opt in keep the original
             behaviour byte-for-byte.
+        repo_root: When supplied, a dirty **submodule** entry is expanded into
+            its inner changes and classified against *expected_dirty* (a
+            submodule whose only changes are expected-dirty paths is not a
+            change surface). When omitted, submodules stay opaque dirty paths
+            — the pre-existing behaviour.
 
     Returns:
         True if any non-.worklog, non-expected-dirty file is dirty.
     """
     if status_output is None:
-        status_output = git_status()
+        status_output = git_status(cwd=str(repo_root) if repo_root else None)
     for line in status_output.splitlines():
         # Skip branch info line
         if line.startswith("##"):
@@ -2616,11 +2767,21 @@ def git_has_dirty_files(
         file_path = line[3:].strip() if len(line) > 3 else ""
         if file_path.startswith(".worklog/"):
             continue
+        if not line.strip():
+            continue
+        if repo_root is not None:
+            # Submodule-aware classification: resolve a dirty gitlink to what
+            # actually changed inside it (RISE-0MWOIAXAG008HMK3 AC2).
+            is_surface, _ = _dirty_entry_is_change_surface(
+                repo_root, file_path, expected_dirty
+            )
+            if is_surface:
+                return True
+            continue
         # Skip project-declared expected-dirty paths (never a hard-fail).
         if _path_is_expected_dirty(file_path, expected_dirty):
             continue
-        if line.strip():
-            return True
+        return True
     return False
 
 
@@ -2887,7 +3048,10 @@ def _main_checkout_offending_paths(
     Returns:
         Sorted, de-duplicated list of paths (relative to *repo_root*) that are
         dirty outside ``.worklog/`` and not expected-dirty. Empty when the
-        checkout is clean or only expected-dirty paths are modified.
+        checkout is clean or only expected-dirty paths are modified. A dirty
+        submodule entry is expanded into its offending inner paths, so the
+        list names the file that actually changed rather than the bare
+        submodule (RISE-0MWOIAXAG008HMK3 AC2).
     """
     status_output = git_status(cwd=repo_root)
     paths: list[str] = []
@@ -2901,9 +3065,11 @@ def _main_checkout_offending_paths(
             file_path = file_path.split(" -> ", 1)[1].strip()
         if not file_path or file_path.startswith(".worklog/"):
             continue
-        if _path_is_expected_dirty(file_path, expected_dirty):
-            continue
-        paths.append(file_path)
+        is_surface, reported = _dirty_entry_is_change_surface(
+            repo_root, file_path, expected_dirty
+        )
+        if is_surface:
+            paths.extend(reported)
     return sorted(set(paths))
 
 
@@ -20406,7 +20572,9 @@ def _worktree_placement_violation(
     2. another change surface holds the work — the main checkout holds
        uncommitted changes outside ``.worklog/``, or the cwd resolves into a
        **registered sibling worktree** of the same repository that holds
-       changes (SA-0MW5FIJNQ002Z24I), and
+       changes (SA-0MW5FIJNQ002Z24I). Each surface is classified with its own
+       ``ignoreDirtyPaths`` declaration and a dirty submodule is expanded
+       into its inner changes (RISE-0MWOIAXAG008HMK3), and
     3. the worktree itself holds NO changes (no dirty files and no commits
        ahead of the parent branch) — i.e. the work was done in the main
        checkout or a sibling worktree, not the worktree.
@@ -20445,11 +20613,15 @@ def _worktree_placement_violation(
             wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
         ):
             return None  # work lives in the worktree; sibling dirt is unrelated
+        # Resolve the *sibling's own* expected-dirty declaration, not the
+        # root repo's: a linked worktree is a checkout of the project and may
+        # carry its own ``ignoreDirtyPaths`` (RISE-0MWOIAXAG008HMK3 AC1).
+        sibling_expected = expected_dirty_paths(str(sibling))
         if _git_path_has_changes(
-            sibling, parent_branch, expected_dirty=root_expected
+            sibling, parent_branch, expected_dirty=sibling_expected
         ) and _is_live_foreign_surface(sibling, wt, root):
             offending = _main_checkout_offending_paths(
-                str(sibling), expected_dirty=root_expected
+                str(sibling), expected_dirty=sibling_expected
             )
             evidence = _placement_path_listing(offending, parent_branch)
             return (
@@ -20467,7 +20639,7 @@ def _worktree_placement_violation(
         # scan, which still applies when the work landed there instead.
 
     if not git_has_dirty_files(
-        git_status(cwd=str(root)), expected_dirty=root_expected
+        git_status(cwd=str(root)), expected_dirty=root_expected, repo_root=root
     ):
         return None  # main checkout clean; work must be in the worktree
 
@@ -20509,7 +20681,7 @@ def _git_path_has_changes(
         *parent_branch*; False when it is clean and has none.
     """
     if git_has_dirty_files(
-        git_status(cwd=str(path)), expected_dirty=expected_dirty
+        git_status(cwd=str(path)), expected_dirty=expected_dirty, repo_root=path
     ):
         return True
     ahead = run_cmd(
@@ -20547,7 +20719,10 @@ def _child_main_checkout_violation(
        uncommitted changes outside ``.worklog/``, or a **registered sibling
        worktree** of the same repository holds changes and is a *live*
        surface (:func:`_is_live_foreign_surface` — stale debris from stale
-       scratch trees and terminal items is never evidence), and
+       scratch trees and terminal items is never evidence). Each surface is
+       classified with **its own** ``ignoreDirtyPaths`` declaration, and a
+       dirty submodule is expanded into its inner changes
+       (:func:`_dirty_entry_is_change_surface`, RISE-0MWOIAXAG008HMK3), and
     3. the child's worktree holds NO changes (no dirty files and no commits
        ahead of the parent branch) — so the work did not land in the worktree.
 
@@ -20613,11 +20788,16 @@ def _child_main_checkout_violation(
     offending = _main_checkout_offending_paths(str(root), expected_dirty=root_expected)
     sibling_offending: list[tuple[Path, list[str]]] = []
     for sibling in _registered_sibling_worktree_paths(wt, root):
+        # Resolve the *sibling's own* expected-dirty declaration per surface —
+        # not the root repo's list. A linked worktree is a checkout of the
+        # project and may declare its own framework noise
+        # (RISE-0MWOIAXAG008HMK3 AC1).
+        sibling_expected = expected_dirty_paths(str(sibling))
         # Cheap first (dirty scan), then the debris filter (path scope, then
         # at most one worklog lookup), then the evidence listing: the fast
         # paths never reach the worklog (WL-0MWQLHDOS006CAIH).
         if not _git_path_has_changes(
-            sibling, parent_branch, expected_dirty=root_expected
+            sibling, parent_branch, expected_dirty=sibling_expected
         ):
             continue
         if not _is_live_foreign_surface(sibling, wt, root):
@@ -20626,7 +20806,7 @@ def _child_main_checkout_violation(
             (
                 sibling,
                 _main_checkout_offending_paths(
-                    str(sibling), expected_dirty=root_expected
+                    str(sibling), expected_dirty=sibling_expected
                 ),
             )
         )

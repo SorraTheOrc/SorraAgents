@@ -406,6 +406,38 @@ the main-checkout scan unchanged for every other cwd — and the same live-surfa
 filter applies, after the child's own worktree and the sibling's dirt have been
 checked.
 
+### Per-worktree expected-dirty declarations and submodule surfaces
+
+Every scanned surface is classified with **that worktree's own**
+`.pi/skills_extensions/implement/extension.json` → `ignoreDirtyPaths`
+declaration, not the root repository's list: `_child_main_checkout_violation`
+and the sibling branch of `_worktree_placement_violation` each call
+`expected_dirty_paths(<surface root>)`. A linked worktree is a checkout of the
+project, so a project's declaration therefore takes effect for the main
+checkout and for every sibling alike, and a sibling's declaration can never
+silently grant the main checkout an exemption (or vice versa). The
+declaration is **additive, never a blanket exemption**: a path that is not
+actually dirty is unaffected, and undeclared dirt in the same tree is still
+reported.
+
+A dirty **submodule** (gitlink) entry is classified by what changed *inside*
+it, not by its bare outer entry. `git status` reports a submodule as a single
+path (` M core`) and never names the inner change, so a path-prefix
+declaration could never match it. The guard therefore expands each dirty
+gitlink into its inner `git status` paths, maps them to outer-relative form
+(`core/node_modules`) and classifies those against the same declaration: a
+submodule whose only changes are expected-dirty paths (the worktree bootstrap's
+`core/node_modules` link farm) is **not** a change surface, while a genuine
+inner edit is still reported — by its inner path, not the bare submodule. A
+moved submodule pointer (the checked-out submodule HEAD differs from its index
+gitlink), an unreadable inner repository, or a clean inner tree with no
+explainable expected-dirty change stays **fail-closed** and is reported as the
+bare submodule path (RISE-0MWOIAXAG008HMK3 AC1/AC2).
+
+The declarations are pinned by
+`skill/implement/tests/test_drive_sibling_worktree_stray.py`
+(`TestPerWorktreeExpectedDirtyResolution`, `TestSubmoduleNoiseIsNotASurface`).
+
 ### Driven-child red-gate stop rule
 
 A driven child whose **first** `finish` gate is red because of a failure it

@@ -35,7 +35,10 @@ guards are never re-implemented.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import shutil
 import sys
 from pathlib import Path
 from unittest import mock
@@ -1029,3 +1032,360 @@ class TestDebrisSkipIsReported:
             messages = self._skip_messages(rooted_repo, canonical_child, caplog)
 
         assert not any("Ignoring registered worktree" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# Per-worktree expected-dirty resolution and submodule-aware surfaces
+# (RISE-0MWOIAXAG008HMK3: drive's sibling-worktree guard fails closed on
+# pre-existing dirt in unrelated worktrees)
+# ---------------------------------------------------------------------------
+#
+# Two residual false-positive sources survive the surrounding debris and
+# spawn-failure work:
+#
+# 1. **Per-worktree declarations were ignored.** The sibling scan classified
+#    every sibling with the *root* repo's ``ignoreDirtyPaths`` extension, so a
+#    project's own per-worktree declaration could never take effect.
+# 2. **Submodule noise was an opaque surface.** Every tce-the-rising worktree
+#    reports `` M core`` because the worktree bootstrap materialises
+#    ``core/node_modules`` inside the ``core`` submodule; the guard saw the
+#    bare ``core`` entry and no path-prefix declaration could ever match it.
+#
+# Contract pinned here (parent AC1/AC2):
+#
+# - Each sibling surface is classified with *that worktree's own*
+#   ``ignoreDirtyPaths`` declaration.
+# - A dirty submodule entry is expanded into its inner changes and those are
+#   classified, so framework-materialised noise is not a surface while a
+#   genuine inner edit still fails closed.
+# - The genuine cross-worktree write detection is unchanged (a sibling
+#   without the declaration is still reported).
+
+
+def _write_implement_extension(worktree: Path, ignore_dirty: list[str]) -> None:
+    """Write a project-local implement extension into *worktree*."""
+    ext_dir = worktree / ".pi" / "skills_extensions" / "implement"
+    ext_dir.mkdir(parents=True, exist_ok=True)
+    (ext_dir / "extension.json").write_text(
+        json.dumps({"ignoreDirtyPaths": ignore_dirty}), encoding="utf-8"
+    )
+
+
+def _init_declared_repo(root: Path) -> None:
+    """A repo whose ``.pi/`` extension directory is git-ignored.
+
+    Ignoring ``.pi/`` keeps the per-worktree declaration file itself out of
+    the dirty surface, so a test is about *classification*, not about the
+    declaration file leaking into ``git status``.
+    """
+    gs.init_repo(root, default_branch=PARENT_BRANCH)
+    (root / "README.md").write_text("base\n", encoding="utf-8")
+    (root / ".gitignore").write_text(".pi/\n", encoding="utf-8")
+    gs.commit_all(root, "base")
+
+
+@pytest.fixture()
+def declared_repo(tmp_path: Path) -> Path:
+    root = tmp_path / "declared-repo"
+    _init_declared_repo(root)
+    return root
+
+
+@pytest.fixture()
+def declared_child(declared_repo: Path, tmp_path: Path) -> Path:
+    wt = tmp_path / "dwt" / f"wl-{CHILD_ID}"
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    return gs.add_worktree(declared_repo, wt, f"wl-{CHILD_ID}", base=PARENT_BRANCH)
+
+
+@pytest.fixture()
+def declared_sibling(declared_repo: Path, tmp_path: Path) -> Path:
+    wt = tmp_path / "dwt2" / f"wl-{SIBLING_ID}"
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    return gs.add_worktree(declared_repo, wt, f"wl-{SIBLING_ID}", base=PARENT_BRANCH)
+
+
+def _dirty_noise(sibling: Path, name: str = "generated-bundle.js") -> Path:
+    """Create an undeclared dirty file in a sibling's ``noise/`` directory."""
+    noise = sibling / "noise"
+    noise.mkdir(exist_ok=True)
+    target = noise / name
+    target.write_text("bundled\n", encoding="utf-8")
+    return target
+
+
+class TestPerWorktreeExpectedDirtyResolution:
+    """AC1: a sibling surface is classified with *its own* declaration."""
+
+    def _child_violation(self, repo: Path, child: Path) -> str | None:
+        with _patch_wl_show():
+            return implement._child_main_checkout_violation(
+                CHILD_ID, str(child), PARENT_BRANCH, repo_root=str(repo)
+            )
+
+    def test_sibling_with_its_own_declaration_is_not_a_surface(
+        self, declared_repo: Path, declared_child: Path, declared_sibling: Path
+    ) -> None:
+        _write_implement_extension(declared_sibling, ["noise/"])
+        _dirty_noise(declared_sibling)
+
+        assert self._child_violation(declared_repo, declared_child) is None
+
+    def test_identical_dirt_without_a_declaration_is_still_a_surface(
+        self, declared_repo: Path, declared_child: Path, declared_sibling: Path
+    ) -> None:
+        # The genuine-detection floor is unchanged: no declaration, no exemption.
+        _dirty_noise(declared_sibling)
+
+        violation = self._child_violation(declared_repo, declared_child)
+
+        assert violation is not None
+        assert str(declared_sibling) in violation
+        assert "noise" in violation
+
+    def test_unrelated_declaration_does_not_mask_other_dirt(
+        self, declared_repo: Path, declared_child: Path, declared_sibling: Path
+    ) -> None:
+        # A declaration is additive, not a blanket exemption for the worktree.
+        _write_implement_extension(declared_sibling, ["other/"])
+        _dirty_noise(declared_sibling)
+
+        violation = self._child_violation(declared_repo, declared_child)
+
+        assert violation is not None
+        assert str(declared_sibling) in violation
+
+    def test_main_checkout_uses_its_own_declaration_not_a_siblings(
+        self, declared_repo: Path, declared_child: Path, declared_sibling: Path
+    ) -> None:
+        # The sibling declares ``noise/`` but only the *main checkout* is
+        # dirty; the main checkout has no declaration, so it is still reported.
+        _write_implement_extension(declared_sibling, ["noise/"])
+        _dirty_noise(declared_repo)
+
+        violation = self._child_violation(declared_repo, declared_child)
+
+        assert violation is not None
+        assert str(declared_repo) in violation
+
+    def test_placement_guard_resolves_the_siblings_own_declaration(
+        self, declared_repo: Path, declared_child: Path, declared_sibling: Path
+    ) -> None:
+        _write_implement_extension(declared_sibling, ["noise/"])
+        _dirty_noise(declared_sibling)
+
+        with _patch_wl_show():
+            violation = implement._worktree_placement_violation(
+                str(declared_child),
+                cwd=str(declared_sibling),
+                repo_root=str(declared_repo),
+                parent_branch=PARENT_BRANCH,
+            )
+
+        assert violation is None
+
+    def test_placement_guard_reports_undeclared_sibling_dirt(
+        self, declared_repo: Path, declared_child: Path, declared_sibling: Path
+    ) -> None:
+        _dirty_noise(declared_sibling)
+
+        with _patch_wl_show():
+            violation = implement._worktree_placement_violation(
+                str(declared_child),
+                cwd=str(declared_sibling),
+                repo_root=str(declared_repo),
+                parent_branch=PARENT_BRANCH,
+            )
+
+        assert violation is not None
+        assert str(declared_sibling) in violation
+
+
+def _init_repo_with_submodule_noise(outer: Path, inner: Path) -> str:
+    """Outer repo whose ``core`` gitlink carries only untracked inner noise.
+
+    Reproduces the tce-the-rising shape: an outer repository with a ``core``
+    submodule whose only inner change is framework-materialised (the worktree
+    bootstrap links ``core/node_modules``). Returns the pinned inner sha.
+    """
+    gs.init_repo(inner, default_branch="main")
+    (inner / "engine.txt").write_text("engine\n", encoding="utf-8")
+    inner_sha = gs.commit_all(inner, "inner base")
+
+    gs.init_repo(outer, default_branch=PARENT_BRANCH)
+    (outer / "README.md").write_text("base\n", encoding="utf-8")
+    (outer / ".gitignore").write_text(".pi/\n", encoding="utf-8")
+    gs.commit_all(outer, "base")
+    gs.run_git(
+        outer,
+        ["update-index", "--add", "--cacheinfo", f"160000,{inner_sha},core"],
+        check=True,
+    )
+    # Commit the staged gitlink directly: ``git add -A`` would drop it, because
+    # the submodule has no working-tree checkout yet and looks deleted.
+    gs.run_git(outer, ["commit", "-q", "-m", "track core gitlink"], check=True)
+    # Materialise a clean ``core`` checkout in the main checkout as well: an
+    # unpopulated gitlink reports as `` D core`` there, which would otherwise
+    # make the main checkout itself the offending surface.
+    shutil.rmtree(outer / "core", ignore_errors=True)
+    gs.run_git(outer, ["clone", "-q", str(inner), "core"], check=True)
+    gs.run_git(outer / "core", ["checkout", "-q", inner_sha], check=True)
+    return inner_sha
+
+
+def _materialise_submodule(
+    worktree: Path,
+    inner: Path,
+    inner_sha: str,
+    *,
+    node_modules: bool = True,
+) -> Path:
+    """Populate *worktree*'s ``core`` gitlink with a checkout of *inner*.
+
+    Mimics ``implement.py start``'s worktree bootstrap: the submodule is
+    checked out at the pinned revision and ``core/node_modules`` is
+    materialised as a symlink to a shared install.
+    """
+    core = worktree / "core"
+    shutil.rmtree(core, ignore_errors=True)
+    gs.run_git(worktree, ["clone", "-q", str(inner), "core"], check=True)
+    gs.run_git(core, ["checkout", "-q", inner_sha], check=True)
+    if node_modules:
+        shared = worktree.parent / "shared-node-modules"
+        shared.mkdir(parents=True, exist_ok=True)
+        os.symlink(shared, core / "node_modules")
+    return core
+
+
+class TestSubmoduleNoiseIsNotASurface:
+    """AC2: a dirty submodule is classified by what changed *inside* it."""
+
+    def _sandbox(self, tmp_path: Path) -> tuple[Path, Path, str, Path, Path]:
+        outer = tmp_path / "outer"
+        inner = tmp_path / "inner"
+        inner_sha = _init_repo_with_submodule_noise(outer, inner)
+        child = gs.add_worktree(
+            outer, tmp_path / "swt" / f"wl-{CHILD_ID}", f"wl-{CHILD_ID}",
+            base=PARENT_BRANCH,
+        )
+        sibling = gs.add_worktree(
+            outer, tmp_path / "swt2" / f"wl-{SIBLING_ID}", f"wl-{SIBLING_ID}",
+            base=PARENT_BRANCH,
+        )
+        return outer, inner, inner_sha, child, sibling
+
+    def _child_violation(self, outer: Path, child: Path) -> str | None:
+        with _patch_wl_show():
+            return implement._child_main_checkout_violation(
+                CHILD_ID, str(child), PARENT_BRANCH, repo_root=str(outer)
+            )
+
+    def test_expected_dirty_submodule_noise_is_not_a_surface(
+        self, tmp_path: Path
+    ) -> None:
+        outer, inner, inner_sha, child, sibling = self._sandbox(tmp_path)
+        _write_implement_extension(sibling, ["core/node_modules"])
+        _materialise_submodule(sibling, inner, inner_sha)
+
+        # Sanity: the outer status really does report the bare submodule entry
+        # (the shape no path-prefix declaration could previously match).
+        status = gs.run_git(sibling, ["status", "--porcelain=v1"]).stdout
+        assert "core" in status
+
+        assert self._child_violation(outer, child) is None
+
+    def test_genuine_inner_edit_still_fails_closed(self, tmp_path: Path) -> None:
+        outer, inner, inner_sha, child, sibling = self._sandbox(tmp_path)
+        _write_implement_extension(sibling, ["core/node_modules"])
+        core = _materialise_submodule(sibling, inner, inner_sha)
+        (core / "engine.txt").write_text("changed\n", encoding="utf-8")
+
+        violation = self._child_violation(outer, child)
+
+        assert violation is not None
+        assert str(sibling) in violation
+        assert "engine.txt" in violation
+
+    def test_submodule_noise_without_a_declaration_is_reported(
+        self, tmp_path: Path
+    ) -> None:
+        # Nothing is silently swallowed: without the declaration the noise is
+        # still a genuine change surface.
+        outer, inner, inner_sha, child, sibling = self._sandbox(tmp_path)
+        _materialise_submodule(sibling, inner, inner_sha)
+
+        violation = self._child_violation(outer, child)
+
+        assert violation is not None
+        assert str(sibling) in violation
+        assert "core/node_modules" in violation
+
+    def test_placement_guard_ignores_expected_dirty_submodule_noise(
+        self, tmp_path: Path
+    ) -> None:
+        outer, inner, inner_sha, child, sibling = self._sandbox(tmp_path)
+        _write_implement_extension(sibling, ["core/node_modules"])
+        _materialise_submodule(sibling, inner, inner_sha)
+
+        with _patch_wl_show():
+            violation = implement._worktree_placement_violation(
+                str(child),
+                cwd=str(sibling),
+                repo_root=str(outer),
+                parent_branch=PARENT_BRANCH,
+            )
+
+        assert violation is None
+
+    def test_placement_guard_reports_genuine_inner_edit(self, tmp_path: Path) -> None:
+        outer, inner, inner_sha, child, sibling = self._sandbox(tmp_path)
+        _write_implement_extension(sibling, ["core/node_modules"])
+        core = _materialise_submodule(sibling, inner, inner_sha)
+        (core / "engine.txt").write_text("changed\n", encoding="utf-8")
+
+        with _patch_wl_show():
+            violation = implement._worktree_placement_violation(
+                str(child),
+                cwd=str(sibling),
+                repo_root=str(outer),
+                parent_branch=PARENT_BRANCH,
+            )
+
+        assert violation is not None
+        assert "engine.txt" in violation
+
+    def test_moved_submodule_pointer_is_never_silently_clean(
+        self, tmp_path: Path
+    ) -> None:
+        # A submodule whose pointer advanced (inner tree clean, inner HEAD moved)
+        # is a genuine change surface — never silently clean.
+        outer, inner, inner_sha, child, sibling = self._sandbox(tmp_path)
+        _write_implement_extension(sibling, ["core/node_modules"])
+        core = _materialise_submodule(sibling, inner, inner_sha)
+        (core / "engine.txt").write_text("advanced\n", encoding="utf-8")
+        gs.run_git(core, ["commit", "-q", "-am", "advance engine"], check=True)
+
+        # The submodule pointer advanced: its checked-out HEAD no longer
+        # matches the pinned gitlink, so it is a genuine change surface even
+        # though the inner tree holds only the expected-dirty noise.
+        assert "core" in gs.run_git(sibling, ["status", "--porcelain=v1"]).stdout
+
+        assert self._child_violation(outer, child) is not None
+
+    def test_unreadable_inner_repo_is_never_silently_clean(
+        self, tmp_path: Path
+    ) -> None:
+        # The fail-closed branch of the classifier: if the inner repo cannot be
+        # read, the submodule entry stays a surface (reported as the bare path).
+        outer, inner, inner_sha, child, sibling = self._sandbox(tmp_path)
+        _materialise_submodule(sibling, inner, inner_sha)
+
+        with mock.patch.object(
+            implement, "_submodule_inner_paths", return_value=None
+        ):
+            is_surface, reported = implement._dirty_entry_is_change_surface(
+                str(sibling), "core", ("core/node_modules",)
+            )
+
+        assert is_surface is True
+        assert reported == ["core"]
