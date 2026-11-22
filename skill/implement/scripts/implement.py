@@ -149,6 +149,17 @@ except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
 
 try:
+    # Best-effort, read-only concurrent-actor attribution
+    # (WL-0MWR1OYAJ000UVJS). Kept soft/fail-open: evidence is a second,
+    # informational signal, so a partial skill install degrades to ``unknown``
+    # rather than blocking a finish.
+    from shared.concurrent_actor import (
+        describe_concurrent_actor as _describe_concurrent_actor,
+    )
+except Exception:  # noqa: BLE001 -- broad by design: evidence must fail open
+    _describe_concurrent_actor = None  # pragma: no cover - partial install
+
+try:
     # Fail-open self-referential-upstream warning (SA-0MVX35AUC003CNUD AC2/
     # AC3). Deliberately OUTSIDE the hard-fail shared block above: the
     # detection module is optional, so a partial skill install or a repo
@@ -3411,62 +3422,72 @@ def _record_finish_own_churn(
 
 
 def _main_checkout_actor_evidence(
-    repo_root: str, worktree_path: str
+    repo_root: str, worktree_path: str, work_item_id: str = ""
 ) -> str:
     """Best-effort concurrent-actor evidence for the guard's abort message.
 
-    Sources, in order:
+    Delegates to the shared, read-only
+    :func:`shared.concurrent_actor.describe_concurrent_actor` helper so the
+    finish guard and every other consumer share one evidence contract instead
+    of duplicating it (WL-0MWR1OYAJ000UVJS). The helper names the likely owner
+    from the main checkout's and sibling worktrees' ``.implement_state.json``
+    files, one bounded ``wl`` claim lookup, the main-checkout lock holder and
+    live ``/proc`` sessions, and returns ``"unknown"`` when none is
+    discoverable.
 
-    1. other worktree state files (``.implement_state.json``) under the main
-       checkout — each names its owning work item and start time,
-    2. live processes whose ``/proc/<pid>/cwd`` resolves to the main
-       checkout root (Linux only; skipped elsewhere).
-
-    Returns ``"unknown"`` when no source yields evidence (the abort message
-    still fires — evidence is informative, never gating).
+    Attribution is informational only: the abort message still fires and the
+    guard verdict is unchanged whether an owner is named or not. The delegation
+    is fail-open — a missing helper or any error degrades to ``"unknown"`` and
+    is never raised into the verdict path.
 
     Args:
         repo_root: Absolute path to the main checkout.
         worktree_path: This finish run's own worktree (excluded from the
             evidence scan).
+        work_item_id: This finish run's own work item (excluded so the run
+            never names itself, e.g. via the lock it holds while finishing).
     """
-    own = str(Path(worktree_path).resolve())
-    evidence: list[str] = []
-    worktrees_dir = Path(repo_root) / ".worklog" / "worktrees"
+    if _describe_concurrent_actor is None:  # pragma: no cover - partial install
+        return "unknown"
     try:
-        state_files = sorted(worktrees_dir.glob("wl-*/.implement_state.json"))
-    except OSError:
-        state_files = []
-    for state_file in state_files:
-        try:
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if str(state_file.parent.resolve()) == own:
-            continue
-        evidence.append(
-            f"work item {data.get('work_item_id', '?')} "
-            f"(worktree {state_file.parent}, started "
-            f"{data.get('started_at', '?')})"
+        return _describe_concurrent_actor(
+            repo_root,
+            own_worktree=worktree_path,
+            own_work_item_id=work_item_id,
+            worklog_dir=str(Path(repo_root) / ".worklog"),
         )
-        if len(evidence) >= 5:
-            break
-    try:
-        root = str(Path(repo_root).resolve())
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            try:
-                cwd = os.readlink(f"/proc/{entry}/cwd")
-            except OSError:
-                continue
-            if str(Path(cwd).resolve()) == root:
-                evidence.append(f"pid {entry} with cwd in the main checkout")
-                if len(evidence) >= 8:
-                    break
-    except OSError:
-        pass
-    return "; ".join(evidence) if evidence else "unknown"
+    except Exception:
+        LOG.debug("Concurrent-actor evidence lookup failed", exc_info=True)
+        return "unknown"
+
+
+def _annotate_excluded_churn_notes(
+    notes: list[str], repo_root: str, worktree_path: str, work_item_id: str
+) -> tuple[list[str], str]:
+    """Append the documented actor second signal to excluded-churn notes.
+
+    The role-scoped guard excludes concurrent main-checkout churn from the
+    verdict but never silently: each note names the path and status code. This
+    adds the *likely actor* as an explicitly labelled second signal
+    (WL-0MWR1OYAJ000UVJS AC4) — it never changes the verdict and never replaces
+    the plumbing rule that produced the note. When no owner is discoverable the
+    appended signal says ``unknown`` explicitly, so the operator sees the
+    attribution attempt rather than an unexplained absence.
+
+    Args:
+        notes: The ``live_repo_excluded`` notes produced by the guard.
+        repo_root: Absolute path to the main checkout.
+        worktree_path: This finish run's own worktree.
+        work_item_id: This finish run's own work item.
+
+    Returns:
+        ``(annotated_notes, actor_evidence)``.
+    """
+    evidence = _main_checkout_actor_evidence(
+        repo_root, worktree_path, work_item_id
+    )
+    annotated = [f"{note} [likely actor: {evidence}]" for note in notes]
+    return annotated, evidence
 
 
 def _main_checkout_guard_message(
@@ -3525,6 +3546,7 @@ def _verify_main_checkout(
     own_churn: list[str],
     expected_dirty: tuple[str, ...],
     stage: str,
+    work_item_id: str = "",
 ) -> list[str]:
     """Re-snapshot the main checkout and record a guard verify entry.
 
@@ -3541,6 +3563,8 @@ def _verify_main_checkout(
         own_churn: Paths changed by finish's own fast-forward.
         expected_dirty: Project-declared dirty path prefixes to exclude.
         stage: Verify stage label — one of :data:`VERIFY_STAGES`.
+        work_item_id: This finish run's own work item, excluded from the
+            concurrent-actor evidence so a run never names itself.
 
     Returns:
         The offending paths (empty list on pass).
@@ -3560,7 +3584,7 @@ def _verify_main_checkout(
     if violations:
         entry["offending"] = violations
         entry["actor_evidence"] = _main_checkout_actor_evidence(
-            repo_root, worktree_path
+            repo_root, worktree_path, work_item_id
         )
     guard["verifies"].append(entry)
     guard["verdict"] = entry["verdict"]
@@ -12995,6 +13019,7 @@ def phase_finish(
             own_churn=own_churn,
             expected_dirty=expected_dirty_paths(repo_root),
             stage=stage,
+            work_item_id=work_item_id,
         )
         if not violations:
             return
@@ -13047,6 +13072,7 @@ def phase_finish(
             own_churn=main_checkout_guard["own_churn"],
             expected_dirty=expected_dirty_paths(repo_root),
             stage=stage,
+            work_item_id=work_item_id,
         )
         if not violations:
             return violations
@@ -13316,11 +13342,18 @@ def phase_finish(
     # Working-tree churn attributed to a concurrent session is excluded from
     # the guard's verdict but is never silent: surface the note in the finish
     # output and the JSON report so the operator can tell an excluded foreign
-    # change from a clean run (SA-0MUIJAHXS003M7BG AC3).
+    # change from a clean run (SA-0MUIJAHXS003M7BG AC3). Each note also carries
+    # the documented actor second signal (WL-0MWR1OYAJ000UVJS AC4): the likely
+    # owner when discoverable, else an explicit ``unknown``. Attribution is
+    # informational and never changes the verdict.
     excluded_churn = list(test_result.get("live_repo_excluded") or [])
     if excluded_churn:
-        report["live_repo_excluded"] = excluded_churn
-        for note in excluded_churn:
+        annotated_notes, actor_evidence = _annotate_excluded_churn_notes(
+            excluded_churn, repo_root, worktree_path, work_item_id
+        )
+        report["live_repo_excluded"] = annotated_notes
+        report["live_repo_actor_evidence"] = actor_evidence
+        for note in annotated_notes:
             LOG.info("Live-repo guard note: %s", note)
 
     # ── Step 3a: Full-suite coverage stays at the dev-push gate ─────

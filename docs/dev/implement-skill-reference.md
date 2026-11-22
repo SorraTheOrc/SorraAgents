@@ -2253,11 +2253,13 @@ stage, aborting or advisory:
   `completed`/`in_review`) and the audit trail survives the status reset.
 - **Message content.** The abort message names the stage, **every** offending
   path (`<path> [<code>]`, capped at 20 lines plus `… and N more`), the
-  concurrent-actor evidence available at runtime (other worktree
-  `.implement_state.json` entries, live processes whose cwd is the main
+  concurrent-actor evidence available at runtime (the main checkout's and
+  sibling worktrees' `.implement_state.json` entries, one bounded `wl` claim
+  lookup, the main-checkout lock holder, live processes whose cwd is the main
   checkout, or `unknown`) and the recovery command (`git checkout -- <path>`
   / `git restore <path>`), so an agent hitting the abort can act without
-  spelunking.
+  spelunking. The evidence comes from the read-only shared helper
+  `skill/shared/concurrent_actor.py` (see *Concurrent-actor evidence* below).
 
 Pre-existing dirty files present in the baseline snapshot and project-declared
 expected-dirty paths are never a failure.
@@ -2316,6 +2318,51 @@ Proven by `skill/implement/tests/test_finish_cross_checkout_attribution.py`
 (`test_violations_own_churn_allow_list_never_hides_deletion`,
 `test_violations_own_churn_list_only_matches_listed_paths`).
 
+### Concurrent-actor evidence (second signal)
+
+When the guard records a failure it appends a **concurrent-actor evidence**
+string to the failure note (`verifies[].actor_evidence`, and the abort message's
+`Concurrent actor evidence:` line), and `finish` appends the same signal to each
+excluded-churn note (`[likely actor: …]`) and to `report["live_repo_actor_evidence"]`.
+The evidence is produced by the read-only shared helper
+`skill/shared/concurrent_actor.py` (`describe_concurrent_actor`), so the guard
+and any other consumer share one contract instead of duplicating a probe.
+
+Sources, in priority order, each optional:
+
+1. **`.implement_state.json`** — the main checkout's own state file and its
+   registered sibling worktrees' state files
+   (`<main>/.worklog/worktrees/*/.implement_state.json`). A state file is a
+   candidate only when its `repo_root` resolves to this main checkout and its
+   `worktree_path` lives inside it; this run's own worktree and item are
+   excluded so a finish never names itself.
+2. **Claimed items** — one **bounded** `wl list --status in-progress` lookup
+   (`DEFAULT_WL_LOOKUP_TIMEOUT_SECONDS`, `DEFAULT_WL_LOOKUP_LIMIT`), filtered
+   to items with a non-empty assignee. The lookup is skipped entirely when the
+   repository has no initialised `.worklog` store, so a hermetic fixture never
+   resolves an unrelated ambient store.
+3. **Main-checkout lock holder** — `RepoLock.read_holder()` /
+   `describe_holder()` metadata, consulted only when the holder records a live
+   pid and a work item that is not this run's own (finish holds this lock).
+4. **Live processes** — pids whose `/proc/<pid>/cwd` resolves to the main
+   checkout (Linux only, bounded). These name a session rather than a work item
+   and are appended beside a named owner.
+
+**Informational only.** The verdict is derived solely from the git-plumbing
+rule above; actor evidence never turns a green run red or a red run green and
+never excuses a tracked-file deletion. It is a **documented second signal**,
+never a substitute for the plumbing rule and never a path-name or `wl-*`
+heuristic. When no single owner is discoverable — no state file, several
+candidate owners, unreadable JSON, or a lock held by an unrelated process — the
+helper returns the explicit string `unknown`. Every error degrades to `unknown`
+and is never raised into the verdict path. The helper runs only when building
+the finished-run note or the failure message; it adds no subprocess to the
+per-test guard path. Pinned by
+`skill/shared/tests/test_concurrent_actor.py` (the four required `unknown`
+fallbacks and the bounded/read-only contract) and
+`skill/implement/tests/test_finish_main_checkout_guard.py` (the finish-side
+delegation and note annotation).
+
 ### Fail-closed `repo_root` resolution
 
 `_resolve_main_repo_root` **derives** the main checkout instead of trusting
@@ -2351,7 +2398,7 @@ that asserts observable behaviour (no source greps).
 |---|---|---|---|---|
 | `_snapshot_main_checkout` / `_main_checkout_status_map` | nothing — `git status --porcelain=v1` read only | `repo_root` | confined (read-only) | `test_finish_write_surface_confinement.py::test_guard_surfaces_leave_the_checkout_byte_identical` |
 | `_verify_main_checkout` / `_main_checkout_guard_violations` | nothing — re-snapshot plus an in-memory verdict | `repo_root` | confined (read-only; never restores a foreign deletion) | `test_finish_write_surface_confinement.py::test_guard_verify_reports_a_foreign_deletion_without_touching_it` |
-| `_main_checkout_actor_evidence` | nothing — `.implement_state.json` and `/proc/<pid>/cwd` reads | `repo_root` | confined (read-only) | `test_finish_write_surface_confinement.py::test_guard_surfaces_leave_the_checkout_byte_identical` |
+| `_main_checkout_actor_evidence` / `describe_concurrent_actor` | nothing — `.implement_state.json` reads, the lock file's diagnostic metadata, one bounded `wl list` lookup and `/proc/<pid>/cwd` reads | `repo_root` | confined (read-only; the `wl` store is only queried when initialised) | `test_finish_write_surface_confinement.py::test_guard_surfaces_leave_the_checkout_byte_identical`, `skill/shared/tests/test_concurrent_actor.py::test_helper_is_read_only` |
 | `_fast_forward_local_dev_for_push` | `git fetch` / `checkout` / `merge --ff-only` — refs and working tree | `repo_root` | confined — every git call uses `cwd=repo_root` | `test_finish_write_surface_confinement.py::test_main_checkout_git_operations_only_run_in_repo_root` |
 | `_restore_local_dev_after_failed_push` | `git reset --merge` / `git update-ref` | `repo_root` | confined — same `cwd` rule | `test_finish_write_surface_confinement.py::test_main_checkout_git_operations_only_run_in_repo_root` |
 | `_sync_parent_branch` | `git fetch` / `merge --ff-only` on the shared branch | `repo_root` | confined — same `cwd` rule | `test_finish_write_surface_confinement.py::test_main_checkout_git_operations_only_run_in_repo_root` |

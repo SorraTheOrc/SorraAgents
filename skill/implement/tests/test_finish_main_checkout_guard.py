@@ -1,4 +1,10 @@
 
+# <!-- REFACTOR-SA-0MWRDN7TC003VLD0
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
+
 # <!-- REFACTOR-SA-0MWI3MT6L004K1L7
 # smell: unused_import
 # severity: critical
@@ -38,6 +44,7 @@ Covered here:
 from __future__ import annotations
 
 import contextlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -204,6 +211,114 @@ def test_actor_evidence_unknown_when_no_other_worktrees(tmp_path):
     repo = git_sandbox.init_repo(tmp_path / "main")
     evidence = implement._main_checkout_actor_evidence(str(repo), "/tmp/none")
     assert evidence == "unknown"
+
+
+def _write_sibling_state(repo: Path, work_item_id: str) -> Path:
+    """Write a sibling worktree state file naming *work_item_id*."""
+    sibling = repo / ".worklog" / "worktrees" / f"wl-{work_item_id}"
+    sibling.mkdir(parents=True)
+    (sibling / implement.STATE_FILE_NAME).write_text(
+        json.dumps(
+            {
+                "work_item_id": work_item_id,
+                "worktree_path": str(sibling),
+                "repo_root": str(repo),
+                "started_at": "2026-01-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return sibling
+
+
+def test_actor_evidence_names_a_sibling_owner_instead_of_the_run(tmp_path):
+    """A sibling state file names the likely actor (never the running item)."""
+    repo = git_sandbox.init_repo(tmp_path / "main")
+    _write_sibling_state(repo, "WL-SIBLING")
+    own = tmp_path / "own-worktree"
+    own.mkdir()
+
+    evidence = implement._main_checkout_actor_evidence(
+        str(repo), str(own), "WL-SELF"
+    )
+
+    assert "work item WL-SIBLING" in evidence
+    assert "WL-SELF" not in evidence
+
+
+def test_actor_evidence_never_names_the_own_worktree(tmp_path):
+    """The caller's own state file is excluded from the evidence."""
+    repo = git_sandbox.init_repo(tmp_path / "main")
+    own = _write_sibling_state(repo, "WL-OWN")
+
+    evidence = implement._main_checkout_actor_evidence(
+        str(repo), str(own), "WL-OWN"
+    )
+
+    assert evidence == "unknown"
+
+
+def test_verify_records_actor_evidence_on_failure(tmp_path):
+    """A guard failure records the discoverable actor beside the paths."""
+    repo = git_sandbox.init_repo(tmp_path / "main")
+    target = repo / "packages" / "shared.ts"
+    target.parent.mkdir()
+    target.write_text("export {}\n", encoding="utf-8")
+    git_sandbox.commit_all(repo, "seed")
+    _write_sibling_state(repo, "WL-SIBLING")
+    own = tmp_path / "own-worktree"
+    own.mkdir()
+
+    baseline = implement._snapshot_main_checkout(str(repo))
+    target.unlink()
+    guard: dict = {"verifies": [], "verdict": "pass"}
+
+    violations = implement._verify_main_checkout(
+        guard,
+        baseline,
+        repo_root=str(repo),
+        worktree_path=str(own),
+        own_churn=[],
+        expected_dirty=(),
+        stage="pre_push",
+        work_item_id="WL-SELF",
+    )
+
+    assert violations == ["packages/shared.ts [ D]"]
+    assert "work item WL-SIBLING" in guard["verifies"][0]["actor_evidence"]
+
+
+def test_annotate_excluded_churn_notes_appends_unknown_explicitly(tmp_path):
+    """The actor second signal is always labelled, ``unknown`` included."""
+    repo = git_sandbox.init_repo(tmp_path / "main")
+    own = tmp_path / "own-worktree"
+    own.mkdir()
+    notes = [
+        "excluded: concurrently resolved working-tree change in "
+        f"{repo}: src/app.ts [ M]"
+    ]
+
+    annotated, evidence = implement._annotate_excluded_churn_notes(
+        notes, str(repo), str(own), "WL-SELF"
+    )
+
+    assert evidence == "unknown"
+    assert annotated == [f"{notes[0]} [likely actor: unknown]"]
+
+
+def test_annotate_excluded_churn_notes_names_the_actor(tmp_path):
+    """The second signal names the owner when one is discoverable."""
+    repo = git_sandbox.init_repo(tmp_path / "main")
+    _write_sibling_state(repo, "WL-SIBLING")
+    own = tmp_path / "own-worktree"
+    own.mkdir()
+
+    annotated, evidence = implement._annotate_excluded_churn_notes(
+        ["excluded: path [ M]"], str(repo), str(own), "WL-SELF"
+    )
+
+    assert "work item WL-SIBLING" in evidence
+    assert annotated == [f"excluded: path [ M] [likely actor: {evidence}]"]
 
 
 # ---------------------------------------------------------------------------
