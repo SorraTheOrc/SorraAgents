@@ -235,6 +235,32 @@ class TestGateFailureMessage:
         assert "refs/heads/intruder" in message
         assert "infrastructure" in message
 
+    def test_excluded_foreign_churn_is_reported_beside_a_mutation(self) -> None:
+        """AC2/AC5: a red gate keeps the excluded notes instead of dropping them.
+
+        A mutation and an excluded concurrent write coexist in the same diff;
+        the failure text names the mutation and separately labels the excluded
+        churn as foreign and not counted in the verdict
+        (WL-0MWR1P1F3008AH3V).
+        """
+        note = (
+            "excluded: concurrently resolved working-tree change in /main: "
+            "docs/dev/x.md [ M] [likely actor: WL-SIBLING]"
+        )
+        adapted = _adapt(
+            success=False,
+            mutation="live-repo mutation detected: ...\n  deleted path [ D] a.ts",
+            extra={"live_repo_excluded": [note]},
+        )
+
+        assert adapted["live_repo_excluded"] == [note]
+        message = _message(adapted)
+
+        assert "Live-repo mutation detected" in message
+        assert "deleted path [ D] a.ts" in message
+        assert note in message
+        assert "Excluded foreign churn (not counted in the verdict)" in message
+
 
 # ---------------------------------------------------------------------------
 # Timeout / kill / unparsed-output classification (SA-0MVU8XQTU006DP37)

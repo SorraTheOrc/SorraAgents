@@ -58,6 +58,15 @@ from typing import Any
 #: Returned whenever no single owner can be established.
 UNKNOWN = "unknown"
 
+#: Label prefixing the actor second signal wherever it is rendered — the outer
+#: guard's ``live_repo_excluded`` notes, the inner plugin's session output and
+#: the finish report. Shared so every consumer renders one format and a note
+#: can be recognised as already annotated (WL-0MWR1P1F3008AH3V).
+ACTOR_EVIDENCE_LABEL = "likely actor"
+
+#: The rendered marker of an annotated note, e.g. ``[likely actor: unknown]``.
+ACTOR_EVIDENCE_MARKER = f"[{ACTOR_EVIDENCE_LABEL}:"
+
 #: State file written by ``implement.py`` into a worktree (``STATE_FILE_NAME``).
 STATE_FILE_NAME = ".implement_state.json"
 
@@ -163,6 +172,63 @@ def describe_concurrent_actor(
 
     pids = _live_process_pids(root) if include_process_scan else []
     return _render_pids(pids) if pids else UNKNOWN
+
+
+def work_item_id_from_state(worktree: str | os.PathLike[str]) -> str:
+    """The work item id recorded in *worktree*'s ``.implement_state.json``.
+
+    Returns ``""`` when the state file is absent, unreadable, malformed or
+    carries no id. Callers use it to exclude their own item from the evidence
+    (e.g. from the main-checkout lock a finish run holds), so it is
+    intentionally fail-open.
+    """
+    root = _resolve(worktree)
+    if root is None:
+        return ""
+    try:
+        data = json.loads((root / STATE_FILE_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("work_item_id") or "").strip()
+
+
+def render_actor_evidence(evidence: str | None) -> str:
+    """Render the labelled actor second signal, falling back to ``unknown``."""
+    value = str(evidence or "").strip() or UNKNOWN
+    return f"[{ACTOR_EVIDENCE_LABEL}: {value}]"
+
+
+def annotate_excluded_notes(
+    notes: list[str] | tuple[str, ...], evidence: str | None
+) -> list[str]:
+    """Append the labelled actor second signal to each excluded-churn *note*.
+
+    The note itself (path, status code and checkout) is the verdict-bearing
+    plumbing rule; the actor is an explicitly labelled, informational second
+    signal that never replaces it. A note that already carries the signal is
+    left untouched so the same exclusion cannot be annotated twice as it
+    passes from the outer guard to the finish report
+    (WL-0MWR1P1F3008AH3V).
+    """
+    signal = render_actor_evidence(evidence)
+    return [
+        note if ACTOR_EVIDENCE_MARKER in note else f"{note} {signal}"
+        for note in notes
+    ]
+
+
+def actor_evidence_from_note(note: str) -> str:
+    """The actor evidence already rendered in *note*, or ``""`` when absent."""
+    marker = ACTOR_EVIDENCE_MARKER
+    start = note.find(marker)
+    if start < 0:
+        return ""
+    end = note.find("]", start + len(marker))
+    if end < 0:
+        return ""
+    return note[start + len(marker):end].strip()
 
 
 # ---------------------------------------------------------------------------

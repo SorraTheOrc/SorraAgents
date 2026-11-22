@@ -135,11 +135,21 @@ if _SKILLS_ROOT_STR in sys.path:
     sys.path.remove(_SKILLS_ROOT_STR)
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
+from shared.concurrent_actor import (
+    UNKNOWN as _ACTOR_UNKNOWN,
+)
+from shared.concurrent_actor import (
+    annotate_excluded_notes,
+    describe_concurrent_actor,
+    work_item_id_from_state,
+)
 from shared.git_sandbox import (
+    MAIN_CHECKOUT_ROLE,
     describe_guarded_diff,
     diff_guarded_roots,
     excluded_churn_notes,
     git_env_for_repo,
+    main_checkout_root,
     snapshot_guarded_roots,
 )
 from shared.process_semaphore import Semaphore, nested_semaphore_dir  # noqa: F401
@@ -4277,13 +4287,59 @@ def run_summary(
     return result
 
 
+def _linked_main_checkout(project_root: Path) -> Path | None:
+    """The main checkout of a linked-worktree run, or ``None``.
+
+    A run started in an ordinary checkout shares that checkout with its own
+    session, so there is no *foreign* checkout to attribute churn to. Only a
+    linked worktree has a main checkout another session may be writing.
+    """
+    main = main_checkout_root(project_root)
+    if main is None:
+        return None
+    main = Path(main).resolve()
+    return main if main != project_root.resolve() else None
+
+
+def _main_checkout_actor_evidence(
+    project_root: Path, main_root: Path
+) -> str:
+    """Best-effort owner of the main checkout's concurrent churn.
+
+    Delegates to the shared, read-only ``describe_concurrent_actor`` helper
+    (WL-0MWR1OYAJ000UVJS) so the outer guard, the inner plugin and the finish
+    report share one evidence contract. The caller's own worktree and work item
+    are excluded. Fail-open: any error degrades to ``unknown`` and is never
+    raised into the verdict path.
+    """
+    try:
+        return describe_concurrent_actor(
+            main_root,
+            own_worktree=project_root,
+            own_work_item_id=work_item_id_from_state(project_root),
+            worklog_dir=main_root / ".worklog",
+        )
+    except Exception:  # noqa: BLE001 - evidence is diagnostic only
+        return _ACTOR_UNKNOWN
+
+
+def _main_checkout_changed(diff: dict[str, Any]) -> bool:
+    """True when the *main checkout* role itself carries verdict-bearing churn."""
+    return any(
+        entry.get("role") == MAIN_CHECKOUT_ROLE
+        and (entry.get("diff") or {}).get("changed")
+        for entry in diff.get("roots", ())
+    )
+
+
 def _detect_live_repo_mutation(
     project_root: Path,
     snapshot_before: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Evaluate the guarded run's checkout delta.
 
-    Returns ``{"mutation": <rendered diff or None>, "excluded": [<note>, ...]}``.
+    Returns ``{"mutation": <rendered diff or None>, "excluded": [<note>, ...],
+    "actor_evidence": <string>}``.
     Detect-only: it never prevents a mutation, it stops a corrupted checkout
     from being reported as a green suite (and therefore from being pushed).
     ``mutation`` is ``None`` for a non-git root (no-op) and when the guard was
@@ -4293,8 +4349,12 @@ def _detect_live_repo_mutation(
     attributed to a concurrent session and therefore cannot fail the run
     (SA-0MUIJAHXS003M7BG AC1/AC3) — the paths, the checkout and the status
     codes, so a reviewer can tell an excluded foreign change from a clean run.
-    The attribution rule itself lives in the shared ``git_sandbox`` helper, so
-    the inner ``live_repo_guard`` plugin cannot drift from it.
+    When the run started in a linked worktree each note also carries the
+    documented actor second signal (WL-0MWR1OYAJ000UVJS): the likely owner of
+    the shared main checkout, or an explicit ``unknown``
+    (WL-0MWR1P1F3008AH3V). The attribution rule itself lives in the shared
+    ``git_sandbox`` helper, so the inner ``live_repo_guard`` plugin cannot
+    drift from it; the actor is an added, informational signal only.
 
     The surface is **every checkout the guarded run can reach**
     (WL-0MVPE2BY9001CR9O): the guarded root plus, when the run started in a
@@ -4302,21 +4362,41 @@ def _detect_live_repo_mutation(
     store and a symlinked ``node_modules`` with the main checkout, so a
     root-only check reported a gutted main checkout as clean (the 2026-10-26
     `packages/shared` wipe). The message names the mutated checkout and every
-    mutated path in it.
+    mutated path in it, plus the discoverable concurrent owner when the main
+    checkout itself is the mutated checkout.
     """
     if snapshot_before is None:
-        return {"mutation": None, "excluded": []}
+        return {"mutation": None, "excluded": [], "actor_evidence": ""}
     snapshot_after = snapshot_guarded_roots(project_root)
     diff = diff_guarded_roots(snapshot_before, snapshot_after)
     excluded = excluded_churn_notes(diff)
+    main_root = _linked_main_checkout(project_root)
+    main_mutated = main_root is not None and _main_checkout_changed(diff)
+    # The bounded evidence lookup runs at most once per guarded run, and only
+    # when there is something to attribute (an excluded note or a mutation of
+    # the main checkout) — never in the per-test path and never on a clean run.
+    actor_evidence = ""
+    if main_root is not None and (excluded or main_mutated):
+        actor_evidence = _main_checkout_actor_evidence(project_root, main_root)
+        excluded = annotate_excluded_notes(excluded, actor_evidence)
     if not diff["changed"]:
-        return {"mutation": None, "excluded": excluded}
+        return {
+            "mutation": None,
+            "excluded": excluded,
+            "actor_evidence": actor_evidence,
+        }
     mutation = (
         "live-repo mutation detected: the test suite changed a guarded "
         f"checkout for {project_root}. The run is failed so a corrupted "
         "checkout cannot be pushed as green.\n" + describe_guarded_diff(diff)
     )
-    return {"mutation": mutation, "excluded": excluded}
+    if main_mutated:
+        mutation += f"\nConcurrent actor evidence: {actor_evidence}"
+    return {
+        "mutation": mutation,
+        "excluded": excluded,
+        "actor_evidence": actor_evidence,
+    }
 
 
 def guarded_run_all(
@@ -4377,7 +4457,10 @@ def guarded_run_all(
         ``live_repo_mutation`` set when the owned guard detected a mutation,
         and ``live_repo_excluded`` (informational notes) when working-tree
         churn was attributed to a concurrent session and excluded from the
-        verdict (SA-0MUIJAHXS003M7BG AC3).
+        verdict (SA-0MUIJAHXS003M7BG AC3). When the run started in a linked
+        worktree each note also carries the labelled actor second signal —
+        the likely owner of the shared main checkout, or an explicit
+        ``unknown`` (WL-0MWR1OYAJ000UVJS, WL-0MWR1P1F3008AH3V).
     """
     project_root = Path(cwd or REPO_ROOT).resolve()
 

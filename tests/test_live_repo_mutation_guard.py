@@ -21,6 +21,7 @@ No live checkout is mutated to obtain any proof; every mutation happens in a
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -1348,3 +1349,128 @@ def test_both_guards_agree_on_narrowed_main_checkout_churn(tmp_path, monkeypatch
     outer_notes = outer.get("live_repo_excluded") or []
     assert any("README.md" in n and "[ M]" in n for n in inner_notes), inner_text
     assert any("README.md" in n and "[ M]" in n for n in outer_notes), outer_notes
+    # The informational actor second signal is rendered the same way by both
+    # (WL-0MWR1P1F3008AH3V): same verdict, same notes, one shared helper.
+    assert any("likely actor:" in n for n in inner_notes), inner_text
+    assert any("likely actor:" in n for n in outer_notes), outer_notes
+
+
+# ---------------------------------------------------------------------------
+# WL-0MWR1P1F3008AH3V — the actor second signal reaches the inner plugin, and a
+# real mutation names the discoverable owner beside the mutated checkout/path.
+# ---------------------------------------------------------------------------
+
+
+def _write_sibling_actor_state(main: Path, work_item_id: str) -> Path:
+    """Write a sibling worktree state file naming *work_item_id* into *main*."""
+    sibling = main / ".worklog" / "worktrees" / f"wl-{work_item_id}"
+    sibling.mkdir(parents=True, exist_ok=True)
+    (sibling / ".implement_state.json").write_text(
+        json.dumps(
+            {
+                "work_item_id": work_item_id,
+                "worktree_path": str(sibling),
+                "repo_root": str(main),
+                "started_at": "2026-01-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return sibling
+
+
+def test_inner_guard_excluded_note_says_unknown_actor(tmp_path):
+    """The excluded note carries an explicit `unknown` actor signal."""
+    main, worktree = _main_with_linked_guard_worktree(tmp_path)
+    _write_guard_conftest(worktree)
+    _write_sibling_mutator(
+        worktree,
+        main,
+        "(Path(MAIN) / 'README.md').write_text('sibling edit\\n')\n",
+    )
+
+    proc = _run_nested_pytest(worktree)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    notes = [
+        line
+        for line in combined.splitlines()
+        if gs.EXCLUDED_CHURN_NOTE_PREFIX in line
+    ]
+    assert any("likely actor: unknown" in note for note in notes), combined
+
+
+def test_inner_guard_excluded_note_names_discoverable_actor(tmp_path):
+    """A sibling state file names the likely owner in the excluded note."""
+    main, worktree = _main_with_linked_guard_worktree(tmp_path)
+    _write_sibling_actor_state(main, "WL-SIBLING")
+    _write_guard_conftest(worktree)
+    _write_sibling_mutator(
+        worktree,
+        main,
+        "(Path(MAIN) / 'README.md').write_text('sibling edit\\n')\n",
+    )
+
+    proc = _run_nested_pytest(worktree)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    notes = [
+        line
+        for line in combined.splitlines()
+        if gs.EXCLUDED_CHURN_NOTE_PREFIX in line
+    ]
+    assert any(
+        "README.md" in note and "likely actor: work item WL-SIBLING" in note
+        for note in notes
+    ), combined
+
+
+def test_inner_guard_mutation_names_discoverable_actor(tmp_path):
+    """A real main-checkout deletion fails and names the discoverable owner."""
+    main, worktree = _main_with_linked_guard_worktree(tmp_path)
+    _write_sibling_actor_state(main, "WL-SIBLING")
+    _write_guard_conftest(worktree)
+    _write_sibling_mutator(
+        worktree,
+        main,
+        "subprocess.run(['git', '-C', str(MAIN), 'rm', 'README.md'], check=True)\n",
+    )
+
+    proc = _run_nested_pytest(worktree)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, combined
+    assert "live-repo mutation" in combined, combined
+    assert "README.md" in combined, combined
+    assert str(main.resolve()) in combined, combined
+    assert "Concurrent actor evidence: work item WL-SIBLING" in combined, combined
+
+
+def test_actor_helper_loads_by_file_location():
+    """The plugin's file-location loader yields a usable actor helper.
+
+    ``concurrent_actor`` declares a ``@dataclass``; on Python 3.14
+    ``dataclasses`` resolves the owning module through ``sys.modules`` while
+    the class is built, so the loaded module must be registered before
+    ``exec_module``. A silent load failure would strip every note of its actor
+    signal, so the loader itself is pinned (WL-0MWR1P1F3008AH3V).
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_live_repo_guard_loader_probe", GUARD_MODULE
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
+
+    actor = module._load_concurrent_actor()
+
+    assert actor is not None
+    assert actor.annotate_excluded_notes(["note"], None) == [
+        "note [likely actor: unknown]"
+    ]

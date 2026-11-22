@@ -321,6 +321,28 @@ def test_annotate_excluded_churn_notes_names_the_actor(tmp_path):
     assert annotated == [f"excluded: path [ M] [likely actor: {evidence}]"]
 
 
+def test_annotate_excluded_churn_notes_does_not_annotate_twice(tmp_path):
+    """A note the outer guard already annotated is passed through unchanged.
+
+    ``run_tests`` annotates its own output (WL-0MWR1P1F3008AH3V), so the finish
+    report must adopt that signal instead of appending a second lookup and a
+    duplicate label. The bounded actor lookup is therefore not called.
+    """
+    note = (
+        "excluded: concurrently resolved working-tree change in /repo: "
+        "docs/dev/x.md [ M] [likely actor: WL-SIBLING]"
+    )
+
+    with patch.object(implement, "_main_checkout_actor_evidence") as lookup:
+        annotated, evidence = implement._annotate_excluded_churn_notes(
+            [note], str(tmp_path), "/tmp/none", ""
+        )
+
+    lookup.assert_not_called()
+    assert annotated == [note]
+    assert evidence == "WL-SIBLING"
+
+
 # ---------------------------------------------------------------------------
 # phase_finish behaviour
 # ---------------------------------------------------------------------------
@@ -609,6 +631,49 @@ def test_finish_clean_run_reports_guard_step(tmp_path):
     assert guard["snapshot_at"]
     assert [v["stage"] for v in guard["verifies"]] == ["pre_push", "pre_worktree_removal"]
     assert all(v["verdict"] == "pass" for v in guard["verifies"])
+
+
+def test_finish_surfaces_excluded_foreign_churn(tmp_path, caplog):
+    """AC1: a green gate still reports the excluded foreign churn and its owner.
+
+    The excluded paths never fail the finish, but they must reach the JSON
+    report and the log, labelled with the discoverable actor rather than
+    implied as damage caused by this run (WL-0MWR1P1F3008AH3V).
+    """
+    note = (
+        "excluded: concurrently resolved working-tree change in /main: "
+        "docs/dev/x.md [ M]"
+    )
+    tests = {**_tests_result(), "live_repo_excluded": [note]}
+    actor = "work item WL-SIBLING (claimed by agent)"
+
+    with _finish_harness(tmp_path), patch.object(
+        implement,
+        "run_gate_suite",
+        return_value=(
+            tests,
+            {
+                "tree": "abc1234",
+                "scope": "changed",
+                "cached": False,
+                "index_unchanged": True,
+            },
+        ),
+    ), patch.object(
+        implement, "_main_checkout_actor_evidence", return_value=actor
+    ), patch.object(
+        implement, "_snapshot_main_checkout", side_effect=_snapshots([{}, {}, {}])
+    ):
+        caplog.set_level("INFO", logger="implement.scripts.implement")
+        report = implement.phase_finish(
+            "WL-TEST", json_output=True, no_refactor=True
+        )
+
+    assert report["success"] is True, report["message"]
+    assert report["live_repo_excluded"] == [f"{note} [likely actor: {actor}]"]
+    assert report["live_repo_actor_evidence"] == actor
+    assert "Live-repo guard note" in caplog.text
+    assert actor in caplog.text
 
 
 def test_finish_abort_before_worktree_removal_leaves_item_open(tmp_path):

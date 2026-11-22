@@ -2322,11 +2322,16 @@ Proven by `skill/implement/tests/test_finish_cross_checkout_attribution.py`
 
 When the guard records a failure it appends a **concurrent-actor evidence**
 string to the failure note (`verifies[].actor_evidence`, and the abort message's
-`Concurrent actor evidence:` line), and `finish` appends the same signal to each
-excluded-churn note (`[likely actor: …]`) and to `report["live_repo_actor_evidence"]`.
-The evidence is produced by the read-only shared helper
-`skill/shared/concurrent_actor.py` (`describe_concurrent_actor`), so the guard
-and any other consumer share one contract instead of duplicating a probe.
+`Concurrent actor evidence:` line), and each excluded-churn note carries the
+same signal (`[likely actor: …]`) wherever it is rendered: `run_tests.py`'s text
+output and `live_repo_excluded` JSON notes, the inner plugin's session output,
+and `finish`'s report (`report["live_repo_excluded"]` /
+`report["live_repo_actor_evidence"]`). `finish` adopts a note the guard already
+annotated instead of looking the evidence up a second time
+(WL-0MWR1P1F3008AH3V). The evidence is produced by the read-only shared helper
+`skill/shared/concurrent_actor.py` (`describe_concurrent_actor`,
+`annotate_excluded_notes`), so the outer guard, the inner plugin and the finish
+report share one contract instead of duplicating a probe.
 
 Sources, in priority order, each optional:
 
@@ -2355,9 +2360,10 @@ never a substitute for the plumbing rule and never a path-name or `wl-*`
 heuristic. When no single owner is discoverable — no state file, several
 candidate owners, unreadable JSON, or a lock held by an unrelated process — the
 helper returns the explicit string `unknown`. Every error degrades to `unknown`
-and is never raised into the verdict path. The helper runs only when building
-the finished-run note or the failure message; it adds no subprocess to the
-per-test guard path. Pinned by
+and is never raised into the verdict path. The helper runs at most once per
+guarded run, when a guard builds a note or failure message (never in the
+per-test fingerprint path); it adds no subprocess to the per-test guard path.
+Pinned by
 `skill/shared/tests/test_concurrent_actor.py` (the four required `unknown`
 fallbacks and the bounded/read-only contract) and
 `skill/implement/tests/test_finish_main_checkout_guard.py` (the finish-side

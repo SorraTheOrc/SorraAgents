@@ -1,3 +1,9 @@
+
+# <!-- REFACTOR-SA-0MWRQZQ210043IPM
+# smell: unknown
+# severity: low
+# description: Unparenthesized implicit string concatenation in collection
+# -->
 """Unit tests for ``skill/shared/concurrent_actor.py`` (WL-0MWR1OYAJ000UVJS).
 
 The helper names the *likely* concurrent actor behind a dirty main checkout.
@@ -412,3 +418,61 @@ def test_helper_is_read_only(repo: Path):
 def test_unresolvable_repo_root_is_unknown():
     """A missing/invalid repository path never raises."""
     assert describe_concurrent_actor("/does/not/exist", include_process_scan=False) == UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers (WL-0MWR1P1F3008AH3V)
+# ---------------------------------------------------------------------------
+# The outer guard, the inner plugin and the finish report all render the actor
+# signal through these helpers, so the second signal has one format and a note
+# that already carries it is never annotated twice as it crosses a boundary.
+
+
+def test_annotate_excluded_notes_appends_unknown_signal():
+    """A note without evidence gains an explicit `unknown` actor signal."""
+    notes = ["excluded: concurrently resolved working-tree change in /repo: a.py [ M]"]
+
+    assert concurrent_actor.annotate_excluded_notes(notes, None) == [
+        notes[0] + " [likely actor: unknown]"
+    ]
+
+
+def test_annotate_excluded_notes_names_the_evidence():
+    notes = ["excluded: concurrently resolved working-tree change in /repo: a.py [ M]"]
+
+    assert concurrent_actor.annotate_excluded_notes(
+        notes, "work item WL-SIBLING (claimed by agent)"
+    ) == [notes[0] + " [likely actor: work item WL-SIBLING (claimed by agent)]"]
+
+
+def test_annotate_excluded_notes_does_not_double_annotate():
+    """A note the guard already annotated is left untouched."""
+    annotated = [
+        "excluded: concurrently resolved working-tree change in /repo: a.py [ M] "
+        "[likely actor: WL-SIBLING]"
+    ]
+
+    assert concurrent_actor.annotate_excluded_notes(annotated, "WL-OTHER") == annotated
+
+
+def test_actor_evidence_from_note_round_trips():
+    note = concurrent_actor.annotate_excluded_notes(["excluded: x"], "WL-X")[0]
+
+    assert concurrent_actor.actor_evidence_from_note(note) == "WL-X"
+    assert concurrent_actor.actor_evidence_from_note("excluded: x") == ""
+
+
+def test_work_item_id_from_state_reads_the_state_file(tmp_path):
+    worktree = tmp_path / "wt"
+    _write_state(worktree, "WL-OWN", repo_root=tmp_path)
+
+    assert concurrent_actor.work_item_id_from_state(worktree) == "WL-OWN"
+
+
+def test_work_item_id_from_state_is_empty_for_missing_or_malformed(tmp_path):
+    assert concurrent_actor.work_item_id_from_state(tmp_path / "absent") == ""
+
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / STATE_FILE_NAME).write_text("{not json", encoding="utf-8")
+    assert concurrent_actor.work_item_id_from_state(broken) == ""

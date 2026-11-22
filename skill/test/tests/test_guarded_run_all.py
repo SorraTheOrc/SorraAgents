@@ -29,6 +29,7 @@ Contract under test:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -587,13 +588,24 @@ def test_guarded_run_fails_on_staged_main_checkout_deletion(tmp_path, monkeypatc
     assert "live_repo_excluded" not in result, result
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "actor 'unknown' fallback lands in "
-        "WL-0MWR1OYAJ000UVJS/WL-0MWR1P1F3008AH3V"
-    ),
-)
+def _write_sibling_state(main: Path, work_item_id: str) -> Path:
+    """Write a sibling worktree state file naming *work_item_id* into *main*."""
+    sibling = main / ".worklog" / "worktrees" / f"wl-{work_item_id}"
+    sibling.mkdir(parents=True, exist_ok=True)
+    (sibling / ".implement_state.json").write_text(
+        json.dumps(
+            {
+                "work_item_id": work_item_id,
+                "worktree_path": str(sibling),
+                "repo_root": str(main),
+                "started_at": "2026-01-01T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return sibling
+
+
 def test_guarded_run_reports_unknown_actor_for_main_checkout_churn(
     tmp_path, monkeypatch
 ):
@@ -624,6 +636,74 @@ def test_guarded_run_reports_unknown_actor_for_main_checkout_churn(
     notes = result.get("live_repo_excluded")
     assert notes, result
     assert any("unknown" in note for note in notes), notes
+
+
+def test_guarded_run_names_discoverable_actor_for_main_checkout_churn(
+    tmp_path, monkeypatch
+):
+    """AC1/AC3: an excluded note names the discoverable owner of the churn."""
+    from shared.process_semaphore import nested_semaphore_dir
+
+    _gs, main, worktree = _main_with_linked_worktree(tmp_path)
+    _write_sibling_state(main, "WL-SIBLING")
+    command = _sibling_main_checkout_command(
+        tmp_path,
+        main,
+        "(main / 'keep.txt').write_text('sibling edit\\n', encoding='utf-8')\n",
+    )
+
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(nested_semaphore_dir(tmp_path)))
+    monkeypatch.delenv(MARKER_ENV, raising=False)
+
+    result = guarded_run_all(
+        worktree,
+        timeout=120,
+        suites=("all",),
+        commands=[command],
+        scope="full",
+        use_cache=False,
+        no_cache=True,
+    )
+
+    assert result["success"] is True, result.get("live_repo_mutation")
+    notes = result.get("live_repo_excluded")
+    assert notes, result
+    assert any("keep.txt" in note for note in notes), notes
+    assert any("likely actor: work item WL-SIBLING" in note for note in notes), notes
+
+
+def test_guarded_run_mutation_names_discoverable_actor(tmp_path, monkeypatch):
+    """AC3: a real main-checkout deletion still fails and names the owner."""
+    from shared.process_semaphore import nested_semaphore_dir
+
+    _gs, main, worktree = _main_with_linked_worktree(tmp_path)
+    _write_sibling_state(main, "WL-SIBLING")
+    command = _sibling_main_checkout_command(
+        tmp_path,
+        main,
+        "import subprocess\n"
+        "subprocess.run(['git', '-C', str(main), 'rm', 'keep.txt'], check=True)\n",
+    )
+
+    monkeypatch.setenv("PI_SEMAPHORE_DIR", str(nested_semaphore_dir(tmp_path)))
+    monkeypatch.delenv(MARKER_ENV, raising=False)
+
+    result = guarded_run_all(
+        worktree,
+        timeout=120,
+        suites=("all",),
+        commands=[command],
+        scope="full",
+        use_cache=False,
+        no_cache=True,
+    )
+
+    assert result["success"] is False, result
+    mutation = result.get("live_repo_mutation")
+    assert mutation, result
+    assert "keep.txt" in mutation, mutation
+    assert "main checkout" in mutation, mutation
+    assert "Concurrent actor evidence: work item WL-SIBLING" in mutation, mutation
 
 
 # ---------------------------------------------------------------------------

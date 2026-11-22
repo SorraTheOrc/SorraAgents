@@ -154,10 +154,18 @@ try:
     # informational signal, so a partial skill install degrades to ``unknown``
     # rather than blocking a finish.
     from shared.concurrent_actor import (
+        actor_evidence_from_note as _actor_evidence_from_note,
+    )
+    from shared.concurrent_actor import (
+        annotate_excluded_notes as _annotate_actor_notes,
+    )
+    from shared.concurrent_actor import (
         describe_concurrent_actor as _describe_concurrent_actor,
     )
 except Exception:  # noqa: BLE001 -- broad by design: evidence must fail open
     _describe_concurrent_actor = None  # pragma: no cover - partial install
+    _annotate_actor_notes = None  # pragma: no cover - partial install
+    _actor_evidence_from_note = None  # pragma: no cover - partial install
 
 try:
     # Fail-open self-referential-upstream warning (SA-0MVX35AUC003CNUD AC2/
@@ -3482,12 +3490,25 @@ def _annotate_excluded_churn_notes(
 
     Returns:
         ``(annotated_notes, actor_evidence)``.
+
+    A note the guard already annotated carries the shared marker; its evidence
+    is adopted for every note (and no second lookup is spent), so the outer
+    guard's signal is never duplicated as it passes into the finish report
+    (WL-0MWR1P1F3008AH3V).
     """
-    evidence = _main_checkout_actor_evidence(
-        repo_root, worktree_path, work_item_id
-    )
-    annotated = [f"{note} [likely actor: {evidence}]" for note in notes]
-    return annotated, evidence
+    evidence = ""
+    if _actor_evidence_from_note is not None:
+        for note in notes:
+            evidence = _actor_evidence_from_note(note)
+            if evidence:
+                break
+    if not evidence:
+        evidence = _main_checkout_actor_evidence(
+            repo_root, worktree_path, work_item_id
+        )
+    if _annotate_actor_notes is not None:
+        return _annotate_actor_notes(notes, evidence), evidence
+    return [f"{note} [likely actor: {evidence}]" for note in notes], evidence
 
 
 def _main_checkout_guard_message(
@@ -10525,6 +10546,19 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
         sections.append(
             "Live-repo mutation detected:\n" + _tail_text(str(mutation))
         )
+    # Excluded foreign churn never fails the gate, but a red gate must not drop
+    # it: a mutation and an excluded concurrent write can coexist, and the
+    # operator has to be able to tell them apart (WL-0MWR1P1F3008AH3V).
+    excluded_notes = [
+        str(n).strip()
+        for n in (test_result.get("live_repo_excluded") or [])
+        if str(n).strip()
+    ]
+    if excluded_notes:
+        sections.append(
+            "Excluded foreign churn (not counted in the verdict):\n"
+            + "\n".join(f"- {note}" for note in excluded_notes[:20])
+        )
     facts = _render_gate_facts(_gate_facts(test_result, _gate_exit_code(test_result)))
     if facts:
         sections.append("Gate facts:\n" + facts)
@@ -13317,6 +13351,27 @@ def phase_finish(
             _gate_attempt_record(test_attempts + 1, test_result)
         )
 
+    # Working-tree churn attributed to a concurrent session is excluded from
+    # the guard's verdict but is never silent: surface the note in the finish
+    # output and the JSON report so the operator can tell an excluded foreign
+    # change from a clean run (SA-0MUIJAHXS003M7BG AC3). Each note also carries
+    # the documented actor second signal (WL-0MWR1OYAJ000UVJS AC4): the likely
+    # owner when discoverable, else an explicit ``unknown``. Attribution is
+    # informational and never changes the verdict. The notes are attached to
+    # the result *before* the failure branch so a red gate reports the excluded
+    # foreign churn beside the mutation instead of dropping it
+    # (WL-0MWR1P1F3008AH3V).
+    excluded_churn = list(test_result.get("live_repo_excluded") or [])
+    if excluded_churn:
+        annotated_notes, actor_evidence = _annotate_excluded_churn_notes(
+            excluded_churn, repo_root, worktree_path, work_item_id
+        )
+        test_result["live_repo_excluded"] = annotated_notes
+        report["live_repo_excluded"] = annotated_notes
+        report["live_repo_actor_evidence"] = actor_evidence
+        for note in annotated_notes:
+            LOG.info("Live-repo guard note: %s", note)
+
     if not test_result["success"]:
         msg = (
             f"Tests failed after {max_retry} retries.\n\n"
@@ -13338,23 +13393,6 @@ def phase_finish(
         else:
             LOG.error(msg)
         return report
-
-    # Working-tree churn attributed to a concurrent session is excluded from
-    # the guard's verdict but is never silent: surface the note in the finish
-    # output and the JSON report so the operator can tell an excluded foreign
-    # change from a clean run (SA-0MUIJAHXS003M7BG AC3). Each note also carries
-    # the documented actor second signal (WL-0MWR1OYAJ000UVJS AC4): the likely
-    # owner when discoverable, else an explicit ``unknown``. Attribution is
-    # informational and never changes the verdict.
-    excluded_churn = list(test_result.get("live_repo_excluded") or [])
-    if excluded_churn:
-        annotated_notes, actor_evidence = _annotate_excluded_churn_notes(
-            excluded_churn, repo_root, worktree_path, work_item_id
-        )
-        report["live_repo_excluded"] = annotated_notes
-        report["live_repo_actor_evidence"] = actor_evidence
-        for note in annotated_notes:
-            LOG.info("Live-repo guard note: %s", note)
 
     # ── Step 3a: Full-suite coverage stays at the dev-push gate ─────
     # (SA-0MVECQUGF0064U81 — defer full-suite testing to integration.) The

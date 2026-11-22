@@ -543,18 +543,21 @@ surfaced as ``live_repo_excluded`` (a list of notes) in the ``run_tests.py``
 result JSON, as ``note:`` lines in its text output, printed by the inner plugin
 at session end, and logged by ``implement.py finish``'s test gate.
 
-**Actor attribution is a documented second signal, never a substitute.** When
-``implement.py finish`` surfaces an excluded-churn note it appends
-``[likely actor: …]`` using the read-only, best-effort
-``skill/shared/concurrent_actor.py`` helper (WL-0MWR1OYAJ000UVJS). The helper
-examines the main checkout's and sibling worktrees' ``.implement_state.json``
-files, one bounded ``wl`` claim lookup, the main-checkout lock holder and live
-``/proc`` sessions, and falls back to the explicit string ``unknown`` when no
-single owner is discoverable. The attribution is informational only — it never
-changes the verdict (a green run stays green, a red run stays red), it never
-excuses a tracked-file deletion, and it is never derived from a path name. The
-helper runs only when ``finish`` builds its note or a failure message; the
-per-test guard path never invokes it and performs no attribution work.
+**Actor attribution is a documented second signal, never a substitute.** The
+outer ``guarded_run_all``, the inner plugin and ``implement.py finish`` append
+``[likely actor: …]`` to every excluded-churn note using the read-only,
+best-effort ``skill/shared/concurrent_actor.py`` helper
+(WL-0MWR1OYAJ000UVJS, wired by WL-0MWR1P1F3008AH3V). The helper examines the
+main checkout's and sibling worktrees' ``.implement_state.json`` files, one
+bounded ``wl`` claim lookup, the main-checkout lock holder and live ``/proc``
+sessions, and falls back to the explicit string ``unknown`` when no single
+owner is discoverable. A real mutation still fails and names every mutated
+checkout and path, with the same evidence appended when the main checkout is
+the mutated checkout. The attribution is informational only — it never changes
+the verdict (a green run stays green, a red run stays red), it never excuses a
+tracked-file deletion, and it is never derived from a path name. The helper
+runs at most once per guarded run, when a note or failure message is built;
+the per-test guard path never invokes it and performs no attribution work.
 
 **Blind spots (accepted, pinned).**
 
