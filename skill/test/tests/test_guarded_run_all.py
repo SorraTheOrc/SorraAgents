@@ -471,10 +471,10 @@ def test_guarded_run_fast_forward_of_main_checkout_dev_is_expected_churn(
 # DELETION in the main checkout (the 2026-10-26 wipe class) stays
 # verdict-bearing.
 #
-# Test-first: the narrowing tests are ``xfail(strict=True)`` tracer bullets
-# until the implementation sibling WL-0MWR1OXHX001KJC6 removes the markers
+# Test-first: the narrowing tests were ``xfail(strict=True)`` tracer bullets
+# until the implementation sibling WL-0MWR1OXHX001KJC6 removed the markers
 # (the wiring sibling WL-0MWR1P1F3008AH3V carries the reporting half). The
-# deletion pin is green today.
+# deletion pin was green from the start.
 
 
 _MAIN_CHECKOUT_CHURN_CASES = (
@@ -516,10 +516,6 @@ def _sibling_main_checkout_command(tmp_path: Path, main: Path, body: str) -> str
     return f"{sys.executable} {script}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="narrowed main-checkout verdict lands in WL-0MWR1OXHX001KJC6",
-)
 @pytest.mark.parametrize("path,code,body", _MAIN_CHECKOUT_CHURN_CASES)
 def test_guarded_run_ignores_main_checkout_churn(
     tmp_path, monkeypatch, path, code, body

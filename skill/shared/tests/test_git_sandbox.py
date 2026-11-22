@@ -33,8 +33,8 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
   session mid-run is informational, while a tracked-file deletion (` D`/`D `)
   in the main checkout still fails (the 2026-10-26 `packages/shared` wipe
   class). The **guarded root** keeps full clean→dirty sensitivity. The
-  new-behaviour tests are red-for-the-right-reason via `xfail(strict=True)`
-  until the implementation sibling WL-0MWR1OXHX001KJC6 removes the markers;
+  implementation lands in WL-0MWR1OXHX001KJC6, which removed the `xfail`
+  markers once the rule was in place;
 - concurrency ref-namespace exclusion (WL-0MV5MYBKJ0033P8U): moving only
   ``refs/heads/dev``, only ``refs/remotes/origin/dev`` or any
   ``refs/remotes/origin/*`` ref (a sibling ``finish`` fast-forward, a
@@ -1466,11 +1466,11 @@ class TestGuardedRoots:
 # tracked-file DELETION in the main checkout) verdict-bearing and moves the
 # concurrent-session shapes (` M`, `??`, `M `) into the informational bucket.
 #
-# Test-first: the new-behaviour tests are `xfail(strict=True)` tracer bullets
+# Test-first: the new-behaviour tests were `xfail(strict=True)` tracer bullets
 # (same convention as the ownership pins above) until the implementation
-# sibling WL-0MWR1OXHX001KJC6 removes the markers. The retained-behaviour pins
-# (deletion, guarded root, refs) are green today and are deliberately unmarked —
-# an unexpected pass under strict xfail would itself be a failure.
+# sibling WL-0MWR1OXHX001KJC6 removed the markers. The retained-behaviour pins
+# (deletion, guarded root, refs) were green from the start and are deliberately
+# unmarked.
 
 
 class TestMainCheckoutRoleScopedVerdict:
@@ -1482,10 +1482,6 @@ class TestMainCheckoutRoleScopedVerdict:
     checkout** narrows.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="main-checkout ` M` narrowing lands in WL-0MWR1OXHX001KJC6",
-    )
     def test_main_checkout_modified_tracked_file_is_informational(self, tmp_path):
         """2026-11-13 shape: a sibling ` M` in the main checkout is a note."""
         main, worktree = _main_with_worktree(tmp_path)
@@ -1503,10 +1499,6 @@ class TestMainCheckoutRoleScopedVerdict:
         assert "[ M]" in notes[0]
         assert str(main.resolve()) in notes[0]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="main-checkout `??` narrowing lands in WL-0MWR1OXHX001KJC6",
-    )
     def test_main_checkout_untracked_creation_is_informational(self, tmp_path):
         """2026-11-13 shape: a sibling `??` in the main checkout is a note."""
         main, worktree = _main_with_worktree(tmp_path)
@@ -1523,10 +1515,6 @@ class TestMainCheckoutRoleScopedVerdict:
         assert "[??]" in notes[0]
         assert str(main.resolve()) in notes[0]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="main-checkout `M ` narrowing lands in WL-0MWR1OXHX001KJC6",
-    )
     def test_main_checkout_staged_modification_is_informational(self, tmp_path):
         """2026-11-13 shape: a sibling `M ` in the main checkout is a note."""
         main, worktree = _main_with_worktree(tmp_path)

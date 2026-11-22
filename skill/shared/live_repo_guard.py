@@ -80,6 +80,19 @@ another session's *uncommitted* work, the deliberately retained clean→dirty
 false-positive direction, and invisible content-only changes to an
 already-dirty path. Derivation is git plumbing (``git status`` codes across
 the two snapshots), never a ``wl-*`` or path-name pattern.
+
+Role-scoped main-checkout verdict (WL-0MWR1OXHX001KJC6)
+-----------------------------------------------------
+
+This plugin inherits the role-scoped rule straight from
+``diff_guarded_roots`` — it runs no comparison of its own. The guarded root
+keeps full clean→dirty sensitivity, while a clean→dirty path in the shared
+**main checkout** is verdict-bearing only when it reports a tracked-file
+deletion (``D`` in either status column, the 2026-10-26 ``packages/shared``
+wipe class). A sibling session's mid-run `` M``/``??``/``M `` write to the
+main checkout is therefore informational: it becomes an ``excluded: …`` note
+accumulated across tests and printed at session end, never a failure. Refs and
+config stay fully verdict-bearing on both roots.
 """
 
 from __future__ import annotations

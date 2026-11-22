@@ -1216,10 +1216,10 @@ class TestWorkingTreeAttributionNested:
 # green, note names the path/code/checkout), while a tracked-file DELETION in
 # the main checkout still fails the session and names the checkout and path.
 #
-# Test-first: the narrowing tests are ``xfail(strict=True)`` tracer bullets
-# until the implementation sibling WL-0MWR1OXHX001KJC6 removes the markers (the
+# Test-first: the narrowing tests were ``xfail(strict=True)`` tracer bullets
+# until the implementation sibling WL-0MWR1OXHX001KJC6 removed the markers (the
 # wiring sibling WL-0MWR1P1F3008AH3V carries the reporting half). The deletion
-# pin is green today and is deliberately unmarked.
+# pin was green from the start and is deliberately unmarked.
 
 _MAIN_CHECKOUT_CHURN_CASES = (
     pytest.param(
@@ -1256,10 +1256,6 @@ def _write_sibling_mutator(worktree: Path, main: Path, body: str) -> None:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="narrowed main-checkout verdict lands in WL-0MWR1OXHX001KJC6",
-)
 @pytest.mark.parametrize("path,code,body", _MAIN_CHECKOUT_CHURN_CASES)
 def test_worktree_run_ignores_main_checkout_churn(tmp_path, path, code, body):
     """The inner guard reaches the narrowed (green) verdict and names the path."""
@@ -1303,10 +1299,6 @@ def test_worktree_run_still_fails_on_staged_main_checkout_deletion(tmp_path):
     assert "main checkout" in combined, combined
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="narrowed main-checkout verdict lands in WL-0MWR1OXHX001KJC6",
-)
 def test_both_guards_agree_on_narrowed_main_checkout_churn(tmp_path, monkeypatch):
     """AC5 parity: the inner plugin and the outer guard reach the same verdict.
 
