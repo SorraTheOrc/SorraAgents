@@ -28,6 +28,13 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
   mutation. The rule's blind spots (masked revert/delete of another session's
   uncommitted work, the retained clean→dirty direction, invisible content-only
   changes) are pinned by characterisation tests;
+- role-scoped verdict (WL-0MWR1OUF7009FG4I): only the **main checkout** root
+  narrows — a newly dirty ` M`, `??` or `M ` path written by a concurrent
+  session mid-run is informational, while a tracked-file deletion (` D`/`D `)
+  in the main checkout still fails (the 2026-10-26 `packages/shared` wipe
+  class). The **guarded root** keeps full clean→dirty sensitivity. The
+  new-behaviour tests are red-for-the-right-reason via `xfail(strict=True)`
+  until the implementation sibling WL-0MWR1OXHX001KJC6 removes the markers;
 - concurrency ref-namespace exclusion (WL-0MV5MYBKJ0033P8U): moving only
   ``refs/heads/dev``, only ``refs/remotes/origin/dev`` or any
   ``refs/remotes/origin/*`` ref (a sibling ``finish`` fast-forward, a
@@ -1445,6 +1452,149 @@ class TestGuardedRoots:
             guarded["roots"][0]["diff"]
         )
         assert "refs/heads/feature-x" in gs.describe_guarded_diff(guarded)
+
+
+# ---------------------------------------------------------------------------
+# WL-0MWR1OUF7009FG4I — role-scoped verdict: the MAIN CHECKOUT narrows to the
+# tracked-file deletion / wipe class; the guarded root stays fully sensitive.
+# ---------------------------------------------------------------------------
+# The producer approved mechanism (A) for the 2026-11-13 false positive: a
+# sibling session wrote `.ts` sources into the shared main checkout *during* a
+# worktree-scoped run, so the start-of-run snapshot was clean and the end
+# snapshot reported the foreign `added path [ M]` / `[??]` shapes as suite
+# damage. The narrowed rule keeps the 2026-10-26 `packages/shared` wipe class (a
+# tracked-file DELETION in the main checkout) verdict-bearing and moves the
+# concurrent-session shapes (` M`, `??`, `M `) into the informational bucket.
+#
+# Test-first: the new-behaviour tests are `xfail(strict=True)` tracer bullets
+# (same convention as the ownership pins above) until the implementation
+# sibling WL-0MWR1OXHX001KJC6 removes the markers. The retained-behaviour pins
+# (deletion, guarded root, refs) are green today and are deliberately unmarked —
+# an unexpected pass under strict xfail would itself be a failure.
+
+
+class TestMainCheckoutRoleScopedVerdict:
+    """`diff_guarded_roots` role-scopes the main checkout's verdict surface.
+
+    The guarded root keeps the rule documented in `test-isolation.md` §8.5 —
+    every clean→dirty transition is verdict-bearing, pinned by
+    :class:`TestWorkingTreeAttributionIncidents`; only the shared **main
+    checkout** narrows.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="main-checkout ` M` narrowing lands in WL-0MWR1OXHX001KJC6",
+    )
+    def test_main_checkout_modified_tracked_file_is_informational(self, tmp_path):
+        """2026-11-13 shape: a sibling ` M` in the main checkout is a note."""
+        main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+
+        (main / "tracked.txt").write_text("sibling edit\n", encoding="utf-8")
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is False, gs.describe_guarded_diff(diff)
+        assert gs.describe_guarded_diff(diff) == "  (no differences)"
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1, notes
+        assert gs.EXCLUDED_CHURN_NOTE_PREFIX in notes[0]
+        assert "tracked.txt" in notes[0]
+        assert "[ M]" in notes[0]
+        assert str(main.resolve()) in notes[0]
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="main-checkout `??` narrowing lands in WL-0MWR1OXHX001KJC6",
+    )
+    def test_main_checkout_untracked_creation_is_informational(self, tmp_path):
+        """2026-11-13 shape: a sibling `??` in the main checkout is a note."""
+        main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+
+        (main / "sibling-new.ts").write_text("sibling work\n", encoding="utf-8")
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is False, gs.describe_guarded_diff(diff)
+        assert gs.describe_guarded_diff(diff) == "  (no differences)"
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1, notes
+        assert "sibling-new.ts" in notes[0]
+        assert "[??]" in notes[0]
+        assert str(main.resolve()) in notes[0]
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="main-checkout `M ` narrowing lands in WL-0MWR1OXHX001KJC6",
+    )
+    def test_main_checkout_staged_modification_is_informational(self, tmp_path):
+        """2026-11-13 shape: a sibling `M ` in the main checkout is a note."""
+        main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+
+        (main / "tracked.txt").write_text("sibling edit\n", encoding="utf-8")
+        gs.run_git(main, ["add", "tracked.txt"], check=True)
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is False, gs.describe_guarded_diff(diff)
+        assert gs.describe_guarded_diff(diff) == "  (no differences)"
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 1, notes
+        assert "tracked.txt" in notes[0]
+        assert "[M ]" in notes[0]
+        assert str(main.resolve()) in notes[0]
+
+    def test_main_checkout_staged_deletion_still_fails(self, tmp_path):
+        """Wipe protection: a `D ` deletion in the main checkout still fails.
+
+        This is the 2026-10-26 ``packages/shared`` class the narrowed rule must
+        never let through. The unstaged `` D`` shape is already pinned by
+        :meth:`TestGuardedRoots.test_main_checkout_tracked_file_deletion_is_reported`;
+        this pins the staged ``D `` shape the narrowing must also retain.
+        """
+        main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+
+        gs.run_git(main, ["rm", "tracked.txt"], check=True)
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is True
+        by_role = {entry["role"]: entry for entry in diff["roots"]}
+        assert by_role[gs.MAIN_CHECKOUT_ROLE]["diff"]["status"]["added"] == {
+            "tracked.txt": "D "
+        }
+        assert gs.excluded_churn_notes(diff) == []
+        text = gs.describe_guarded_diff(diff)
+        assert "tracked.txt" in text, text
+        assert str(main.resolve()) in text, text
+        assert "main checkout" in text, text
+
+    def test_role_scope_does_not_widen_to_the_guarded_root(self, tmp_path):
+        """The guarded root keeps full clean→dirty sensitivity."""
+        _main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+
+        (worktree / "tracked.txt").write_text("suite damage\n", encoding="utf-8")
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is True
+        by_role = {entry["role"]: entry for entry in diff["roots"]}
+        assert by_role[gs.GUARDED_ROOT_ROLE]["diff"]["changed"] is True
+        assert by_role[gs.MAIN_CHECKOUT_ROLE]["diff"]["changed"] is False
+        assert "tracked.txt" in gs.describe_guarded_diff(diff)
+        assert gs.excluded_churn_notes(diff) == []
+
+    def test_main_checkout_ref_move_is_still_verdict_bearing(self, tmp_path):
+        """Role-scoping narrows the working tree only — refs stay monitored."""
+        main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+
+        gs.run_git(main, ["branch", "intruder"], check=True)
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is True
+        assert "refs/heads/intruder" in gs.describe_guarded_diff(diff)
+        assert gs.excluded_churn_notes(diff) == []
 
 
 # ---------------------------------------------------------------------------

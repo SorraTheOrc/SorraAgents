@@ -1204,3 +1204,155 @@ class TestWorkingTreeAttributionNested:
         assert "live-repo mutation" in combined, combined
         assert "test_creates_an_untracked_file" in combined, combined
         assert "artefact.txt" in combined, combined
+
+
+# ---------------------------------------------------------------------------
+# WL-0MWR1OUF7009FG4I — role-scoped main-checkout verdict (inner-plugin parity)
+# ---------------------------------------------------------------------------
+# The inner ``live_repo_guard`` plugin must reach the SAME verdict as the outer
+# ``guarded_run_all`` for the narrowed main-checkout surface — it inherits the
+# shared helper, never a forked rule. A sibling session's mid-run `` M`` /
+# ``??`` / ``M `` writes to the main checkout are informational (session stays
+# green, note names the path/code/checkout), while a tracked-file DELETION in
+# the main checkout still fails the session and names the checkout and path.
+#
+# Test-first: the narrowing tests are ``xfail(strict=True)`` tracer bullets
+# until the implementation sibling WL-0MWR1OXHX001KJC6 removes the markers (the
+# wiring sibling WL-0MWR1P1F3008AH3V carries the reporting half). The deletion
+# pin is green today and is deliberately unmarked.
+
+_MAIN_CHECKOUT_CHURN_CASES = (
+    pytest.param(
+        "README.md",
+        "[ M]",
+        "(Path(MAIN) / 'README.md').write_text('sibling edit\\n')\n",
+        id="modified-tracked",
+    ),
+    pytest.param(
+        "sibling-new.ts",
+        "[??]",
+        "(Path(MAIN) / 'sibling-new.ts').write_text('sibling work\\n')\n",
+        id="untracked-creation",
+    ),
+    pytest.param(
+        "README.md",
+        "[M ]",
+        "(Path(MAIN) / 'README.md').write_text('sibling edit\\n')\n"
+        "subprocess.run(['git', '-C', str(MAIN), 'add', 'README.md'], check=True)\n",
+        id="staged-modification",
+    ),
+)
+
+
+def _write_sibling_mutator(worktree: Path, main: Path, body: str) -> None:
+    """A nested pytest test that plays the concurrent sibling writing *main*."""
+    (worktree / "test_sibling_writes_main.py").write_text(
+        "import subprocess\n"
+        "from pathlib import Path\n\n"
+        f"MAIN = Path({str(main)!r})\n\n"
+        "def test_sibling_writes_the_main_checkout():\n"
+        + textwrap.indent(body, "    "),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="narrowed main-checkout verdict lands in WL-0MWR1OXHX001KJC6",
+)
+@pytest.mark.parametrize("path,code,body", _MAIN_CHECKOUT_CHURN_CASES)
+def test_worktree_run_ignores_main_checkout_churn(tmp_path, path, code, body):
+    """The inner guard reaches the narrowed (green) verdict and names the path."""
+    main, worktree = _main_with_linked_guard_worktree(tmp_path)
+    _write_guard_conftest(worktree)
+    _write_sibling_mutator(worktree, main, body)
+
+    proc = _run_nested_pytest(worktree)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    assert "live-repo mutation" not in combined, combined
+    assert gs.EXCLUDED_CHURN_NOTE_PREFIX in combined, combined
+    assert path in combined, combined
+    assert code in combined, combined
+    assert str(main.resolve()) in combined, combined
+
+
+def test_worktree_run_still_fails_on_staged_main_checkout_deletion(tmp_path):
+    """Wipe protection: a `D ` deletion in the main checkout still fails.
+
+    Companion to ``test_worktree_run_deleting_a_main_checkout_file_is_failed_and_named``
+    (which pins the unstaged `` D`` shape); the inner plugin must retain every
+    tracked-file deletion in the main checkout.
+    """
+    main, worktree = _main_with_linked_guard_worktree(tmp_path)
+    _write_guard_conftest(worktree)
+    _write_sibling_mutator(
+        worktree,
+        main,
+        "subprocess.run(['git', '-C', str(MAIN), 'rm', 'README.md'], check=True)\n",
+    )
+
+    proc = _run_nested_pytest(worktree)
+
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, combined
+    assert "live-repo mutation" in combined, combined
+    assert "README.md" in combined, combined
+    assert str(main.resolve()) in combined, combined
+    assert "main checkout" in combined, combined
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="narrowed main-checkout verdict lands in WL-0MWR1OXHX001KJC6",
+)
+def test_both_guards_agree_on_narrowed_main_checkout_churn(tmp_path, monkeypatch):
+    """AC5 parity: the inner plugin and the outer guard reach the same verdict.
+
+    No forked rule: for the same concurrent-sibling `` M`` shape both must be
+    green and name the same path and status code.
+    """
+    # -- inner plugin: a nested pytest run whose test writes the main checkout.
+    inner_main, inner_worktree = _main_with_linked_guard_worktree(tmp_path / "inner")
+    _write_guard_conftest(inner_worktree)
+    _write_sibling_mutator(
+        inner_worktree,
+        inner_main,
+        "(Path(MAIN) / 'README.md').write_text('sibling edit\\n')\n",
+    )
+    inner = _run_nested_pytest(inner_worktree)
+    inner_text = inner.stdout + inner.stderr
+
+    # -- outer guard: the same sibling shape driven through guarded_run_all.
+    outer_main, outer_worktree = _main_with_linked_guard_worktree(tmp_path / "outer")
+    mutator = tmp_path / "outer_sibling_write.py"
+    mutator.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(outer_main / 'README.md')!r}).write_text('sibling edit\\n')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv(MARKER_ENV, raising=False)
+    outer = guarded_run_all(
+        outer_worktree,
+        timeout=120,
+        suites=("all",),
+        commands=[f"{sys.executable} {mutator}"],
+        scope="full",
+        use_cache=False,
+        no_cache=True,
+    )
+
+    assert inner.returncode == 0, inner_text
+    assert "live-repo mutation" not in inner_text, inner_text
+    assert outer["success"] is True, outer.get("live_repo_mutation")
+    assert "live_repo_mutation" not in outer
+
+    inner_notes = [
+        line
+        for line in inner_text.splitlines()
+        if gs.EXCLUDED_CHURN_NOTE_PREFIX in line
+    ]
+    outer_notes = outer.get("live_repo_excluded") or []
+    assert any("README.md" in n and "[ M]" in n for n in inner_notes), inner_text
+    assert any("README.md" in n and "[ M]" in n for n in outer_notes), outer_notes
