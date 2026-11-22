@@ -24,10 +24,12 @@ Behaviour under test (``skill/shared/git_sandbox.py``):
 - working-tree attribution (SA-0MUIJAHXS003M7BG): a status entry that
   disappears was non-clean at snapshot start, so its resolution is concurrent
   churn excluded from the verdict (reported as a note), while a newly dirty
-  path — modified, deleted or created from a clean start — is still a
-  mutation. The rule's blind spots (masked revert/delete of another session's
-  uncommitted work, the retained clean→dirty direction, invisible content-only
-  changes) are pinned by characterisation tests;
+  path in the **guarded root** — modified, deleted or created from a clean
+  start — is still a mutation. The rule's blind spots (masked revert/delete of
+  another session's uncommitted work, invisible content-only changes) are
+  pinned by characterisation tests; the clean→dirty direction is role-scoped by
+  the verdict pins below (full strength on the guarded root, tracked-file
+  deletions only in the main checkout);
 - role-scoped verdict (WL-0MWR1OUF7009FG4I): only the **main checkout** root
   narrows — a newly dirty ` M`, `??` or `M ` path written by a concurrent
   session mid-run is informational, while a tracked-file deletion (` D`/`D `)
@@ -1176,12 +1178,16 @@ class TestWorkingTreeAttributionIncidents:
 
 
 class TestWorkingTreeAttributionBoundaries:
-    """AC4: pinned boundaries — what the rule does *not* do.
+    """AC4: pinned boundaries — what the **guarded-root** rule does *not* do.
 
-    These characterisation tests pin the chosen rule's blind spots and its
+    These characterisation tests pin the guarded root's blind spots and its
     retained sensitivity so a later refactor cannot silently widen or narrow
     them; they are documented in ``git_sandbox``'s module docstring and
-    ``docs/dev/test-isolation.md`` §8.5.
+    ``docs/dev/test-isolation.md`` §8.5. The clean→dirty direction is
+    **role-scoped** (WL-0MWR1OXHX001KJC6): the pins here keep full strength for
+    the guarded root, while the main checkout's narrowed direction is pinned by
+    :class:`TestMainCheckoutRoleScopedVerdict` (its new-behaviour shapes must
+    stay informational there) and documented as §8.5's blind spot #2.
     """
 
     @staticmethod
@@ -1557,6 +1563,40 @@ class TestMainCheckoutRoleScopedVerdict:
         assert str(main.resolve()) in text, text
         assert "main checkout" in text, text
 
+    def test_narrowed_bucket_json_contract_is_auditable(self, tmp_path):
+        """The excluded bucket's JSON shape matches §8.5's documented contract.
+
+        The reference documents ``excluded.status`` with disjoint ``removed``
+        (resolved pre-existing dirt) and ``narrowed`` (main-checkout
+        non-deletion churn) buckets, merged by ``excluded_working_tree_churn``
+        and rendered by ``excluded_churn_notes``. An auditor relies on those
+        names, so a rename or a silent bucket merge must fail here.
+        """
+        main, worktree = _main_with_worktree(tmp_path)
+        before = gs.snapshot_guarded_roots(worktree)
+
+        (main / "tracked.txt").write_text("sibling edit\n", encoding="utf-8")
+        (main / "sibling-new.ts").write_text("sibling work\n", encoding="utf-8")
+
+        diff = gs.diff_guarded_roots(before, gs.snapshot_guarded_roots(worktree))
+        assert diff["changed"] is False, gs.describe_guarded_diff(diff)
+        by_role = {entry["role"]: entry["diff"] for entry in diff["roots"]}
+        main_diff = by_role[gs.MAIN_CHECKOUT_ROLE]
+        assert main_diff["status"] == {"added": {}, "changed": {}}
+        assert main_diff["excluded"]["status"]["narrowed"] == {
+            "sibling-new.ts": "??",
+            "tracked.txt": " M",
+        }
+        # The two buckets are disjoint: nothing was resolved in this run.
+        assert main_diff["excluded"]["status"].get("removed", {}) == {}
+        assert gs.excluded_working_tree_churn(main_diff) == {
+            "sibling-new.ts": "??",
+            "tracked.txt": " M",
+        }
+        notes = gs.excluded_churn_notes(diff)
+        assert len(notes) == 2, notes
+        assert all(note.startswith(gs.EXCLUDED_CHURN_NOTE_PREFIX) for note in notes)
+
     def test_role_scope_does_not_widen_to_the_guarded_root(self, tmp_path):
         """The guarded root keeps full clean→dirty sensitivity."""
         _main, worktree = _main_with_worktree(tmp_path)
@@ -1727,8 +1767,16 @@ class TestOwnCheckoutState:
         assert comp["moved"] is True, "content-only rewrite of a dirty path moves"
         assert comp["attributed"] == []
 
-    def test_clean_to_dirty_is_a_retained_move_direction(self, tmp_path: Path) -> None:
-        """A path dirtying from a clean start is a move (incident direction)."""
+    def test_clean_to_dirty_on_the_guarded_root_is_a_move(
+        self, tmp_path: Path
+    ) -> None:
+        """A guarded-root path dirtying from a clean start is still a move.
+
+        This surface is taken on the **guarded root only**, so the §8.5
+        role-scoping of the shared main checkout does not reach it: the run's
+        own checkout keeps full clean→dirty sensitivity (the role contrast is
+        pinned by :class:`TestMainCheckoutRoleScopedVerdict`).
+        """
         repo = gs.init_repo(tmp_path / "repo", default_branch="dev")
         (repo / "tracked.txt").write_text("one\n", encoding="utf-8")
         gs.commit_all(repo, "init")

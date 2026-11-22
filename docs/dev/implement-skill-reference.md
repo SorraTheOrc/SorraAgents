@@ -2120,17 +2120,38 @@ checkout**, so the main checkout's own churn is never a failure:
 - `refs/worklog/*` (worklog tooling refs).
 
 Working-tree churn is attributed rather than excluded wholesale
-(SA-0MUIJAHXS003M7BG): a path that was **already dirty at run start** and is
-clean at run end was resolved during the run (a sibling session committing work
-it had itself dirtied in the shared checkout), so it does not fail the run. It
-is never silent — the run result carries the note
+(SA-0MUIJAHXS003M7BG), and the attribution is **role-scoped** by root
+(WL-0MWR1OXHX001KJC6) in the shared `diff_guarded_roots`: a path that was
+**already dirty at run start** and is clean at run end was resolved during the
+run (a sibling session committing work it had itself dirtied in the shared
+checkout), so it does not fail the run on **either** root. A path in the
+**guarded root** that becomes dirty from a clean start is still a mutation
+(delete/modify/create), and so is a path that stays dirty with a different
+status code. The shared **main checkout** narrows that direction to the damage
+class a suite can plausibly cause — a **tracked-file deletion** (`D` in either
+column, the 2026-10-26 `packages/shared` wipe class): a newly dirty ` M`,
+`M `, `MM`, `??` or staged-addition path there is excluded as
+concurrent-session churn. Refs and config stay fully verdict-bearing on both
+roots. The excluded entries are never silent: the run result carries the note
 (`excluded: concurrently resolved working-tree change in <checkout>: <path>
-[<code>]`) and `implement.py finish`'s test gate logs it
+[<code>]`), both buckets are named in the result's `excluded.status`
+(`removed` for resolved pre-existing dirt, `narrowed` for the main checkout's
+non-deletion shapes), and `implement.py finish`'s test gate logs it
 (`Live-repo guard note: …`) plus records it in the JSON report under
-`live_repo_excluded`. A path that becomes dirty from a clean start is still a
-mutation (delete/modify/create), and so is a path that stays dirty with a
-different status code. Full rule and pinned blind spots: §8.5 of
-[test-isolation.md](test-isolation.md).
+`live_repo_excluded`. Full rule, the excluded-bucket JSON contract and the
+pinned blind spots: §8.5 of [test-isolation.md](test-isolation.md).
+
+**What a finish-time excluded note means.** A `live_repo_excluded` note on a
+finish report is the gate's record of churn it **attributed away**: foreign
+working-tree movement in the main checkout (or a resolved pre-dirty path) that
+did **not** fail the run and did **not** block the push. It is informational —
+the gate's verdict is derived from the plumbing rule above, never from the note
+— and it names the checkout, path and status code plus the likely owner
+(`[likely actor: …]`, or the explicit `unknown` fallback described under
+*Concurrent-actor evidence*). A genuine mutation is **not** reported as a note:
+`live_repo_mutation` still fails the finish gate and is still classified
+`GATE_FAILURE_INFRASTRUCTURE` (`kind: infrastructure`), naming every mutated
+checkout and path, so a red gate can never be mistaken for excluded churn.
 
 A **failure names the mutated checkout and every mutated path in it**, e.g.:
 

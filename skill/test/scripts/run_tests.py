@@ -76,7 +76,14 @@ own branch stays monitored (SA-0MV8311B3005DNG8). The guard also covers the
 **main checkout** whenever the guarded root is a linked worktree — the two
 exclusions are applied per checkout, so a worktree-scoped run that unlinks a
 tracked file in the main checkout can no longer be reported green
-(WL-0MVPE2BY9001CR9O). See also the repo-root
+(WL-0MVPE2BY9001CR9O). The working-tree verdict is **role-scoped**
+(WL-0MWR1OXHX001KJC6): the guarded root keeps full clean→dirty sensitivity
+while a clean→dirty path in the shared main checkout is verdict-bearing only
+for a **tracked-file deletion** (`D` in either column — the 2026-10-26
+`packages/shared` wipe class); its modified (` M`, `M `, `MM`), untracked
+(`??`) and staged-addition shapes are excluded as concurrent-session churn and
+surfaced as `live_repo_excluded` notes
+(`docs/dev/test-isolation.md` §8.5). See also the repo-root
 ``conftest.py`` / ``skill/shared/live_repo_guard.py`` inner guard, which this
 outer guard stands down (SA-0MUG30J5F001L57H, SA-0MUH1MJL6003767Q).
 

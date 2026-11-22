@@ -76,10 +76,11 @@ instead of failing a test. Blind spots, pinned by
 ``TestWorkingTreeAttributionBoundaries`` in
 ``skill/shared/tests/test_git_sandbox.py`` and documented in
 ``docs/dev/test-isolation.md`` §8.5: masking a suite that reverts or deletes
-another session's *uncommitted* work, the deliberately retained clean→dirty
-false-positive direction, and invisible content-only changes to an
-already-dirty path. Derivation is git plumbing (``git status`` codes across
-the two snapshots), never a ``wl-*`` or path-name pattern.
+another session's *uncommitted* work, and invisible content-only changes to
+an already-dirty path. The clean→dirty direction is **role-scoped** by the
+rule below: full strength on the guarded root, tracked-file deletions only in
+the shared main checkout. Derivation is git plumbing (``git status`` codes
+across the two snapshots), never a ``wl-*`` or path-name pattern.
 
 Role-scoped main-checkout verdict (WL-0MWR1OXHX001KJC6)
 -----------------------------------------------------

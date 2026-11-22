@@ -76,16 +76,22 @@ hermetic suite never commits, checks out or reverts, so such a resolution is
 concurrent churn (a sibling session committing work it had already dirtied in
 the shared checkout) and is excluded from the verdict, reported instead as an
 informational note (``EXCLUDED_CHURN_NOTE_PREFIX``, AC1/AC3). Everything else
-stays a mutation (AC2): a path that was **clean at snapshot start** and is
-modified, deleted or created at snapshot end, and a path that is *still* dirty
-with a different status code. Derivations are status codes and snapshot
-provenance only — never a ``wl-*`` or path-name pattern (AC4).
+stays a mutation on the **guarded root** (AC2): a path that was **clean at
+snapshot start** and is modified, deleted or created at snapshot end, and a
+path that is *still* dirty with a different status code. The shared **main
+checkout** is role-scoped by the rule below (tracked-file deletions only).
+Derivations are status codes and snapshot provenance only — never a ``wl-*`` or
+path-name pattern (AC4).
 
 Pinned blind spots (AC4, ``TestWorkingTreeAttributionBoundaries``): a suite
 that reverts or deletes another session's *uncommitted* work is masked (the
-path was pre-dirty, so its resolution is attributed), the clean→dirty
-false-positive direction is deliberately retained, and a content-only change
-to an already-dirty path is invisible to a status-code surface.
+path was pre-dirty, so its resolution is attributed), and a content-only change
+to an already-dirty path is invisible to a status-code surface. The third
+boundary — the clean→dirty direction — is **role-scoped** by the rule below:
+the guarded root keeps it at full strength, while the shared main checkout
+narrows it to the tracked-file deletion class, so a suite modifying or adding a
+path in the main checkout is no longer caught there (see §8.5 blind spot #2 in
+``docs/dev/test-isolation.md``).
 
 **Role-scoped verdict (WL-0MWR1OXHX001KJC6).** The clean→dirty direction is
 further narrowed by root *role* in :func:`diff_guarded_roots` — the only place
