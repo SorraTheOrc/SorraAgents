@@ -266,106 +266,137 @@ class TestMissingRunnerFailClosed:
 # ── Hook-like environment regression (AC2: GIT_DIR / GIT_INDEX_FILE) ──────────
 
 
+def _decoy_git_env_leak(tmp_path: Path) -> dict[str, str]:
+    """Build a throwaway repo and return its ``GIT_DIR`` / ``GIT_INDEX_FILE``.
+
+    Git hooks export a real repository's absolute ``GIT_DIR`` and
+    ``GIT_INDEX_FILE``; a non-hermetic fixture inherits them and writes into
+    that repository. Leaking the **live** checkout into a pipeline that
+    commits/merges would let a hermeticity regression corrupt the live repo
+    before the failure is even reported, so this uses a throwaway **decoy**
+    repository: a faithful stand-in (a real absolute git dir + index) with no
+    blast radius. The test additionally asserts the decoy is untouched, which
+    is a stronger proof of the scrub than "the pipeline happened to pass".
+    """
+    decoy = tmp_path / "decoy"
+    run_git(tmp_path, ["init", "-q", "-b", "dev", str(decoy)]).check_returncode()
+    run_git(decoy, ["config", "user.email", "decoy@example.invalid"]).check_returncode()
+    run_git(decoy, ["config", "user.name", "decoy"]).check_returncode()
+    (decoy / "decoy.txt").write_text("decoy\n", encoding="utf-8")
+    run_git(decoy, ["add", "decoy.txt"]).check_returncode()
+    run_git(decoy, ["commit", "-q", "-m", "decoy"]).check_returncode()
+    git_dir = run_git(decoy, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+    assert git_dir, "could not resolve the decoy git directory"
+    return {
+        "GIT_DIR": git_dir,
+        # The decoy is a normal (non-linked-worktree) repo, so its index is
+        # always ``<git_dir>/index``.
+        "GIT_INDEX_FILE": str(Path(git_dir) / "index"),
+    }
+
+
+def _decoy_state(decoy: Path) -> tuple[str, str, str]:
+    """The decoy's HEAD, refs and working-tree status (for an unchanged check)."""
+    return (
+        run_git(decoy, ["rev-parse", "HEAD"]).stdout.strip(),
+        run_git(decoy, ["for-each-ref", "--format=%(refname) %(objectname)"]).stdout,
+        run_git(decoy, ["status", "--porcelain=v1"]).stdout,
+    )
+
+
 class TestHookLikeEnvironment:
-    def test_passes_under_leaked_git_dir_and_index_file(
+    def test_module_pipeline_passes_under_leaked_git_dir_and_index_file(
         self, tmp_path: Path
     ) -> None:
-        """Regression: the module must survive a hook-like environment.
+        """Regression: the module is hermetic under a hook-like environment.
 
-        Git hooks export ``GIT_DIR`` (and often ``GIT_INDEX_FILE``) into the
-        hook process environment.  When a test module builds fixtures using
-        ambient ``git`` commands, those leaks make the fixture operations
-        target the live checkout instead of the fixture repo — the root
-        cause of the pre-push gate failures described in SA-0MVZQVDUY0011DQD.
+        SA-0MVZQVDUY0011DQD: under the pre-push hook the full-suite gate
+        inherited ``GIT_DIR`` / ``GIT_INDEX_FILE``; the fixture's git commands
+        then targeted the wrong repository, ``merge-dev-to-main.sh``
+        short-circuited and the stubbed suite runner was never invoked
+        (``FileNotFoundError: runner-marker.txt``).
 
-        This test exercises the full fixture pipeline under leaked
-        ``GIT_DIR`` / ``GIT_INDEX_FILE`` so that any future regression in
-        the fixture's hermeticity is caught immediately.
+        This runs the *whole* gate pipeline — fixture construction **and** the
+        release-script subprocess — in a child process whose environment leaks
+        an absolute ``GIT_DIR`` / ``GIT_INDEX_FILE`` exactly as a hook does. It
+        asserts the release proceeded, the full-suite gate actually ran, and
+        the leaked decoy repository was left untouched, so a regression in
+        either ``_git()``/``run_git()`` or ``_run_release()``'s env scrub is
+        caught (a weak ``run_git``-only probe would not be).
         """
-        live_repo = REPO_ROOT
-        # Capture the *current* working tree so pytest can clean up.
-        live_git_dir = str(live_repo / ".git")
-        live_index = str(live_repo / ".git" / "index")
+        leak = _decoy_git_env_leak(tmp_path)
+        decoy = tmp_path / "decoy"
+        before = _decoy_state(decoy)
 
-        # Leak the live repository's git variables into the environment that
-        # the fixture pipeline will inherit.
-        leaked_env = dict(os.environ)
-        leaked_env["GIT_DIR"] = live_git_dir
-        leaked_env["GIT_INDEX_FILE"] = live_index
+        env = dict(os.environ)
+        env.update(leak)
+        env["REGRESSION_REPO_ROOT"] = str(REPO_ROOT)
+        env["REGRESSION_TMP_PATH"] = str(tmp_path)
 
-        # _build_release_fixture calls ``run_git()`` which invokes
-        # ``fixture_git_env()``; ``fixture_git_env()`` must strip the leaked
-        # vars before any subprocess call.  If the scrubbing works the
-        # fixture builds cleanly even though the process environment is
-        # polluted.
-        leaked_env["REPO_ROOT_FOR_REGRESSION"] = str(live_repo)
-        with subprocess.Popen(
-            ["python3", "-c", _REGRESSION_HELPER],
-            env=leaked_env,
-            cwd=str(live_repo),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        result = subprocess.run(
+            ["python3", "-c", _PIPELINE_UNDER_LEAK_HELPER],
+            env=env,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
             text=True,
-        ) as proc:
-            _, stderr = proc.communicate()
-            assert proc.returncode == 0, (
-                f"fixture pipeline failed under leaked GIT_DIR/GIT_INDEX_FILE:\n"
-                f"stderr: {stderr}"
-            )
+            check=False,
+        )
+        assert result.returncode == 0, (
+            "release-gate pipeline failed under leaked "
+            f"GIT_DIR={leak['GIT_DIR']} / GIT_INDEX_FILE={leak['GIT_INDEX_FILE']}:\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "PIPELINE-UNDER-LEAK: GREEN" in result.stdout, result.stdout
+        assert _decoy_state(decoy) == before, (
+            "the leaked GIT_DIR/GIT_INDEX_FILE was not neutralised: the decoy "
+            "repository was mutated by the fixture pipeline"
+        )
 
 
-# Inline helper to keep the test file self-contained (no external dependency
-# on conftest fixtures).  It re-uses the exact same pipeline as the gate
-# tests so a regression in either path is caught.
-_REGRESSION_HELPER = r"""\
-import os, sys, subprocess
+# Runs the module's real gate pipeline under the leaked environment. Kept in
+# a child process (not the pytest process) so the intentionally-polluted
+# ``GIT_DIR`` / ``GIT_INDEX_FILE`` never leak into other tests. Imports the
+# module by file location so the identical ``_build_release_fixture`` /
+# ``_run_release`` helpers are exercised.
+_PIPELINE_UNDER_LEAK_HELPER = r"""\
+import importlib.util
+import os
+import sys
 from pathlib import Path
 
-# Mirror the sys.path setup in tests/conftest.py so shared is importable.
-repo_root = Path(os.environ.get("REPO_ROOT_FOR_REGRESSION", ".")).resolve()
-skills_root = repo_root / "skill"
+repo_root = Path(os.environ["REGRESSION_REPO_ROOT"]).resolve()
+tmp_path = Path(os.environ["REGRESSION_TMP_PATH"]).resolve()
+
+# Mirror tests/conftest.py's sys.path setup so ``shared`` is importable.
 if str(repo_root) not in sys.path:
     sys.path.insert(0, str(repo_root))
+skills_root = repo_root / "skill"
 if str(skills_root) not in sys.path:
     sys.path.insert(1, str(skills_root))
 
-# Re-import the production helpers that the gate tests use.
-from shared.git_sandbox import fixture_git_env, run_git
+spec = importlib.util.spec_from_file_location(
+    "_gate_module_under_test", repo_root / "tests" / "test_release_full_suite_gate.py"
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
 
-origin = Path("/tmp/fixture-regression-origin.git")
-seed = Path("/tmp/fixture-regression-seed")
-repo = Path("/tmp/fixture-regression-repo")
+repo, runner_marker, gh_marker, bin_dir = module._build_release_fixture(tmp_path)
+result = module._run_release(repo, tmp_path, bin_dir, runner_marker, gh_marker)
 
-# Clean slate.
-import shutil
-for p in (origin, seed, repo):
-    if p.exists():
-        shutil.rmtree(p)
+if result.returncode != 0:
+    print(f"PIPELINE-UNDER-LEAK: RED (returncode={result.returncode})")
+    print(result.stdout)
+    print(result.stderr, file=sys.stderr)
+    raise SystemExit(1)
 
-origin.mkdir(parents=True)
-seed.mkdir(parents=True)
+marker_text = runner_marker.read_text() if runner_marker.exists() else ""
+if "--scope full" not in marker_text:
+    print("PIPELINE-UNDER-LEAK: RED (suite gate never ran)")
+    print(f"runner marker: {marker_text!r}")
+    raise SystemExit(1)
+if not module._has_marker(gh_marker):
+    print("PIPELINE-UNDER-LEAK: RED (release did not reach PR creation)")
+    raise SystemExit(1)
 
-# Build a minimal fixture repo the same way the gate tests do.
-# run_git(cwd, args) — not the legacy _git() signature.
-run_git(origin, ["init", "-q", "--bare"])
-run_git(origin, ["--git-dir", str(origin), "symbolic-ref", "HEAD", "refs/heads/main"])
-
-run_git(seed, ["init", "-q"])
-run_git(seed, ["config", "user.email", "r@r"])
-run_git(seed, ["config", "user.name", "r"])
-(seed / "f.txt").write_text("f\n", encoding="utf-8")
-run_git(seed, ["add", "f.txt"])
-run_git(seed, ["commit", "-m", "base"])
-run_git(seed, ["branch", "-M", "main"])
-run_git(seed, ["checkout", "-q", "-b", "dev"])
-(seed / "d.txt").write_text("d\n", encoding="utf-8")
-run_git(seed, ["add", "d.txt"])
-run_git(seed, ["commit", "-m", "dev work"])
-run_git(seed, ["remote", "add", "origin", str(origin)])
-run_git(seed, ["push", "-q", "origin", "main", "dev"])
-run_git(seed, ["clone", "-q", str(origin), str(repo)])
-run_git(repo, ["config", "user.email", "r@r"])
-run_git(repo, ["config", "user.name", "r"])
-
-print("fixture-regression: OK", file=sys.stdout)
+print("PIPELINE-UNDER-LEAK: GREEN")
 """

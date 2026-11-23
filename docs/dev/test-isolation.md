@@ -987,6 +987,24 @@ layer, not a substitute for the rule above:
   driven session's own `finish` gate run — an environment-dependent failure of
   the same family as the ones this item fixes.
 
+#### Hook-like environments: `GIT_DIR` + `GIT_INDEX_FILE` (SA-0MVZQVDUY0011DQD)
+
+`tests/test_release_full_suite_gate.py` drives `merge-dev-to-main.sh` inside a
+throwaway fixture repo. Under the pre-push hook its fixture inherited the
+hook's `GIT_DIR` / `GIT_INDEX_FILE`, so the release script short-circuited and
+the stubbed suite runner never ran — the gate was red for every `dev` push.
+The module now routes both fixture construction (`run_git`) and the release
+subprocess (`fixture_git_env`) through the hermetic helpers, and its
+`TestHookLikeEnvironment` regression test runs the **whole** pipeline in a
+child process with an absolute `GIT_DIR` / `GIT_INDEX_FILE` leaked into the
+environment. The leak targets a throwaway **decoy** repository rather than the
+live checkout: a hermeticity regression in a pipeline that commits/merges
+would otherwise corrupt the live repo before the failure is reported, while
+the decoy gives an equivalent "real repository" leak with a safe blast radius.
+The test asserts the full-suite gate actually ran and the decoy was left
+untouched, so a `**os.environ` regression in `_run_release` (or a raw `_git`)
+fails it (verified by a red witness).
+
 ### 9.8 Per-work-item lock store isolation (SA-0MVWJ6U3J003TLRZ)
 
 `implement.py phase_start` takes a **real** per-work-item `flock` at
