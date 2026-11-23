@@ -783,7 +783,12 @@ another log, a `python3` probe, a `cat` of the runner source) that reproduce
 is trusted only when its assistant `toolCall` command is a slot consumer
 (`run_tests.py`, `implement.py`, `git push`, `wait_for_job.py`); results with no
 resolvable command are kept only when the text carries a structural run marker.
-This is what stops a log-tail from inventing a > 120 s sample.
+Only a `bash` result (or one with no `toolName` field, as in older/forked logs)
+is eligible at all: a result produced by a non-bash tool — reading a fixture or
+source file, an `edit`, a `grep` — is never a run, however much run_tests.py
+structure its text echoes. This is what stops a log-tail *and* a `read` of this
+repository's own test fixtures (which contain `"slot_wait_seconds": 999.0` and a
+gate-provenance marker) from inventing a > 120 s sample.
 
 **Pass/fail (parent SA-0MVXUCGPK003G2KV AC3).** The report evaluates three
 thresholds and its exit status is non-zero on any failure:

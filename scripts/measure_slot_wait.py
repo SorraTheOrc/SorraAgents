@@ -43,6 +43,13 @@ Results with no resolvable command (e.g. a forked/compacted log) are kept only
 when their text carries a structural run marker, so genuine data is never lost
 to a missing call record.
 
+Only a ``bash`` result (or a result with no ``toolName`` at all) is eligible:
+a result produced by a non-bash tool — a ``read`` of a fixture or source file,
+an ``edit``, a ``grep`` — is never a run, however much run_tests.py structure
+its text echoes. This is what stops reading this repository's own test
+fixtures (which contain ``"slot_wait_seconds": 999.0`` and a
+gate-provenance marker) from injecting phantom samples.
+
 Wait categories
 ---------------
 =====================  ==========================================================
@@ -432,7 +439,19 @@ def measure(
             if message.get("role") != "toolResult":
                 continue
 
-            # Genuine-run filter: reject echoes produced by analysis commands.
+            # Genuine-run filter: only a test-slot consumer's own bash command
+            # can produce a measurement. A result from any other tool
+            # (``read``/``edit``/``write``/``grep``/…) is never a run, even when
+            # its text echoes run_tests.py structure — reading a fixture file
+            # must not be counted as a genuine run. Result messages carry
+            # ``toolName``; only ``bash`` (or a result with no tool name at
+            # all, as in older/forked logs) may fall through to the
+            # structural-marker fallback below.
+            tool_name = message.get("toolName")
+            if tool_name not in (None, "", "bash"):
+                continue
+
+            # Reject echoes produced by analysis bash commands (grep/probe/cat).
             call_id = message.get("toolCallId")
             command = commands.get(call_id) if call_id is not None else None
             if command is not None and not _is_run_source_command(command):
