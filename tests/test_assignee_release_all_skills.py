@@ -1626,6 +1626,14 @@ NON_TERMINAL_ENTRY_POINTS: dict[str, dict[str, str]] = {
             "cmd_abort, all covered by matrix rows"
         ),
     },
+    "audit/scripts/audit_runner.py": {
+        "_release_assignee_flags": (
+            "helper that builds the --assignee release flag from the shared "
+            "claim-release predicate (shared.claim_release."
+            "should_release_assignee); its terminal counterpart is "
+            "_restore_pre_audit_state_on_failure, a RELEASE_EXERCISES row"
+        ),
+    },
 }
 
 #: Entry points whose terminal release is asserted by a skill-local test

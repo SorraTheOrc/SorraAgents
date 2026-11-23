@@ -210,6 +210,53 @@ cannot short-circuit or distort a retry: the runner's verdict, counters and
 retry path are unaffected by whatever the file contains, and a leftover file
 only triggers a parent-side restore after an uncatchable kill (`SIGKILL`).
 
+## Race-safe lifecycle restore (SA-0MW7Z77KI005MK0B)
+
+A concurrent `wl sync` (pull -> merge -> push, last-writer-wins on a stale
+snapshot — the WL-0MUXA5RI2009EUTJ class) can overwrite a lifecycle restore
+**after** its readback confirmed it, leaving a `completed`/`in_review` item
+stranded at a stale `open`/`plan_complete`. Every restore path is therefore
+verified and race-bounded:
+
+- **In-run restores (Python).** `_apply_terminal_lifecycle`'s restore
+  branches (failure / fallback-tainted `No` / cascade-suppressed demotion)
+  and `_restore_pre_audit_state_on_failure` use a bounded
+  **settle-verify-retry**: apply the write, verify via `wl show <id> --json`
+  (up to `_STATUS_RESTORE_MAX_ATTEMPTS` = 3 attempts with linear backoff), then
+  sleep `AUDIT_STATUS_SETTLE_DELAY` (default 0.5 s), re-read, and re-apply the
+  identical write once if it was clobbered. An unverified restore prints a
+  loud diagnostic (naming the manual `wl update` recovery command) and the
+  run exits **non-zero** — a restore is never reported as success unverified.
+  The happy-path `Yes` advance and the deliberate explicit-`No` demotion keep
+  the single write + readback (no settle re-read), so audit duration is not
+  regressed. Restore writes reuse the shared claim-release predicate
+  (`shared.claim_release.should_release_assignee`), so the assignee-release
+  invariant matches `StatusLifecycle`.
+- **Claim inside the guard.** The `in_progress` claim, its abort state file
+  and the SIGTERM/SIGINT handlers are applied by `_claim_audit_lifecycle`
+  **inside** `cmd_issue`'s guarded `try` region, so an exception raised
+  immediately after the claim (audit-lease acquisition, checkpoint-store open)
+  or a `KeyboardInterrupt` still restores the captured pre-audit state. The
+  gate's early-return paths (freshness skip, pre-flight refusal) never claim.
+- **Parent-side restore (JS).** `check-audit-gate.js::checkAndRestoreStuckAudit`
+  reads the restore back via `wl show <id> --json`, retries the identical
+  `wl update` once if a concurrent `wl sync` clobbered it, and **retains** the
+  `.audit_state_<id>.json` file (warning loudly with the manual recovery
+  command) when the restore cannot be verified — so a later gate run retries.
+  The file is deleted only after a verified restore. Every consumer of the
+  abort state file routes through this single verified helper.
+
+**Contract.** Only a genuine explicit `Ready to close: No` demotes the item to
+`open`/`plan_complete` (the audit-reject workflow, deliberately and verified).
+An infra-fallback-tainted `No`, a timeout, a parse failure, a provider error,
+or an aborted/crashed audit never demotes — it restores the captured
+pre-audit state. No audit path leaves an item at `open`/`plan_complete` or
+`in_progress` as a side effect.
+
+Bounded retry budget: 3 attempts (linear backoff 0.5 s, 1.0 s) per lifecycle
+write + one settle re-apply; the restore adds at most two extra `wl show`
+reads on failure paths and none on the passing advance.
+
 ## Pre-flight affirmation guard
 
 Entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY) preventing two audits of the same work item from racing. The SKILL.md long documented a "pre-flight affirmation" with no code behind it; this guard makes docs and code agree.
