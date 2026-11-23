@@ -27,6 +27,8 @@ Covered here:
   the lock is free while the suite runs, the verdict is keyed on the
   would-be-commit tree, a red verdict aborts before the lock, and two
   concurrent finishes overlap their suite runs instead of serialising them,
+  observed through a **provenance-aware** probe whose budgets are load-scaled
+  through one env-overridable helper (SA-0MWS9JTRN00483DM),
 - ``scripts/hygiene_check.sh`` reports a held lock and tracked-file deletions
   in both human and ``--json`` output.
 """
@@ -53,6 +55,62 @@ from skill.implement.scripts import implement
 from skill.shared import git_sandbox
 
 HYGIENE_SCRIPT = REPO_ROOT / "scripts" / "hygiene_check.sh"
+
+
+# ---------------------------------------------------------------------------
+# Load-scaled concurrency budgets
+# ---------------------------------------------------------------------------
+#
+# The concurrency budgets in this module are wall-clock margins, so on a loaded
+# host they measure the host's scheduler as much as the contract under test
+# (``skill/shared/test-writing-guidelines.md`` §11, "Wall-Clock TTL Windows":
+# the margin must never *be* the timing budget). They are therefore generous by
+# default and scaled through **one** helper via ``IMPLEMENT_TEST_LOAD_SCALE``,
+# mirroring the ``SEM_TIMEOUT`` precedent in
+# ``skill/shared/tests/test_concurrency_guard.py``. Scaling only widens the
+# margins — it never changes what a test asserts.
+
+#: Env override scaling every concurrency budget in this module.
+ENV_TEST_LOAD_SCALE = "IMPLEMENT_TEST_LOAD_SCALE"
+
+#: Multiplier used when the override is unset, invalid or non-positive.
+DEFAULT_TEST_LOAD_SCALE = 1.0
+
+#: Both finishes must be inside their full-suite run at the same time. Only
+#: reached when the ordering contract is broken, so a generous value costs an
+#: idle host nothing and stops a loaded host reporting a phantom regression.
+BARRIER_TIMEOUT_SECONDS = 120.0
+
+#: Upper bound on how long a finish thread may take to complete.
+JOIN_TIMEOUT_SECONDS = 300.0
+
+#: How long a lock probe retries a *sibling probe's* momentary hold before it
+#: records an observation. Generous: that hold is a metadata write.
+PROBE_DEADLINE_SECONDS = 5.0
+
+#: Pause between probe retries (short: a sibling probe's hold is microseconds).
+PROBE_RETRY_DELAY_SECONDS = 0.01
+
+#: The work-item id the probe acquires under. It is what makes a probe's hold
+#: identifiable in a refusal message (``describe_holder`` names the holder).
+PROBE_WORK_ITEM_ID = "WL-PROBE"
+
+
+def _test_load_scale() -> float:
+    """Multiplier applied to this module's concurrency budgets."""
+    raw = (os.environ.get(ENV_TEST_LOAD_SCALE) or "").strip()
+    if not raw:
+        return DEFAULT_TEST_LOAD_SCALE
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_TEST_LOAD_SCALE
+    return value if value > 0 else DEFAULT_TEST_LOAD_SCALE
+
+
+def _scaled(seconds: float) -> float:
+    """Scale a base budget by the configured load scale."""
+    return seconds * _test_load_scale()
 
 
 # ---------------------------------------------------------------------------
@@ -566,21 +624,87 @@ def test_finish_lock_wait_is_signal_safe(tmp_path):
 # source greps) and the abort path (a red verdict never reaches the lock).
 
 
+def _refusal_is_retryable(refusal: str | None) -> bool:
+    """True when a refusal is **not** evidence of a ``finish`` holding the lock.
+
+    ``RepoLock.refusal_message`` names the holder via ``describe_holder``
+    (``"... (holder: work item WL-PROBE, pid ...)"``) and the requester
+    separately (``"... (requested by WL-PROBE)"``). The requester is *always*
+    this probe, so matching the bare probe id would always succeed; the
+    ``holder: work item <id>`` prefix is what identifies the **holder**.
+
+    Retryable refusals are a sibling probe's momentary ``flock`` hold (it holds
+    the flock across its own metadata write and can be descheduled mid-hold)
+    and a lock file whose holder metadata is not readable yet (the same
+    window). Neither is a ``finish``, and under the barrier a ``finish`` hold is
+    impossible while a probe runs — see ``_observe_main_checkout_lock``.
+    """
+    text = refusal or ""
+    if f"(holder: work item {PROBE_WORK_ITEM_ID}" in text:
+        return True
+    return "(holder: unknown" in text
+
+
+def _observe_main_checkout_lock(
+    repo: str,
+    *,
+    deadline_seconds: float | None = None,
+    retry_delay_seconds: float = PROBE_RETRY_DELAY_SECONDS,
+) -> bool:
+    """Probe the real main-checkout lock from inside a full-suite run.
+
+    ``True`` means the lock was free (or only momentarily held by a *sibling
+    probe*); ``False`` means a real holder — a ``finish`` — held it.
+
+    The concurrent test's barrier forces both finishes to pass the probe before
+    either is released into the mutating window, so a ``finish`` hold can never
+    be what a probe observes: the only possible contention is the sibling
+    probe's own acquire/release. That contention is resolved by **provenance**,
+    not by sleeping longer: a refusal naming another probe (or carrying no
+    holder metadata yet) is retried against a bounded deadline, while a refusal
+    naming any other holder is recorded as a real hold immediately. The
+    previous five fail-fast, no-sleep attempts could all land inside a sibling
+    probe's momentary hold and report a phantom regression
+    (SA-0MWS9JTRN00483DM).
+
+    Args:
+        repo: Main-checkout path the lock belongs to.
+        deadline_seconds: Override for the retry deadline; defaults to the
+            load-scaled :data:`PROBE_DEADLINE_SECONDS`.
+        retry_delay_seconds: Pause between retries.
+    """
+    deadline = time.monotonic() + (
+        _scaled(PROBE_DEADLINE_SECONDS)
+        if deadline_seconds is None
+        else deadline_seconds
+    )
+    while True:
+        fd, refusal = implement.acquire_main_checkout_lock(repo, PROBE_WORK_ITEM_ID)
+        if fd is not None:
+            implement._release_main_checkout_lock(fd)
+            return True
+        if not _refusal_is_retryable(refusal):
+            return False
+        if time.monotonic() >= deadline:
+            # Bounded: a hold that never clears is still an observation, never
+            # a hung test.
+            return False
+        time.sleep(retry_delay_seconds)
+
+
 def _probe_lock_free_during_full_scope(repo: str, observed: list[tuple[str, bool]]):
     """A ``run_tests`` stand-in that observes the lock across a full run.
 
-    A full-scope invocation tries a non-blocking acquisition of the real
-    main-checkout lock. ``True`` means the lock was free while the suite ran;
-    ``False`` means it was held — the regression this item fixes.
+    A full-scope invocation probes the real main-checkout lock with
+    :func:`_observe_main_checkout_lock`. ``True`` means the lock was free while
+    the suite ran; ``False`` means a ``finish`` held it — the regression this
+    item fixes.
     """
 
     def _fake(cwd, scope="changed", base_ref=None, fingerprint=None):
         if scope != "full":
             return _tests_result()
-        fd, _holder = implement.acquire_main_checkout_lock(repo, "WL-PROBE")
-        observed.append(("full_suite", fd is not None))
-        if fd is not None:
-            implement._release_main_checkout_lock(fd)
+        observed.append(("full_suite", _observe_main_checkout_lock(repo)))
         return {
             **_tests_result(),
             "scope": "full",
@@ -834,32 +958,45 @@ def test_concurrent_finishes_overlap_their_full_suite_runs(tmp_path, monkeypatch
     exclusive lock — the second finish could never reach its suite until the
     first released: the barrier would break and this test would fail.
 
+    **Why the barrier makes probe-only contention the only possibility:** both
+    threads must pass their probe (and reach the barrier) before either is
+    released into the mutating window, so a ``finish`` hold cannot exist while
+    a probe runs. The only contending holder a probe can see is therefore the
+    *other probe's* momentary ``flock`` hold.
+
+    **Why provenance, not a longer sleep, keeps the observation honest:** a
+    probe retries a refusal only when it names another probe (or carries no
+    holder metadata yet) and records ``False`` immediately when it names any
+    other holder. Sleep alone cannot distinguish the two — a loaded host can
+    deschedule a probe mid-hold for arbitrarily long, while a real regression
+    would only be hidden by waiting (SA-0MWS9JTRN00483DM).
+
     A bounded lock wait is configured because the two finishes still contend
     for the short *mutating* window; that is the invariant this item keeps.
+    Every budget here is load-scaled through :func:`_scaled`, so a loaded host
+    cannot turn the ordering contract red while an idle host still runs fast.
     """
-    monkeypatch.setenv("IMPLEMENT_FINISH_LOCK_TIMEOUT", "30")
+    #: The mutating window is short; scale it with the rest of the budgets so a
+    #: loaded host cannot time out a *legitimate* short wait.
+    lock_timeout = _scaled(30.0)
+    monkeypatch.setenv(implement.ENV_FINISH_LOCK_TIMEOUT, f"{lock_timeout:g}")
     repo = str(tmp_path / "main")
     #: Both finishes must be inside their suite at the same time.
-    inside_suite = threading.Barrier(2, timeout=30)
+    inside_suite = threading.Barrier(2, timeout=_scaled(BARRIER_TIMEOUT_SECONDS))
     observed: list[tuple[str, bool]] = []
     observed_lock = threading.Lock()
 
     def _fake_run_tests(cwd, scope="changed", base_ref=None, fingerprint=None):
         if scope != "full":
             return _tests_result()
-        # The probe is fail-fast; retry briefly so a *sibling's momentary
-        # probe hold* (its own acquire/release) is never mistaken for a
-        # finish holding the lock during the suite. A real finish hold lasts
-        # the whole mutating window, so it is observed on every retry.
-        fd, _holder = None, None
-        for _attempt in range(5):
-            fd, _holder = implement.acquire_main_checkout_lock(repo, "WL-PROBE")
-            if fd is not None:
-                break
+        # Provenance-aware probe (see `_observe_main_checkout_lock`): a sibling
+        # probe's momentary hold is retried, a real finish hold is recorded.
+        # The probe runs *outside* `observed_lock` so both threads really are
+        # probing concurrently — serialising them here would hide the very
+        # contention this test is about.
+        lock_free = _observe_main_checkout_lock(repo)
         with observed_lock:
-            observed.append(("full_suite", fd is not None))
-        if fd is not None:
-            implement._release_main_checkout_lock(fd)
+            observed.append(("full_suite", lock_free))
         inside_suite.wait()
         return {**_tests_result(), "scope": "full"}
 
@@ -880,7 +1017,7 @@ def test_concurrent_finishes_overlap_their_full_suite_runs(tmp_path, monkeypatch
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=60)
+            thread.join(timeout=_scaled(JOIN_TIMEOUT_SECONDS))
         assert not any(t.is_alive() for t in threads), (
             "a concurrent finish did not complete — the full-suite runs "
             "were serialised on the main-checkout lock"
@@ -891,11 +1028,161 @@ def test_concurrent_finishes_overlap_their_full_suite_runs(tmp_path, monkeypatch
         assert report["success"] is True, (label, report["message"])
         assert report["steps"]["main_checkout_lock"]["acquired"] is True
         # The wait was for the short mutating window only, bounded by the
-        # configured timeout — never the other finish's suite duration.
-        assert report["steps"]["main_checkout_lock"]["waited_seconds"] < 30
+        # configured timeout — never the other finish's suite duration. The
+        # bound is derived from the configuration the test itself set, not a
+        # hardcoded duplicate of it.
+        waited = report["steps"]["main_checkout_lock"]["waited_seconds"]
+        assert waited <= implement._finish_lock_timeout(), (
+            f"{label}: waited {waited}s, beyond the configured "
+            f"IMPLEMENT_FINISH_LOCK_TIMEOUT ({implement._finish_lock_timeout()!r}s)"
+        )
     assert observed == [("full_suite", True), ("full_suite", True)], (
         "both finishes must observe a FREE main-checkout lock while their "
         f"full suite runs (observed {observed!r})"
+    )
+
+
+def test_lock_probe_retries_a_sibling_probe_refusal(tmp_path):
+    """A refusal naming another *probe* is retried, never recorded as held.
+
+    Deterministic form of the load-sensitive flake: a probe can land inside a
+    sibling probe's momentary ``flock`` hold (the probe writes holder metadata
+    while holding). Provenance — the holder named in the refusal — says that
+    hold belongs to a probe, so the observation is retried instead of being
+    recorded as ``False``. Eight probe refusals exceed the previous five
+    fail-fast, no-sleep attempts, so this test fails against the old probe.
+    """
+    repo = str(tmp_path / "main")
+    probe_refusal = (
+        f"Another run holds the repository lock {repo}/main-checkout.lock "
+        f"(holder: work item {PROBE_WORK_ITEM_ID}, pid 4242). Aborting without "
+        f"modifying the checkout or the work item (requested by {PROBE_WORK_ITEM_ID})."
+    )
+    real_acquire = implement.acquire_main_checkout_lock
+    calls: list[int] = []
+
+    def _fake_acquire(repo_root, work_item_id, timeout=0.0, **kwargs):
+        calls.append(len(calls))
+        if len(calls) <= 8:
+            return None, probe_refusal
+        return real_acquire(repo_root, work_item_id, timeout=timeout, **kwargs)
+
+    with patch.object(implement, "acquire_main_checkout_lock", side_effect=_fake_acquire):
+        observed = _observe_main_checkout_lock(repo, retry_delay_seconds=0)
+
+    assert observed is True, "a sibling probe's hold must never be recorded as a lock hold"
+    assert len(calls) == 9, f"expected 8 retries then success; observed {len(calls)} calls"
+
+
+def test_lock_probe_records_a_real_holder_immediately(tmp_path):
+    """A refusal naming a *finish* is a real hold — recorded without retrying.
+
+    Provenance cuts both ways: retrying is only justified for a probe's own
+    momentary hold. A refusal naming any other holder is the regression this
+    suite exists to catch, so it is reported at once (one acquisition attempt),
+    not after a deadline.
+    """
+    repo = str(tmp_path / "main")
+    holder_refusal = (
+        f"Another run holds the repository lock {repo}/main-checkout.lock "
+        f"(holder: work item WL-OTHER, pid 4242). Aborting without modifying "
+        f"the checkout or the work item (requested by {PROBE_WORK_ITEM_ID})."
+    )
+    calls: list[int] = []
+
+    def _fake_acquire(repo_root, work_item_id, timeout=0.0, **kwargs):
+        calls.append(len(calls))
+        return None, holder_refusal
+
+    with patch.object(implement, "acquire_main_checkout_lock", side_effect=_fake_acquire):
+        observed = _observe_main_checkout_lock(repo, retry_delay_seconds=0)
+
+    assert observed is False
+    assert len(calls) == 1, f"a real holder must be recorded immediately; got {len(calls)} calls"
+
+
+def test_lock_probe_gives_up_after_its_bounded_deadline(tmp_path):
+    """A hold that never clears is bounded — the probe cannot hang the suite.
+
+    A sibling probe that is descheduled for longer than the deadline is still
+    an *observation*, not a hung test: the probe returns ``False`` once its
+    deadline expires instead of retrying forever.
+    """
+    repo = str(tmp_path / "main")
+    probe_refusal = (
+        f"(holder: work item {PROBE_WORK_ITEM_ID}, pid 4242) "
+        f"(requested by {PROBE_WORK_ITEM_ID})."
+    )
+    calls: list[int] = []
+
+    def _fake_acquire(repo_root, work_item_id, timeout=0.0, **kwargs):
+        calls.append(len(calls))
+        return None, probe_refusal
+
+    with patch.object(implement, "acquire_main_checkout_lock", side_effect=_fake_acquire):
+        started = time.monotonic()
+        observed = _observe_main_checkout_lock(
+            repo, deadline_seconds=0.05, retry_delay_seconds=0.005
+        )
+        elapsed = time.monotonic() - started
+
+    assert observed is False
+    assert len(calls) >= 2, f"the probe must actually retry; got {len(calls)} call(s)"
+    assert elapsed < 5, f"the probe overran its deadline: {elapsed:.2f}s"
+
+
+def test_load_scale_scales_every_concurrency_budget(monkeypatch):
+    """Lowering ``IMPLEMENT_TEST_LOAD_SCALE`` shortens the budgets.
+
+    Proves the scaling path is wired (mirroring the ``SEM_TIMEOUT`` precedent):
+    an unset/invalid/non-positive override falls back to the idle-host default,
+    and a positive override multiplies every budget through one helper.
+    """
+    monkeypatch.delenv(ENV_TEST_LOAD_SCALE, raising=False)
+    assert _test_load_scale() == DEFAULT_TEST_LOAD_SCALE
+    for base in (
+        BARRIER_TIMEOUT_SECONDS,
+        JOIN_TIMEOUT_SECONDS,
+        PROBE_DEADLINE_SECONDS,
+    ):
+        assert _scaled(base) == base
+
+    monkeypatch.setenv(ENV_TEST_LOAD_SCALE, "2.5")
+    assert _scaled(BARRIER_TIMEOUT_SECONDS) == BARRIER_TIMEOUT_SECONDS * 2.5
+    assert _scaled(JOIN_TIMEOUT_SECONDS) == JOIN_TIMEOUT_SECONDS * 2.5
+    assert _scaled(PROBE_DEADLINE_SECONDS) == PROBE_DEADLINE_SECONDS * 2.5
+
+    for invalid in ("bogus", "", "-2", "0"):
+        monkeypatch.setenv(ENV_TEST_LOAD_SCALE, invalid)
+        assert _test_load_scale() == DEFAULT_TEST_LOAD_SCALE, invalid
+
+
+def test_load_scale_shortens_the_probe_deadline(tmp_path, monkeypatch):
+    """The probe *consumes* the scaled budget, not just the helper.
+
+    With the scale shrunk to a thousandth the 5 s probe deadline becomes 5 ms,
+    so a probe that keeps meeting a sibling's hold gives up almost immediately
+    — mechanical proof that the scaling is wired into the probe itself.
+    """
+    monkeypatch.setenv(ENV_TEST_LOAD_SCALE, "0.001")
+    repo = str(tmp_path / "main")
+    probe_refusal = (
+        f"(holder: work item {PROBE_WORK_ITEM_ID}, pid 4242) "
+        f"(requested by {PROBE_WORK_ITEM_ID})."
+    )
+
+    def _fake_acquire(repo_root, work_item_id, timeout=0.0, **kwargs):
+        return None, probe_refusal
+
+    with patch.object(implement, "acquire_main_checkout_lock", side_effect=_fake_acquire):
+        started = time.monotonic()
+        observed = _observe_main_checkout_lock(repo)
+        elapsed = time.monotonic() - started
+
+    assert observed is False
+    assert elapsed < 1.0, (
+        "the probe deadline must be load-scaled; it ran for "
+        f"{elapsed:.2f}s with IMPLEMENT_TEST_LOAD_SCALE=0.001"
     )
 
 
