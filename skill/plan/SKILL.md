@@ -61,7 +61,7 @@ the item in a **valid terminal status** (`open`, `blocked`, or `completed`)
 when the skill ends — including on error:
 
 - **On completion:** `StatusLifecycle.update_status(<work-item-id>, "open", stage="plan_complete")`
-- **Pausing for producer input (handoff-only):** Release to `open` AND mark needs-producer-review **only when the session genuinely hands control back** for an open-ended wait with no in-session resume. Do **not** release when an in-session resume is expected (e.g. interactive approval pane — see Resume re-claim below). A downtime-dispatched run with no interactive approver that hits the approval gate must **hold `in_progress` or abort cleanly — never release to `open` mid-run** (the `open` window caused duplicate dispatch of AH-0MTFPDKDU006QUDC on 2026-08-30):
+- **Pausing for producer input (handoff-only, genuine decisions only):** Release to `open` AND mark needs-producer-review **only for a genuine producer handoff** — a decision only the producer can make, per the shared [interview contract](../interview/SKILL.md#4-producer-review-handoff). **Routine** questions the agent can resolve itself (repo research or a documented assumption recorded in the Appendix) never set the flag: record the answer and continue. Release only when the session genuinely hands control back **for an open-ended wait with no in-session resume**. Do **not** release when an in-session resume is expected (e.g. interactive approval pane — see Resume re-claim below). A downtime-dispatched run with no interactive approver that hits the approval gate must **hold `in_progress` or abort cleanly — never release to `open` mid-run** (the `open` window caused duplicate dispatch of AH-0MTFPDKDU006QUDC on 2026-08-30):
   ```bash
   wl reviewed <work-item-id> true
   ```
@@ -291,11 +291,16 @@ Then output a summary of what each stage checked/found.
    timeline), and **Risky assumptions** (where a prototype is needed and what
    "success" means).
 
-   **Producer review:** when producer input is required (clarifying questions
-   unanswered, critical information missing), follow the shared contract's
-   `wl reviewed` handoff. **Handoff-only:** only release to `open` when the
-   session genuinely ends and waits for an open-ended producer reply; if the
-   run will resume in-session, **hold `in_progress`** or re-claim via
+   **Producer review:** use the [interview contract](../interview/SKILL.md)'s
+   handoff only for a **genuine** producer decision — a business rule,
+   user-experience or product-strategy choice, or budget/priority trade-off
+   that only the producer can settle. **Routine** questions the agent can
+   answer by repo research or a documented reasonable assumption are recorded
+   in the Appendix and the run continues; they never call `wl reviewed` and
+   never set the hold. When a genuine handoff is required, follow the shared
+   contract's `wl reviewed` handoff. **Handoff-only:** only release to `open`
+   when the session genuinely ends and waits for an open-ended producer reply;
+   if the run will resume in-session, **hold `in_progress`** or re-claim via
    `StatusLifecycle.ensure_claimed` immediately on resume before any mutation
    (see Status lifecycle). A downtime run with no interactive approver must
    hold or abort — never release to `open` mid-run.
