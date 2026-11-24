@@ -29,8 +29,9 @@ MAX_DESC_BYTES = 140
 # the machine-hygiene skill (WL-0MUJLCVRS0093EJJ) adds a 121 B one;
 # the test-churn skill (SA-0MV28WS5G004YNNS) adds a further 121 B one;
 # the agent-log-review skill (SA-0MUEKTJRD0010CGC) adds a further 129 B one
-# (post-baseline prose, excluded from the 48% compaction AC like the others).
-MAX_TOTAL_PROSE_BYTES = 2500
+# (post-baseline prose, excluded from the 48% compaction AC like the others);
+# the skill-linter skill (SA-0MWGAZTX1008LZI4) adds a further ≤160 B one.
+MAX_TOTAL_PROSE_BYTES = 2700
 
 
 def _prose() -> dict[str, str]:
@@ -52,8 +53,9 @@ class TestDescriptionTemplate:
         # (WL-0MUJLCVRS0093EJJ); 20 after adding the test-churn analyser
         # (SA-0MV28WS5G004YNNS); 21 after adding agent-log-review
         # (SA-0MUEKTJRD0010CGC); 22 after adding the mutation-test skill
-        # (SA-0MV28WY5Q003N54O).
-        assert len(prose) == 22, f"expected 22 skills, got {len(prose)}"
+        # (SA-0MV28WY5Q003N54O); 23 after adding the skill-linter skill
+        # (SA-0MWGAZTX1008LZI4).
+        assert len(prose) == 23, f"expected 23 skills, got {len(prose)}"
 
     def test_each_description_within_140_chars(self):
         for name, desc in _prose().items():
@@ -102,9 +104,12 @@ class TestDescriptionTemplate:
         # per-description and total-prose budgets above.
         # mutation-test (SA-0MV28WY5Q003N54O) is likewise new post-baseline
         # prose and is excluded for the same reason.
+        # skill-linter (SA-0MWGAZTX1008LZI4) is likewise new post-baseline
+        # prose and is excluded; its compactness is enforced by the
+        # per-description and total-prose budgets above.
         compacted_total = sum(
             len(d) for k, d in prose.items()
-            if k not in ("report", "interview", "machine-hygiene", "test-churn", "agent-log-review", "mutation-test")
+            if k not in ("report", "interview", "machine-hygiene", "test-churn", "agent-log-review", "mutation-test", "skill-linter")
         )
         reduction = 1 - compacted_total / baseline
         assert reduction >= 0.48, (

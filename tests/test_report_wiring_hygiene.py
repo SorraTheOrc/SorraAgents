@@ -66,8 +66,17 @@ WORK_ITEM_SKILLS = [
 
 # test-churn (SA-0MV28WS5G004YNNS) and mutation-test (SA-0MV28WY5Q003N54O)
 # only analyse a repository and write report artefacts — they never create or
-# update work items, so they are non-work-item skills.
-NON_WORK_ITEM_SKILLS = ["interview", "speak", "standup", "test-churn", "mutation-test"]
+# update work items, so they are non-work-item skills. skill-linter
+# (SA-0MWGAZTX1008LZI4) likewise scans documents and reports findings without
+# touching work items.
+NON_WORK_ITEM_SKILLS = [
+    "interview",
+    "speak",
+    "standup",
+    "test-churn",
+    "mutation-test",
+    "skill-linter",
+]
 
 FINAL_STEP_HEADER = "## Final step: standardized end-of-session report"
 INVOCATION = (

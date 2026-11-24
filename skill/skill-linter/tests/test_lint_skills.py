@@ -966,3 +966,197 @@ class TestApplyKeepsContextSurfaceNonRegressing:
             )
         if applied:
             assert after["total"]["chars"] < before["total"]["chars"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# End-to-end integration and SKILL.md documentation contract
+#
+# Work item: SA-0MWGAZTX1008LZI4 — "Write skill-linter SKILL.md and
+# integration test" (child of SA-0MWFP1E9P0027EOE).
+#
+# - AC1/AC2 the SKILL.md documents invocation, scope, permission flow and the
+#   weekly run, and links the reference instead of restating its rule tables
+# - AC3 one fixture tree exercises the whole lifecycle through the real CLI:
+#   scan → text/JSON report → dry-run immutability → --apply safe fixes only
+#   → --install-cron line
+# - AC4 the SKILL.md passes the linter's own checks (self-consistency)
+# ══════════════════════════════════════════════════════════════════════════
+
+SKILL_MD = REPO_ROOT / "skill" / "skill-linter" / "SKILL.md"
+REFERENCE_DOC = REPO_ROOT / "docs" / "dev" / "skill-linter-reference.md"
+LINT_CLI = REPO_ROOT / "skill" / "skill-linter" / "scripts" / "lint_skills.py"
+
+#: A near-duplicate pair: identical first two lines, a slightly edited third.
+NEAR_BLOCK_ALPHA = (
+    "Operators approve each recommendation before any rewrite is applied.",
+    "The linter reports the file, section, line span and rationale.",
+    "Nothing in the recommendation class is ever written automatically.",
+)
+NEAR_BLOCK_BETA = (
+    "Operators approve each recommendation before any rewrite is applied.",
+    "The linter reports the file, section, line span and rationale.",
+    "Nothing in the recommendation class is written automatically by the tool.",
+)
+
+
+def _integration_tree(tmp_path):
+    """A fixture skill tree carrying every finding class the CLI reports."""
+    alpha = _doc(
+        "# Alpha skill",  # 1
+        "",  # 2
+        "## Usage",  # 3
+        "",  # 4
+        *DUP_BLOCK,  # 5-7
+        "",  # 8
+        f"Tracking note for {WORK_ITEM_ID}.",  # 9
+        f"implement - Session ID: {SESSION_ID} - {SESSION_PATH}",  # 10
+        "",  # 11
+        *DUP_BLOCK,  # 12-14
+        "",  # 15
+        *NEAR_BLOCK_ALPHA,  # 16-18
+        "",
+    )
+    beta = _doc(
+        "# Beta skill",  # 1
+        "",  # 2
+        "## Rules",  # 3
+        "",  # 4
+        *NEAR_BLOCK_BETA,  # 5-7
+        "",
+    )
+    return _make_repo(
+        tmp_path,
+        {"skill/alpha/SKILL.md": alpha, "skill/beta/SKILL.md": beta},
+    )
+
+
+def _run_real_cli(root, *argv: str):
+    """Run the CLI as a subprocess, exactly as an operator or cron would."""
+    return subprocess.run(
+        [sys.executable, str(LINT_CLI), "--root", str(root), *argv],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _snapshot(root) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): path.read_text(encoding="utf-8")
+        for path in sorted(root.rglob("SKILL.md"))
+    }
+
+
+class TestIntegrationLifecycle:
+    def test_scan_report_dry_run_apply_and_cron_over_a_fixture_tree(self, tmp_path):
+        root = _integration_tree(tmp_path)
+        before = _snapshot(root)
+
+        # 1. Scan → text report: every finding class arrives with context.
+        text = _run_real_cli(root)
+        assert text.returncode == lint_skills.EXIT_FINDINGS
+        assert "skill/alpha/SKILL.md" in text.stdout
+        assert "duplicate" in text.stdout
+        assert WORK_ITEM_ID in text.stdout
+        assert "recommendation" in text.stdout
+        assert "rationale:" in text.stdout
+
+        # 2. Report → JSON: parseable, complete and stable in schema.
+        report = _run_real_cli(root, "--json")
+        assert report.returncode == lint_skills.EXIT_FINDINGS
+        payload = json.loads(report.stdout)
+        assert payload["schema_version"] == lint_skills.REPORT_SCHEMA_VERSION
+        assert payload["dry_run"] is True
+        assert {finding["kind"] for finding in payload["findings"]} == {
+            lint_skills.KIND_DUPLICATE,
+            lint_skills.KIND_NEAR_DUPLICATE,
+            lint_skills.KIND_NONESSENTIAL_ID,
+            lint_skills.KIND_WORKFLOW_COMMENT,
+        }
+        assert payload["summary"]["applied"] == 0
+
+        # 3. Dry-run immutability: neither report changed a byte.
+        assert _snapshot(root) == before
+
+        # 4. Apply: safe fixes are written; the recommendation is untouched.
+        applied = _run_real_cli(root, "--apply", "--json")
+        assert applied.returncode == lint_skills.EXIT_FINDINGS  # recommendation remains
+        result = json.loads(applied.stdout)
+        assert result["dry_run"] is False
+        assert result["summary"]["applied"] > 0
+        assert {finding["kind"] for finding in result["findings"]} == {
+            lint_skills.KIND_NEAR_DUPLICATE
+        }
+
+        after = _snapshot(root)
+        alpha = after["skill/alpha/SKILL.md"]
+        assert alpha.count(DUP_BLOCK[0]) == 1
+        assert WORK_ITEM_ID not in alpha
+        assert "Session ID:" not in alpha
+        assert "\n".join(NEAR_BLOCK_ALPHA) in alpha
+        assert "\n".join(NEAR_BLOCK_BETA) in after["skill/beta/SKILL.md"]
+        assert after["skill/beta/SKILL.md"] == before["skill/beta/SKILL.md"]
+
+        # 5. Re-applying changes nothing: the safe fixes are idempotent.
+        again = _run_real_cli(root, "--apply", "--json")
+        assert json.loads(again.stdout)["summary"]["applied"] == 0
+        assert _snapshot(root) == after
+
+        # 6. Cron helper prints a weekly dry-run line, never claiming it is active.
+        cron = _run_real_cli(root, "--install-cron", "weekly")
+        assert cron.returncode == lint_skills.EXIT_CRON_OK
+        line = next(line for line in cron.stdout.splitlines() if "lint_skills.py" in line)
+        assert line.split()[:5] == ["0", "3", "*", "*", "1"]
+        assert "--dry-run" in line and "--json" in line
+        assert str(root) in line
+        assert "NOT installed" in cron.stdout
+
+
+class TestSkillMdDocumentation:
+    def _text(self) -> str:
+        return SKILL_MD.read_text(encoding="utf-8")
+
+    def test_frontmatter_and_invocation_follow_sibling_conventions(self):
+        text = self._text()
+        assert text.startswith("---\n")
+        frontmatter, separator, body = text.partition("\n---\n")
+        assert separator, "SKILL.md must carry a closing frontmatter fence"
+        assert "name: skill-linter" in frontmatter
+        assert "description:" in frontmatter
+        assert "/skill:skill-linter" in body
+        assert "$(skill_path skill-linter)/scripts/lint_skills.py" in body
+
+    def test_scope_rules_permission_flow_and_cron_usage_are_documented(self):
+        body = self._text()
+        for phrase in (
+            "skill/<name>/SKILL.md",
+            "AGENTS.md",
+            "AGENTS_GLOBAL.md",
+            "--apply",
+            "--dry-run",
+            "--install-cron weekly",
+            "Permission flow",
+            "Recommendations",
+            "Exit codes",
+        ):
+            assert phrase in body, f"SKILL.md does not document {phrase!r}"
+
+    def test_links_the_reference_without_restating_its_contract(self):
+        body = self._text()
+        reference = REFERENCE_DOC.read_text(encoding="utf-8")
+        assert "docs/dev/skill-linter-reference.md" in body
+        # The brief summarises; the rule tables, schema and constants live in
+        # the reference (AC2: no wholesale duplication).
+        assert len(body) < len(reference) / 2
+        for internal in ("MIN_DUPLICATE_LINES", "REPORT_SCHEMA_VERSION", "schema_version"):
+            assert internal not in body
+
+
+class TestSkillMdSelfConsistency:
+    def test_skill_md_passes_the_linters_own_checks(self):
+        result = _run_real_cli(REPO_ROOT, "--target", str(SKILL_MD), "--json")
+
+        assert result.returncode == lint_skills.EXIT_CLEAN, result.stdout + result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["findings"] == []
+        assert payload["summary"]["total"] == 0
