@@ -9120,6 +9120,18 @@ SPAWN_FAILURE_KINDS: tuple[str, ...] = (
 #: ``No API key found for <provider>``. The pattern/credential text arrives
 #: inside the spawner reason because ``_default_session_spawner`` embeds the
 #: child's stderr tail and the pane spawner embeds the herdr reason.
+#:
+#: The third fragment is the **provider-stream** signature: Pi's
+#: ``mapStopReason`` (``openai-completions``) turns a raw
+#: ``finish_reason: "error"`` into the literal message
+#: ``Provider finish_reason: error`` and treats it as a fatal turn. Driven
+#: children run with ``--no-extensions``, so the ContextHub ``Worklog``
+#: recovery extension (which retries that reason in interactive sessions)
+#: never loads and the child exits non-zero; the drive layer must absorb it
+#: here (WL-0MWTZEDWG008YMGQ). ``Provider`` is Pi's fixed prefix, not a
+#: provider name. Deliberately narrow: it matches neither bare ``error`` nor
+#: the other ``finish_reason`` values (``content_filter``, ``length``,
+#: ``network_error``), so a genuine defect still hard-stops.
 SPAWN_INFRA_REASONS: tuple[tuple[str, str], ...] = (
     (
         "No models match pattern",
@@ -9136,6 +9148,18 @@ SPAWN_INFRA_REASONS: tuple[tuple[str, str], ...] = (
             "Provide the missing API key for the provider (`pi login` for "
             "it, or set its API-key environment variable), then re-run "
             "`implement.py drive`."
+        ),
+    ),
+    (
+        "finish_reason: error",
+        (
+            "The local model proxy returned an error stop reason "
+            "(`Provider finish_reason: error`) mid-stream — a transient "
+            "proxy/provider hiccup that usually clears on retry. Re-run "
+            "`implement.py drive`: the bounded `--infra-retry-limit` budget "
+            "re-spawns the same child in the same worktree. If it persists, "
+            "check the Local Proxy (http://192.168.0.199:8000/v1) and the "
+            "model it serves — retrying cannot fix an unservable model."
         ),
     ),
 )
@@ -9178,6 +9202,9 @@ def _spawn_failure_provider(reason: str) -> str | None:
     Only called once a :data:`SPAWN_INFRA_REASONS` fragment has matched, so a
     ``None`` return means the fragment carried no extractable provider — the
     caller reports the failure without a provider rather than inventing one.
+    The provider-stream signature (``Provider finish_reason: error``) always
+    returns ``None``: ``Provider`` is Pi's fixed literal prefix, not a
+    provider name.
 
     Args:
         reason: The spawner's failure reason.
@@ -9200,10 +9227,15 @@ def classify_spawn_failure(reason: Any) -> dict[str, Any]:
     The spawn-side counterpart of :func:`classify_finish_failure`
     (SA-0MWLDZ8ZN0030T15). A driven child session can die at startup because
     the configured model cannot be served (``No models match pattern
-    "MunitoAI/*"``, ``No API key found for …``); that is a transient
-    provider/model-resolution failure the drive loop may retry on its
-    infrastructure budget, whereas any other spawn failure is a genuine
-    defect that must hard-stop the chain.
+    "MunitoAI/*"``, ``No API key found for …``), or mid-stream because the
+    provider answered with a fatal ``finish_reason: "error"``
+    (``Provider finish_reason: error``); both are transient provider
+    failures the drive loop may retry on its infrastructure budget, whereas
+    any other spawn failure is a genuine defect that must hard-stop the
+    chain. Driven children run with ``--no-extensions``, so the interactive
+    recovery extension never sees the provider-stream stop — this drive-layer
+    classification is the only retry that can absorb it
+    (WL-0MWTZEDWG008YMGQ).
 
     Resolution rules:
 
@@ -9213,6 +9245,8 @@ def classify_spawn_failure(reason: Any) -> dict[str, Any]:
       timeout message;
     * ``kind == "infrastructure"`` only for an explicit
       :data:`SPAWN_INFRA_REASONS` fragment hit (case-insensitive substring);
+      the provider-stream fragment is the exact ``finish_reason: error``
+      signature, never the bare word ``error``;
     * anything else — including ``None``, ``""``, a traceback tail and any
       arbitrary message — is ``kind == "unknown"`` (fail-safe: ``unknown`` is
       never ``infrastructure``, so drive can never retry a real defect).

@@ -176,7 +176,73 @@ documented locally only.
 extension from driven children, removing its provider-error auto-retry/notify
 path. This is accepted because driven children are headless, the same exclusion
 is already accepted for audit calls, and the implement skill manages its own
-loop.
+loop. Since WL-0MWTZEDWG008YMGQ the drive layer replaces that lost retry for
+the transient ``Provider finish_reason: error`` stop (see below).
+
+### The lost provider-error retry is replaced at the drive layer (WL-0MWTZEDWG008YMGQ)
+
+``--no-extensions`` removes a retry the child would otherwise get. In an
+interactive session the ContextHub ``Worklog`` recovery extension classifies a
+mid-stream ``finish_reason: "error"`` as a retryable ``SERVER_ERROR`` and
+retries it (WL-0MUQO8AEE003G1Z2). A driven child never loads that extension,
+so a transient provider reply reaches Pi core, which treats an error stop
+reason as a **fatal turn** and exits the session non-zero. Nothing in the
+child retries or degrades — the session simply dies.
+
+The mechanism, end to end:
+
+1. ``_default_session_spawner`` runs
+   ``pi -p "/skill:implement <child-id>" --approve --no-extensions``.
+2. ``--no-extensions`` disables extension discovery, so the recovery
+   extension is not loaded.
+3. Pi's ``mapStopReason`` (``openai-completions``) maps
+   ``finish_reason: "error"`` to the literal ``Provider finish_reason: error``
+   and ``stopReason: "error"``; the agent loop throws and the turn ends
+   fatally.
+4. The session exits non-zero; ``_default_session_spawner`` reports the
+   stderr tail as the spawn reason.
+5. Before this change ``classify_spawn_failure`` classified that reason
+   ``unknown``, so the drive chain hard-stopped and the operator had to
+   re-run ``implement.py drive`` by hand.
+
+Since this change, ``SPAWN_INFRA_REASONS`` carries the exact provider-stream
+fragment ``finish_reason: error``, so ``classify_spawn_failure`` reports
+``infrastructure`` and ``phase_drive`` re-spawns the **same** child in the
+**same** worktree on the shared ``--infra-retry-limit`` budget (exponential
+backoff, durable child comment). The classification is deliberately narrow:
+
+- It matches the full ``finish_reason: error`` signature, never the bare word
+  ``error`` or the other ``finish_reason`` values (``content_filter``,
+  ``length``, ``network_error``), so a genuine defect — a traceback, a red
+  gate, a timeout — still classifies ``unknown`` and hard-stops.
+- ``Provider`` is Pi's fixed literal prefix, not a provider name, so the
+  classifier does not fabricate a provider (``provider`` is ``None``); the
+  remedy names the Local Proxy and the model it serves instead.
+- The ``timed out`` precedence is unchanged: a timeout that happens to echo
+  provider text stays ``unknown``.
+
+**Layering (deliberate, not a double retry).** The recovery extension retries
+the reason for *interactive* sessions; the drive classifier retries it for
+``--no-extensions`` *children*. A single session only ever runs one of the two
+layers, so the retries cannot compound.
+
+### Recovery-cost measurement (WL-0MWTZEDWG008YMGQ AC4)
+
+Measured before/after on the same 7-child epic (``WL-0MWTAD1KM0081UUD``) and
+pinned by a deterministic harness (``TestDriveRetriesProviderStreamFailure`` in
+``skill/implement/tests/test_drive_sibling_worktree_stray.py``):
+
+| Scenario | Before | After |
+|---|---|---|
+| One transient reply, 7-child epic | 1 hard-stopped spawn → operator re-runs ``implement.py drive`` (measured: 25+ manual re-runs over ~5.3 h; one child needed 20 consecutive failed spawns) | 1 extra bounded re-spawn in the same worktree; the epic proceeds in the same ``drive`` invocation |
+| Persistent provider failure | n/a (hard-stop on the first reply) | consumes ``--infra-retry-limit`` (default 5) with backoff, then hard-stops naming the proxy/model — still bounded |
+| Genuine defect (traceback/red gate) | 1 spawn, hard-stop | 1 spawn, hard-stop (unchanged — fail-safe floor) |
+
+The harness is deterministic: an injected spawner fails ``k`` times with
+``Provider finish_reason: error`` then succeeds, and the test asserts
+``k + 1`` spawns in the same worktree with ``k`` ``infra-retry`` entries. A
+genuine defect in the same harness costs exactly one spawn and never touches
+the infra budget.
 
 ## Why drive reconciles terminal children after a session timeout (SA-0MVHXWLPG007OQVN)
 
@@ -964,10 +1030,12 @@ in `children_driven`:
    provider/model-resolution failure (SA-0MWLDZBTF004LJFP): when
    `_reconcile_spawn_failure` proves the child non-terminal and
    `classify_spawn_failure` classifies the spawn reason `infrastructure`
-   (an unservable `enabledModels` pattern, a missing API key), the driver
+   (an unservable `enabledModels` pattern, a missing API key, or a transient
+   `Provider finish_reason: error` — WL-0MWTZEDWG008YMGQ), the driver
    re-spawns the **same** child in its **same** worktree after the same
    backoff. That retry records `result: "infra-retry"` with `step: "spawn"`,
-   the spawner `reason`, the `attempt` number, the extracted `provider` and
+   the spawner `reason`, the `attempt` number, the extracted `provider`
+   (absent for the provider-stream signature, which names no provider) and
    a `message` naming the provider and model; it never creates a second
    worktree, never re-records spawn-failure evidence for an attempt that
    produced no work, and is charged to the infra budget rather than the

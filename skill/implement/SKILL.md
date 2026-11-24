@@ -299,8 +299,8 @@ not the short-lived `start` subprocess, holds the child's per-child lock for
 the session's whole lifetime (`IMPLEMENT_CHILD_LOCK_TOKEN` re-entry, released
 on every spawner outcome); a killed driver is the residual window
 ([reference](../../docs/dev/implement-skill-reference.md#per-child-implementation-lock-sa-0mvq7vmrl00498yb)).
-`--infra-retry-limit N` (5; 2 s doubling to a 30 s cap) bounds finish
-retries. **Manual fallback:**
+`--infra-retry-limit N` (5; 2 s doubling to a 30 s cap) bounds finish and
+spawn retries. **Manual fallback:**
 `python3 $(skill_path implement)/scripts/implement.py parent <parent-id>` —
 no children = leaf; all-terminal children advance the parent to
 `completed`/`in_review`; otherwise `phase_parent` finishes children whose

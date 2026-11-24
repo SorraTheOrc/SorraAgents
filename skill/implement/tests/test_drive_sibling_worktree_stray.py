@@ -103,8 +103,8 @@ def sibling_worktree(repo: Path, tmp_path: Path) -> Path:
 
 
 SPAWN_FAILURE_REASON = (
-    f"Child session for {CHILD_ID} exited with code 1: Provider "
-    "finish_reason: error"
+    f"Child session for {CHILD_ID} exited with code 1: "
+    "ModuleNotFoundError: No module named 'nonexistent_module'"
 )
 
 
@@ -259,12 +259,18 @@ class TestDrivenChildStraysIntoSiblingWorktree:
 # ---------------------------------------------------------------------------
 #
 # Incident: ``implement.py drive`` spawned a child session that died before
-# writing anything (a transient provider error, ``Provider finish_reason:
-# error``). The child was left ``in-progress`` with a clean worktree (no dirty
-# files, no commits ahead), and the next ``drive``/``parent`` run then
-# attributed *pre-existing* dirt in the main checkout and in three sibling
-# worktrees to it — naming paths the child had never touched — and failed the
-# chain closed. Recovering needed a manual ``implement.py abort``.
+# writing anything (in the original report, a provider error). The child was
+# left ``in-progress`` with a clean worktree (no dirty files, no commits
+# ahead), and the next ``drive``/``parent`` run then attributed *pre-existing*
+# dirt in the main checkout and in three sibling worktrees to it — naming
+# paths the child had never touched — and failed the chain closed. Recovering
+# needed a manual ``implement.py abort``.
+#
+# NOTE: the transient provider-stream signature (``Provider finish_reason:
+# error``) is now classified as retryable infrastructure and absorbed on the
+# ``--infra-retry-limit`` budget (WL-0MWTZEDWG008YMGQ), so this module's
+# failure reason is a *genuine* ``unknown`` defect — the fail-safe floor that
+# still records evidence and hard-stops.
 #
 # Contract (parent ACs):
 #
@@ -501,7 +507,7 @@ class TestDriveRecordsSpawnFailureEvidence:
 
         evidence = implement.read_spawn_failure(str(child_worktree), CHILD_ID)
         assert evidence is not None
-        assert "Provider finish_reason: error" in evidence["reason"]
+        assert "ModuleNotFoundError" in evidence["reason"]
 
     def test_recorded_evidence_makes_the_next_parent_run_startable_again(
         self, child_worktree: Path, sibling_worktree: Path
@@ -1389,3 +1395,184 @@ class TestSubmoduleNoiseIsNotASurface:
 
         assert is_surface is True
         assert reported == ["core"]
+
+
+class TestDriveRetriesProviderStreamFailure:
+    """``phase_drive`` absorbs a transient ``Provider finish_reason: error``.
+
+    Recovery-cost harness for ``WL-0MWTZEDWG008YMGQ`` AC4. The real
+    ``phase_drive`` retry accounting is exercised with an injected spawner, so
+    the attempt count is measured deterministically — no real ``pi`` session,
+    no sleep (``delay`` is a zero-cost recorder).
+
+    The comparison is the before/after recovery cost:
+
+    * a genuine ``unknown`` failure — what the provider signature *was* before
+      the classifier learned it — costs one spawn and hard-stops the chain
+      (the operator then re-runs ``implement.py drive`` by hand);
+    * the provider signature now consumes one bounded ``--infra-retry-limit``
+      slot per transient reply and re-spawns the **same** child in the
+      **same** worktree, so the epic proceeds in the same invocation.
+
+    The retry accounting is the subject here; the classification itself is
+    pinned in ``test_spawn_failure_classification.py``. Release/reconcile side
+    effects are stubbed so the harness never writes to a real worklog store.
+    """
+
+    PROVIDER_REASON = (
+        f"Child session for {CHILD_ID} exited with code 1: Provider "
+        "finish_reason: error"
+    )
+    GENUINE_REASON = (
+        f"Child session for {CHILD_ID} exited with code 1: "
+        "ModuleNotFoundError: No module named 'nonexistent_module'"
+    )
+
+    def _drive(
+        self,
+        child_worktree: Path,
+        *,
+        reason: str,
+        infra_retry_limit: int,
+        transient_failures: int | None = None,
+    ) -> tuple[dict, int]:
+        """Drive one child; return ``(report, spawn_count)``.
+
+        ``transient_failures=None`` means "always fail"; an integer means
+        "fail this many times, then succeed" so the chain can advance.
+        """
+        child_item = _child("in-progress")
+        spawns: list[str] = []
+        succeeded = {"value": False}
+
+        def _wl_show(work_item_id: str) -> dict:
+            if work_item_id == PARENT_ID:
+                return {
+                    "id": PARENT_ID,
+                    "title": "Parent",
+                    "status": "plan_complete",
+                    "stage": "plan_complete",
+                }
+            return dict(child_item)
+
+        def _spawner(child_id, worktree_path, timeout, env, verbose=False):
+            spawns.append(child_id)
+            assert child_id == CHILD_ID
+            assert worktree_path == str(child_worktree)
+            if transient_failures is not None and len(spawns) > transient_failures:
+                succeeded["value"] = True
+                return {"success": True, "returncode": 0, "reason": ""}
+            return {"success": False, "returncode": 1, "reason": reason}
+
+        def _parent(*_args, **_kwargs) -> dict:
+            if succeeded["value"]:
+                return {
+                    "success": True,
+                    "parent_advanced": True,
+                    "message": "all children terminal",
+                }
+            return {
+                "success": True,
+                "next_child": CHILD_ID,
+                "worktree_path": str(child_worktree),
+            }
+
+        with (
+            mock.patch.object(implement, "wl_show", side_effect=_wl_show),
+            mock.patch.object(
+                implement, "wl_show_children", return_value=[child_item]
+            ),
+            mock.patch.object(
+                implement, "_discover_worktree", return_value=str(child_worktree)
+            ),
+            mock.patch.object(implement, "wl_add_comment", return_value=True),
+            mock.patch.object(
+                implement,
+                "_release_provider_failed_child",
+                return_value={"released": False, "reason": "test stub"},
+            ),
+            mock.patch.object(
+                implement,
+                "_release_orphaned_child_claim",
+                return_value={"released": False, "reason": "test stub"},
+            ),
+            mock.patch.object(
+                implement,
+                "record_spawn_failure",
+                return_value={"child_id": CHILD_ID, "reason": reason},
+            ),
+            mock.patch.object(
+                implement,
+                "_detect_stranded_child",
+                return_value={"stranded": False},
+            ),
+            mock.patch.object(
+                implement, "_maybe_remove_child_worktree", return_value=None
+            ),
+        ):
+            report = implement.phase_drive(
+                PARENT_ID,
+                parent_runner=_parent,
+                spawn_session=_spawner,
+                infra_retry_limit=infra_retry_limit,
+                delay=lambda _seconds: None,
+                child_timeout=60,
+            )
+        return report, len(spawns)
+
+    def test_a_transient_reply_is_retried_and_the_epic_proceeds(
+        self, child_worktree: Path
+    ) -> None:
+        report, spawn_count = self._drive(
+            child_worktree,
+            reason=self.PROVIDER_REASON,
+            infra_retry_limit=5,
+            transient_failures=1,
+        )
+
+        # Before: one transient reply hard-stopped the chain (1 spawn, then a
+        # manual re-run). After: one bounded re-spawn in the same worktree and
+        # the drive completes.
+        assert spawn_count == 2
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert report["infra_retries"][CHILD_ID] == 1
+        retries = [
+            entry
+            for entry in report["children_driven"]
+            if entry.get("result") == "infra-retry"
+            and entry.get("step") == "spawn"
+        ]
+        assert len(retries) == 1
+        assert retries[0]["attempt"] == 1
+        assert "Provider finish_reason: error" in retries[0]["reason"]
+
+    def test_the_retry_budget_stays_bounded(self, child_worktree: Path) -> None:
+        report, spawn_count = self._drive(
+            child_worktree,
+            reason=self.PROVIDER_REASON,
+            infra_retry_limit=2,
+        )
+
+        # 1 initial attempt + 2 infra retries, then the bound stops the chain.
+        # No new retry budget is introduced: this is the shared
+        # --infra-retry-limit.
+        assert spawn_count == 3
+        assert report["failed_child"] == CHILD_ID
+        assert report["infra_retries"][CHILD_ID] == 2
+
+    def test_a_genuine_defect_is_never_retried(
+        self, child_worktree: Path
+    ) -> None:
+        report, spawn_count = self._drive(
+            child_worktree,
+            reason=self.GENUINE_REASON,
+            infra_retry_limit=5,
+        )
+
+        # Fail-safe floor: a real defect costs one spawn and hard-stops; the
+        # infra budget is never touched.
+        assert spawn_count == 1
+        assert report["failed_child"] == CHILD_ID
+        assert report["infra_retries"].get(CHILD_ID, 0) == 0
+        assert report["children_driven"][0]["spawn_failure_kind"] == "unknown"
