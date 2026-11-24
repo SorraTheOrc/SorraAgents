@@ -87,7 +87,7 @@ wording; cross-referenced here rather than restated).
 
 - **Before any other step**, claim the work item:
   ```bash
-  python3 $(skill_path intake)/scripts/intake.py start <work-item-id> --assignee Map
+  python3 $(skill_path intake)/scripts/intake.py start <work-item-id> --assignee Intake
   ```
   This must happen before any evaluation, context gathering, or preflight checks.
 
@@ -142,7 +142,7 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
 - If `<work-item-id>` was provided: review `issueType`; update if it doesn't match: `wl update <work-item-id> --issue-type <correct-type> --json`.
 - If no id was provided: extract a working title, infer the issue type (guide below), and create:
   ```bash
-  wl create --stage idea --status in_progress --title "<title>" --description "<seed-context>" --issue-type <type> --assignee Map --json
+  wl create --stage idea --status in_progress --title "<title>" --description "<seed-context>" --issue-type <type> --assignee Intake --json
   ```
   (Creation is not a status transition — the initial status is set at creation.) Remember the returned id.
 

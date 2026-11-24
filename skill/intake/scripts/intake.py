@@ -61,7 +61,7 @@ LOG = logging.getLogger("intake.scripts.intake")
 # ---------------------------------------------------------------------------
 
 
-def cmd_start(item_id: str, assignee: str | None = None) -> dict:
+def cmd_start(item_id: str, assignee: str | None = "Intake") -> dict:
     """Claim the work item by setting status to in_progress.
 
     Uses StatusLifecycle.update_status to set the status without the
