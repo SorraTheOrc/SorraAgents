@@ -20,8 +20,15 @@ All fixtures are in-memory documents; nothing on disk is touched.
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import lint_skills
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+CONTEXT_AUDIT = REPO_ROOT / "skill" / "context-audit" / "scripts" / "measure_context.py"
 
 #: A three-line block that clears MIN_DUPLICATE_LINES and MIN_DUPLICATE_CHARS.
 DUP_BLOCK = (
@@ -275,6 +282,45 @@ class TestStripping:
         assert cleaned == text
         assert removed == []
 
+    def test_traceability_only_lines_are_dropped_with_their_markdown_marker(self):
+        """A bullet/quote/table marker must not survive as a stray artefact."""
+        text = _doc(
+            "Keep this instruction.",
+            f"- {WORK_ITEM_ID}",
+            f"1. {WORK_ITEM_ID}",
+            f"> {WORK_ITEM_ID}",
+            f"| {WORK_ITEM_ID} |",
+            f"- [ ] ({WORK_ITEM_ID})",
+            "End.",
+            "",
+        )
+
+        cleaned, removed = lint_skills.strip_nonessential_ids(text)
+
+        assert cleaned == _doc("Keep this instruction.", "End.", "")
+        assert removed == [WORK_ITEM_ID] * 5
+
+    def test_inline_removal_leaves_readable_prose(self):
+        text = _doc(
+            f"Tracked in ({WORK_ITEM_ID}).",
+            f"Tracked in {WORK_ITEM_ID}.",
+            f"{WORK_ITEM_ID} explains the gate.",
+            f"The gate ({WORK_ITEM_ID}) protects the tree.",
+            f"- see {WORK_ITEM_ID} for detail",
+            "",
+        )
+
+        cleaned, _ = lint_skills.strip_nonessential_ids(text)
+
+        assert cleaned == _doc(
+            "Tracked in.",
+            "Tracked in.",
+            "explains the gate.",
+            "The gate protects the tree.",
+            "- see for detail",
+            "",
+        )
+
     def test_strip_workflow_comments_removes_noise_and_keeps_instructions(self):
         text = _doc(
             "Keep this instruction.",
@@ -468,6 +514,37 @@ def _read(root, relative: str) -> str:
     return (root / relative).read_text(encoding="utf-8")
 
 
+def _copy_repo_documents(destination: Path) -> Path:
+    """Copy this repo's scannable documents into *destination*.
+
+    The skill-linter's default scope (``skill/*/SKILL.md`` plus the root
+    ``AGENTS.md`` / ``AGENTS_GLOBAL.md``) is mirrored so the context-audit
+    measurement can run against a disposable tree.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in ("AGENTS.md", "AGENTS_GLOBAL.md"):
+        source = REPO_ROOT / name
+        if source.is_file():
+            shutil.copy2(source, destination / name)
+    for source in sorted(REPO_ROOT.glob("skill/*/SKILL.md")):
+        target = destination / "skill" / source.parent.name / "SKILL.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+    return destination
+
+
+def _measure_context(root: Path) -> dict:
+    """Run the context-audit measurement for *root* and return its components."""
+    result = subprocess.run(
+        [sys.executable, str(CONTEXT_AUDIT), "--repo-root", str(root), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)["components"]
+
+
 # ── AC1: text and JSON report formatting ──────────────────────────────────
 
 
@@ -647,6 +724,67 @@ class TestApply:
         assert WORK_ITEM_ID not in _read(root, "skill/alpha/SKILL.md")
 
 
+# ── AC1: --target replaces the default scan scope ─────────────────────────
+
+
+class TestTargetFlag:
+    def test_target_file_is_scanned_instead_of_the_default_scope(
+        self, tmp_path, capsys
+    ):
+        root = _make_repo(
+            tmp_path,
+            {
+                "skill/alpha/SKILL.md": _doc("# Alpha", "", "A unique instruction."),
+                "docs/notes.md": _doc("# Notes", "", f"Tracking {WORK_ITEM_ID}."),
+            },
+        )
+
+        default_code, default_out, _ = _run_cli(capsys, "--root", root)
+        assert default_code == lint_skills.EXIT_CLEAN
+        assert "docs/notes.md" not in default_out
+
+        code, out, _ = _run_cli(
+            capsys, "--root", root, "--target", "docs/notes.md", "--json"
+        )
+
+        assert code == lint_skills.EXIT_FINDINGS
+        payload = json.loads(out)
+        assert {entry["path"] for entry in payload["findings"]} == {"docs/notes.md"}
+
+    def test_repeated_targets_are_scanned_together(self, tmp_path, capsys):
+        root = _make_repo(
+            tmp_path,
+            {
+                "skill/alpha/SKILL.md": _doc(
+                    "# Alpha", "", f"Tracking {WORK_ITEM_ID}."
+                ),
+                "skill/beta/SKILL.md": _doc(
+                    "# Beta", "", f"Tracking {WORK_ITEM_ID}."
+                ),
+                "skill/gamma/SKILL.md": _doc(
+                    "# Gamma", "", f"Tracking {WORK_ITEM_ID}."
+                ),
+            },
+        )
+
+        _, out, _ = _run_cli(
+            capsys,
+            "--root",
+            root,
+            "--json",
+            "--target",
+            "skill/alpha/SKILL.md",
+            "--target",
+            "skill/beta/SKILL.md",
+        )
+
+        payload = json.loads(out)
+        assert {entry["path"] for entry in payload["findings"]} == {
+            "skill/alpha/SKILL.md",
+            "skill/beta/SKILL.md",
+        }
+
+
 # ── AC4: recommendation-class findings require operator approval ──────────
 
 
@@ -797,3 +935,34 @@ class TestSectionResolution:
             lint_skills.section_for_line("plain body\nsecond line\n", 2)
             == "(document top)"
         )
+
+
+# ── AC5: --apply leaves the measured context surface non-regressing ───────
+
+
+class TestApplyKeepsContextSurfaceNonRegressing:
+    def test_apply_over_repo_documents_never_grows_a_measured_component(
+        self, tmp_path, capsys
+    ):
+        """Applying safe fixes may only shrink the context-audit surface.
+
+        The committed context-budget gate (``tests/test_context_budget_gate.py``)
+        enforces an upper bound on the startup surface, so the linter's safe
+        fixes must never push any measured component above its pre-apply value.
+        """
+        assert CONTEXT_AUDIT.is_file(), f"missing context-audit tool: {CONTEXT_AUDIT}"
+        root = _copy_repo_documents(tmp_path / "repo")
+        before = _measure_context(root)
+
+        code, out, _ = _run_cli(capsys, "--root", root, "--apply", "--json")
+
+        assert code in (lint_skills.EXIT_CLEAN, lint_skills.EXIT_FINDINGS)
+        applied = json.loads(out)["summary"]["applied"]
+        after = _measure_context(root)
+        for component, measurement in before.items():
+            assert after[component]["chars"] <= measurement["chars"], (
+                f"applying safe fixes grew the {component!r} context component: "
+                f"{measurement['chars']} -> {after[component]['chars']}"
+            )
+        if applied:
+            assert after["total"]["chars"] < before["total"]["chars"]

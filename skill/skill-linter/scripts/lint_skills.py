@@ -637,6 +637,40 @@ def scan_paths(
     return effective.scan(discover_documents(root, targets=targets))
 
 
+#: Markdown structure that can wrap a traceability-only line: list bullets,
+#: ordered-list numbers, task markers and blockquote markers.
+_STRUCTURAL_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:[-*+]|\d+[.)])\s*|\[ \]\s*|\[[xX]\]\s*|>+\s*)+"
+)
+
+#: Bracket pairs left empty by an inline ID removal (``()``, ``[]``, ``<>``).
+_EMPTY_PAIR_RE = re.compile(r"\(\s*\)|\[\s*\]|<\s*>|\{\s*\}")
+
+#: Whitespace left before punctuation when the text it preceded was an ID.
+_SPACE_BEFORE_PUNCT_RE = re.compile(r"[ \t]+([,.;:!?)\]}>])")
+
+
+def _tidy_after_id_removal(original: str, cleaned: str) -> str:
+    """Tidy the whitespace and empty pairs an inline ID removal leaves behind."""
+    cleaned = _EMPTY_PAIR_RE.sub("", cleaned)
+    cleaned = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).rstrip()
+    if original[:1] not in (" ", "\t"):
+        cleaned = cleaned.lstrip(" \t")
+    return cleaned
+
+
+def _holds_content(line: str) -> bool:
+    """True when *line* carries text beyond Markdown structure and punctuation.
+
+    Traceability-only lines such as ``- (SA-0…)``, ``1. SA-0…`` or
+    ``| SA-0… |`` must disappear entirely rather than leave a stray bullet,
+    list number, quote marker or empty table row behind.
+    """
+    residual = _STRUCTURAL_PREFIX_RE.sub("", line)
+    return any(character.isalnum() for character in residual)
+
+
 def strip_nonessential_ids(
     text: str,
     *,
@@ -645,9 +679,11 @@ def strip_nonessential_ids(
     """Remove non-allow-listed work-item IDs from *text*.
 
     Returns the cleaned text and the removed IDs (in document order). A line
-    that held nothing but traceability (e.g. ``(SA-0…)``) is dropped; empty
-    ``()``/``[]`` pairs left behind by an inline ID are removed and runs of
-    spaces collapsed, so surrounding prose stays readable.
+    that held nothing but traceability (e.g. ``(SA-0…)``, ``- (SA-0…)``,
+    ``1. SA-0…``, ``| SA-0… |``) is dropped whole; empty ``()``/``[]`` pairs
+    left behind by an inline ID are removed, whitespace before punctuation is
+    closed up and runs of spaces are collapsed, so surrounding prose stays
+    readable.
     """
     allowed = frozenset(allow_ids)
     removed: list[str] = []
@@ -663,11 +699,10 @@ def strip_nonessential_ids(
     for line in text.splitlines():
         cleaned = WORK_ITEM_ID_RE.sub(_replace, line)
         if cleaned != line:
-            cleaned = re.sub(r"\(\s*\)", "", cleaned)
-            cleaned = re.sub(r"\[\s*\]", "", cleaned)
-            cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).rstrip()
-        if cleaned.strip() or not line.strip():
-            kept.append(cleaned)
+            cleaned = _tidy_after_id_removal(line, cleaned)
+            if not _holds_content(cleaned):
+                continue
+        kept.append(cleaned)
 
     result = "\n".join(kept)
     if text.endswith("\n") and result:
