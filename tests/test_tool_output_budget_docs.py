@@ -118,7 +118,7 @@ class TestWorkItemTraceability:
         assert "single source of truth" in text.lower() or "single source of truth" in text.lower()
 
 
-#: The 20 skills that ship a `SKILL.md` and must reference the shared doc
+#: The 21 skills that ship a `SKILL.md` and must reference the shared doc
 #: (parent SA-0MWJWJ1HV000EBKP Requirement 2). `context-audit` ships no
 #: `SKILL.md`; `pane-triage` does not read/search as its primary loop — both
 #: deliberately excluded (recorded in the parent Appendix).
@@ -143,6 +143,7 @@ REQUIRED_SKILLS = (
     "effort-and-risk",
     "author-command",
     "interview",
+    "mutation-test",
 )
 
 #: Dev reference docs holding relocated detail that describe reading context.

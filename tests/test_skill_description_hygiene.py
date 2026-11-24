@@ -51,8 +51,9 @@ class TestDescriptionTemplate:
         # (SA-0MUBVM6FR000NDI1); 19 after adding machine-hygiene
         # (WL-0MUJLCVRS0093EJJ); 20 after adding the test-churn analyser
         # (SA-0MV28WS5G004YNNS); 21 after adding agent-log-review
-        # (SA-0MUEKTJRD0010CGC).
-        assert len(prose) == 21, f"expected 21 skills, got {len(prose)}"
+        # (SA-0MUEKTJRD0010CGC); 22 after adding the mutation-test skill
+        # (SA-0MV28WY5Q003N54O).
+        assert len(prose) == 22, f"expected 22 skills, got {len(prose)}"
 
     def test_each_description_within_140_chars(self):
         for name, desc in _prose().items():
@@ -99,9 +100,11 @@ class TestDescriptionTemplate:
         # agent-log-review (SA-0MUEKTJRD0010CGC) is likewise new post-baseline
         # prose and is excluded; its compactness is enforced by the
         # per-description and total-prose budgets above.
+        # mutation-test (SA-0MV28WY5Q003N54O) is likewise new post-baseline
+        # prose and is excluded for the same reason.
         compacted_total = sum(
             len(d) for k, d in prose.items()
-            if k not in ("report", "interview", "machine-hygiene", "test-churn", "agent-log-review")
+            if k not in ("report", "interview", "machine-hygiene", "test-churn", "agent-log-review", "mutation-test")
         )
         reduction = 1 - compacted_total / baseline
         assert reduction >= 0.48, (
