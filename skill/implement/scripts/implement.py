@@ -3910,7 +3910,11 @@ def git_worktree_add(
     Args:
         branch: Name for the new branch.
         worktree_path: Path for the worktree directory.
-        parent_branch: Source branch to fork from.
+        parent_branch: Source ref to fork from. May be a local branch name
+            (``dev``) or a fully-qualified remote-tracking ref
+            (``refs/remotes/origin/dev``). ``--track`` still records
+            ``branch.<new>.merge = refs/heads/<parent>``, so ``finish``'s
+            push-to-``dev`` path is unchanged.
 
     Returns:
         True if the worktree was created.
@@ -8320,6 +8324,48 @@ def _restore_repo_state(repo_root: str) -> None:
     run_cmd(["git", "pull", "origin", DEFAULT_PARENT_BRANCH], cwd=repo_root, check=False)
 
 
+def _ahead_behind_counts(
+    repo_root: str, parent_branch: str = DEFAULT_PARENT_BRANCH
+) -> tuple[int | None, int | None]:
+    """Best-effort ``(ahead, behind)`` of local ``<parent>`` vs ``origin/<parent>``.
+
+    Uses ``git rev-list --left-right --count <local>...refs/remotes/origin/<parent>``.
+    Counts are never allowed to fail a refresh or a start: an unresolved ref or
+    a git failure yields ``(None, None)``.
+    """
+    result = run_cmd(
+        [
+            "git",
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"refs/heads/{parent_branch}...refs/remotes/origin/{parent_branch}",
+        ],
+        cwd=repo_root,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None, None
+    parts = result.stdout.split()
+    if len(parts) != 2:
+        return None, None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None, None
+
+
+def _add_sync_counts(
+    result: dict[str, Any], repo_root: str, parent_branch: str
+) -> dict[str, Any]:
+    """Attach ``ahead``/``behind`` to a refresh *result* when computable."""
+    ahead, behind = _ahead_behind_counts(repo_root, parent_branch)
+    if ahead is not None:
+        result["ahead"] = ahead
+        result["behind"] = behind
+    return result
+
+
 def _sync_parent_branch(
     repo_root: str, parent_branch: str = DEFAULT_PARENT_BRANCH
 ) -> dict[str, Any]:
@@ -8358,6 +8404,7 @@ def _sync_parent_branch(
         result["method"] = "skipped"
         result["success"] = True
         result["reason"] = "dirty_working_tree"
+        _add_sync_counts(result, repo_root, parent_branch)
         result["warning"] = (
             f"Skipped syncing parent branch {parent_branch}: "
             "dirty working tree detected."
@@ -8377,6 +8424,7 @@ def _sync_parent_branch(
         result["method"] = "skipped"
         result["success"] = True
         result["reason"] = "fetch_failed"
+        _add_sync_counts(result, repo_root, parent_branch)
         result["warning"] = (
             f"Skipped syncing parent branch {parent_branch}: "
             f"git fetch origin {parent_branch} failed. "
@@ -8396,6 +8444,7 @@ def _sync_parent_branch(
         result["method"] = "skipped"
         result["success"] = True
         result["reason"] = "cannot_determine_branch"
+        _add_sync_counts(result, repo_root, parent_branch)
         result["warning"] = "Could not determine current branch."
         LOG.info("%s", result["warning"])
         return result
@@ -8420,6 +8469,7 @@ def _sync_parent_branch(
             result["method"] = "skipped"
             result["success"] = True
             result["reason"] = "diverged"
+            _add_sync_counts(result, repo_root, parent_branch)
             result["warning"] = (
                 f"Skipped syncing parent branch {parent_branch}: "
                 f"local {parent_branch} has diverged from "
@@ -8438,6 +8488,7 @@ def _sync_parent_branch(
             result["method"] = "skipped"
             result["success"] = True
             result["reason"] = "merge_failed"
+            _add_sync_counts(result, repo_root, parent_branch)
             result["warning"] = (
                 f"Skipped syncing parent branch {parent_branch}: "
                 f"--ff-only merge failed (unexpected)."
@@ -8461,6 +8512,7 @@ def _sync_parent_branch(
             result["method"] = "skipped"
             result["success"] = True
             result["reason"] = "diverged_or_checked_out"
+            _add_sync_counts(result, repo_root, parent_branch)
             result["warning"] = (
                 f"Skipped syncing parent branch {parent_branch}: "
                 f"current branch is '{current_branch}'; the local "
@@ -8548,29 +8600,34 @@ def _resolve_start_base(
     parent_branch: str = DEFAULT_PARENT_BRANCH,
     refresh_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Resolve a safe worktree base: a **pushed tip**, never a local mutant.
+    """Resolve a safe worktree base: the **published tip**, never a local mutant.
 
-    ``phase_start`` forks a child worktree from the shared parent branch.
-    That branch is a *shared, locally-mutable* ref: a concurrent ``finish``
-    historically fast-forwarded it to an about-to-be-pushed commit inside its
-    write-then-restore window, so a ``start`` that resolved ``dev`` in that
-    window created its branch from an unpushed commit and permanently
-    grafted another item's commit onto it (WL-0MWFKDH78002T2CR AC3).
+    ``phase_start`` forks a child worktree from the shared parent branch, which
+    is a *locally-mutable* ref. Two distinct hazards motivated this helper:
 
-    This helper verifies that local ``parent_branch`` is a **known pushed
-    tip** — equal to the fetched ``refs/remotes/origin/<parent>``, or an
-    ancestor of it (stale-but-pushed). A local branch that carries commits
-    the remote does not have (ahead of, or diverged from, ``origin``) is
-    refused: ``start`` must not branch from it. ``phase_start`` aborts the
-    whole start on that verdict — no worktree, item released to ``open`` —
-    so a foreign commit can never become a new branch's base.
+    * a concurrent ``finish`` could park the local branch on an about-to-be-
+      pushed commit, so branching from it would graft that commit onto the new
+      branch (WL-0MWFKDH78002T2CR);
+    * a stale local branch (behind ``origin``) forks a worktree that is missing
+      published commits, so a driven child starts behind the published base
+      and needs a manual rebase before its first gate
+      (SA-0MWFFX49M0016KOK / AH-0MWFF40700014EE2).
 
-    Fail-open only when the remote tip cannot be resolved at all (a failed
-    fetch): the base cannot be *proven* unsafe and the historical local-base
-    fallback is preserved, exactly like the Step-6.5 refresh's own offline
-    contract. A ``refresh_result`` whose ``method == "synced"`` short-circuits
-    (the refresh already proved local == fetched origin, so no second fetch
-    or verdict is needed); otherwise the helper fetches itself — read-only,
+    Both are solved the same, graft-safe way: fork from the **fetched published
+    tip** ``refs/remotes/origin/<parent>`` whenever the local branch is not
+    equal to it (ahead-only, behind-only or diverged). Forking from the
+    published tip never contains an unpushed local commit and always carries
+    the published commits. The local ref is **never** moved — a diverged local
+    branch stays exactly as it is for the operator to reconcile.
+
+    The local branch itself is used as the base only when it equals the fetched
+    published tip (nothing to gain from the remote ref), or **fail-open** when
+    the remote tip cannot be resolved at all (a failed fetch / missing
+    remote-tracking ref): the base cannot be *proven* stale, so the historical
+    local-base fallback is preserved, exactly like the Step-6.5 refresh's own
+    offline contract. A ``refresh_result`` whose ``method == "synced"``
+    short-circuits (the refresh already proved local == fetched origin, so no
+    second fetch is needed); otherwise the helper fetches itself — read-only,
     never under the per-repository lock — so the verdict is grounded on a
     current remote-tracking ref even when the refresh skipped (lock held /
     dirty tree / divergence).
@@ -8582,21 +8639,26 @@ def _resolve_start_base(
             used to short-circuit the synced case.
 
     Returns:
-        Dict with ``method`` (``local_dev`` | ``refused``), ``base`` (the ref
-        to branch the worktree from, or ``None`` when refused), ``reason``
-        and, on refusal, a loud ``warning`` naming both tips and the remedy.
+        Dict with ``method`` (``local_dev`` | ``origin_fork``), ``ref`` and
+        ``base`` (the ref to branch the worktree from), ``reason``,
+        ``skipped_local`` (True when the local branch was not used) and, when
+        computable, ``ahead`` / ``behind`` counts.
     """
     if refresh_result and refresh_result.get("method") == "synced":
-        # The refresh just proved local == the fetched origin tip.
+        # The refresh just fast-forwarded local == the fetched origin tip.
         return {
             "method": "local_dev",
             "base": parent_branch,
+            "ref": parent_branch,
             "reason": "refresh_synced",
+            "skipped_local": False,
         }
     result: dict[str, Any] = {
         "method": "local_dev",
         "base": parent_branch,
+        "ref": parent_branch,
         "reason": "in_sync",
+        "skipped_local": False,
     }
     remote_ref = f"refs/remotes/origin/{parent_branch}"
     fetch_result = run_cmd(
@@ -8608,7 +8670,7 @@ def _resolve_start_base(
     if fetch_result.returncode != 0:
         result["reason"] = "fetch_failed"
         result["warning"] = (
-            f"Cannot verify that local {parent_branch} is a pushed tip: "
+            f"Cannot resolve the published tip of {parent_branch}: "
             f"git fetch origin {parent_branch} failed in {repo_root}. "
             f"Branching from local {parent_branch} anyway (fail-open, "
             f"matching the Step-6.5 refresh's offline fallback); re-run "
@@ -8623,44 +8685,34 @@ def _resolve_start_base(
     if not remote_tip:
         result["reason"] = "no_remote_tracking_ref"
         result["warning"] = (
-            f"Cannot verify that local {parent_branch} is a pushed tip: "
+            f"Cannot resolve the published tip of {parent_branch}: "
             f"{remote_ref} does not resolve after a successful fetch. "
             f"Branching from local {parent_branch} anyway (fail-open)."
         )
         LOG.warning("%s", result["warning"])
         return result
+    ahead, behind = _ahead_behind_counts(repo_root, parent_branch)
+    if ahead is not None:
+        result["ahead"] = ahead
+        result["behind"] = behind
     if local_tip == remote_tip:
         result["reason"] = "in_sync"
         return result
-    ancestor_result = run_cmd(
-        ["git", "merge-base", "--is-ancestor", local_tip, remote_ref],
-        cwd=repo_root,
-        check=False,
-    )
-    if ancestor_result.returncode == 0:
-        # Local dev is an ancestor of the remote tip: every local commit is
-        # published; the base is stale-but-pushed (safe).
+    # The local branch is not the published tip (behind-only, ahead-only or
+    # diverged). Fork from the published tip: always graft-safe and always
+    # carries the published commits. Never move the local ref.
+    result["method"] = "origin_fork"
+    result["base"] = remote_ref
+    result["ref"] = remote_ref
+    result["skipped_local"] = True
+    if ahead is None or behind is None:
+        result["reason"] = "local_not_published"
+    elif behind == 0:
+        result["reason"] = "ahead_only"
+    elif ahead == 0:
         result["reason"] = "behind_remote"
-        return result
-    result["method"] = "refused"
-    result["base"] = None
-    result["reason"] = "local_dev_not_a_pushed_tip"
-    result["warning"] = (
-        f"Refusing to create a worktree from local {parent_branch}: it is "
-        f"not a known pushed tip. local={local_tip}, "
-        f"origin/{parent_branch}={remote_tip}. A concurrent `finish` may "
-        f"have advanced it to an unpushed commit (WL-0MWFKDH78002T2CR) or "
-        f"the branch holds deliberate local commits. Resolve first, then "
-        f"re-run start:\n"
-        f"  1. Inspect: git -C {repo_root} log --oneline --graph "
-        f"--decorate --all -20\n"
-        f"  2. Verify nothing important is lost "
-        f"(git -C {repo_root} log {remote_ref}..{parent_branch})\n"
-        f"  3. Push the local commits, or discard them deliberately "
-        f"(git -C {repo_root} reset --hard {remote_ref}) — never without "
-        f"operator confirmation."
-    )
-    LOG.warning("%s", result["warning"])
+    else:
+        result["reason"] = "diverged"
     return result
 
 
@@ -12750,18 +12802,20 @@ def _phase_start_locked(
     # a fresh child session run the standard leaf workflow unchanged.
     resumed = _is_worktree(Path(abs_wt_path))
 
+    # Named on the start/resume comment so the base is always recorded (AC2).
+    worktree_base_note = f"local {parent_branch} (resumed existing worktree)"
     if resumed:
         LOG.info(
             "Worktree already exists at %s — resuming implementation",
             abs_wt_path,
         )
     else:
-        # AC3 (WL-0MWFKDH78002T2CR): the worktree base must be a **known
-        # pushed tip**, never a locally-mutable ``dev`` a concurrent finish
-        # could have parked on an unpushed commit. Positive evidence of
-        # unpushed local commits refuses the whole start (no worktree, item
-        # released to open); an unresolvable remote tip fails open, like the
-        # Step-6.5 refresh.
+        # Fork from the **published tip** whenever the local parent branch is
+        # not equal to it (ahead-only, behind-only or diverged): graft-safe and
+        # always carries the published commits, so a driven child never starts
+        # behind ``origin`` (SA-0MWFFX49M0016KOK). The local ref is never
+        # moved; an unresolvable remote tip fails open, like the Step-6.5
+        # refresh.
         base_resolution = _resolve_start_base(
             repo_root, parent_branch, refresh_result=refresh_result
         )
@@ -12796,9 +12850,20 @@ def _phase_start_locked(
                 print(f"\n⛔ {msg}\n")
             return report
         worktree_base = base_resolution["base"] or parent_branch
+        base_ahead = base_resolution.get("ahead")
+        base_behind = base_resolution.get("behind")
+        counts = (
+            f", ahead {base_ahead} behind {base_behind}"
+            if base_ahead is not None
+            else ""
+        )
+        worktree_base_note = (
+            f"{worktree_base} ({base_resolution.get('reason', 'in_sync')}"
+            f"{counts})"
+        )
         LOG.info(
-            "Creating worktree at %s from branch %s (verified pushed "
-            "tip: %s)...",
+            "Creating worktree at %s from base %s (verified published "
+            "ref: %s)...",
             abs_wt_path,
             worktree_base,
             base_resolution.get("reason", "in_sync"),
@@ -12898,9 +12963,9 @@ def _phase_start_locked(
     wl_add_comment(
         work_item_id,
         (
-            f"Implementation resumed\n- Worktree: {abs_wt_path}\n- Branch: {branch}"
+            f"Implementation resumed\n- Worktree: {abs_wt_path}\n- Branch: {branch}\n- Base: {worktree_base_note}"
             if resumed
-            else f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}"
+            else f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}\n- Base: {worktree_base_note}"
         ),
     )
 

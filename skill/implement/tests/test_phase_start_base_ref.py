@@ -736,3 +736,103 @@ def test_recorded_worktree_base_agrees_with_the_created_worktree(
         assert _is_ancestor(base.repo, resolved, _rev(worktree, "HEAD") or ""), (
             f"recorded base {ref!r} is not contained in the worktree HEAD"
         )
+
+
+# ---------------------------------------------------------------------------
+# New behaviour (SA-0MWFFXNNM00148IX): fork from origin/<parent> whenever the
+# local parent is not the published tip — ahead-only, behind-only or diverged
+# — and record the base ref plus ahead/behind counts.  Written red-first
+# against the pre-fix tree (which refuses ahead/diverged and keeps a stale
+# local base for a skipped behind-only refresh).
+# ---------------------------------------------------------------------------
+
+
+def test_diverged_local_parent_forks_from_origin(base_factory, monkeypatch):
+    """Diverged local parent: the worktree forks origin, never the mutant local ref."""
+    base = base_factory()  # ahead 1, behind 1
+    local_before = _rev(base.repo, base.local_ref)
+
+    report, worktree = _start(base, monkeypatch)
+
+    assert _rev(worktree, "HEAD") == base.origin_tip
+    assert merge_base_with_origin(worktree, base.parent_branch) == base.origin_tip
+    recorded = worktree_base_report(report)
+    assert recorded.get("ref") == base.origin_ref, recorded
+    assert recorded.get("reason") == "diverged", recorded
+    assert (recorded.get("ahead"), recorded.get("behind")) == (1, 1), recorded
+    # Never force-update the diverged local ref.
+    assert _rev(base.repo, base.local_ref) == local_before == base.local_tip
+
+
+def test_ahead_only_local_parent_forks_from_origin(base_factory, monkeypatch):
+    """Ahead-only local parent: fork origin (drop the unpushed commit from the base)."""
+    base = base_factory(origin_ahead=0, local_ahead=1)
+    local_before = _rev(base.repo, base.local_ref)
+
+    report, worktree = _start(base, monkeypatch)
+
+    assert _rev(worktree, "HEAD") == base.origin_tip
+    recorded = worktree_base_report(report)
+    assert recorded.get("ref") == base.origin_ref, recorded
+    assert recorded.get("reason") == "ahead_only", recorded
+    assert (recorded.get("ahead"), recorded.get("behind")) == (1, 0), recorded
+    assert _rev(base.repo, base.local_ref) == local_before == base.local_tip
+
+
+def test_behind_only_lock_held_forks_from_origin(base_factory, monkeypatch):
+    """A held lock skips the fast-forward; the worktree still forks the published tip."""
+    base = base_factory(origin_ahead=1, local_ahead=0, lock_held=True)
+    monkeypatch.setenv(implement.ENV_START_LOCK_TIMEOUT, "0")
+
+    report, worktree = _start(base, monkeypatch)
+
+    assert _rev(worktree, "HEAD") == base.origin_tip
+    recorded = worktree_base_report(report)
+    assert recorded.get("ref") == base.origin_ref, recorded
+    assert recorded.get("reason") == "behind_remote", recorded
+    assert _rev(base.repo, base.local_ref) == base.local_tip  # not fast-forwarded
+
+
+def test_behind_only_dirty_checkout_forks_from_origin(base_factory, monkeypatch):
+    """A dirty checkout skips the fast-forward; the worktree still forks origin."""
+    base = base_factory(origin_ahead=1, local_ahead=0, dirty_checkout=True)
+
+    report, worktree = _start(base, monkeypatch, description=KEY_FILES_DESCRIPTION)
+
+    assert _rev(worktree, "HEAD") == base.origin_tip
+    assert worktree_base_report(report).get("ref") == base.origin_ref
+    assert _rev(base.repo, base.local_ref) == base.local_tip
+
+
+def test_ac3_worktree_contains_the_published_commit(base_factory, monkeypatch):
+    """AC3: a behind-only local parent's worktree already carries origin's commit.
+
+    The published commit adds ``origin-0.txt``; a driven child forked from the
+    stale local parent would lack it and would need a manual rebase before its
+    first changed-scope gate.  A held lock forces the refresh to skip so the
+    local parent genuinely stays stale.
+    """
+    base = base_factory(origin_ahead=1, local_ahead=0, lock_held=True)
+    monkeypatch.setenv(implement.ENV_START_LOCK_TIMEOUT, "0")
+
+    _report, worktree = _start(base, monkeypatch)
+
+    assert (worktree / "origin-0.txt").exists(), (
+        "the worktree must contain the commit origin/dev published after the "
+        "local clone — otherwise a driven child starts behind the published base"
+    )
+    assert not (base.repo / "origin-0.txt").exists(), (
+        "sanity: the stale local parent must not have the published commit"
+    )
+
+
+def test_origin_fork_branch_tracks_origin(base_factory, monkeypatch):
+    """The origin-forked branch keeps an upstream naming origin/<parent> (finish pushes there)."""
+    base = base_factory()  # diverged
+
+    report, _worktree = _start(base, monkeypatch)
+
+    branch = report["branch"]
+    remote, merge = upstream_tracking(base.repo, branch)
+    assert merge == f"refs/heads/{base.parent_branch}", (remote, merge)
+    assert remote == "origin", (remote, merge)
