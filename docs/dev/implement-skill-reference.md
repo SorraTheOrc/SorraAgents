@@ -2557,7 +2557,9 @@ Concurrency contract:
   (`_sync_parent_branch_locked`), **fail-open**: it waits at most
   `IMPLEMENT_START_LOCK_TIMEOUT` (default 30 s) and then skips the refresh with
   a warning naming the lock (`reason: "lock_held"`) — a start is never blocked
-  or failed by a concurrent finish, and the local branch remains a valid base.
+  or failed by a concurrent finish, and the base is then resolved from the
+  published tip whenever the local branch is stale — see
+  [Worktree base-ref resolution](#worktree-base-ref-resolution-start).
   The abort-path `_restore_repo_state` is deliberately unlocked: it runs in a
   process that may already hold the lock, and a dying process releases the
   lock itself.
@@ -2603,6 +2605,49 @@ metadata, SIGKILL crash release, cross-checkout independence, `phase_finish`
 refusal/success, hygiene script JSON + human output) and
 `tests/test_implement_finish_concurrent_orphan.py` (dev-ref window scenarios,
 including the bounded-wait timeout message and the `start` refresh window).
+
+## Worktree base-ref resolution (`start`)
+
+`phase_start` forks the child worktree from the **published tip**, not from a
+possibly-stale local parent branch (SA-0MWFFX49M0016KOK / AH-0MWFF40700014EE2):
+
+- **Equal to `origin/<parent>` → local branch.** When the local parent branch
+  equals the fetched `refs/remotes/origin/<parent>` (an in-sync checkout, or a
+  refresh that just fast-forwarded it), the worktree forks from the local
+  branch — it *is* the published tip.
+- **Otherwise → `refs/remotes/origin/<parent>`.** When the local parent branch
+  differs from the published tip — **behind-only**, **ahead-only** or
+  **diverged** — the worktree forks from the remote-tracking ref. This is
+  always graft-safe (the new branch contains no unpushed local commit) and
+  always carries the published commits, so a driven child starts on the
+  published base and needs no manual rebase before its first changed-scope
+  gate (AC3).
+- **Never force-update the local ref.** A diverged (or ahead-only) local parent
+  is left exactly as it is for the operator to reconcile; `start` only chooses
+  a different base.
+- **Fail-open.** A failed fetch or a missing `refs/remotes/origin/<parent>`
+  leaves the local branch as the base, exactly like the Step-6.5 refresh's
+  offline contract — a start is never blocked by an unreachable remote.
+
+`report["steps"]["worktree_base"]` records the decision:
+`{method: "local_dev" | "origin_fork", ref, base, reason, skipped_local,
+ahead, behind}`. `reason` is one of `refresh_synced`, `in_sync`,
+`fetch_failed`, `no_remote_tracking_ref`, `behind_remote`, `ahead_only`,
+`diverged` or `local_not_published` (counts unavailable); `skipped_local` is
+`true` only for `origin_fork`. The start/resume worklog comment names the same
+base ref and, when the local branch was skipped, its `reason` plus the
+`ahead`/`behind` counts. `git_worktree_add` accepts a fully-qualified
+remote-tracking base ref; `--track` still records
+`branch.<new>.merge = refs/heads/<parent>`, so `finish`'s push-to-`dev` path is
+unchanged.
+
+The parent-branch refresh (`_sync_parent_branch`) reports the same `ahead` /
+`behind` counts (via `git rev-list --left-right --count`) on every safe-skip
+path where they are computable — `dirty_working_tree`, `fetch_failed`,
+`cannot_determine_branch`, `diverged`, `merge_failed` and
+`diverged_or_checked_out` — alongside its `reason` and `warning`. Counts are
+best-effort: an unavailable count leaves the field absent and never fails the
+refresh.
 
 ## Measuring finish lock contention (SA-0MWFK10NH006QI7E)
 
@@ -2819,8 +2864,11 @@ permanently grafted another item's commit onto its branch. The advance is
 deferred until the commit is a known ``refs/remotes/origin/dev`` tip, so a
 failed/refused push leaves local ``dev`` **provably unchanged** from its
 pre-finish value (``restore` reasons report ``no_advance_to_undo``), and
-``phase_start`` independently refuses to branch from a ``dev`` that is not a
-pushed tip (`_resolve_start_base`). The three cooperating guarantees, all
+``phase_start`` independently forks from the published
+``refs/remotes/origin/dev`` whenever the local ``dev`` is not that tip
+(``_resolve_start_base``, see
+[Worktree base-ref resolution](#worktree-base-ref-resolution-start)). The
+three cooperating guarantees, all
 inside the per-repository lock where the push runs:
 
 | Step | Helper | Report key | Guarantee |
@@ -4793,9 +4841,9 @@ runs reported success.
   cannot switch, the helper **refuses loudly** (`local_dev_diverged`,
   `commit_not_based_on_remote_tip`, `fetch_failed`, `checkout_failed`)
   instead of silently skipping — so an unsafe advance is never taken and the
-  refusal is reported rather than swallowed. `start` independently refuses to
-  branch from a `dev` that is not a known pushed tip (`_resolve_start_base`,
-  `local_dev_not_a_pushed_tip`).
+  refusal is reported rather than swallowed. `start` independently forks from
+  `refs/remotes/origin/dev` whenever the local `dev` is not that known pushed
+  tip (`_resolve_start_base`), so the worktree base is never an unpushed commit.
 - **Nothing to reverse on a failed push.** Because the advance is deferred
   until after the push succeeds, a failed/refused push finds nothing to undo:
   `_restore_local_dev_after_failed_push` reports `no_advance_to_undo` and
@@ -4887,9 +4935,9 @@ idempotent — it re-verifies commit → ancestry → status and marks the item
 conflicts: resolve them, commit, push, and re-run `finish`. Second, when the
 post-push fast-forward reports `local_dev_diverged` because the **main
 checkout's local `dev` carries commits `origin/dev` does not have** (the
-defect family of WL-0MWFKDH78002T2CR — a concurrent `start` now refuses to
-branch from such a `dev` via `_resolve_start_base`, and `finish` never
-advances an unpushed commit):
+defect family of WL-0MWFKDH78002T2CR — a concurrent `start` now forks from
+`refs/remotes/origin/dev` rather than branch from such a `dev` via
+`_resolve_start_base`, and `finish` never advances an unpushed commit):
 
 ```bash
 git -C <main-checkout> log --oneline origin/dev..dev   # what is local-only
