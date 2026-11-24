@@ -3,7 +3,8 @@
 Work item: SA-0MWGAYPMX002Z0VC (child of SA-0MWFP1E9P0027EOE). This module is
 the deterministic half of the linter: regex + structural comparison only, no
 LLM dependency. The CLI (report generator, ``--apply``, ``--install-cron``)
-wraps these primitives and is implemented by sibling children.
+wraps these primitives (report/CLI contract pinned by
+``tests/test_lint_skills.py``; work item SA-0MWGAZ286009G2JR).
 
 Two finding families are detected:
 
@@ -50,8 +51,12 @@ mirrored in ``docs/dev/skill-linter-reference.md``:
 
 from __future__ import annotations
 
+import argparse
+import json
 import re
-from collections.abc import Iterable, Iterator, Mapping
+import shlex
+import sys
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -82,6 +87,22 @@ SCAN_DOCUMENT_NAMES = frozenset({"SKILL.md", *DEFAULT_ROOT_DOCUMENTS})
 
 #: Allow-list default: no work-item ID is essential unless the caller says so.
 DEFAULT_ALLOW_IDS: tuple[str, ...] = ()
+
+#: Report schema version — bumped only on an incompatible JSON shape change.
+REPORT_SCHEMA_VERSION = 1
+
+#: CLI exit codes (AC6): clean, findings present, usage/scan error.
+EXIT_CLEAN = 0
+EXIT_FINDINGS = 1
+EXIT_ERROR = 2
+
+#: ``--install-cron`` success is exit 0 on its own path; kept as a named
+#: constant so callers never equate "cron printed" with "tree clean".
+EXIT_CRON_OK = 0
+
+#: Cron schedule printed by ``--install-cron weekly`` (Mondays at 03:00).
+CRON_SCHEDULE_WEEKLY = "0 3 * * 1"
+CRON_SCHEDULES = {"weekly": CRON_SCHEDULE_WEEKLY}
 
 #: Work-item IDs: an uppercase prefix, a hyphen, then a digit and ASCII
 #: alphanumerics (e.g. ``SA-0MWGAYPMX002Z0VC``, ``WL-0MSS55LFU00973S2``).
@@ -667,3 +688,350 @@ def strip_workflow_comments(text: str) -> tuple[str, list[str]]:
     if text.endswith("\n") and result:
         result += "\n"
     return result, removed
+
+
+# ── Report generation ──────────────────────────────────────────────────────
+
+
+_HEADING_RE = re.compile(r"^#{1,6}\s+\S")
+
+
+def section_for_line(text: str, line_number: int) -> str:
+    """Return the nearest Markdown heading at or above *line_number*.
+
+    ``(document top)`` is returned when no heading precedes the line, so the
+    report always names a section (AC1: file, section/line span, text).
+    """
+    lines = text.splitlines()
+    if line_number < 1:
+        return "(document top)"
+    for index in range(min(line_number, len(lines)) - 1, -1, -1):
+        if _HEADING_RE.match(lines[index]):
+            return lines[index].strip()
+    return "(document top)"
+
+
+def _proposed_text(finding: Finding) -> str:
+    """The text a safe fix would leave behind (recommendations: first copy)."""
+    if finding.kind == KIND_WORKFLOW_COMMENT:
+        return ""
+    if finding.kind == KIND_NONESSENTIAL_ID:
+        cleaned, _ = strip_nonessential_ids(finding.spans[0].text)
+        return cleaned
+    return finding.spans[0].text
+
+
+def _action_text(finding: Finding) -> str:
+    """Human-readable description of what a fix would do (AC2/AC3/AC4)."""
+    if finding.kind == KIND_DUPLICATE:
+        return "would remove duplicate copies, keeping the first occurrence"
+    if finding.kind == KIND_NEAR_DUPLICATE:
+        return (
+            "would merge or shorten near-identical copies — requires explicit "
+            "operator approval, never applied automatically"
+        )
+    if finding.kind == KIND_NONESSENTIAL_ID:
+        return f"would strip work-item ID {finding.text}"
+    if finding.kind == KIND_WORKFLOW_COMMENT:
+        return "would remove the workflow-comment line"
+    return "would fix the finding"
+
+
+def _finding_entry(finding: Finding, documents: Mapping[str, str]) -> dict:
+    """Project one finding into the stable report-entry schema (AC1)."""
+    first = finding.spans[0]
+    return {
+        "kind": finding.kind,
+        "fix_class": finding.fix_class,
+        "path": first.path,
+        "start_line": first.start_line,
+        "end_line": first.end_line,
+        "section": section_for_line(documents.get(first.path, ""), first.start_line),
+        "text": finding.text,
+        "proposed_text": _proposed_text(finding),
+        "rationale": finding.rationale,
+        "requires_approval": finding.fix_class == FIX_RECOMMENDATION,
+        "action": _action_text(finding),
+        "spans": [span.to_dict() for span in finding.spans],
+    }
+
+
+def build_report(
+    findings: Sequence[Finding],
+    documents: Mapping[str, str],
+    *,
+    root: str | Path = ".",
+    dry_run: bool = True,
+    applied: int = 0,
+) -> dict:
+    """Build the machine-readable report payload (AC1/AC2/AC3)."""
+    entries = [_finding_entry(finding, documents) for finding in findings]
+    safe = sum(1 for finding in findings if finding.fix_class == FIX_SAFE)
+    recommendation = sum(
+        1 for finding in findings if finding.fix_class == FIX_RECOMMENDATION
+    )
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "root": str(Path(root).expanduser().resolve()),
+        "dry_run": dry_run,
+        "findings": entries,
+        "summary": {
+            "total": len(entries),
+            "safe": safe,
+            "recommendation": recommendation,
+            "applied": applied,
+            "remaining": len(entries),
+        },
+    }
+
+
+def render_text_report(report: Mapping) -> str:
+    """Render a report as the human-readable text form (AC1/AC2)."""
+    lines = [
+        f"skill-linter report ({'dry-run' if report['dry_run'] else 'apply'})",
+        f"root: {report['root']}",
+    ]
+    if report["dry_run"]:
+        lines.append("(dry-run: no files modified)")
+    entries = report["findings"]
+    if not entries:
+        lines.append("")
+        lines.append("no findings — clean")
+    for entry in entries:
+        lines.append("")
+        lines.append(
+            f"{entry['path']}:{entry['start_line']}-{entry['end_line']}  "
+            f"{entry['kind']}  [fix class: {entry['fix_class']}]  "
+            f"section: {entry['section']}"
+        )
+        lines.append("  current text:")
+        for current in entry["text"].splitlines() or [""]:
+            lines.append(f"    {current}")
+        lines.append("  proposed text:")
+        if entry["proposed_text"]:
+            for proposed in entry["proposed_text"].splitlines():
+                lines.append(f"    {proposed}")
+        else:
+            lines.append("    (line removed)")
+        lines.append(f"  action: {entry['action']}")
+        lines.append(f"  rationale: {entry['rationale']}")
+        if entry["requires_approval"]:
+            lines.append(
+                "  approval: required — operator must approve; never auto-applied"
+            )
+    summary = report["summary"]
+    lines.append("")
+    lines.append(
+        f"summary: {summary['total']} finding(s) — {summary['safe']} safe, "
+        f"{summary['recommendation']} recommendation, {summary['applied']} "
+        f"applied, {summary['remaining']} remaining"
+    )
+    return "\n".join(lines)
+
+
+def render_json_report(report: Mapping) -> str:
+    """Render a report as deterministic, parseable JSON (AC1)."""
+    return json.dumps(report, indent=2, sort_keys=False)
+
+
+# ── Safe-fix application ───────────────────────────────────────────────────
+
+
+def apply_safe_fixes(
+    documents: Mapping[str, str],
+    findings: Iterable[Finding],
+    *,
+    allow_ids: Iterable[str] = (),
+) -> dict[str, str]:
+    """Apply only ``FIX_SAFE`` findings and return the changed documents.
+
+    Recommendation-class findings are ignored: they need explicit operator
+    approval (AC3/AC4). Duplicate copies beyond the first are deleted, then
+    non-allow-listed work-item IDs and workflow-comment lines are stripped.
+    Nothing is written to disk here — the CLI writes the returned mapping.
+    """
+    remove_lines: dict[str, set[int]] = {}
+    for finding in findings:
+        if finding.fix_class != FIX_SAFE or finding.kind != KIND_DUPLICATE:
+            continue
+        for span in finding.spans[1:]:
+            remove_lines.setdefault(span.path, set()).update(
+                range(span.start_line, span.end_line + 1)
+            )
+
+    changed: dict[str, str] = {}
+    for path, text in documents.items():
+        lines = text.splitlines()
+        dropped = remove_lines.get(path, set())
+        kept = "\n".join(
+            line for index, line in enumerate(lines, start=1) if index not in dropped
+        )
+        if text.endswith("\n") and kept:
+            kept += "\n"
+        cleaned, _ = strip_nonessential_ids(kept, allow_ids=allow_ids)
+        cleaned, _ = strip_workflow_comments(cleaned)
+        if cleaned != text:
+            changed[path] = cleaned
+    return changed
+
+
+# ── Cron helper ────────────────────────────────────────────────────────────
+
+
+def cron_line(root: str | Path, script: str | Path, *, log_path: str | Path | None = None) -> str:
+    """Return the weekly dry-run crontab line printed by ``--install-cron``.
+
+    The line runs the linter with ``--dry-run --json``, appending to a log
+    under ``.worklog/`` (AC5). Printing it never installs anything.
+    """
+    root_path = Path(root).expanduser().resolve()
+    script_path = Path(script).expanduser().resolve()
+    log = (
+        Path(log_path).expanduser()
+        if log_path is not None
+        else root_path / ".worklog" / "skill-linter-cron.log"
+    )
+    return (
+        f"{CRON_SCHEDULE_WEEKLY} cd {shlex.quote(str(root_path))} && "
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))} "
+        f"--dry-run --json >> {shlex.quote(str(log))} 2>&1"
+    )
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="lint_skills.py",
+        description=(
+            "Scan SKILL.md / AGENTS documents for duplicated content and "
+            "workflow traceability noise. Dry-run by default; --apply removes "
+            "only safe-fix findings."
+        ),
+    )
+    parser.add_argument("--root", default=".", help="repository root to scan")
+    parser.add_argument(
+        "--target",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="file or directory to scan (repeatable; replaces the default scope)",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="apply safe-fix findings (recommendations are only reported)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would change without modifying files (the default)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="emit the machine-readable JSON report",
+    )
+    parser.add_argument(
+        "--install-cron",
+        nargs="?",
+        const="weekly",
+        default=None,
+        metavar="SCHEDULE",
+        help="print a crontab line for a scheduled dry-run report (weekly)",
+    )
+    parser.add_argument(
+        "--allow-id",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="work-item ID that is essential and must be preserved",
+    )
+    parser.add_argument(
+        "--min-lines",
+        type=int,
+        default=MIN_DUPLICATE_LINES,
+        help="minimum lines in a duplicate block",
+    )
+    parser.add_argument(
+        "--min-chars",
+        type=int,
+        default=MIN_DUPLICATE_CHARS,
+        help="minimum characters in a duplicate block",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entry point; returns the process exit code (AC6)."""
+    parser = _build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if args.install_cron is not None:
+        schedule = args.install_cron
+        if schedule not in CRON_SCHEDULES:
+            print(
+                f"lint_skills: error: unknown cron schedule {schedule!r}; "
+                f"supported: {', '.join(sorted(CRON_SCHEDULES))}",
+                file=sys.stderr,
+            )
+            return EXIT_ERROR
+        line = cron_line(args.root, Path(__file__))
+        print(
+            "Weekly skill-linter dry-run crontab line "
+            "(printed only; NOT installed — add it with `crontab -e`):"
+        )
+        print()
+        print(line)
+        return EXIT_CRON_OK
+
+    try:
+        config = ScanConfig(
+            min_lines=args.min_lines,
+            min_chars=args.min_chars,
+            include_near=True,
+            allow_ids=tuple(args.allow_id),
+        )
+    except (TypeError, ValueError) as exc:
+        print(f"lint_skills: error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    root = Path(args.root).expanduser()
+    try:
+        documents = discover_documents(root, targets=args.target)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"lint_skills: error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    findings = config.scan(documents)
+    apply_requested = args.apply and not args.dry_run
+    applied = 0
+    if apply_requested:
+        changed = apply_safe_fixes(documents, findings, allow_ids=config.allow_ids)
+        applied = sum(1 for finding in findings if finding.fix_class == FIX_SAFE)
+        for path, text in changed.items():
+            target = Path(path)
+            if not target.is_absolute():
+                target = root / target
+            target.write_text(text, encoding="utf-8")
+        documents.update(changed)
+        findings = config.scan(documents)
+
+    report = build_report(
+        findings,
+        documents,
+        root=root,
+        dry_run=not apply_requested,
+        applied=applied,
+    )
+    if args.as_json:
+        print(render_json_report(report))
+    else:
+        print(render_text_report(report))
+    return EXIT_CLEAN if not findings else EXIT_FINDINGS
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via main()
+    raise SystemExit(main())

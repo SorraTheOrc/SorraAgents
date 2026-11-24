@@ -411,3 +411,389 @@ class TestFindingSerialisation:
                 item["kind"],
             ),
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CLI, report formatting, --dry-run / --apply and --install-cron
+#
+# Work item: SA-0MWGAZ286009G2JR — "Test report format, CLI, dry-run, cron"
+# (child of SA-0MWFP1E9P0027EOE). The tests pin the CLI contract that the
+# sibling child SA-0MWGAZA390062S6B implements on top of the detector core:
+#
+# - AC1 text and JSON reports carry file, section/line span, current text,
+#   proposed text, fix class and rationale; JSON is parseable and stable
+# - AC2 --dry-run (the default) changes nothing and prints what would change
+# - AC3 --apply applies only safe-fix classes; exit reflects what remains
+# - AC4 recommendation-class findings are reported with full context and are
+#   never applied automatically (explicit operator approval required)
+# - AC5 --install-cron weekly prints a valid weekly crontab line for a
+#   dry-run report and does NOT claim the schedule is active
+# - AC6 exit codes: 0 clean, 1 findings present, 2 usage/scan error
+# ══════════════════════════════════════════════════════════════════════════
+
+CLI_DOC = _doc(
+    "# Alpha skill",  # 1
+    "",  # 2
+    "## Usage",  # 3
+    "",  # 4
+    *DUP_BLOCK,  # 5-7
+    "",  # 8
+    f"Tracking note for {WORK_ITEM_ID}.",  # 9
+    f"implement - Session ID: {SESSION_ID} - {SESSION_PATH}",  # 10
+    "",  # 11
+    *DUP_BLOCK,  # 12-14
+)
+
+
+def _make_repo(tmp_path, documents: dict[str, str]):
+    """Materialise *documents* under *tmp_path* and return the repo root."""
+    from pathlib import Path
+
+    root = Path(tmp_path)
+    for relative, text in documents.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+def _run_cli(capsys, *argv: str):
+    """Invoke ``lint_skills.main`` in-process and capture its streams."""
+    code = lint_skills.main([str(item) for item in argv])
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def _read(root, relative: str) -> str:
+    return (root / relative).read_text(encoding="utf-8")
+
+
+# ── AC1: text and JSON report formatting ──────────────────────────────────
+
+
+class TestTextReport:
+    def test_text_report_shows_file_span_section_text_and_rationale(self, tmp_path, capsys):
+        root = _make_repo(tmp_path, {"skill/alpha/SKILL.md": CLI_DOC})
+
+        code, out, _ = _run_cli(capsys, "--root", root)
+
+        assert code == lint_skills.EXIT_FINDINGS
+        # File and the duplicate's line span, with its nearest section heading.
+        assert "skill/alpha/SKILL.md:5-7" in out
+        assert "## Usage" in out
+        # Current text and rationale are rendered for each finding.
+        assert DUP_BLOCK[0] in out
+        assert "rationale:" in out
+        # Fix class is visible in the text report.
+        assert "safe" in out
+        # The duplicate action explains exactly what would change.
+        assert "would" in out.lower()
+
+    def test_text_report_lists_every_finding(self, tmp_path, capsys):
+        root = _make_repo(tmp_path, {"skill/alpha/SKILL.md": CLI_DOC})
+
+        _, out, _ = _run_cli(capsys, "--root", root)
+
+        assert WORK_ITEM_ID in out
+        assert SESSION_ID in out
+        assert out.count("rationale:") == 3
+
+
+class TestJsonReport:
+    def test_json_report_is_parseable_with_a_stable_schema(self, tmp_path, capsys):
+        root = _make_repo(tmp_path, {"skill/alpha/SKILL.md": CLI_DOC})
+
+        code, out, _ = _run_cli(capsys, "--root", root, "--json")
+
+        assert code == lint_skills.EXIT_FINDINGS
+        payload = json.loads(out)
+        assert payload["schema_version"] == lint_skills.REPORT_SCHEMA_VERSION
+        assert payload["dry_run"] is True
+        assert payload["root"] == str(root)
+        assert set(payload["summary"]) == {
+            "total",
+            "safe",
+            "recommendation",
+            "applied",
+            "remaining",
+        }
+        assert payload["summary"]["total"] == len(payload["findings"]) == 3
+        assert payload["summary"]["safe"] == 3
+        assert payload["summary"]["recommendation"] == 0
+        assert payload["summary"]["applied"] == 0
+
+        entry = payload["findings"][0]
+        assert set(entry) == {
+            "kind",
+            "fix_class",
+            "path",
+            "start_line",
+            "end_line",
+            "section",
+            "text",
+            "proposed_text",
+            "rationale",
+            "requires_approval",
+            "action",
+            "spans",
+        }
+        assert entry["path"] == "skill/alpha/SKILL.md"
+        assert (entry["start_line"], entry["end_line"]) == (5, 7)
+        assert entry["section"] == "## Usage"
+        assert entry["text"] == DUP_TEXT
+        assert entry["proposed_text"] == DUP_TEXT
+        assert entry["requires_approval"] is False
+        assert set(entry["spans"][0]) == {
+            "path",
+            "start_line",
+            "end_line",
+            "text",
+        }
+
+    def test_json_report_is_deterministic_between_runs(self, tmp_path, capsys):
+        root = _make_repo(tmp_path, {"skill/alpha/SKILL.md": CLI_DOC})
+
+        _, first, _ = _run_cli(capsys, "--root", root, "--json")
+        _, second, _ = _run_cli(capsys, "--root", root, "--json")
+
+        assert first == second
+
+
+# ── AC2: --dry-run is the default and changes nothing ─────────────────────
+
+
+class TestDryRun:
+    def test_default_run_modifies_no_files(self, tmp_path, capsys):
+        path = "skill/alpha/SKILL.md"
+        root = _make_repo(tmp_path, {path: CLI_DOC})
+        before = _read(root, path)
+
+        code, out, _ = _run_cli(capsys, "--root", root)
+
+        assert code == lint_skills.EXIT_FINDINGS
+        assert _read(root, path) == before
+        assert "dry-run" in out.lower()
+        assert "no files modified" in out.lower()
+
+    def test_explicit_dry_run_overrides_apply(self, tmp_path, capsys):
+        path = "skill/alpha/SKILL.md"
+        root = _make_repo(tmp_path, {path: CLI_DOC})
+        before = _read(root, path)
+
+        code, _, _ = _run_cli(capsys, "--root", root, "--apply", "--dry-run")
+
+        assert code == lint_skills.EXIT_FINDINGS
+        assert _read(root, path) == before
+
+    def test_clean_tree_exits_zero(self, tmp_path, capsys):
+        root = _make_repo(
+            tmp_path,
+            {"skill/alpha/SKILL.md": _doc("# Alpha", "", "A single unique instruction.")},
+        )
+
+        code, out, _ = _run_cli(capsys, "--root", root)
+
+        assert code == lint_skills.EXIT_CLEAN
+        assert "no findings" in out.lower()
+
+
+# ── AC3: --apply only applies safe-fix classes ────────────────────────────
+
+
+class TestApply:
+    def test_apply_removes_duplicates_and_strips_traceability_noise(self, tmp_path, capsys):
+        path = "skill/alpha/SKILL.md"
+        root = _make_repo(tmp_path, {path: CLI_DOC})
+
+        code, out, _ = _run_cli(capsys, "--root", root, "--apply")
+
+        assert code == lint_skills.EXIT_CLEAN
+        cleaned = _read(root, path)
+        assert cleaned.count(DUP_BLOCK[0]) == 1
+        assert WORK_ITEM_ID not in cleaned
+        assert SESSION_ID not in cleaned
+        assert "## Usage" in cleaned
+        assert "applied" in out.lower()
+
+    def test_apply_leaves_recommendation_findings_untouched(self, tmp_path, capsys):
+        path = "skill/alpha/SKILL.md"
+        variant = (
+            DUP_BLOCK[0],
+            "It normalises indentation before comparing every candidate window.",
+            DUP_BLOCK[2],
+        )
+        text = _doc("# Alpha", "", *DUP_BLOCK, "", "---", "", *variant)
+        root = _make_repo(tmp_path, {path: text})
+
+        code, out, _ = _run_cli(capsys, "--root", root, "--apply")
+
+        assert code == lint_skills.EXIT_FINDINGS
+        assert _read(root, path) == text
+        assert "recommendation" in out.lower()
+
+    def test_apply_exit_code_reflects_remaining_findings(self, tmp_path, capsys):
+        root = _make_repo(
+            tmp_path,
+            {
+                "skill/alpha/SKILL.md": _doc(
+                    "# Alpha", "", f"Tracking note for {WORK_ITEM_ID}."
+                )
+            },
+        )
+
+        code, _, _ = _run_cli(capsys, "--root", root, "--apply")
+
+        assert code == lint_skills.EXIT_CLEAN
+        assert WORK_ITEM_ID not in _read(root, "skill/alpha/SKILL.md")
+
+
+# ── AC4: recommendation-class findings require operator approval ──────────
+
+
+class TestRecommendationGating:
+    def test_recommendation_is_reported_with_context_and_needs_approval(self, tmp_path, capsys):
+        variant = (
+            DUP_BLOCK[0],
+            "It normalises indentation before comparing every candidate window.",
+            DUP_BLOCK[2],
+        )
+        text = _doc("# Alpha", "", *DUP_BLOCK, "", "---", "", *variant)
+        root = _make_repo(tmp_path, {"skill/alpha/SKILL.md": text})
+
+        code, out, _ = _run_cli(capsys, "--root", root, "--json")
+
+        assert code == lint_skills.EXIT_FINDINGS
+        payload = json.loads(out)
+        recommendations = [
+            entry
+            for entry in payload["findings"]
+            if entry["fix_class"] == lint_skills.FIX_RECOMMENDATION
+        ]
+        assert recommendations
+        entry = recommendations[0]
+        assert entry["requires_approval"] is True
+        assert entry["path"] == "skill/alpha/SKILL.md"
+        assert entry["start_line"] == 3
+        assert entry["end_line"] == 5
+        assert entry["section"] == "# Alpha"
+        assert DUP_BLOCK[0] in entry["text"]
+        assert entry["rationale"]
+        assert "approval" in entry["action"].lower()
+
+    def test_recommendation_class_never_changes_files_on_apply(self, tmp_path, capsys):
+        variant = (
+            DUP_BLOCK[0],
+            "It normalises indentation before comparing every candidate window.",
+            DUP_BLOCK[2],
+        )
+        text = _doc("# Alpha", "", *DUP_BLOCK, "", "---", "", *variant)
+        root = _make_repo(tmp_path, {"skill/alpha/SKILL.md": text})
+
+        _, out, _ = _run_cli(capsys, "--root", root, "--apply")
+
+        assert _read(root, "skill/alpha/SKILL.md") == text
+        assert "operator approval" in out.lower()
+
+
+# ── AC5: --install-cron weekly ────────────────────────────────────────────
+
+
+class TestInstallCron:
+    def _cron_line(self, out: str) -> str:
+        for line in out.splitlines():
+            if "lint_skills.py" in line:
+                return line
+        raise AssertionError(f"no crontab line in output:\n{out}")
+
+    def test_install_cron_prints_a_valid_weekly_line(self, tmp_path, capsys):
+        root = _make_repo(tmp_path, {})
+
+        code, out, _ = _run_cli(capsys, "--root", root, "--install-cron", "weekly")
+
+        assert code == lint_skills.EXIT_CRON_OK
+        line = self._cron_line(out)
+        assert line.split()[:5] == ["0", "3", "*", "*", "1"]
+        assert "--dry-run" in line
+        assert "--json" in line
+        assert str(root) in line
+
+    def test_install_cron_defaults_to_weekly(self, tmp_path, capsys):
+        root = _make_repo(tmp_path, {})
+
+        _, out, _ = _run_cli(capsys, "--root", root, "--install-cron")
+
+        assert self._cron_line(out).split()[:5] == ["0", "3", "*", "*", "1"]
+
+    def test_install_cron_does_not_claim_the_schedule_is_active(self, tmp_path, capsys):
+        root = _make_repo(tmp_path, {})
+
+        _, out, _ = _run_cli(capsys, "--root", root, "--install-cron")
+
+        lowered = out.lower()
+        assert "not installed" in lowered
+        assert "crontab -e" in lowered
+        assert "is installed" not in lowered
+        assert "has been installed" not in lowered
+
+    def test_install_cron_rejects_an_unknown_schedule(self, tmp_path, capsys):
+        root = _make_repo(tmp_path, {})
+
+        code, _, err = _run_cli(capsys, "--root", root, "--install-cron", "daily")
+
+        assert code == lint_skills.EXIT_ERROR
+        assert "weekly" in err.lower()
+
+
+# ── AC6: exit codes ───────────────────────────────────────────────────────
+
+
+class TestExitCodes:
+    def test_exit_codes_are_distinct(self):
+        assert lint_skills.EXIT_CLEAN == 0
+        assert lint_skills.EXIT_FINDINGS == 1
+        assert lint_skills.EXIT_ERROR == 2
+        assert len(
+            {
+                lint_skills.EXIT_CLEAN,
+                lint_skills.EXIT_FINDINGS,
+                lint_skills.EXIT_ERROR,
+            }
+        ) == 3
+
+    def test_missing_target_is_a_usage_error(self, tmp_path, capsys):
+        root = _make_repo(tmp_path, {})
+
+        code, _, err = _run_cli(capsys, "--root", root, "--target", "missing.md")
+
+        assert code == lint_skills.EXIT_ERROR
+        assert "does not exist" in err
+
+
+# ── Section resolution used by the report ─────────────────────────────────
+
+
+class TestSectionResolution:
+    def test_nearest_preceding_heading_is_reported(self):
+        text = _doc(
+            "# Top",  # 1
+            "",  # 2
+            "Intro.",  # 3
+            "",  # 4
+            "## Usage",  # 5
+            "",  # 6
+            "Body.",  # 7
+            "",  # 8
+            "### Details",  # 9
+            "",  # 10
+            "Deep body.",  # 11
+        )
+
+        assert lint_skills.section_for_line(text, 3) == "# Top"
+        assert lint_skills.section_for_line(text, 7) == "## Usage"
+        assert lint_skills.section_for_line(text, 11) == "### Details"
+
+    def test_documents_without_headings_report_the_document_top(self):
+        assert (
+            lint_skills.section_for_line("plain body\nsecond line\n", 2)
+            == "(document top)"
+        )
