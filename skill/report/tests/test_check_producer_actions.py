@@ -38,9 +38,19 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 SCRIPTS_DIR = REPO_ROOT / "skill" / "report" / "scripts"
 SHARED_DIR = REPO_ROOT / "skill" / "shared"
-for _path in (SCRIPTS_DIR, SHARED_DIR, REPO_ROOT / "skill", REPO_ROOT):
-    if str(_path) not in sys.path:
-        sys.path.insert(0, str(_path))
+# Insert in priority order: REPO_ROOT first so that ``import tests``
+# resolves to the repo-level ``tests/`` package rather than
+# ``skill/shared/tests/`` (which would lack ``skill_inventory``).
+# Remove each path first (to avoid duplicates from conftest mutations),
+# then insert in REVERSE order so the tuple's first element ends up at
+# index 0 (insert(0) pushes previous entries down).
+_paths = (REPO_ROOT, REPO_ROOT / "skill", SCRIPTS_DIR, SHARED_DIR)
+for _p in _paths:
+    _s = str(_p)
+    if _s in sys.path:
+        sys.path.remove(_s)
+for _p in reversed(_paths):
+    sys.path.insert(0, str(_p))
 
 import check_producer_actions as cpa
 from shared import herdr_pane
@@ -257,6 +267,8 @@ def test_cli_reports_a_clean_pass_offline(tmp_path):
         capture_output=True,
         text=True,
         timeout=60,
+        # Intentional: the clean-pass contract is asserted on returncode below,
+        # so check=True would turn that assertion into a raised exception.
         check=False,
     )
     payload = json.loads(result.stdout)
@@ -278,6 +290,8 @@ def test_cli_fails_loudly_and_names_the_offending_template(tmp_path):
         capture_output=True,
         text=True,
         timeout=60,
+        # Intentional: the failure contract is asserted on returncode below, so
+        # check=True would raise instead of exercising the documented exit code.
         check=False,
     )
     payload = json.loads(result.stdout)
