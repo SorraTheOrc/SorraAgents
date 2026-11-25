@@ -1844,3 +1844,148 @@ class TestRepoHelpersAreHermetic:
                 created, ["rev-parse", "--show-toplevel"], check=True
             ).stdout.strip()
             assert Path(toplevel).resolve() == created.resolve()
+
+
+# ---------------------------------------------------------------------------
+# TypeScript import-graph selection
+# ---------------------------------------------------------------------------
+# Reproduction: WL-0MW0JF5YE008LV1R edited ``src/github-sync.ts`` (a barrel);
+# the convention mapper looked for ``github-sync.test.ts`` and missed every
+# test that imports the barrel through a TypeScript ESM specifier
+# (SA-0MWHUVI5J005RQHZ / SA-0MWHUVHHV003UJTH).
+#
+# Imports use the ``.js`` extension even though the sources are ``.ts`` — the
+# TypeScript ESM convention — so the selector must map ``x.js`` → ``x.ts`` /
+# ``x.tsx`` and treat ``export … from`` as an import edge (barrel re-exports).
+
+
+def _make_ts_import_repo(tmp_path: Path) -> Path:
+    """Hermetic repo mirroring the WL-0MW0JF5YE008LV1R github-sync layout.
+
+    ``src/github-sync.ts`` is a barrel re-exporting sibling modules. The three
+    reproduction tests import the barrel; ``comments-module.test.ts`` imports a
+    sibling module that itself imports ``types.ts`` (the transitive case).
+    """
+    repo = tmp_path / "ts_import_repo"
+    (repo / "src" / "github-sync").mkdir(parents=True)
+    (repo / "tests" / "integration").mkdir(parents=True)
+    (repo / "tests" / "github-sync").mkdir(parents=True)
+    (repo / "package.json").write_text(
+        json.dumps(
+            {
+                "scripts": {"test": "vitest run"},
+                "devDependencies": {"vitest": "^1.0.0"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Public barrel — re-exports type + value modules via `.js` specifiers.
+    (repo / "src" / "github-sync.ts").write_text(
+        "export type { GithubProgress } from './github-sync/types.js';\n"
+        "export { upsertIssuesFromWorkItems } from './github-sync/push.js';\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "github-sync" / "types.ts").write_text(
+        "export type GithubProgress = { done: number };\n", encoding="utf-8"
+    )
+    (repo / "src" / "github-sync" / "push.ts").write_text(
+        "import type { GithubProgress } from './types.js';\n"
+        "export function upsertIssuesFromWorkItems(): void {}\n",
+        encoding="utf-8",
+    )
+    (repo / "src" / "github-sync" / "comments.ts").write_text(
+        "import type { GithubProgress } from './types.js';\n"
+        "export function syncComments(): void {}\n",
+        encoding="utf-8",
+    )
+
+    # Reproduction tests: import the barrel, not a same-stem module.
+    for name in (
+        "tests/github-sync-comments.test.ts",
+        "tests/github-sync-output.test.ts",
+    ):
+        (repo / name).write_text(
+            "import { upsertIssuesFromWorkItems } from '../src/github-sync.js';\n",
+            encoding="utf-8",
+        )
+    (
+        repo / "tests" / "integration" / "github-throttler-concurrency.test.ts"
+    ).write_text(
+        "import * as githubSync from '../../src/github-sync.js';\n",
+        encoding="utf-8",
+    )
+    # Transitive: imports comments.ts (which imports types.ts).
+    (repo / "tests" / "github-sync" / "comments-module.test.ts").write_text(
+        "import { syncComments } from '../../src/github-sync/comments.js';\n",
+        encoding="utf-8",
+    )
+    # Unrelated test, no shared imports.
+    (repo / "tests" / "unrelated.test.ts").write_text(
+        "export const x = 1;\n", encoding="utf-8"
+    )
+
+    _init_repo_with_dev(repo)
+    return repo
+
+
+class TestTypeScriptImportGraphSelection:
+    """Changed-scope selection follows static TypeScript import graphs."""
+
+    def test_barrel_edit_selects_importing_tests(self, tmp_path: Path) -> None:
+        """Editing ``src/github-sync.ts`` selects the tests importing it."""
+        repo = _make_ts_import_repo(tmp_path)
+
+        tests = map_changed_to_tests(repo, {"src/github-sync.ts"})
+
+        assert "tests/github-sync-comments.test.ts" in tests
+        assert "tests/github-sync-output.test.ts" in tests
+        assert "tests/integration/github-throttler-concurrency.test.ts" in tests
+        # The unrelated test imports nothing shared and must not be dragged in.
+        assert "tests/unrelated.test.ts" not in tests
+
+    def test_transitive_import_selects_test(self, tmp_path: Path) -> None:
+        """A test importing a module that imports the changed module is hit."""
+        repo = _make_ts_import_repo(tmp_path)
+
+        tests = map_changed_to_tests(repo, {"src/github-sync/types.ts"})
+
+        # comments-module.test.ts → comments.ts → types.ts (transitive).
+        assert "tests/github-sync/comments-module.test.ts" in tests
+        # The barrel re-exports types.ts, so barrel importers are hit too.
+        assert "tests/github-sync-comments.test.ts" in tests
+        assert "tests/unrelated.test.ts" not in tests
+
+    def test_export_from_counts_as_import(self, tmp_path: Path) -> None:
+        """``export … from`` is a graph edge (barrel re-export)."""
+        repo = _make_ts_import_repo(tmp_path)
+
+        tests = map_changed_to_tests(repo, {"src/github-sync/push.ts"})
+
+        # Barrel re-exports push.ts; the reproduction tests import the barrel.
+        assert "tests/github-sync-comments.test.ts" in tests
+        assert "tests/github-sync-output.test.ts" in tests
+
+    def test_tsx_source_and_test(self, tmp_path: Path) -> None:
+        """``.tsx`` sources and tests participate in the import graph."""
+        repo = _make_ts_import_repo(tmp_path)
+        (repo / "src" / "Widget.tsx").write_text(
+            "export const Widget = () => null;\n", encoding="utf-8"
+        )
+        (repo / "tests" / "widget.test.tsx").write_text(
+            "import { Widget } from '../src/Widget.js';\n", encoding="utf-8"
+        )
+
+        tests = map_changed_to_tests(repo, {"src/Widget.tsx"})
+
+        assert "tests/widget.test.tsx" in tests
+
+    def test_no_ts_change_runs_no_ts_scan(self, tmp_path: Path) -> None:
+        """A Python-only change set keeps the TypeScript graph untouched."""
+        repo = _make_repo(tmp_path)
+
+        tests = map_changed_to_tests(repo, {"src/utils.py"})
+
+        # Existing convention/import behaviour is unchanged.
+        assert "tests/test_utils.py" in tests
+        assert all(not t.endswith((".ts", ".tsx")) for t in tests)
