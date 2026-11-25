@@ -102,6 +102,20 @@ hit the same entries because both resolve the same project root.
   audit runner whose PATH lacks the user-local bin directory). The path stays
   clean for callers that already have the directory configured (no duplicate
   entry).
+- **`node_modules/.bin` PATH augmentation for suite commands
+  (SA-0MWWKLY8M009PD78)**: every suite command `run_tests.py` spawns through
+  `_run_cmd` gets the checkout's absolute `<repo>/node_modules/.bin`
+  **prepended** to its child `PATH` (ahead of the `~/.local/bin`
+  normalisation above — npm's own ordering), when that directory exists. A
+  changed-scope run builds a direct `node_modules/.bin/vitest run <files>`
+  command; without the prepend a test that shells out to a local bin (`tsx`
+  etc.) failed with `sh: tsx: not found`, even though the same test passed
+  under `npm test` (which puts the directory on `PATH`). The prepend is
+  **existence-gated** (a pytest-only repo, or a checkout without installed
+  deps — the SorraAgents checkout itself — is a graceful no-op) and
+  **deduped** (an entry a launcher already put on `PATH` is moved, not
+  repeated). It is **env-only**: command strings and therefore per-repo cache
+  keys are byte-identical.
 
 #### Cache fingerprint contract (SA-0MVQHVHXI007PQAB, SA-0MVQHVKUH009VQMD)
 

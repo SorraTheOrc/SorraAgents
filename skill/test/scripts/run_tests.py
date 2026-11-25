@@ -2893,7 +2893,7 @@ def _test_concurrency_slot(lane: str | None = None) -> Iterator[None]:
         ) from exc
 
 
-def _suite_command_env() -> dict[str, str]:
+def _suite_command_env(repo_root: Path | None = None) -> dict[str, str]:
     """Return the child environment for a suite command.
 
     Layers, in order:
@@ -2902,11 +2902,20 @@ def _suite_command_env() -> dict[str, str]:
        (:func:`test_runner.subprocess_env_with_scrubbed_overrides`) — a leaked
        ``GIT_DIR`` must not redirect real-git fixtures at the live checkout
        (F2, SA-0MUIA3OE40001QJX).
-    2. The resolved per-suite vitest worker bound as ``VITEST_MAX_WORKERS``
+    2. ``<repo_root>/node_modules/.bin`` prepended to PATH **ahead of** the
+       ``~/.local/bin`` normalisation (npm's own ordering), when *repo_root*
+       is supplied and that directory exists (SA-0MWWKLY8M009PD78). Without
+       it, a changed-scope ``node_modules/.bin/vitest run <files>`` command
+       cannot shell-spawn a local bin (``tsx`` etc.) and fails with
+       ``sh: tsx: not found``, while the same tests pass under ``npm test``
+       (which puts the directory on PATH). The prepend is existence-gated
+       and deduped, so it is a graceful no-op for pytest-only repos and
+       checkouts without installed deps.
+    3. The resolved per-suite vitest worker bound as ``VITEST_MAX_WORKERS``
        (SA-0MVE98T1M006A17T). An ambient value wins (it is re-exported
-       normalised); otherwise the calibrated default applies. This is the
-       only mutation, and it never leaks back into ``os.environ``.
-    3. A disk-backed ``TMPDIR`` resolved by the shared helper
+       normalised); otherwise the calibrated default applies. This never
+       leaks back into ``os.environ``.
+    4. A disk-backed ``TMPDIR`` resolved by the shared helper
        (:func:`shared.test_tmpdir.resolve_test_tmpdir`, F1
        SA-0MW3EN72O005BMIP) so a suite subprocess never exhausts a tiny
        tmpfs ``/tmp`` inode budget (SA-0MW2QED9M005FWOK). Resolved once per
@@ -2916,10 +2925,23 @@ def _suite_command_env() -> dict[str, str]:
 
     ``NODE_OPTIONS`` and every other unrelated variable are preserved, so
     consumer-provided vitest/NODE_OPTIONS plumbing keeps working. The
-    TMPDIR/VITEST changes are env-only — command strings and therefore cache
-    keys are byte-identical (SA-0MW3ENF32006BGN1 AC4).
+    PATH/TMPDIR/VITEST changes are env-only — command strings and therefore
+    cache keys are byte-identical (SA-0MW3ENF32006BGN1 AC4,
+    SA-0MWWKLY8M009PD78 AC5).
     """
     env = subprocess_env_with_scrubbed_overrides()
+    if repo_root is not None:
+        node_bin = Path(repo_root) / "node_modules" / ".bin"
+        if node_bin.is_dir():
+            node_bin_str = str(node_bin.resolve())
+            path_parts = env.get("PATH", "").split(os.pathsep)
+            # Prepend ahead of the ``~/.local/bin`` normalisation (npm's own
+            # ordering: ``node_modules/.bin`` first), deduped so an entry a
+            # launcher already put on PATH is moved, never repeated.
+            path_parts = [node_bin_str] + [
+                part for part in path_parts if part != node_bin_str
+            ]
+            env["PATH"] = os.pathsep.join(path_parts)
     env[TEST_VITEST_MAX_WORKERS_ENV] = str(_test_vitest_max_workers())
     env["TMPDIR"] = _resolved_test_tmpdir()
     return env
@@ -2983,7 +3005,9 @@ def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.Comple
     bare inherit of the parent environment, so a leaked ``GIT_DIR`` cannot
     redirect real-git test fixtures at the live checkout. It additionally
     carries the per-suite ``VITEST_MAX_WORKERS`` bound
-    (SA-0MVE98T1M006A17T) — see :func:`_suite_command_env`.
+    (SA-0MVE98T1M006A17T) and, when *cwd* holds ``node_modules/.bin``, that
+    directory prepended to PATH so a directly-invoked local bin can be found
+    (SA-0MWWKLY8M009PD78) — see :func:`_suite_command_env`.
     """
     log_repository_override_scrub()
     return subprocess.run(
@@ -2993,7 +3017,7 @@ def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.Comple
         text=True,
         timeout=timeout,
         check=False,
-        env=_suite_command_env(),
+        env=_suite_command_env(Path(cwd)),
     )
 
 
