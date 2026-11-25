@@ -20791,6 +20791,31 @@ def phase_drive(
                     "it recurs, apply the remedy: "
                     f"{spawn_classification['remedy']}",
                 )
+                # Record durable evidence that this attempt produced nothing
+                # *before* the retry ``continue`` (WL-0MWWBJJBD008TBPB): the
+                # re-run parent phase runs the placement guard immediately
+                # after this point, and without the record it cannot tell an
+                # unproductive child from one whose work landed in a live
+                # sibling worktree — a false ``_child_main_checkout_violation``
+                # that stops the drive. Mirror the budget-exhausted path
+                # below, recording only a child with no work of its own.
+                spawn_failure = None
+                if (
+                    _classify_child_worktree(
+                        child_id, worktree_path, parent_branch
+                    )
+                    in (CHILD_CLEAN, CHILD_NO_WORK)
+                ):
+                    spawn_failure = record_spawn_failure(
+                        worktree_path,
+                        child_id,
+                        reconciliation["reason"]
+                        or str(
+                            spawn_result.get("reason", "")
+                            or "session failed"
+                        ),
+                    )
+                entry["spawn_failure_recorded"] = spawn_failure is not None
                 sleeper(backoff)
                 continue
 

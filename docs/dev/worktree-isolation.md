@@ -370,7 +370,12 @@ session died before writing anything is exempt too: `phase_drive` records the
 failure in `<worktree>/.worklog/spawn-failure.json`, so the foreign dirt is
 pre-existing and unrelated and the child is reported startable again (the next
 `drive` re-spawns it) rather than failing the chain closed
-(SA-0MWGZ8NWP009QD8G). A **foreign
+(SA-0MWGZ8NWP009QD8G). The record is written on the budget-exhausted failure
+**and** immediately before an `infrastructure`-classified child is re-spawned
+on the retry budget, so the exemption applies from the moment of that
+classification: a transient provider failure never lets the re-run parent phase
+attribute a live sibling worktree's mid-flight work to the failed child
+(WL-0MWWBJJBD008TBPB). A **foreign
 repository checkout** — even one reachable by path — is never a sibling: only
 paths `git worktree list` registers for the child's own repository count
 (cross-checkout attribution). The ahead-count (rather than a HEAD comparison)

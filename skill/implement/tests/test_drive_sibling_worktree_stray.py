@@ -1593,13 +1593,12 @@ class TestDriveRetriesProviderStreamFailure:
 # work to the failed child and stopped the whole drive chain with a false
 # accusation against an unrelated item.
 #
-# Test-first slice (this item): the two expectations that need the fix are
-# ``xfail(strict=True)`` until the sibling fix slice
-# (WL-0MWWBJJBD008TBPB) records the evidence before the retry ``continue``;
-# that change set removes the markers. The companions — the guard still fails
-# closed without evidence, and a child holding its own work never reaches the
-# exemption — pass before **and** after the fix, so a failing test can only be
-# failing on the behaviour under test.
+# Fix slice (this item): the two expectations that needed
+# WL-0MWWBJJBD008TBPB now assert the fixed behaviour directly (the evidence is
+# recorded before the retry ``continue``), so they are no longer ``xfail``.
+# The companions — the guard still fails closed without evidence, and a child
+# holding its own work never reaches the exemption — pass before **and** after
+# the fix, so a failing test can only be failing on the behaviour under test.
 
 
 class TestInfraRetryWithLiveSiblingWorktree:
@@ -1767,13 +1766,6 @@ class TestInfraRetryWithLiveSiblingWorktree:
                 is None
             )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "needs WL-0MWWBJJBD008TBPB: record spawn-failure evidence before "
-            "the infra-retry continue"
-        ),
-    )
     def test_the_retry_records_evidence_before_re_running_the_parent(
         self, child_worktree: Path, sibling_worktree: Path
     ) -> None:
@@ -1802,13 +1794,6 @@ class TestInfraRetryWithLiveSiblingWorktree:
         )
         assert violations == [None]
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "needs WL-0MWWBJJBD008TBPB: record spawn-failure evidence before "
-            "the infra-retry continue"
-        ),
-    )
     def test_a_live_sibling_ahead_of_dev_never_stops_the_retry(
         self, child_worktree: Path, sibling_worktree: Path
     ) -> None:
