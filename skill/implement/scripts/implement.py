@@ -13047,6 +13047,14 @@ def _phase_start_locked(
         base_resolution = _resolve_start_base(
             repo_root, parent_branch, refresh_result=refresh_result
         )
+        # Record the refresh outcome alongside the base decision
+        # (SA-0MWFFX49M0016KOK AC2): an operator reading the report or the
+        # start comment must be able to tell a deliberate origin fork from a
+        # refresh that was skipped (lock held, dirty checkout, diverged).
+        base_resolution["refresh"] = {
+            "method": refresh_result.get("method"),
+            "reason": refresh_result.get("reason"),
+        }
         report["steps"]["worktree_base"] = base_resolution
         if base_resolution["method"] == "refused":
             msg = (
@@ -13085,9 +13093,20 @@ def _phase_start_locked(
             if base_ahead is not None
             else ""
         )
+        # Name a skipped refresh explicitly (SA-0MWFFX49M0016KOK AC2): the
+        # base-ref reason says why *this* ref was chosen, not whether the
+        # parent refresh ran. `ahead 0 behind 1` alone cannot distinguish a
+        # held lock from a clean fast-forward.
+        refresh_method = str(refresh_result.get("method") or "")
+        refresh_reason = refresh_result.get("reason") or refresh_method
+        refresh_note = (
+            f", refresh skipped: {refresh_reason}"
+            if refresh_method and refresh_method != "synced"
+            else ""
+        )
         worktree_base_note = (
             f"{worktree_base} ({base_resolution.get('reason', 'in_sync')}"
-            f"{counts})"
+            f"{counts}{refresh_note})"
         )
         LOG.info(
             "Creating worktree at %s from base %s (verified published "

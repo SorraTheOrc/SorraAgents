@@ -2699,12 +2699,16 @@ possibly-stale local parent branch (SA-0MWFFX49M0016KOK / AH-0MWFF40700014EE2):
 
 `report["steps"]["worktree_base"]` records the decision:
 `{method: "local_dev" | "origin_fork", ref, base, reason, skipped_local,
-ahead, behind}`. `reason` is one of `refresh_synced`, `in_sync`,
-`fetch_failed`, `no_remote_tracking_ref`, `behind_remote`, `ahead_only`,
-`diverged` or `local_not_published` (counts unavailable); `skipped_local` is
-`true` only for `origin_fork`. The start/resume worklog comment names the same
-base ref and, when the local branch was skipped, its `reason` plus the
-`ahead`/`behind` counts. `git_worktree_add` accepts a fully-qualified
+ahead, behind, refresh}` where `refresh` is `{method, reason}` copied from the
+parent-branch refresh (`{"synced", null}` for a completed fast-forward, or
+`{"skipped", "lock_held"}` and friends). `reason` is one of `refresh_synced`,
+`in_sync`, `fetch_failed`, `no_remote_tracking_ref`, `behind_remote`,
+`ahead_only`, `diverged` or `local_not_published` (counts unavailable);
+`skipped_local` is `true` only for `origin_fork`. The start/resume worklog
+comment names the same base ref and, when the local branch was skipped, its
+`reason` plus the `ahead`/`behind` counts — and, when the refresh itself did
+not run, the skip reason (`refresh skipped: lock_held`), so a deliberate
+`origin` fork is never confused with a failed refresh. `git_worktree_add` accepts a fully-qualified
 remote-tracking base ref; `--track` still records
 `branch.<new>.merge = refs/heads/<parent>`, so `finish`'s push-to-`dev` path is
 unchanged.

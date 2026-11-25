@@ -836,3 +836,73 @@ def test_origin_fork_branch_tracks_origin(base_factory, monkeypatch):
     remote, merge = upstream_tracking(base.repo, branch)
     assert merge == f"refs/heads/{base.parent_branch}", (remote, merge)
     assert remote == "origin", (remote, merge)
+
+
+# ---------------------------------------------------------------------------
+# AC2: the start comment names the refresh outcome too
+# ---------------------------------------------------------------------------
+
+
+def _start_with_comments(
+    base: DivergedBase,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    description: str = "",
+) -> tuple[dict, list[str]]:
+    """Run ``phase_start`` in *base* and return ``(report, recorded comments)``."""
+    monkeypatch.chdir(base.repo)
+    with _start_harness(description=description) as comments:
+        report = implement.phase_start(ITEM_ID, json_output=True)
+    return report, comments
+
+
+def _base_note(comments: list[str]) -> str:
+    """The comment line naming the worktree base (``- Base: ...``)."""
+    for text in comments:
+        for line in text.splitlines():
+            if line.strip().startswith("- Base:"):
+                return line
+    raise AssertionError(f"no '- Base:' line recorded: {comments!r}")
+
+
+def test_skipped_refresh_reason_is_surfaced_in_the_start_comment(
+    base_factory, monkeypatch
+):
+    """AC2: a skipped refresh states why, not just which base was used.
+
+    The lock-held refresh makes the local parent genuinely stale; the start
+    comment must name the base ref, the base-ref reason, the ahead/behind
+    counts AND the refresh skip reason — otherwise an operator cannot tell a
+    deliberate ``origin`` fork from a failed refresh.
+    """
+    base = base_factory(origin_ahead=1, local_ahead=0, lock_held=True)
+    monkeypatch.setenv(implement.ENV_START_LOCK_TIMEOUT, "0")
+
+    report, comments = _start_with_comments(base, monkeypatch)
+
+    assert report["success"] is True, report
+    note = _base_note(comments)
+    assert "refs/remotes/origin/dev" in note, note
+    assert "behind_remote" in note, note
+    assert "ahead 0 behind 1" in note, note
+    assert "lock_held" in note, note
+    recorded = worktree_base_report(report)
+    assert recorded.get("refresh") == {"method": "skipped", "reason": "lock_held"}, (
+        recorded
+    )
+
+
+def test_synced_refresh_note_names_the_sync_and_not_a_skip(
+    base_factory, monkeypatch
+):
+    """AC2: a successful refresh is recorded as synced, with no skip wording."""
+    base = base_factory(origin_ahead=1, local_ahead=0)  # refresh fast-forwards
+
+    report, comments = _start_with_comments(base, monkeypatch)
+
+    assert report["success"] is True, report
+    recorded = worktree_base_report(report)
+    assert recorded.get("refresh", {}).get("method") == "synced", recorded
+    note = _base_note(comments)
+    assert "lock_held" not in note, note
+    assert "refresh skipped" not in note, note
