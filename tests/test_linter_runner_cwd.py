@@ -35,7 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from code_review.scripts import linter_runner
+from code_review.scripts import code_quality, linter_runner
 
 
 def _mock_result(returncode: int = 0, stdout: str = "[]", stderr: str = ""):
@@ -193,3 +193,277 @@ class TestRunRuffEntryPointIsCwdIndependent:
 
         assert result["findings"] == []
         assert runner.cwds == [str(project)]
+
+
+# ---------------------------------------------------------------------------
+# Every other linter invocation must be pinned too (WL-0MWVZF57Y005VOKN)
+# ---------------------------------------------------------------------------
+#
+# The ruff read path was pinned by WL-0MWVZEZXC00748QD; the fix-mode, eslint,
+# markdownlint, shellcheck and dotnet-format call sites still invoked the
+# runner with the inherited process cwd. These tests assert a single funnel
+# (``_invoke_pinned``) is used everywhere, so a code-quality scan can never
+# depend on where the caller stands.
+
+
+class _CwdRecordingRunner:
+    """Runner double that records the effective ``cwd`` of every invocation.
+
+    Unlike :class:`_RuffPathEmulator` this does not emulate a linter: the
+    assertions here are about *where* the child process would run, which is
+    the property that makes the scan cwd-independent. A non-empty default
+    stdout keeps the markdownlint/eslint fix-mode commit probe faithful to a
+    linter that reported something.
+    """
+
+    def __init__(self, stdout: str = "[]", returncode: int = 0, stderr: str = ""):
+        self.calls: list[dict[str, Any]] = []
+        self._stdout = stdout
+        self._returncode = returncode
+        self._stderr = stderr
+
+    def __call__(self, cmd, cwd=None):
+        self.calls.append({"cmd": list(cmd), "cwd": cwd})
+        return _mock_result(self._returncode, self._stdout, self._stderr)
+
+    def cwds_for(self, binary: str) -> list[str | None]:
+        return [call["cwd"] for call in self.calls if call["cmd"][0] == binary]
+
+
+def _project_with_file(tmp_path: Path, relative: str, content: str = "x\n") -> Path:
+    project = tmp_path / "project"
+    target = project / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    return project
+
+
+def _force_linter(monkeypatch, language: str, linter: str) -> None:
+    """Make ``run_*`` proceed for *language* without a real binary on PATH."""
+    monkeypatch.setattr(
+        linter_runner, "probe_linter",
+        lambda name: {"name": name, "available": True},
+    )
+    monkeypatch.setattr(
+        linter_runner, "detect_languages", lambda root: [language]
+    )
+    monkeypatch.setattr(
+        linter_runner, "get_linters_for_language", lambda lang: [linter]
+    )
+
+
+class TestMarkdownlintIsCwdIndependent:
+    def test_check_scan_pins_cwd(self, tmp_path, monkeypatch):
+        project = _project_with_file(tmp_path, "docs/guide.md", "# Guide\n")
+        _foreign_cwd(tmp_path, monkeypatch)
+        _force_linter(monkeypatch, "markdown", "markdownlint")
+        runner = _CwdRecordingRunner()
+
+        linter_runner.run_markdownlint(project, runner=runner)
+
+        assert runner.cwds_for("markdownlint") == [str(project)]
+
+    def test_fix_mode_pins_cwd_on_both_passes(self, tmp_path, monkeypatch):
+        project = _project_with_file(tmp_path, "docs/guide.md", "# Guide\n")
+        _foreign_cwd(tmp_path, monkeypatch)
+        _force_linter(monkeypatch, "markdown", "markdownlint")
+        runner = _CwdRecordingRunner()
+
+        linter_runner.run_markdownlint(
+            project, runner=runner, fix=True, files=["docs/guide.md"]
+        )
+
+        assert runner.cwds_for("markdownlint") == [str(project), str(project)]
+
+
+class TestEslintIsCwdIndependent:
+    def test_check_scan_pins_cwd(self, tmp_path, monkeypatch):
+        project = _project_with_file(tmp_path, "src/app.ts", "export const x = 1;\n")
+        _foreign_cwd(tmp_path, monkeypatch)
+        _force_linter(monkeypatch, "typescript", "eslint")
+        runner = _CwdRecordingRunner()
+
+        linter_runner.run_eslint(project, runner=runner, files=["src/app.ts"])
+
+        assert runner.cwds_for("eslint") == [str(project)]
+
+    def test_fix_mode_pins_cwd_on_both_passes(self, tmp_path, monkeypatch):
+        project = _project_with_file(tmp_path, "src/app.ts", "export const x = 1;\n")
+        _foreign_cwd(tmp_path, monkeypatch)
+        _force_linter(monkeypatch, "typescript", "eslint")
+        runner = _CwdRecordingRunner()
+
+        linter_runner.run_eslint(
+            project, runner=runner, fix=True, files=["src/app.ts"]
+        )
+
+        assert runner.cwds_for("eslint") == [str(project), str(project)]
+
+
+class TestShellcheckIsCwdIndependent:
+    def test_scan_pins_cwd(self, tmp_path, monkeypatch):
+        project = _project_with_file(tmp_path, "scripts/run.sh", "#!/bin/sh\necho hi\n")
+        _foreign_cwd(tmp_path, monkeypatch)
+        _force_linter(monkeypatch, "shell", "shellcheck")
+        runner = _CwdRecordingRunner()
+
+        linter_runner.run_shellcheck(project, runner=runner)
+
+        assert runner.cwds_for("shellcheck") == [str(project)]
+
+
+class TestDotnetFormatIsCwdIndependent:
+    def test_check_scan_pins_cwd(self, tmp_path, monkeypatch):
+        project = _project_with_file(tmp_path, "src/Program.cs", "class P {}\n")
+        _foreign_cwd(tmp_path, monkeypatch)
+        _force_linter(monkeypatch, "csharp", "dotnet-format")
+        runner = _CwdRecordingRunner()
+
+        linter_runner.run_dotnet_format(project, runner=runner)
+
+        assert runner.cwds_for("dotnet") == [str(project)]
+
+    def test_fix_mode_pins_cwd_on_both_passes(self, tmp_path, monkeypatch):
+        project = _project_with_file(tmp_path, "src/Program.cs", "class P {}\n")
+        _foreign_cwd(tmp_path, monkeypatch)
+        _force_linter(monkeypatch, "csharp", "dotnet-format")
+        runner = _CwdRecordingRunner()
+
+        linter_runner.run_dotnet_format(project, runner=runner, fix=True)
+
+        assert runner.cwds_for("dotnet") == [str(project), str(project)]
+
+
+class TestRuffFixModeIsCwdIndependent:
+    def test_fix_and_rescan_are_pinned(self, tmp_path, monkeypatch):
+        project = _project_with_python_file(tmp_path)
+        _foreign_cwd(tmp_path, monkeypatch)
+        runner = _CwdRecordingRunner()
+
+        linter_runner._run_ruff_fix_mode(project, runner, files=["pkg/module.py"])
+
+        assert runner.cwds_for("ruff") == [str(project), str(project)]
+
+
+class TestSharedFixModeFunnelIsCwdIndependent:
+    """``_run_linter_fix_mode`` is the single fix-mode funnel for every linter."""
+
+    def test_fix_and_rescan_are_pinned(self, tmp_path, monkeypatch):
+        project = _project_with_python_file(tmp_path)
+        _foreign_cwd(tmp_path, monkeypatch)
+        runner = _CwdRecordingRunner()
+
+        linter_runner._run_linter_fix_mode(
+            "demo",
+            project,
+            runner,
+            fix_cmd_builder=lambda root: ["demo", "--fix", str(root)],
+            rescan_cmd_builder=lambda root: ["demo", str(root)],
+            fixes_detected=lambda result, output: False,
+            rescan_parser=lambda result: [],
+        )
+
+        assert runner.cwds_for("demo") == [str(project), str(project)]
+
+
+class TestCmdOnlyRunnerStillSupported:
+    """Pinning must never break an injectable runner without a ``cwd`` kwarg."""
+
+    def test_markdownlint_cmd_only_double(self, tmp_path, monkeypatch):
+        project = _project_with_file(tmp_path, "docs/guide.md", "# Guide\n")
+        _foreign_cwd(tmp_path, monkeypatch)
+        _force_linter(monkeypatch, "markdown", "markdownlint")
+        calls: list[list[str]] = []
+
+        def cmd_only_runner(cmd):
+            calls.append(list(cmd))
+            return _mock_result(0, "[]")
+
+        linter_runner.run_markdownlint(project, runner=cmd_only_runner)
+
+        assert calls and calls[0][0] == "markdownlint"
+
+
+class TestRunCodeQualityIsCwdIndependent:
+    """End-to-end: the audit's entry point emits no ghost E902 from a
+    foreign cwd."""
+
+    def test_no_e902_for_files_under_project_root(self, tmp_path, monkeypatch):
+        project = _project_with_python_file(tmp_path)
+        _foreign_cwd(tmp_path, monkeypatch)
+
+        monkeypatch.setattr(
+            linter_runner, "probe_linter",
+            lambda name: {"name": name, "available": True},
+        )
+        monkeypatch.setattr(
+            linter_runner, "detect_languages", lambda root: ["python"]
+        )
+        monkeypatch.setattr(
+            linter_runner, "get_linters_for_language", lambda lang: ["ruff"]
+        )
+        monkeypatch.setattr(code_quality, "probe_linter", linter_runner.probe_linter)
+        monkeypatch.setattr(
+            code_quality, "detect_languages", linter_runner.detect_languages
+        )
+        monkeypatch.setattr(
+            code_quality, "get_linters_for_language",
+            linter_runner.get_linters_for_language,
+        )
+        runner = _RuffPathEmulator()
+
+        result = code_quality.run_code_quality(
+            project_root=project, runner=runner, files=["pkg/module.py"]
+        )
+
+        assert result["success"] is True
+        assert result["findings"] == [], (
+            "code-quality scan produced ghost findings from a foreign cwd: "
+            f"{result['findings']}"
+        )
+        assert runner.cwds == [str(project)]
+
+
+def _load_hyphen_copy():
+    """Load ``skill/code-review/scripts/linter_runner.py`` in isolation."""
+    import importlib.util
+
+    path = REPO_ROOT / "skill" / "code-review" / "scripts" / "linter_runner.py"
+    before_path = list(sys.path)
+    before_modules = set(sys.modules)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_hyphen_linter_runner_cwd", path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.path[:] = before_path
+        for name in list(sys.modules):
+            if name not in before_modules:
+                del sys.modules[name]
+
+
+class TestHyphenCopyIsCwdIndependent:
+    """The documented-canonical ``code-review`` copy is pinned for parity."""
+
+    def test_ruff_check_pins_cwd(self, tmp_path, monkeypatch):
+        project = _project_with_python_file(tmp_path)
+        _foreign_cwd(tmp_path, monkeypatch)
+        hyphen = _load_hyphen_copy()
+        runner = _CwdRecordingRunner()
+
+        hyphen._run_ruff_check(project, runner)
+
+        assert runner.cwds_for("ruff") == [str(project)]
+
+    def test_ruff_fix_mode_pins_cwd(self, tmp_path, monkeypatch):
+        project = _project_with_python_file(tmp_path)
+        _foreign_cwd(tmp_path, monkeypatch)
+        hyphen = _load_hyphen_copy()
+        runner = _CwdRecordingRunner()
+
+        hyphen._run_ruff_fix_mode(project, runner)
+
+        assert runner.cwds_for("ruff") == [str(project), str(project)]

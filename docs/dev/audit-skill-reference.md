@@ -1440,6 +1440,22 @@ Runner performs code quality checks before AC verification (invokes `../code_rev
    `--fix` mode). As defence in depth, the epic creator drops any
    Python-only-linter finding on a non-Python file, so such a finding can
    never become a work item.
+8. **Cwd-independent linter invocation** (WL-0MWVZEZXC00748QD,
+   WL-0MWVZF57Y005VOKN): every linter call site funnels through
+   `_invoke_pinned(runner, cmd, root)` in `linter_runner.py`, which invokes the
+   child process with `cwd=<project_root>` (ruff check and `--fix`/rescan,
+   eslint, markdownlint, shellcheck and dotnet-format; both shipped copies of
+   the module). The audit validates its file scope against `project_root` (the
+   audit's code root) but may itself run from a **different repository**. With
+   the inherited cwd, ruff resolved relative path arguments — and its config
+   discovery — against the caller's directory, so files that exist under
+   `project_root` were reported as ghost `E902 No such file or directory`
+   findings (evidence: WL-0MWTZEDWG008YMGQ, 2026-11-25T05:49:58Z, three false
+   HIGH `E902` findings on ContextHub paths while the audit code root was
+   SorraAgents). Pinning the child cwd makes a scan result independent of where
+   the caller stands. A genuinely absent path still reports `E902`, so real
+   findings are never suppressed; a cmd-only runner double keeps working via a
+   retry without the `cwd` keyword.
 
 - Persist from stdin: `cat report.md | python3 ./scripts/persist_audit.py --issue-id SA-123`
 - Persist from a file: `python3 ./scripts/persist_audit.py --issue-id SA-123 --file report.md`
