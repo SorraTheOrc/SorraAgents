@@ -122,6 +122,7 @@ import contextvars
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -435,6 +436,12 @@ _NODE_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s*-\s*(.+)$", re.MULTILINE)
 
 TRACKED_SOURCE_EXTENSIONS = (".py", ".mjs", ".js", ".ts", ".tsx")
 
+#: TypeScript/TSX source extensions scanned by the import-graph expansion
+#: (:func:`_expand_by_ts_imports`). Kept separate from
+#: ``TRACKED_SOURCE_EXTENSIONS`` (which also covers Python/Node) so a change
+#: set with no TypeScript files never walks the TS graph.
+TS_SOURCE_EXTENSIONS = (".ts", ".tsx")
+
 #: Suffixes recognised as test files by the convention mapper. The
 #: TypeScript/JavaScript forms cover vitest (``*.test.ts`` / ``*.spec.ts``),
 #: which previously mapped to nothing and forced the full suite
@@ -621,13 +628,17 @@ def map_changed_to_tests(
        pytest (``test_*.py`` / ``*_test.py``), node (``*.test.mjs`` /
        ``*_test.mjs`` / ``*.spec.mjs``) and vitest/TypeScript
        (``*.test.ts`` / ``*.spec.ts``, plus the ``.js``/``.tsx`` variants).
-    2. **Import-graph expansion**: AST-scan every test file once; for each
-       changed module (dotted name derived from its path relative to the
-       project root), find test files whose import statements reference the
-       changed module OR any module that (transitively) imports it. This
-       catches indirect breakage — e.g. ``utils.py`` changed →
-       ``test_report.py`` imported via a chain. (Python only; the TypeScript
-       side uses the conservative stem convention.)
+    2. **Import-graph expansion**: scan every test file once; for each
+       changed module derive its name from its path relative to the project
+       root and find test files whose imports reference the changed module OR
+       any module that (transitively) imports it. This catches indirect
+       breakage — e.g. ``utils.py`` changed → ``test_report.py`` imported via
+       a chain. Python uses its AST (:func:`_expand_by_imports`); TypeScript
+       /TSX uses a static ``import``/``export … from`` scan
+       (:func:`_expand_by_ts_imports`), including barrel re-exports and the
+       TS-ESM ``.js``-specifier → ``.ts``-source mapping. Dynamic
+       ``import()``/``require()`` and path aliases are not resolved (static
+       statements only, over-match preferred to under-match).
 
     ``changed_files`` defaults to :func:`compute_changed_files` against the
     calling repo. Non-source changes (README, yaml, …) never map to tests
@@ -694,9 +705,14 @@ def map_changed_to_tests(
                 # Package init changed → every test under that package tree.
                 selected.add(test)
 
-    # 2. Import-graph expansion
+    # 2. Import-graph expansion (Python AST, then TypeScript static scan).
+    # Each language only walks its own graph when the change set touches that
+    # language, so a repo without TypeScript files (or a Python-only change
+    # set) pays nothing for the TS scan.
     if selected or _has_python_changes(changed):
         selected |= _expand_by_imports(root, all_tests, changed)
+    if _has_ts_changes(changed):
+        selected |= _expand_by_ts_imports(root, all_tests, changed)
 
     # Final existence filter: convention mapping scans the filesystem so its
     # entries exist, but a changed test file added directly above (or an
@@ -736,6 +752,10 @@ def _iter_test_files(root: Path) -> Iterator[str]:
 
 def _has_python_changes(changed: set[str]) -> bool:
     return any(p.endswith(".py") for p in changed)
+
+
+def _has_ts_changes(changed: set[str]) -> bool:
+    return any(p.endswith(TS_SOURCE_EXTENSIONS) for p in changed)
 
 
 def _expand_by_imports(
@@ -858,6 +878,173 @@ def _ast_imports(root: Path, test_file: str) -> set[str]:
             elif name:
                 imports.add(name)
     return imports
+
+
+#: Static TypeScript import/export specifiers. Two forms are understood:
+#: - value/type imports and re-exports, ``import … from 'x'`` /
+#:   ``export … from 'x'`` (including ``import type``, ``export type``,
+#:   ``export *`` and multi-line named lists);
+#: - side-effect imports, ``import 'x'``.
+#: ``[^'"]*?`` spans newlines (named lists wrap) but stops at the first
+#: quote, so it cannot run past the module specifier. Dynamic ``import('x')``
+#: and ``require('x')`` are deliberately not matched.
+_TS_FROM_SPECIFIER_RE = re.compile(
+    r"(?:^|\n)[ \t]*(?:import|export)\b[^'\"]*?\bfrom\s*['\"]([^'\"]+)['\"]"
+)
+_TS_SIDE_EFFECT_IMPORT_RE = re.compile(
+    r"(?:^|\n)[ \t]*import\s*['\"]([^'\"]+)['\"]"
+)
+
+
+def _path_to_ts_module(path: str) -> str | None:
+    """Repo-relative module key for a ``.ts``/``.tsx`` path (or ``None``).
+
+    ``src/github-sync.ts`` → ``src/github-sync``; ``src/foo/index.ts`` →
+    ``src/foo`` (TypeScript resolves a directory import to its index module).
+    """
+    p = Path(path)
+    if p.suffix not in TS_SOURCE_EXTENSIONS:
+        return None
+    parts = list(p.with_suffix("").parts)
+    if parts and parts[-1] == "index":
+        parts = parts[:-1]
+    if not parts:
+        return None
+    return "/".join(parts)
+
+
+def _resolve_ts_module_key(importer: str, specifier: str) -> str | None:
+    """Resolve a TypeScript import specifier to a repo-relative module key.
+
+    Relative specifiers resolve against the importing file. TypeScript's ESM
+    convention writes ``'../src/github-sync.js'`` for a ``.ts`` source, so a
+    known source/compiled extension is stripped and ``x.js`` maps to ``x.ts``
+    / ``x.tsx``. A trailing ``/index`` collapses to its directory (matching
+    TypeScript's directory-import resolution). Bare specifiers (packages,
+    path aliases) are returned verbatim and match only a changed module whose
+    own key is identical — path aliases are not resolved. Specifiers that
+    escape the repository resolve to ``None``.
+    """
+    if not specifier:
+        return None
+    if specifier.startswith("."):
+        joined = posixpath.normpath(
+            posixpath.join(posixpath.dirname(importer), specifier)
+        )
+    else:
+        joined = specifier
+    if joined in ("", ".", "..") or joined.startswith("../"):
+        return None
+    for ext in (".d.ts", ".tsx", ".ts", ".jsx", ".mjs", ".cjs", ".js"):
+        if joined.endswith(ext):
+            joined = joined[: -len(ext)]
+            break
+    if joined.endswith("/index"):
+        joined = joined[: -len("/index")]
+    return joined or None
+
+
+def _iter_ts_files(root: Path) -> Iterator[str]:
+    """Yield repo-relative paths of every ``.ts``/``.tsx`` file under *root*.
+
+    Prunes the same VCS/dependency/build directories as the test scan so the
+    graph never walks ``node_modules`` or ``dist``.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _TEST_SCAN_EXCLUDED_DIRS]
+        for filename in filenames:
+            if Path(filename).suffix in TS_SOURCE_EXTENSIONS:
+                rel = Path(dirpath, filename).relative_to(root)
+                yield rel.as_posix()
+
+
+def _ts_imports(root: Path, rel: str) -> set[str]:
+    """Return the resolved module keys imported/re-exported by *rel*.
+
+    Best-effort: a read/decode failure yields no imports (the run never
+    crashes on an unreadable file). Comments and string literals are not
+    stripped, so a commented-out import over-matches — acceptable under the
+    over-match-over-under-match contract.
+    """
+    try:
+        text = (root / rel).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    specifiers: set[str] = set()
+    for pattern in (_TS_FROM_SPECIFIER_RE, _TS_SIDE_EFFECT_IMPORT_RE):
+        for match in pattern.finditer(text):
+            specifiers.add(match.group(1))
+    resolved: set[str] = set()
+    for specifier in specifiers:
+        key = _resolve_ts_module_key(rel, specifier)
+        if key:
+            resolved.add(key)
+    return resolved
+
+
+def _expand_by_ts_imports(
+    root: Path,
+    all_tests: set[str],
+    changed: set[str],
+) -> set[str]:
+    """Static import graph: tests importing changed TypeScript modules.
+
+    Mirrors :func:`_expand_by_imports`'s BFS shape for ``.ts``/``.tsx``. Only
+    static ``import``/``export … from`` statements are followed (dynamic
+    ``import()``/``require()`` and path aliases are out of scope); an
+    ``export … from`` re-export counts as an edge, so a test importing a
+    barrel is selected when any module the barrel re-exports changes. Each
+    module is registered under its path-derived key and its basename (as the
+    Python expansion does) so both namespaces resolve. Over-matching is
+    preferred to under-matching: an extra test runs, never fewer.
+    """
+    changed_targets: set[str] = set()
+    for p in changed:
+        key = _path_to_ts_module(p)
+        if key is None:
+            continue
+        changed_targets.add(key)
+        changed_targets.add(Path(p).stem)
+    if not changed_targets:
+        return set()
+
+    # module key → directly-imported module keys, parsed once per file (both
+    # source and test files, so transitive edges through source modules are
+    # visible). Each node is registered under its path-derived key AND its
+    # basename.
+    module_imports: dict[str, set[str]] = {}
+    for ts_file in _iter_ts_files(root):
+        key = _path_to_ts_module(ts_file)
+        if key is None:
+            continue
+        imports = _ts_imports(root, ts_file)
+        module_imports[key] = imports
+        module_imports.setdefault(Path(ts_file).stem, imports)
+
+    # BFS: does module *m* (transitively) import module *target*?
+    def imports_module(m: str, target: str) -> bool:
+        seen: set[str] = set()
+        stack = [m]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if cur == target:
+                return True
+            stack.extend(module_imports.get(cur, ()))
+        return False
+
+    affected: set[str] = set()
+    for test in all_tests:
+        test_key = _path_to_ts_module(test)
+        if test_key is None:
+            continue
+        for mod in module_imports.get(test_key, set()):
+            if any(mod == cm or imports_module(mod, cm) for cm in changed_targets):
+                affected.add(test)
+                break
+    return affected
 
 
 #: Stable reason strings returned by :func:`changed_scope_selection` when no
