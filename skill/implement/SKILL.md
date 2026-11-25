@@ -232,17 +232,17 @@ git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-
 cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 ```
 
-> **`node_modules` is a worktree-local link farm:** `implement.py start`
-> materialises it as per-package symlinks (nested and workspace packages
-> resolve to the worktree itself; supersedes the whole-directory symlink,
-> SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** —
-> writes corrupt the shared install. Deep detail:
-> [reference — worktree creation](../../docs/dev/implement-skill-reference.md#relocated-step-5--create-a-worktree-from-dev-and-branch-inside-it).
-
-> **Submodules initialise before `node_modules`:** `start` runs
-> `git submodule update --init --recursive` first — a nested link in an empty
-> gitlink blocks the clone (SA-0MVTOR53E003IIEQ). Failures only **WARNING**;
-> no `.gitmodules`, no change.
+> **`node_modules` is a worktree-local link farm:** `start` materialises
+> per-package and nested symlinks (supersedes whole-directory symlink,
+> SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** — it
+> corrupts the shared install. Submodules initialise before `node_modules`
+> (SA-0MVTOR53E003IIEQ; failures **WARNING**). Ref:
+> [reference](../../docs/dev/implement-skill-reference.md#relocated-step-5--create-a-worktree-from-dev-and-branch-inside-it).
+>
+> **Shared package built at start:** missing/stale `packages/shared/dist`
+> builds (no-op without it); failure is one `npm run build:shared` message
+> (SA-0MWHUVJFO009R9EC, WL-0MW3EDP6D002U6V4; helper shared with
+> WL-0MW8G1X3V007CGAE). See ContextHub `docs/dev/wl-shared-dist-diagnostic.md`.
 
 `implement.py start` handles the rest (idempotent resume, stale-resolution
 gate).

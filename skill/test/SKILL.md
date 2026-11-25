@@ -191,8 +191,18 @@ marked `[cached]` in non-JSON output and carry `cached: true` per suite in JSON
 **Scope-aware execution (SA-0MT6BYQHB008DOGC):** `run_tests.py --scope full|changed`
 — the FULL suite by default, or only the tests affected by changes since
 `--target-branch` (default `origin/dev`) via named test groups, convention
-mapping (pytest, node and vitest/TypeScript `*.test.ts`/`*.spec.ts`) and AST
-import-graph expansion. `full` is the only scope accepted as full-suite
+mapping (pytest, node and vitest/TypeScript `*.test.ts`/`*.spec.ts`), Python
+AST import-graph expansion, and a static **TypeScript import-graph** expansion
+(SA-0MWHUVI5J005RQHZ, WL-0MW3EDP6D002U6V4). Editing a `.ts`/`.tsx` module
+selects the tests that import it — directly or transitively — following static
+`import`/`export … from` statements (barrel re-exports included) and the
+TypeScript `x.js` → `x.ts`/`x.tsx` specifier convention. Over-match is
+preferred to under-match: dynamic `import()`/`require()` and path aliases are
+not resolved, and a change set with no `.ts`/`.tsx` files never walks the TS
+graph, so TypeScript-less repos pay nothing. The worktree shared-package build
+precondition (freshness helper shared with WL-0MW8G1X3V007CGAE) is documented
+in [implement/SKILL.md](../implement/SKILL.md); ContextHub's
+`docs/dev/wl-shared-dist-diagnostic.md` is the operator-facing diagnostic. `full` is the only scope accepted as full-suite
 evidence: changed-scope runs get independent cache keys, record `scope:
 changed` in their metadata, and NEVER populate the full-suite cache entry —
 the audit's read-only full-suite query rejects `changed` entries, so a

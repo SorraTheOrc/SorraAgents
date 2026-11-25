@@ -4144,6 +4144,24 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 > Failures produce a ``WARNING`` log message but **do not abort** — the worktree
 > remains usable (best-effort). Repos without ``.gitmodules`` are unaffected.
 
+**Shared-package build at start (SA-0MWHUVJFO009R9EC, WL-0MW3EDP6D002U6V4).**
+Because the link farm points `@worklog/shared` at the worktree's own
+`packages/shared`, and `dist/` is gitignored, a fresh worktree has no build
+output and every TypeScript import of the package fails until someone builds by
+hand. `start` runs `_ensure_shared_build` after the link step:
+freshness-based and unconditional on the change set (producer decision Q2=A) —
+it builds `packages/shared/dist` when it is missing or older than the newest
+`packages/shared/src/**` file, skips when fresh, and is a no-op for a repo
+without a workspace shared package. It only ever builds the worktree's own
+copy (never the main checkout) and only when the worktree resolves the package
+locally. The single `_newest_mtime` / `_shared_dist_freshness` helper is
+shared with the stale-resolution guard (WL-0MW8G1X3V007CGAE). The step is
+best-effort: a build failure does not abort `start`, but the report records one
+actionable diagnostic naming `npm run build:shared` and the resolved
+`packages/shared` path (`report["steps"]["shared_build"]`, mirrored as
+`shared_build`) — never a cascade of import errors. Regression pins:
+`skill/implement/tests/test_worktree_shared_build.py`.
+
 See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
 
 ### Relocated: Submodule bootstrap ordering (SA-0MVTOR53E003IIEQ)
