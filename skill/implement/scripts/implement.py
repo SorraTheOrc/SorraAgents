@@ -7592,6 +7592,200 @@ def _stale_shared_resolution(
     )
 
 
+def _newest_mtime(path: Path) -> float | None:
+    """Newest mtime (seconds) of *path* or of any file under it, else None.
+
+    The single mtime primitive shared by the start-time shared-build step and
+    the stale-resolution guard (WL-0MW8G1X3V007CGAE). A missing path yields
+    ``None`` so callers can distinguish "absent" from "old".
+    """
+    try:
+        if path.is_file():
+            return path.stat().st_mtime
+        if not path.is_dir():
+            return None
+    except OSError:
+        return None
+    newest: float | None = None
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for name in filenames:
+            try:
+                mtime = (Path(dirpath) / name).stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+    return newest
+
+
+def _shared_dist_freshness(shared_dir: Path) -> dict[str, Any]:
+    """Compare the newest ``src/**`` mtime with the newest ``dist/**`` mtime.
+
+    Mirrors ContextHub's ``isDistFresh()`` (``bench/wl-startup-perf.ts``):
+    the build is fresh when ``dist`` exists and its newest mtime is not older
+    than the newest source mtime. Returns ``fresh`` (bool), ``reason``
+    (``fresh`` / ``missing_dist`` / ``stale_dist``), ``dist_mtime`` and
+    ``newest_source_mtime`` (epoch seconds, or ``None``).
+    """
+    newest_source = _newest_mtime(shared_dir / "src")
+    dist_mtime = _newest_mtime(shared_dir / "dist")
+    if dist_mtime is None:
+        return {
+            "fresh": False,
+            "reason": "missing_dist",
+            "dist_mtime": None,
+            "newest_source_mtime": newest_source,
+        }
+    if newest_source is not None and dist_mtime < newest_source:
+        return {
+            "fresh": False,
+            "reason": "stale_dist",
+            "dist_mtime": dist_mtime,
+            "newest_source_mtime": newest_source,
+        }
+    return {
+        "fresh": True,
+        "reason": "fresh",
+        "dist_mtime": dist_mtime,
+        "newest_source_mtime": newest_source,
+    }
+
+
+def _shared_build_command(worktree_path: Path, shared_dir: Path) -> list[str] | None:
+    """Repo-appropriate command that rebuilds the workspace shared package.
+
+    Prefers the checkout's ``build:shared`` script (ContextHub's root
+    ``package.json`` runs ``cd packages/shared && npm run build``); falls back
+    to the shared package's own ``build`` script. ``None`` when neither is
+    declared — the step then reports ``no_build_script`` rather than guessing.
+    """
+    root_scripts = _read_package_json(worktree_path).get("scripts")
+    if isinstance(root_scripts, dict) and "build:shared" in root_scripts:
+        return ["npm", "run", "build:shared"]
+    shared_scripts = _read_package_json(shared_dir).get("scripts")
+    if isinstance(shared_scripts, dict) and "build" in shared_scripts:
+        return ["npm", "run", "build"]
+    return None
+
+
+def _run_shared_build(command: list[str], cwd: Path) -> Any:
+    """Run the shared-package build command (thin, patchable seam)."""
+    return run_cmd(
+        command, cwd=str(cwd), check=False, timeout=300, capture=True
+    )
+
+
+def _ensure_shared_build(
+    worktree_path: str, repo_root: str | None, resolution: dict[str, Any]
+) -> dict[str, Any]:
+    """Ensure the worktree's ``packages/shared/dist`` exists and is fresh.
+
+    Producer decision Q2=A (freshness-based, unconditional on the change set):
+    build when ``dist`` is missing or older than the newest ``src/**`` file;
+    skip when fresh; no-op for a repo without a workspace shared package. The
+    step only ever builds the worktree-resolved package (never the main
+    checkout), and stays best-effort like the node_modules link step: a build
+    failure does not abort ``start``, but the report records ONE actionable
+    diagnostic naming ``npm run build:shared`` so downstream gates fail with
+    that message instead of a cascade of import errors.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout (unused for the build;
+            kept for symmetry with the other start steps).
+        resolution: The :func:`_shared_resolution_check` result for this
+            worktree.
+
+    Returns:
+        The ``shared_build`` report block: ``applicable``, ``action``
+        (``built`` / ``skipped_fresh`` / ``skipped_unresolved`` /
+        ``no_build_script`` / ``not_applicable`` / ``failed``), ``success``,
+        ``message``, ``resolved_root``, ``dist_path``, ``command``,
+        ``dist_mtime`` and ``newest_source_mtime``.
+    """
+    wt = Path(worktree_path)
+    shared_dir = wt / SHARED_WORKSPACE_PACKAGE_DIR
+    block: dict[str, Any] = {
+        "applicable": bool(resolution.get("applicable")),
+        "action": "not_applicable",
+        "success": True,
+        "message": (
+            f"No workspace {SHARED_WORKSPACE_PACKAGE_NAME} package — "
+            "shared build step is a no-op."
+        ),
+        "resolved_root": resolution.get("expected_root"),
+        "dist_path": str(shared_dir / "dist"),
+        "command": None,
+        "dist_mtime": None,
+        "newest_source_mtime": None,
+    }
+    if not resolution.get("applicable"):
+        return block
+    if not resolution.get("ok"):
+        block["action"] = "skipped_unresolved"
+        block["message"] = (
+            f"{SHARED_WORKSPACE_PACKAGE_NAME} resolves outside this worktree "
+            f"({resolution.get('resolved_root') or '<missing>'}); not building "
+            "to avoid mutating the main checkout. Re-run `implement.py start` "
+            "from the main checkout to refresh the link farm."
+        )
+        return block
+    if not shared_dir.is_dir():
+        block["action"] = "skipped_missing_package"
+        block["message"] = (
+            f"No {SHARED_WORKSPACE_PACKAGE_DIR.as_posix()} directory in this "
+            "worktree — shared build step is a no-op."
+        )
+        return block
+
+    freshness = _shared_dist_freshness(shared_dir)
+    block["dist_mtime"] = freshness["dist_mtime"]
+    block["newest_source_mtime"] = freshness["newest_source_mtime"]
+    if freshness["fresh"]:
+        block["action"] = "skipped_fresh"
+        block["message"] = (
+            f"{SHARED_WORKSPACE_PACKAGE_NAME} dist is fresh — no rebuild."
+        )
+        return block
+
+    command = _shared_build_command(wt, shared_dir)
+    if command is None:
+        block["action"] = "no_build_script"
+        block["message"] = (
+            f"{SHARED_WORKSPACE_PACKAGE_NAME} dist is {freshness['reason']} but "
+            "no build script is declared (expected `npm run build:shared`)."
+        )
+        return block
+
+    block["command"] = command
+    build_cwd = shared_dir if command == ["npm", "run", "build"] else wt
+    try:
+        result = _run_shared_build(command, build_cwd)
+        returncode = int(result.returncode)
+        stderr = (result.stderr or "").strip()
+    except Exception as exc:  # pragma: no cover - defensive
+        returncode = 1
+        stderr = str(exc)
+    if returncode == 0:
+        block["action"] = "built"
+        block["message"] = (
+            f"Built {SHARED_WORKSPACE_PACKAGE_NAME} "
+            f"({freshness['reason']})."
+        )
+        return block
+
+    block["action"] = "failed"
+    block["success"] = False
+    detail = f" {stderr[:300]}" if stderr else ""
+    block["message"] = (
+        f"Failed to build {SHARED_WORKSPACE_PACKAGE_NAME}: dist is "
+        f"{freshness['reason']} and `npm run build:shared` exited "
+        f"{returncode}. Run `npm run build:shared` in {shared_dir} and re-run "
+        f"`implement.py start`.{detail}"
+    )
+    return block
+
+
 # Directories pruned by the nested node_modules discovery walk. ``.git`` and
 # ``.worklog`` are large/irrelevant trees; ``node_modules`` is pruned so the
 # walk never descends into (and therefore never mirrors) a dependency tree's
@@ -12988,6 +13182,21 @@ def _phase_start_locked(
     # (OSL-0MUFG3PJA00379CT). Runs after submodule init so a gitlink is never
     # handed a symlink it cannot clone over (SA-0MVTOR53E003IIEQ).
     _ensure_nested_node_modules_symlinks(abs_wt_path, _get_repo_root())
+
+    # Ensure the worktree's workspace shared package is built and fresh
+    # (producer decision Q2=A: freshness-based, unconditional on the change
+    # set). A linked worktree has no gitignored ``packages/shared/dist``, so
+    # every TypeScript suite importing ``@worklog/shared`` would otherwise
+    # fail with N import errors. Best-effort and worktree-local only: a build
+    # failure is recorded as ONE actionable diagnostic, never a fatal start
+    # error (SA-0MWHUVJFO009R9EC).
+    shared_build_report = _ensure_shared_build(
+        abs_wt_path, _get_repo_root(), resolution_check
+    )
+    report["steps"]["shared_build"] = shared_build_report
+    report["shared_build"] = shared_build_report
+    if shared_build_report["action"] == "failed":
+        LOG.warning("%s", shared_build_report["message"])
 
     # The work item was already claimed (status-only) in Step 3; the stage
     # must be left untouched here. There is deliberately no second
