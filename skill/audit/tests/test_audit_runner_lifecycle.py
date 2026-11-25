@@ -16,6 +16,38 @@ from audit.scripts import audit_runner
 from audit.tests.wl_helpers import stateful_wl_side_effect
 
 
+def _assert_cas_lifecycle_write(updates, *, status, stage, producer_flag=None):
+    """Assert the terminal lifecycle write's contract, CAS guard included.
+
+    AC5 (SA-0MWFMV31W00532T3): restore/demotion writes carry
+    ``--if-status``/``--if-stage`` so they can never blind-overwrite a
+    concurrent writer. The exact CAS *values* (the pair equals the state read
+    immediately before the write) are pinned by
+    ``test_audit_runner_restore_race.py::TestRestoreCasGuards``, which drives a
+    harness with full control of the observed lifecycle; here the guard's
+    presence and the unchanged lifecycle contract are what matter.
+    """
+    assert updates, "expected at least one wl update command"
+    cmd = updates[-1]
+    if cmd[:1] == ["wl"] and len(cmd) >= 3 and cmd[1] == "--worklog-dir":
+        cmd = ["wl"] + cmd[3:]
+
+    def value(command, flag):
+        return command[command.index(flag) + 1] if flag in command else None
+
+    assert cmd[:3] == ["wl", "update", "TEST-1"], cmd
+    assert value(cmd, "--status") == status, cmd
+    assert value(cmd, "--stage") == stage, cmd
+    assert value(cmd, "--assignee") == "", cmd
+    if producer_flag is None:
+        assert "--needs-producer-review" not in cmd, cmd
+    else:
+        assert value(cmd, "--needs-producer-review") == producer_flag, cmd
+    assert value(cmd, "--if-status"), cmd
+    assert value(cmd, "--if-stage"), cmd
+    assert cmd[-1] == "--json", cmd
+
+
 class TestCoerceValidStatusStage:
     """Unit tests for the _coerce_valid_status_stage helper.
 
@@ -328,11 +360,9 @@ class TestVerdictDrivenStatusLifecycle:
             verdict_report="Ready to close: No\n\n## Summary\n2 unmet.",
             status="completed", stage="in_review",
         )
-        assert self._last_update(updates) == [
-            "wl", "update", "TEST-1",
-            "--status", "open", "--stage", "plan_complete",
-            "--assignee", "", "--needs-producer-review", "yes", "--json",
-        ]
+        _assert_cas_lifecycle_write(
+            updates, status="open", stage="plan_complete", producer_flag="yes",
+        )
 
     def test_ready_no_moves_open_item_to_plan_complete(self):
         """AC2: No on an already-open item still lands at open/plan_complete."""
@@ -342,11 +372,9 @@ class TestVerdictDrivenStatusLifecycle:
             verdict_report="Ready to close: No\n\n## Summary\nunmet.",
             status="open", stage="in_progress",
         )
-        assert self._last_update(updates) == [
-            "wl", "update", "TEST-1",
-            "--status", "open", "--stage", "plan_complete",
-            "--assignee", "", "--needs-producer-review", "yes", "--json",
-        ]
+        _assert_cas_lifecycle_write(
+            updates, status="open", stage="plan_complete", producer_flag="yes",
+        )
 
     # ------------------------------------------------------------------
     # Failure / unparseable verdict

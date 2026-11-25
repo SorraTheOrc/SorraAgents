@@ -17353,10 +17353,87 @@ disagree with ``StatusLifecycle`` about what a claim is (assignee-release
     item = data.get("workItem") if isinstance(data, dict) else None
     if not isinstance(item, dict):
         item = data if isinstance(data, dict) else {}
+    return _claim_release_flags_for_item(item)
+
+
+def _claim_release_flags_for_item(item: dict) -> list[str]:
+    """Claim-release flags for an already-fetched work-item payload.
+
+    Split out of :func:`_release_assignee_flags` so the CAS guard
+    (SA-0MWFMV31W00532T3 AC5) can share the single ``wl show`` read that
+    decides both the claim release and the conditional-write expectation.
+    """
     # Fail-safe: release unless the item explicitly reports an empty claim.
     if "assignee" not in item or should_release_assignee(item):
         return ["--assignee", ""]
     return []
+
+
+def _lifecycle_cmd_side_effect_flags(cmd: Sequence[str]) -> list[str]:
+    """Flags in *cmd* that change something beyond the lifecycle write itself.
+
+    A restore/re-assert command may also carry producer-review or similar
+    flags; when it does, the write is never redundant even if the item already
+    matches the target status/stage (those flags still have to land).
+    """
+    allowed = {"--status", "--stage", "--assignee", "--json"}
+    return [
+        flag for flag in cmd
+        if flag.startswith("--") and flag not in allowed
+    ]
+
+
+def _guard_restore_cmd(
+    ctx: _AuditContext,
+    cmd: Sequence[str],
+    expected_status: str,
+    expected_stage: str,
+) -> tuple[list[str] | None, bool]:
+    """Add CAS flags to a restore write, or report it as redundant (AC5).
+
+    Restore writes must never blind-overwrite a lifecycle they did not
+    observe, and must never re-issue a write that would change nothing. This
+    helper performs ONE ``wl show`` read and returns:
+
+    * ``(None, True)`` — the item already carries the expected status/stage
+      and holds no releasable claim, and the command carries no other
+      side-effect flag (e.g. ``--needs-producer-review``), so the write would
+      be a no-op. The caller skips it (no redundant write, no CAS round-trip).
+    * ``(cmd_with_cas, False)`` — ``--if-status``/``--if-stage`` pinned to the
+      state just observed, so a concurrent writer that moved the item makes
+      the write fail with ``stale`` (the caller re-reads and retries) instead
+      of clobbering it.
+    * ``(cmd, False)`` — the read failed or carried no lifecycle: the write
+      stays unconditional and the existing readback verification still
+      governs. Never a silent success.
+    """
+    try:
+        data = _run_wl(
+            ctx.runner, ["wl", "show", ctx.issue_id, "--json"],
+            worklog_dir=ctx.worklog_dir,
+        )
+    except RuntimeError:
+        return None, False
+    item = data.get("workItem") if isinstance(data, dict) else None
+    if not isinstance(item, dict):
+        item = data if isinstance(data, dict) else {}
+    status = str(item.get("status") or "")
+    stage = str(item.get("stage") or "")
+    claim_flags = _claim_release_flags_for_item(item)
+    side_effect_flags = _lifecycle_cmd_side_effect_flags(cmd)
+    if (
+        status and stage and not claim_flags and not side_effect_flags
+        and _lifecycle_state_matches(expected_status, expected_stage, (status, stage))
+    ):
+        return None, True
+    if not status or not stage:
+        return None, False
+    flags = list(cmd)
+    insert_at = len(flags) - 1 if flags and flags[-1] == "--json" else len(flags)
+    flags[insert_at:insert_at] = [
+        "--if-status", status, "--if-stage", stage,
+    ]
+    return flags, False
 
 
 def _verified_lifecycle_update(
@@ -17366,6 +17443,7 @@ def _verified_lifecycle_update(
     *,
     extra_flags: Sequence[str] = (),
     settle: bool = True,
+    cas: bool = False,
 ) -> bool:
     """Apply, verify and settle-check a lifecycle write for *ctx*.
 
@@ -17379,7 +17457,7 @@ def _verified_lifecycle_update(
     Returns True only when the persisted lifecycle was verified; an
     unverified write is never reported as success.
     """
-    cmd = [
+    base_cmd = [
         "wl", "update", ctx.issue_id,
         "--status", expected_status,
         "--stage", expected_stage,
@@ -17387,9 +17465,24 @@ def _verified_lifecycle_update(
         *extra_flags,
         "--json",
     ]
+    # The command actually sent (CAS-guarded) is rebuilt from the pristine
+    # *base_cmd* on every attempt: re-guarding an already-guarded command would
+    # duplicate ``--if-status``/``--if-stage`` and make the write invalid.
+    cmd = base_cmd
     last_error: Exception | None = None
     for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
         try:
+            cmd = base_cmd
+            if cas:
+                guarded, redundant = _guard_restore_cmd(
+                    ctx, base_cmd, expected_status, expected_stage,
+                )
+                if redundant:
+                    # The item already carries the target state and holds no
+                    # claim: the write would change nothing (AC5).
+                    return True
+                if guarded is not None:
+                    cmd = guarded
             _run_wl(ctx.runner, cmd, worklog_dir=ctx.worklog_dir)
             actual = _read_item_lifecycle_state(
                 ctx.runner, ctx.issue_id, ctx.worklog_dir,
@@ -17483,7 +17576,7 @@ def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> int:
     safe_status, safe_stage = _coerce_valid_status_stage(
         ctx.original_status, ctx.original_stage,
     )
-    if _verified_lifecycle_update(ctx, safe_status, safe_stage):
+    if _verified_lifecycle_update(ctx, safe_status, safe_stage, cas=True):
         print(
             f"Restored {ctx.issue_id} to pre-audit state "
             f"({safe_status}/{safe_stage}).",
@@ -17723,6 +17816,13 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # (SA-0MW7Z77KI005MK0B); the happy-path 'Yes' advance makes no extra
     # read, so it never regresses audit duration.
     restore_write_expected = False
+    # Set True on the same branches plus the deliberate explicit-'No'
+    # demotion: those writes are CAS-guarded against the lifecycle observed
+    # immediately before them and are skipped outright when the item already
+    # carries the target state, so a restore never blind-overwrites a
+    # concurrent writer and never re-writes a no-op (SA-0MWFMV31W00532T3 AC5).
+    # The 'Yes' advance stays unguarded (AC6: no extra read on the happy path).
+    cas_guard_expected = False
     try:
         # Infra-fallback provenance: a "No" derived from infrastructure-
         # failure fallbacks must restore, never demote. The flag does NOT
@@ -17786,6 +17886,7 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             ]
             expected_status, expected_stage = safe_status, safe_stage
             restore_write_expected = True
+            cas_guard_expected = True
         elif ctx.audit_verdict == "yes":
             # Advance to the review queue. Keep a terminal 'done' stage.
             # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6 / Q2=C): a
@@ -17858,6 +17959,7 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                 ]
                 expected_status, expected_stage = safe_status, safe_stage
                 restore_write_expected = True
+                cas_guard_expected = True
                 print(
                     f"Cascade-audit: suppressed demotion for {ctx.issue_id} "
                     f"(was {ctx.original_stage}; verdict 'No' is from "
@@ -17871,6 +17973,7 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                     "--assignee", "", "--json",
                 ]
                 expected_status, expected_stage = "open", "plan_complete"
+                cas_guard_expected = True
                 # Independent failing audit flags the producer queue
                 # (SA-0MVR9B1UH002BUST AC3): every independent top-level
                 # 'No' — merge-gate-blocked or ordinary — surfaces the item,
@@ -17923,9 +18026,24 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # silently: transient wl failures AND verification mismatches are
     # retried, then surfaced loudly with a non-zero exit. The update is
     # idempotent, so retrying after a partially-applied update is harmless.
+    # The CAS-guarded command is rebuilt from *base_restore_cmd* on every
+    # attempt (re-guarding an already-guarded command would duplicate the CAS
+    # flags and make the write invalid); the guarded form that landed is kept
+    # for the settle re-apply.
+    base_restore_cmd = restore_cmd
     last_error: Exception | None = None
     for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
         try:
+            if cas_guard_expected:
+                guarded, redundant = _guard_restore_cmd(
+                    ctx, base_restore_cmd, expected_status, expected_stage,
+                )
+                if redundant:
+                    # Already in the target state and no claim to release:
+                    # the write would change nothing (AC5).
+                    last_error = None
+                    break
+                restore_cmd = guarded if guarded is not None else base_restore_cmd
             _run_wl(ctx.runner, restore_cmd, worklog_dir=ctx.worklog_dir)
             actual = _read_item_lifecycle_state(
                 ctx.runner, ctx.issue_id, ctx.worklog_dir

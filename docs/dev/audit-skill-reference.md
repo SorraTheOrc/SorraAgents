@@ -257,6 +257,20 @@ Bounded retry budget: 3 attempts (linear backoff 0.5 s, 1.0 s) per lifecycle
 write + one settle re-apply; the restore adds at most two extra `wl show`
 reads on failure paths and none on the passing advance.
 
+**CAS-guarded restore writes (SA-0MWFMV31W00532T3 AC5).** Restore and
+demotion writes are conditional on the lifecycle read immediately before
+them: `wl update` is issued with `--if-status <observed status>` and
+`--if-stage <observed stage>`, so a concurrent writer that moved the item
+between the read and the write makes the write fail with `stale` and the
+bounded retry re-reads instead of clobbering it. When the item already
+carries the target status/stage and holds no releasable claim — and the
+command carries no other side-effect flag such as
+`--needs-producer-review` — the write is skipped entirely: there is nothing
+to say. This costs one extra `wl show` per restore *attempt* (the guard read,
+distinct from the claim-release read and the readback verification); the
+passing `Ready to close: Yes` advance remains unguarded and still makes
+exactly one readback, so audit duration on the happy path is unchanged.
+
 ## Pre-flight affirmation guard
 
 Entry guard in `cmd_issue` (SA-0MSL1Z1WU005O5IY) preventing two audits of the same work item from racing. The SKILL.md long documented a "pre-flight affirmation" with no code behind it; this guard makes docs and code agree.

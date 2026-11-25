@@ -109,6 +109,11 @@ class _RaceRunner:
         self.clobber_after_shows: dict[int, tuple[str, str]] = {}
         self.clobber_first_completed_write = False
         self.children_show_fails = False
+        # CAS simulation: reject the first conditional write and, when set,
+        # move the item to *cas_reject_first_to* first — modelling another
+        # session winning the race between our read and our write.
+        self.cas_reject_first_to: tuple[str, str] | None = None
+        self.cas_rejections = 0
 
     # -- helpers ---------------------------------------------------------
 
@@ -142,6 +147,44 @@ class _RaceRunner:
             new_status = self._flag(cmd, "--status")
             new_stage = self._flag(cmd, "--stage")
             new_assignee = self._flag(cmd, "--assignee")
+            # Enforce the CAS guard like wl itself: a conditional write whose
+            # expectation no longer matches is rejected (rc=1, "stale") and
+            # mutates nothing.
+            if_status = self._flag(cmd, "--if-status")
+            if_stage = self._flag(cmd, "--if-stage")
+            if self.cas_reject_first_to is not None:
+                self._clobber(*self.cas_reject_first_to)
+                self.cas_reject_first_to = None
+                self.cas_rejections += 1
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout=json.dumps({
+                        "success": False,
+                        "error": "stale",
+                        "message": (
+                            "Conditional update skipped: item no longer matches "
+                            "--if-status/--if-stage"
+                        ),
+                    }),
+                    stderr="",
+                )
+            if (if_status is not None or if_stage is not None) and (
+                (if_status is not None and if_status != self.status)
+                or (if_stage is not None and if_stage != self.stage)
+            ):
+                self.cas_rejections += 1
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout=json.dumps({
+                        "success": False,
+                        "error": "stale",
+                        "message": (
+                            "Conditional update skipped: item no longer matches "
+                            "--if-status/--if-stage"
+                        ),
+                    }),
+                    stderr="",
+                )
             if new_status is not None:
                 self.status = new_status
             if new_stage is not None:
@@ -392,3 +435,98 @@ class TestRestorePreAuditStateOnFailure:
         )
         rc = audit_runner._restore_pre_audit_state_on_failure(ctx)
         assert rc != 0
+
+
+class TestRestoreCasGuards:
+    """Restore writes are CAS-guarded and skip a redundant write (AC5).
+
+    The restore path must never blind-overwrite a state it did not observe:
+    each write carries ``--if-status``/``--if-stage`` for the lifecycle read
+    immediately before it, and when the item already carries the target state
+    (and no claim to release) no write is issued at all.
+    """
+
+    @staticmethod
+    def _cas(cmd, name):
+        return _RaceRunner._flag(cmd, name)
+
+    def test_restore_write_is_cas_guarded_on_the_observed_state(self):
+        """AC5: the restore write is conditional on the state just read."""
+        runner = _RaceRunner(status="in_progress", stage="in_progress")
+        ctx = _lifecycle_ctx(
+            runner, verdict=None, completed=False,
+            script_failure={"script": "x", "error": "boom"},
+        )
+
+        rc = audit_runner._apply_terminal_lifecycle(ctx)
+
+        assert rc == 0
+        assert (runner.status, runner.stage) == ("completed", "in_review")
+        restore_writes = runner.restore_updates()
+        assert restore_writes, "expected a restore write to completed/in_review"
+        first = restore_writes[0]
+        assert self._cas(first, "--if-status") == "in_progress", first
+        assert self._cas(first, "--if-stage") == "in_progress", first
+
+    def test_redundant_restore_write_is_skipped(self):
+        """AC5: nothing to do when the item already carries the target state."""
+        runner = _RaceRunner(status="completed", stage="in_review", assignee="")
+        ctx = _lifecycle_ctx(
+            runner, verdict=None, completed=False,
+            script_failure={"script": "x", "error": "boom"},
+        )
+
+        rc = audit_runner._restore_pre_audit_state_on_failure(ctx)
+
+        assert rc == 0
+        assert runner.updates == [], (
+            "an already-restored item must not be written again, got "
+            f"{runner.updates}"
+        )
+
+    def test_claim_release_still_writes_when_state_already_matches(self):
+        """AC5: the assignee-release write is not skipped by the CAS shortcut."""
+        runner = _RaceRunner(status="completed", stage="in_review", assignee="agent")
+        ctx = _lifecycle_ctx(
+            runner, verdict=None, completed=False,
+            script_failure={"script": "x", "error": "boom"},
+        )
+
+        rc = audit_runner._restore_pre_audit_state_on_failure(ctx)
+
+        assert rc == 0
+        assert runner.assignee == "", "a lingering claim must be released"
+        assert runner.updates, "the claim release requires a write"
+
+    def test_cas_rejection_is_retried_with_the_refreshed_state(self):
+        """AC5: a lost CAS race is re-read and retried, never blind-retried."""
+        runner = _RaceRunner(status="in_progress", stage="in_progress")
+        # Another session claims the item between our read and our write.
+        runner.cas_reject_first_to = ("in_progress", "plan_complete")
+        ctx = _lifecycle_ctx(
+            runner, verdict=None, completed=False,
+            script_failure={"script": "x", "error": "boom"},
+        )
+
+        rc = audit_runner._apply_terminal_lifecycle(ctx)
+
+        assert rc == 0
+        assert (runner.status, runner.stage) == ("completed", "in_review")
+        assert runner.cas_rejections == 1
+        assert len(runner.updates) >= 2, runner.updates
+        assert self._cas(runner.updates[0], "--if-status") == "in_progress"
+        # The retry is grounded on the refreshed read, not the stale one.
+        assert self._cas(runner.updates[1], "--if-status") == "in_progress"
+        assert self._cas(runner.updates[1], "--if-stage") == "plan_complete"
+
+    def test_happy_path_advance_is_not_cas_guarded(self):
+        """AC6: the 'Yes' advance keeps one write and one readback, no CAS read."""
+        runner = _RaceRunner(status="in_progress", stage="in_progress")
+        ctx = _lifecycle_ctx(runner, verdict="yes", completed=True)
+
+        rc = audit_runner._apply_terminal_lifecycle(ctx)
+
+        assert rc == 0
+        assert (runner.status, runner.stage) == ("completed", "in_review")
+        assert runner.item_shows == 1, runner.item_shows
+        assert self._cas(runner.updates[0], "--if-status") is None, runner.updates[0]
