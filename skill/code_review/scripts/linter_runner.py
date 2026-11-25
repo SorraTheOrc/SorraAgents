@@ -506,7 +506,7 @@ def _run_ruff_check(
                "--extend-exclude", RUFF_NON_PYTHON_EXCLUDE,
                "--force-exclude",
                "--output-format", "json", "--quiet"]
-    result = runner(cmd)
+    result = _invoke_pinned(runner, cmd, root)
 
     if result.returncode not in (0, 1):
         return []
@@ -636,6 +636,41 @@ def _run_subprocess(cmd: list[str], cwd: str | Path | None = None) -> subprocess
             args=cmd, returncode=-1,
             stdout="", stderr=f"Timed out: {' '.join(cmd)}",
         )
+
+
+def _invoke_pinned(runner: Callable, cmd: list[str], root: Path) -> Any:
+    """Invoke *runner* with the subprocess cwd pinned to *root*.
+
+    A linter's path arguments are resolved by the **child** process, so
+    invoking it with the inherited process cwd ties the scan to wherever the
+    caller happens to stand. The audit validates its file scope against
+    ``project_root`` (the audit code root) but may itself run from a different
+    repository; the mismatch produced ghost ``E902 No such file or directory``
+    findings for files that exist under ``project_root`` and no longer exist
+    in the scanning repo (WL-0MWVZEZXC00748QD, evidence
+    WL-0MWTZEDWG008YMGQ).
+
+    Pinning the cwd also fixes ruff config discovery, which walks up from the
+    effective cwd rather than from the passed paths.
+
+    Test doubles (and legacy call sites) often accept only ``cmd``; a stub
+    that rejects the ``cwd`` keyword is retried without it so the pin never
+    breaks an injectable runner that cannot take one.
+
+    Args:
+        runner: Subprocess runner callable.
+        cmd: The command to execute.
+        root: The project root the command's paths were validated against.
+
+    Returns:
+        Whatever *runner* returns.
+    """
+    try:
+        return runner(cmd, cwd=str(root))
+    except TypeError as exc:
+        if "cwd" not in str(exc):
+            raise
+        return runner(cmd)
 
 
 def _commit_changes(
