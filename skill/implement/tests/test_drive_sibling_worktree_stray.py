@@ -1576,3 +1576,287 @@ class TestDriveRetriesProviderStreamFailure:
         assert report["failed_child"] == CHILD_ID
         assert report["infra_retries"].get(CHILD_ID, 0) == 0
         assert report["children_driven"][0]["spawn_failure_kind"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Infra-retry with a live sibling worktree: the driver's classification — not
+# another item's mid-flight tree — decides attribution
+# (WL-0MWWBIXFQ004LZST, parent WL-0MWW96TNJ007EQ9F)
+# ---------------------------------------------------------------------------
+#
+# Incident: ``implement.py drive`` classified a child's first session failure
+# as ``infrastructure`` (``Provider finish_reason: error``) and re-ran the
+# parent phase on the shared ``--infra-retry-limit`` budget — but recorded no
+# spawn-failure evidence on that path (only the budget-exhausted path did).
+# The re-run parent phase therefore saw a *clean* child worktree plus a live
+# sibling worktree holding commits ahead of ``dev``, attributed the sibling's
+# work to the failed child and stopped the whole drive chain with a false
+# accusation against an unrelated item.
+#
+# Test-first slice (this item): the two expectations that need the fix are
+# ``xfail(strict=True)`` until the sibling fix slice
+# (WL-0MWWBJJBD008TBPB) records the evidence before the retry ``continue``;
+# that change set removes the markers. The companions — the guard still fails
+# closed without evidence, and a child holding its own work never reaches the
+# exemption — pass before **and** after the fix, so a failing test can only be
+# failing on the behaviour under test.
+
+
+class TestInfraRetryWithLiveSiblingWorktree:
+    """A retried infrastructure failure is never a stray-write verdict.
+
+    Real git repositories (the shared :mod:`shared.git_sandbox` factories) and
+    an injected spawner keep the harness hermetic: no ``pi`` session is
+    spawned, no wall-clock backoff is slept (``delay`` is a zero-cost
+    recorder) and no real worklog store is written (``wl_add_comment`` and the
+    release/reconcile helpers are stubbed). The re-run parent phase consults
+    the **real** :func:`implement._child_main_checkout_violation`, exactly as
+    ``phase_parent`` does for a non-terminal child with no work of its own.
+
+    ``record_spawn_failure`` is deliberately **not** stubbed: whether the
+    retry path writes that evidence is the behaviour under test.
+    """
+
+    PROVIDER_REASON = (
+        f"Child session for {CHILD_ID} exited with code 1: Provider "
+        "finish_reason: error"
+    )
+
+    def _drive(
+        self,
+        child_worktree: Path,
+        *,
+        infra_retry_limit: int = 5,
+        transient_failures: int = 1,
+    ) -> tuple[dict, int, list[str | None]]:
+        """Drive one child while a live sibling worktree is ahead of ``dev``.
+
+        ``transient_failures=1`` means "the first spawn fails with the
+        retryable provider signature, the second succeeds". Returns
+        ``(report, spawn_count, violations)``, where *violations* records what
+        the real placement guard returned on every **re-run** parent phase
+        (one entry per parent call after the first, which is the pre-spawn
+        "start the child" decision).
+        """
+        child_item = _child("in-progress")
+        spawns: list[str] = []
+        violations: list[str | None] = []
+        parent_calls = {"value": 0}
+        succeeded = {"value": False}
+
+        def _wl_show(work_item_id: str) -> dict:
+            if work_item_id == PARENT_ID:
+                return {
+                    "id": PARENT_ID,
+                    "title": "Parent",
+                    "status": "plan_complete",
+                    "stage": "plan_complete",
+                }
+            return dict(child_item)
+
+        def _spawner(child_id, worktree_path, timeout, env, verbose=False):
+            spawns.append(child_id)
+            assert child_id == CHILD_ID
+            assert worktree_path == str(child_worktree)
+            if len(spawns) > transient_failures:
+                succeeded["value"] = True
+                return {"success": True, "returncode": 0, "reason": ""}
+            return {
+                "success": False,
+                "returncode": 1,
+                "reason": self.PROVIDER_REASON,
+            }
+
+        def _parent(*_args, **_kwargs) -> dict:
+            parent_calls["value"] += 1
+            if succeeded["value"]:
+                return {
+                    "success": True,
+                    "parent_advanced": True,
+                    "message": "all children terminal",
+                }
+            if parent_calls["value"] > 1:
+                # The re-run parent phase, after the infra-retry ``continue``:
+                # this is where ``phase_parent`` runs the placement guard.
+                violation = implement._child_main_checkout_violation(
+                    CHILD_ID, str(child_worktree), PARENT_BRANCH
+                )
+                violations.append(violation)
+                if violation:
+                    return {
+                        "success": False,
+                        "placement_violation": True,
+                        "next_child": CHILD_ID,
+                        "message": violation,
+                    }
+            return {
+                "success": True,
+                "next_child": CHILD_ID,
+                "worktree_path": str(child_worktree),
+            }
+
+        with (
+            mock.patch.object(implement, "wl_show", side_effect=_wl_show),
+            mock.patch.object(
+                implement, "wl_show_children", return_value=[child_item]
+            ),
+            mock.patch.object(
+                implement, "_discover_worktree", return_value=str(child_worktree)
+            ),
+            mock.patch.object(implement, "wl_add_comment", return_value=True),
+            mock.patch.object(
+                implement,
+                "_release_provider_failed_child",
+                return_value={"released": False, "reason": "test stub"},
+            ),
+            mock.patch.object(
+                implement,
+                "_release_orphaned_child_claim",
+                return_value={"released": False, "reason": "test stub"},
+            ),
+            mock.patch.object(
+                implement,
+                "_detect_stranded_child",
+                return_value={"stranded": False},
+            ),
+            mock.patch.object(
+                implement, "_maybe_remove_child_worktree", return_value=None
+            ),
+        ):
+            report = implement.phase_drive(
+                PARENT_ID,
+                parent_runner=_parent,
+                spawn_session=_spawner,
+                infra_retry_limit=infra_retry_limit,
+                delay=lambda _seconds: None,
+                child_timeout=60,
+            )
+        return report, len(spawns), violations
+
+    def test_committed_live_sibling_still_fails_closed_without_evidence(
+        self, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        """Companion (unchanged): no failure evidence → the guard still fires.
+
+        Pins the genuine cross-worktree-write detection
+        (SA-0MW5FIJNQ002Z24I) on exactly the fixture the new exemption tests
+        use, and pins that the *driver's* evidence — only ever written for a
+        child that produced no work — is what turns the same surface into
+        pre-existing dirt. Passing before and after the fix makes the
+        ``xfail`` baselines unambiguous.
+        """
+        _commit(sibling_worktree, "sibling-work.py", branch_tag=SIBLING_ID)
+
+        # Ownership stays unresolved (an empty lookup), so the sibling keeps
+        # counting as a foreign surface without a real worklog subprocess.
+        with mock.patch.object(implement, "wl_show", return_value={}):
+            violation = implement._child_main_checkout_violation(
+                CHILD_ID, str(child_worktree), PARENT_BRANCH
+            )
+            assert violation is not None
+            assert str(sibling_worktree) in violation
+            assert "commits ahead of dev" in violation
+
+            implement.record_spawn_failure(
+                str(child_worktree), CHILD_ID, self.PROVIDER_REASON
+            )
+            assert (
+                implement._child_main_checkout_violation(
+                    CHILD_ID, str(child_worktree), PARENT_BRANCH
+                )
+                is None
+            )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "needs WL-0MWWBJJBD008TBPB: record spawn-failure evidence before "
+            "the infra-retry continue"
+        ),
+    )
+    def test_the_retry_records_evidence_before_re_running_the_parent(
+        self, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        """AC1: the exemption exists from the moment of the classification."""
+        _commit(sibling_worktree, "sibling-work.py", branch_tag=SIBLING_ID)
+
+        report, spawn_count, violations = self._drive(child_worktree)
+
+        # The retry ran on the infra budget: same child, same worktree.
+        assert spawn_count == 2
+        assert report["infra_retries"][CHILD_ID] == 1
+        evidence = implement.read_spawn_failure(str(child_worktree), CHILD_ID)
+        assert evidence is not None, (
+            "the failed session left no spawn-failure evidence before the "
+            "retry, so the re-run parent phase cannot tell this child from "
+            "one that wrote into the sibling worktree"
+        )
+        assert evidence["child_id"] == CHILD_ID
+        assert "Provider finish_reason: error" in evidence["reason"]
+        # The evidence never counts as the child's own work.
+        assert (
+            implement._classify_child_worktree(
+                CHILD_ID, str(child_worktree), PARENT_BRANCH
+            )
+            == implement.CHILD_CLEAN
+        )
+        assert violations == [None]
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "needs WL-0MWWBJJBD008TBPB: record spawn-failure evidence before "
+            "the infra-retry continue"
+        ),
+    )
+    def test_a_live_sibling_ahead_of_dev_never_stops_the_retry(
+        self, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        """AC2: the retried child is startable again, not accused."""
+        _commit(sibling_worktree, "sibling-work.py", branch_tag=SIBLING_ID)
+        # The sibling is a *live* surface holding work of its own: the exact
+        # shape that used to be attributed to the failed child.
+        assert (
+            implement._git_path_has_changes(sibling_worktree, PARENT_BRANCH)
+            is True
+        )
+        assert (
+            implement._git_path_has_changes(child_worktree, PARENT_BRANCH)
+            is False
+        )
+
+        report, spawn_count, violations = self._drive(child_worktree)
+
+        assert spawn_count == 2
+        # The re-run parent phase must not report a placement violation, so
+        # the chain proceeds instead of stopping on a false accusation.
+        assert violations == [None]
+        assert report.get("placement_violation") is not True
+        assert report["success"] is True
+        assert report["parent_advanced"] is True
+        assert report.get("failed_child") in (None, "")
+
+    def test_a_child_holding_its_own_work_never_earns_the_exemption(
+        self, child_worktree: Path, sibling_worktree: Path
+    ) -> None:
+        """AC4: ``CHILD_DIRTY``/``CHILD_AHEAD`` never reach the exemption."""
+        _commit(sibling_worktree, "sibling-work.py", branch_tag=SIBLING_ID)
+        _commit(child_worktree, "own-work.py", branch_tag=CHILD_ID)
+        assert (
+            implement._classify_child_worktree(
+                CHILD_ID, str(child_worktree), PARENT_BRANCH
+            )
+            == implement.CHILD_WORK
+        )
+
+        report, spawn_count, violations = self._drive(child_worktree)
+
+        # The retry still happens on the infra budget …
+        assert spawn_count == 2
+        assert report["infra_retries"][CHILD_ID] == 1
+        # … but a child that produced its own work never earns the record the
+        # exemption relies on (whether or not the fix is in place).
+        assert implement.read_spawn_failure(str(child_worktree), CHILD_ID) is None
+        # Its own work short-circuits the guard first (condition 3), so the
+        # sibling surface is never even attributed to it.
+        assert violations == [None]
