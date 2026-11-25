@@ -270,11 +270,10 @@ def test_fresh_worktree_missing_dist_is_built_during_start(tmp_path):
     )
     pkg.write_text(json.dumps(data), encoding="utf-8")
 
-    with _mocked_phase_start(main, wt, resumed=False):
-        with patch.object(
-            implement, "_run_shared_build", side_effect=_ok_run
-        ) as run_cmd:
-            report = implement.phase_start("SA-TEST", json_output=True)
+    with _mocked_phase_start(main, wt, resumed=False), patch.object(
+        implement, "_run_shared_build", side_effect=_ok_run
+    ) as run_cmd:
+        report = implement.phase_start("SA-TEST", json_output=True)
 
     assert report["success"] is True, report
     block = report["steps"]["shared_build"]
