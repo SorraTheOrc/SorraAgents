@@ -939,8 +939,7 @@ def _resolve_ts_module_key(importer: str, specifier: str) -> str | None:
         if joined.endswith(ext):
             joined = joined[: -len(ext)]
             break
-    if joined.endswith("/index"):
-        joined = joined[: -len("/index")]
+    joined = joined.removesuffix("/index")
     return joined or None
 
 
