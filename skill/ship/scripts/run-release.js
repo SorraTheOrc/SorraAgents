@@ -2258,7 +2258,7 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   }
   stepTimers['Step 5: execute release script'].stop();
 
-  // ── Step 6: Post-release - wait for PR merge and sync dev ──────────────
+  // ── Step 6: Post-release - wait for PR merge ───────────────────────────
   startStep('Step 6: wait for PR merge');
   const prUrl = parsePRUrl(stdout);
 
@@ -2273,24 +2273,14 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   }
   stepTimers['Step 6: wait for PR merge'].stop();
 
-  // ── Step 7: Sync dev with main ─────────────────────────────────────────
-  startStep('Step 7: sync dev with main');
-  const syncResult = syncDevWithMain();
-  if (!syncResult.success) {
-    console.error(`\n⚠️  ${syncResult.message}`);
-    return finish(5);
-  }
-  stepTimers['Step 7: sync dev with main'].stop();
-
-  // ── Step 8: Verify the release merge landed on main (gating) ───────────
-  // Merge-verification guard (SA-0MSJ2XMQL006CVQS): only close work items
-  // after verifying the release actually landed on main — the version tag
-  // exists on origin AND the tag commit is an ancestor of origin/main.
-  // This prevents spurious "Shipped in v<version>" closes when the close
-  // step runs without a real dev→main merge.
+  // ── Step 8: Resolve the released version and gate the post-release tail ─
+  // Merge-verification and tag-provenance gates (SA-0MSJ2XMQL006CVQS,
+  // SA-0MV0PZYMI004SUFR) run before ANY post-release step: the version must be
+  // readable, its tag must be newly created by this run, and the tag commit
+  // must be an ancestor of `origin/main`. The verify itself and the verified
+  // tail live in `runVerifiedPostReleaseTail()` below.
   //
   // Read the released version from the git tag created by the release script
-  startStep('Step 8: verify release merge');
   let version = null;
   try {
     version = execSync('git describe --tags --abbrev=0', {
@@ -2308,78 +2298,190 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
       );
       version = pkg.version;
     } catch {
-      console.warn('⚠ Unable to determine released version. Skipping close work items step.');
+      version = null;
     }
   }
 
-  if (version) {
-    // Newly-created-tag gate (SA-0MV0PZYMI004SUFR): the version read from
-    // `git describe` is only trustworthy when its tag did not already exist
-    // before this run. An already-present tag means the merge script exited 0
-    // without producing a release (the 2026-10-09 spurious-close incident), so
-    // refuse every post-release step instead of closing against a stale tag.
-    if (!isNewlyCreatedTag(version, preRunTags)) {
-      const detail = preRunTags === null
-        ? 'Could not read the pre-run git tag snapshot — cannot prove a new release tag was created.'
-        : `Release tag v${version} already existed before this run — no new release tag was created.`;
-      console.error(`\n⚠️  ${detail}`);
-      console.error('Refusing to close work items (exit code 14).');
-      return finish(14);
-    }
+  if (!version) {
+    console.warn('⚠ Unable to determine released version. Skipping close work items step.');
+    return finish(0);
+  }
 
-    const mergeVerification = verifyReleaseMerge(version);
-    if (!mergeVerification.success) {
-      console.error(`\n⚠️  ${mergeVerification.message}`);
-      console.error('Refusing to close work items (exit code 11).');
-      return finish(11);
-    }
-    stepTimers['Step 8: verify release merge'].stop();
+  // Newly-created-tag gate (SA-0MV0PZYMI004SUFR): the version read from
+  // `git describe` is only trustworthy when its tag did not already exist
+  // before this run. An already-present tag means the merge script exited 0
+  // without producing a release (the 2026-10-09 spurious-close incident), so
+  // refuse every post-release step instead of closing against a stale tag.
+  if (!isNewlyCreatedTag(version, preRunTags)) {
+    const detail = preRunTags === null
+      ? 'Could not read the pre-run git tag snapshot — cannot prove a new release tag was created.'
+      : `Release tag v${version} already existed before this run — no new release tag was created.`;
+    console.error(`\n⚠️  ${detail}`);
+    console.error('Refusing to close work items (exit code 14).');
+    return finish(14);
+  }
 
-    // ── Step 8.5: Post-release Discord notification (non-blocking) ────────
-    // Send release details + changelog to the configured Discord channel
-    // (SA-0MSQ6K7Z1002H14Z). Runs only after the release merge is verified
-    // (never on --dry-run or failed releases). Notification failures are
-    // logged as warnings and never change the release exit code.
-    //
-    // The pre-run tag snapshot is forwarded so the notifier can independently
-    // refuse to announce a stale tag (SA-0MV0QEI3Q0063KH3 AC5 defence in
-    // depth) — a second layer beneath the Step 8 newly-created-tag gate.
-    startStep('Step 8.5: discord notification');
-    try {
-      await sendReleaseNotification({ version, prUrl, projectRoot }, { preRunTags });
-    } catch (err) {
-      console.warn(`\n⚠ Discord notification step failed: ${err.message} (non-blocking).`);
-    }
-    stepTimers['Step 8.5: discord notification'].stop();
-
-    // ── Step 9: Close work items shipped in this release (non-blocking) ──
-    startStep('Step 9: close work items');
-    const closeResult = closeWorkItemsAfterRelease(version, { dryRun: isDryRun });
-    if (!closeResult.success
-        && (closeResult.errorCount > 0 || closeResult.unclosedCount > 0)) {
-      console.warn(`\n⚠ Non-critical: ${closeResult.message}`);
-    }
-    stepTimers['Step 9: close work items'].stop();
-
-    // ── Step 10: Post-release branch cleanup (non-blocking) ─────────────
-    // Automatically prune merged local branches and stale remote branches
-    // after a successful release. Failures are logged as warnings and never
-    // change the release exit code (AC3).
-    startStep('Step 10: post-release cleanup');
-    try {
-      const cleanupResult = runPostReleaseCleanup({ dryRun: isDryRun });
-      if (!cleanupResult.success) {
-        console.warn(`\n⚠ Post-release cleanup failed: ${cleanupResult.message}`);
-      }
-    } catch (err) {
-      console.warn(`\n⚠ Post-release cleanup threw an error: ${err.message}`);
-    }
-    stepTimers['Step 10: post-release cleanup'].stop();
-  } else {
-    stepTimers['Step 8: verify release merge'].stop();
+  // ── Verified post-release tail ─────────────────────────────────────────
+  // Extracted (SA-0MWXMTNIV006TJH5) so the normal release path and the
+  // `--finish-release` recovery entry point share ONE implementation
+  // verbatim. Order: verify release merge (gating) → Discord notification →
+  // close work items → branch cleanup → sync dev with main LAST, so a
+  // network-dependent `git push origin dev` can never suppress the verified
+  // tail (the 2026-11-26 v0.2.0 incident).
+  const tail = await runVerifiedPostReleaseTail({
+    version,
+    prUrl,
+    projectRoot,
+    dryRun: isDryRun,
+    provenance: { preRunTags },
+    startStep,
+  });
+  if (!tail.verified) {
+    console.error('Refusing to close work items (exit code 11).');
+    return finish(11);
   }
 
   return finish(0);
+}
+
+// ── runVerifiedPostReleaseTail ───────────────────────────────────────────────
+
+/**
+ * Run the verified post-release tail shared by the normal release path and the
+ * `--finish-release <version>` recovery entry point (SA-0MWXMTNIV006TJH5).
+ *
+ * Order (and why):
+ * 1. `verifyReleaseMerge` — gating: nothing is announced or closed unless the
+ *    release provably landed on `main` (tag on origin, ancestor of
+ *    `origin/main`). A failure returns `verified: false` and performs NO
+ *    notification, closure, cleanup or sync; the caller maps it to exit 11.
+ * 2. Discord notification — non-blocking (failures only warn).
+ * 3. Close work items — non-blocking.
+ * 4. Branch cleanup — non-blocking.
+ * 5. Sync `dev` with `main` — **last** and **non-fatal**: the release has
+ *    already landed, so a transport failure on `git push origin dev` must
+ *    never discard the notification or the closures. It logs a loud `⚠️`
+ *    warning naming the exact recovery command (`git push origin dev`) and
+ *    leaves the exit code untouched. Exit code 5 is no longer emitted here
+ *    (reserved — see skill/ship/SKILL.md).
+ *
+ * @param {object} opts - Tail options.
+ * @param {string} opts.version - Released version (without a leading `v`).
+ * @param {string|null} [opts.prUrl] - Release PR URL forwarded to the
+ *   notifier (`null` on the recovery path).
+ * @param {string} [opts.projectRoot] - Project root for the notifier.
+ * @param {boolean} [opts.dryRun] - Dry-run: no close/cleanup mutations.
+ * @param {object} [opts.provenance] - Provenance forwarded to
+ *   `sendReleaseNotification`: `{ preRunTags }` on the normal path,
+ *   `{ tagCreatedByThisRun: true }` on the recovery path.
+ * @param {(name: string) => object|null} [opts.startStep] - Optional timing
+ *   hook: the caller's step timer is registered for each tail step so the
+ *   dev-sync outcome appears in its timing/summary report.
+ * @returns {Promise<{
+ *   version: string,
+ *   verified: boolean,
+ *   verification: { success: boolean, message: string },
+ *   notified: boolean,
+ *   close: object|null,
+ *   cleanup: object|null,
+ *   sync: { success: boolean, message: string }|null,
+ * }>} The tail outcome. `sync` is `null` whenever the tail did not run.
+ */
+export async function runVerifiedPostReleaseTail({
+  version,
+  prUrl = null,
+  projectRoot = resolveProjectRoot(),
+  dryRun = false,
+  provenance = {},
+  startStep = null,
+}) {
+  // `startStep` is optional so the recovery entry point can call this helper
+  // without the wrapper's timing instrumentation.
+  const beginStep = (name) => (typeof startStep === 'function' ? startStep(name) : null);
+  const endStep = (timer) => {
+    if (timer) timer.stop();
+  };
+
+  // ── Verify the release merge (gating) ──────────────────────────────────
+  const verifyTimer = beginStep('Step 8: verify release merge');
+  const mergeVerification = verifyReleaseMerge(version);
+  endStep(verifyTimer);
+  if (!mergeVerification.success) {
+    console.error(`\n⚠️  ${mergeVerification.message}`);
+    return {
+      version,
+      verified: false,
+      verification: mergeVerification,
+      notified: false,
+      close: null,
+      cleanup: null,
+      sync: null,
+    };
+  }
+
+  // ── Discord notification (non-blocking) ────────────────────────────────
+  // The provenance object is forwarded so the notifier can independently
+  // refuse to announce a stale tag on the normal path (SA-0MV0QEI3Q0063KH3
+  // AC5 defence in depth beneath the newly-created-tag gate) while the
+  // recovery path supplies explicit `{ tagCreatedByThisRun: true }`.
+  let notified = false;
+  const notifyTimer = beginStep('Step 8.5: discord notification');
+  try {
+    const notifyResult = await sendReleaseNotification(
+      { version, prUrl, projectRoot },
+      provenance,
+    );
+    notified = Boolean(notifyResult && notifyResult.notified);
+  } catch (err) {
+    console.warn(`\n⚠ Discord notification step failed: ${err.message} (non-blocking).`);
+  }
+  endStep(notifyTimer);
+
+  // ── Close work items shipped in this release (non-blocking) ────────────
+  const closeTimer = beginStep('Step 9: close work items');
+  const close = closeWorkItemsAfterRelease(version, { dryRun });
+  if (!close.success && (close.errorCount > 0 || close.unclosedCount > 0)) {
+    console.warn(`\n⚠ Non-critical: ${close.message}`);
+  }
+  endStep(closeTimer);
+
+  // ── Post-release branch cleanup (non-blocking) ─────────────────────────
+  // Prune merged local branches and stale remote branches after a successful
+  // release. Failures are logged as warnings and never change the exit code.
+  let cleanup = null;
+  const cleanupTimer = beginStep('Step 10: post-release cleanup');
+  try {
+    cleanup = runPostReleaseCleanup({ dryRun });
+    if (!cleanup.success) {
+      console.warn(`\n⚠ Post-release cleanup failed: ${cleanup.message}`);
+    }
+  } catch (err) {
+    console.warn(`\n⚠ Post-release cleanup threw an error: ${err.message}`);
+  }
+  endStep(cleanupTimer);
+
+  // ── Sync dev with main (LAST, non-fatal) ───────────────────────────────
+  // The release has landed; this is the only network-dependent step of the
+  // tail and it must never suppress the verified work above. A failure warns
+  // loudly, names the exact recovery command and leaves the exit code alone
+  // (exit code 5 is reserved and no longer emitted).
+  const syncTimer = beginStep('Step 11: sync dev with main');
+  const sync = syncDevWithMain();
+  if (!sync.success) {
+    console.warn(`\n⚠️  ${sync.message}`);
+    console.warn('The release itself landed; recover the dev sync with: git push origin dev');
+  }
+  endStep(syncTimer);
+
+  return {
+    version,
+    verified: true,
+    verification: mergeVerification,
+    notified,
+    close,
+    cleanup,
+    sync,
+  };
 }
 
 // ── CLI Entry Point ──────────────────────────────────────────────────────────

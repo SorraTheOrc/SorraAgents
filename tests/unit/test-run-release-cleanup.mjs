@@ -160,26 +160,31 @@ test('AC3: runPostReleaseCleanup returns success even when cleanup fails', async
 test('AC3: runPostReleaseCleanup failure does not propagate to release exit code', async () => {
   const content = readFileSync(RUN_RELEASE_PATH, 'utf-8');
 
-  // After closeWorkItemsAfterRelease and runPostReleaseCleanup, the function
-  // should not use the cleanup result to set an exit code.
-  // Verify: the cleanup step uses try/catch and never assigns exit code from cleanupResult.
+  // The post-release cleanup lives in the extracted
+  // `runVerifiedPostReleaseTail()` helper (SA-0MWXMTNIV006TJH5), so the
+  // non-blocking contract is asserted against that helper's body rather than
+  // against a positional slice of the whole file.
+  const helperStart = content.indexOf('export async function runVerifiedPostReleaseTail');
   assert.ok(
-    content.includes('try') && content.includes('catch'),
-    'runPostReleaseCleanup should have error handling (try/catch)',
+    helperStart >= 0,
+    'runVerifiedPostReleaseTail() should be exported from run-release.js',
   );
+  const helperEnd = content.indexOf('\n// ──', helperStart + 1);
+  assert.ok(helperEnd > helperStart, 'runVerifiedPostReleaseTail() body should be locatable');
+  const helperBody = content.slice(helperStart, helperEnd);
 
   // In Step 10, cleanup should be wrapped in try/catch.
-  const cleanupStep = content.slice(content.indexOf('Step 10: post-release cleanup'));
+  const cleanupStep = helperBody.slice(helperBody.indexOf('Step 10: post-release cleanup'));
   assert.ok(
     cleanupStep.includes('try') && cleanupStep.includes('catch'),
     'Step 10 should wrap cleanup in try/catch',
   );
 
-  // The function should never call process.exit with a non-zero code based on cleanup.
-  const stepToFinish = cleanupStep.slice(0, cleanupStep.indexOf('return finish(0)'));
+  // Cleanup can never influence the exit code: the helper returns a result
+  // object and holds no exit-code plumbing at all.
   assert.ok(
-    !stepToFinish.includes('process.exit(') && !stepToFinish.includes('exitCode ='),
-    'Step 10 should not set exit code based on cleanup results',
+    !helperBody.includes('process.exit(') && !helperBody.includes('exitCode'),
+    'the verified tail helper must not set or propagate an exit code',
   );
 });
 

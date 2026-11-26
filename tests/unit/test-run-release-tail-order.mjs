@@ -19,11 +19,9 @@
  *   verify release merge → Discord notification → close work items
  *   → branch cleanup → sync dev with main (last)
  *
- * The ordering and non-fatal-sync cases are `{ todo: true }` until the
- * sibling reorder item (SA-0MWXIY8D2001DGZ0 decomposition) lands — the
- * red-first analogue of `pytest.mark.xfail(strict=True)` — so the
- * changed-scope gate stays green. The gate assertions (exit 11, exit 14)
- * already hold with today's code and stay unmarked.
+ * All four cases are enforced: the ordering and non-fatal-sync cases landed
+ * with the tail reorder (SA-0MWXMTNIV006TJH5), and the gate assertions
+ * (exit 11, exit 14) hold unchanged.
  */
 
 import { test, describe } from 'node:test';
@@ -288,7 +286,6 @@ function assertOrderedSubsequence(events, expected, label) {
 describe('run-release post-release tail order and non-fatal dev sync', () => {
   test(
     'runs verify merge → Discord notification → close → cleanup → sync dev last',
-    { todo: true },
     () => {
       const { res, eventLog } = runReleaseWithMocks({ gitMode: 'success' });
       assert.equal(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
@@ -311,7 +308,6 @@ describe('run-release post-release tail order and non-fatal dev sync', () => {
 
   test(
     'a failed `git push origin dev` is non-fatal: exit 0, notification + close recorded, recovery command warned',
-    { todo: true },
     () => {
       const { res, eventLog, closeLog } = runReleaseWithMocks({ gitMode: 'push-fail' });
       assert.equal(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
@@ -341,8 +337,21 @@ describe('run-release post-release tail order and non-fatal dev sync', () => {
         out.includes('git push origin dev'),
         `stderr should name the exact recovery command, got:\n${out}`,
       );
+      assert.ok(
+        out.includes('Step 11: sync dev with main'),
+        `the timing report should carry the dev-sync outcome, got:\n${out}`,
+      );
     },
   );
+
+  test('exports runVerifiedPostReleaseTail for the recovery entry point to reuse', async () => {
+    const mod = await import(RUN_RELEASE_SRC);
+    assert.equal(
+      typeof mod.runVerifiedPostReleaseTail,
+      'function',
+      'runVerifiedPostReleaseTail should be exported so --finish-release reuses it verbatim',
+    );
+  });
 
   test('a failed verifyReleaseMerge still exits 11 with no notification and no close recorded', () => {
     const { res, eventLog, closeLog } = runReleaseWithMocks({ gitMode: 'not-ancestor' });

@@ -312,7 +312,8 @@ v0.1.11"); v1.0.0/v1.2.3 never existed as release tags.
    `getCandidateItemsFn`/`runCloseCommand`/`getCloseStateFn` boundaries; the
    unit tests inject fakes, so running the test suite has zero effect on the
    worklog.
-2. **Merge-verification guard** — `run-release.js` Step 8 calls
+2. **Merge-verification guard** — `run-release.js` Step 9 (inside
+   `runVerifiedPostReleaseTail()`) calls
    `verifyReleaseMerge(version)` (tag exists on origin + tag commit is an
    ancestor of `origin/main`) before closing anything; failure aborts with exit
    code 11 and closes nothing.

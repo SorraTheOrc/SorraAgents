@@ -26,7 +26,7 @@ All scripts below are internal implementation details — they are not exposed a
 
 | Script | Purpose |
 |--------|---------|
-| `./skill/ship/scripts/run-release.js` | Release wrapper (includes gating, post-release dev sync) |
+| `./skill/ship/scripts/run-release.js` | Release wrapper (includes gating and the verified post-release tail: verify → notify → close → cleanup → dev sync last, non-fatal) |
 | `./skill/ship/scripts/release/merge-dev-to-main.sh` | Canonical release merge script |
 | `./skill/ship/scripts/release/changelog-merge.js` | CHANGELOG.md dev→main merge helper and post-merge release-section guard (`extractReleaseSection`, `insertReleaseSection`, `mergeReleaseSection`, `guardReleaseSection`; SA-0MVXY0VPC002B0MO) |
 | `./skill/ship/scripts/release/bump-preflight.js` | Version-bump preflight (read-only): gathers `stage: in_review` release candidates, enriches each with `## Impact`/user story, type, priority and a description excerpt, and renders the review packet with the `patch`/`minor`/`major` outcomes computed by `bump-version.js` (`gatherReleaseCandidates`, `enrichCandidate`, `renderReviewPacket`, `runBumpPreflight`; SA-0MWFVQWGN006G4KA) |
@@ -68,7 +68,7 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 2 | Missing release script |
 | 3 | Unmerged branches found |
 | 4 | PR merge failed |
-| 5 | Dev sync failed |
+| 5 | Reserved — **no longer emitted**: a `dev`-sync failure at the end of the verified post-release tail is non-fatal (the release already landed); the wrapper warns and prints the recovery command (`git push origin dev`) |
 | 6 | Audit gate failure — top-level `in_review` item(s) lack a passing audit after conservative auto-remediation (missing/transient audits are re-run automatically via `audit_runner.py`; genuine "not ready to close" verdicts block immediately) |
 | 7 | Critical-items gate failure (critical items not in terminal state) |
 | 8 | Worklog-ref gate failure (worklog refs present) |
@@ -255,8 +255,9 @@ node ./skill/ship/scripts/run-release.js
 ```
 
 **Step 0 is agent-run and precedes every script step**: the version bump
-evaluation (below) settles the bump before any git mutation. Steps 0.1–11 are
-executed by `run-release.js` / `merge-dev-to-main.sh`.
+evaluation (below) settles the bump before any git mutation. Steps 0.1–12 are
+executed by `run-release.js` / `merge-dev-to-main.sh`, with steps 8–12 forming
+the shared `runVerifiedPostReleaseTail()` helper.
 
 0. **Version bump evaluation (agent-run, in-session)** — the agent runs the read-only preflight (`release/bump-preflight.js`), judges the release from the shipped items' content, and chooses exactly one bump: `patch` proceeds automatically; `minor`/`major` require the producer's approval **in the PI session** before any merge, tag, PR or worklog close (a headless run that cannot ask stops with producer review instead of self-approving). An explicit `--bump` is an operator override. See [Version bump evaluation](#version-bump-evaluation-sa-0mw978one008wmib).
 0.1. **Locate the release script (fail-fast, SA-0MUIVIJFT0009ZNV)** — resolves the canonical release script (skill-level or repository-level) **before** the gating checks and exits 2 immediately if absent; no git or live-`wl` gate commands run.
@@ -271,15 +272,16 @@ executed by `run-release.js` / `merge-dev-to-main.sh`.
 
    The wait is **completion-aware** (SA-0MVDP9B83004UD5E): the wrapper launches the background poller [`wait_for_pr_checks.py`](../../skill/ship/scripts/release/wait_for_pr_checks.py) (which polls `gh pr view --json statusCheckRollup` and writes a terminal outcome marker), then waits on it with the shared helper [`wait_for_job.py`](../../skill/shared/wait_for_job.py) — returning the moment the poller completes, with a heartbeat, rather than after a fixed `sleep 10` poll loop. See [background-job etiquette](../../skill/shared/background-job-etiquette.md). When the background-job tooling is absent (a pre-SA-0MVCX570P003VLBK install) the wrapper falls back to a single bounded `gh` query — never a fixed-sleep loop.
 7. **Audit logging** — records merge hash, PR URL in worklog.
-8. **Sync dev with main** — `syncDevWithMain()`: fetch, checkout dev, merge origin/main, push.
-   > Release ops run from **main checkout**, not worktrees.
-9. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): the close step only runs after the release actually landed on main. Both conditions must hold:
+8. **Verify the release merge (gating)** — `verifyReleaseMerge(version)` (SA-0MSJ2XMQL006CVQS): the close step only runs after the release actually landed on main. Both conditions must hold:
    - the released version tag `v<version>` exists on origin (`git ls-remote`), and
    - the tag commit is an ancestor of `origin/main` (`git merge-base --is-ancestor`).
    If verification fails, the release aborts with **exit code 11** and **no work items are closed** — a spurious "Shipped" record cannot be created without a real dev→main merge.
    **Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** before this step, `snapshotReleaseTags()` captures the pre-run tag list; `isNewlyCreatedTag(version, preRunTags)` requires `v<version>` to be absent from it. A stale tag (or an unreadable snapshot) aborts with **exit code 14** and runs no post-release step, so an old reachable tag read by `git describe` can never trigger a close.
-10. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 9 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
-11. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures. **Close verification (SA-0MUXA5ZNZ0019QY5):** every attempted close is re-read through the injectable `getCloseStateFn` boundary (default `getItemLifecycle`); an item is counted as closed only when the persisted lifecycle is `status: completed` **and** `stage: done`. A close that exits 0 but does not persist — the concurrent-`wl sync` lost-update race (WL-0MUXA5RI2009EUTJ) — is retried exactly once and re-verified; if still not terminal (or the read throws/returns `null` — fail-safe) the item is listed in `unclosedCount`/`unclosedItems`, `success` is `false`, and the summary never claims blanket success. The step remains non-blocking.
+9. **Discord release notification (non-blocking)** — `sendReleaseNotification({version, prUrl, projectRoot})` (SA-0MSQ6K7Z1002H14Z): posts release details + changelog to a configured Discord channel. Runs only after Step 8 (merge verification) succeeds — never on `--dry-run` or failed releases. See [Discord release notification](#discord-release-notification) below.
+10. **Close work items (non-blocking)** — `closeWorkItemsAfterRelease(version)`: closes `in_review`/`completed` items with `needsProducerReview === false`. A child with `needsProducerReview = true` whose nearest `in_review` ancestor is audit-ready (`readyToClose === true`) is **overridden**: the flag is cleared (`wl update <child> --needs-producer-review false`), an explanatory comment naming the authorising parent is recorded, and the child is closed (SA-0MUJLWPB10038Z8Q AC1). The override is authorised **only** by the parent's passing audit — never by status alone (AC3). Items with `needsProducerReview = null`/`undefined`, or `true`-but-uncovered, are skipped and logged as "Skipped (needs producer review)". Candidates whose `--force` close would sweep descendants **outside** the candidate set are **refused** and reported (SA-0MU2OY1N9000XL2H AC9/AC10). Under `--dry-run` no override/close mutation is performed (AC4). Logs warnings on individual close failures. **Close verification (SA-0MUXA5ZNZ0019QY5):** every attempted close is re-read through the injectable `getCloseStateFn` boundary (default `getItemLifecycle`); an item is counted as closed only when the persisted lifecycle is `status: completed` **and** `stage: done`. A close that exits 0 but does not persist — the concurrent-`wl sync` lost-update race (WL-0MUXA5RI2009EUTJ) — is retried exactly once and re-verified; if still not terminal (or the read throws/returns `null` — fail-safe) the item is listed in `unclosedCount`/`unclosedItems`, `success` is `false`, and the summary never claims blanket success. The step remains non-blocking.
+11. **Post-release branch cleanup (non-blocking)** — `runPostReleaseCleanup()` prunes merged local branches and stale remote branches; failures are logged as warnings and never change the release exit code.
+12. **Sync dev with main (LAST, non-fatal)** — `syncDevWithMain()`: fetch, checkout `dev`, merge `origin/main`, push. Runs **after** the verified tail so the only network-dependent step can never suppress the notification, closure or cleanup: a failure logs a loud `⚠️` warning naming the error and the exact recovery command `git push origin dev`, and leaves the exit code at 0. Exit code 5 is **reserved** and no longer emitted by a full release.
+    > Release ops run from **main checkout**, not worktrees.
 
 ### Version bump evaluation (SA-0MW978ONE008WMIB)
 

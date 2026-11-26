@@ -118,10 +118,11 @@ marker (`…`) when it exceeds the limit.
 | 4 | PR creation (`release/dev-to-main-<timestamp>`) | Yes |
 | 5 | Status check wait & merge (default 10 min) | Yes |
 | 6 | Audit logging (merge hash, PR URL) | No |
-| 7 | Sync dev with main (`syncDevWithMain()`) | No |
-| 8 | Verify release merge (gating — tag exists, ancestor of main) | Yes |
-| 8.5 | Discord notification (non-blocking) | No |
-| 9 | Close work items (non-blocking) | No |
+| 7 | Verify release merge (gating — tag exists, ancestor of main) | Yes |
+| 7.5 | Discord notification (non-blocking) | No |
+| 8 | Close work items (non-blocking) | No |
+| 8.5 | Post-release branch cleanup (non-blocking) | No |
+| 9 | Sync dev with main — **last** and **non-fatal**: a failure warns and names the recovery command `git push origin dev`; exit code 5 is reserved | No |
 
 ### Pre-flight audit refresh (`--refresh-audits`)
 
