@@ -77,16 +77,41 @@ def _tool_call(call_id: str, command: str, timestamp: str) -> dict:
     }
 
 
-def _tool_result(call_id: str, text: str, timestamp: str) -> dict:
+def _non_bash_tool_call(
+    call_id: str, tool_name: str, arguments: dict, timestamp: str
+) -> dict:
+    """An assistant tool call for a non-bash tool (``read``, ``edit``, …)."""
     return {
         "type": "message",
         "timestamp": timestamp,
         "message": {
-            "role": "toolResult",
-            "toolCallId": call_id,
-            "toolName": "bash",
-            "content": [{"type": "text", "text": text}],
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "toolCall",
+                    "id": call_id,
+                    "name": tool_name,
+                    "arguments": arguments,
+                }
+            ],
         },
+    }
+
+
+def _tool_result(
+    call_id: str, text: str, timestamp: str, *, tool_name: str | None = "bash"
+) -> dict:
+    message: dict = {
+        "role": "toolResult",
+        "toolCallId": call_id,
+        "content": [{"type": "text", "text": text}],
+    }
+    if tool_name is not None:
+        message["toolName"] = tool_name
+    return {
+        "type": "message",
+        "timestamp": timestamp,
+        "message": message,
     }
 
 
@@ -264,6 +289,153 @@ def test_run_source_command_is_counted_and_echo_is_excluded(harness, tmp_path):
     )
     assert full["calls"] == 1
     assert full["max_seconds"] == 2.0
+
+
+def test_read_of_the_fixture_file_injects_no_samples(harness, tmp_path):
+    """Reading this repo's own test file must never count as a run.
+
+    Regression for SA-0MWB872IG007ZC7Y: the test file carries fixture text
+    (``"slot_wait_seconds": 999.0`` plus a ``run_tests: gate-subject`` marker)
+    that the structural-marker fallback used to parse as genuine gate samples,
+    producing a spurious 999.0 s dev-push-gate outlier and a false
+    ``no_run_over_120s`` failure.
+    """
+    fixture = Path(__file__).resolve()
+    text = fixture.read_text(encoding="utf-8")
+    # The fixture really does carry the poison text the read used to admit.
+    assert "999.0" in text
+    assert "run_tests: gate-subject" in text
+
+    session = tmp_path / "sessions" / "--demo--" / "s1.jsonl"
+    _write_session(
+        session,
+        [
+            _non_bash_tool_call(
+                "read1", "read", {"path": str(fixture)}, "2026-11-10T15:23:00Z"
+            ),
+            _tool_result(
+                "read1", text, "2026-11-10T15:23:02.987Z", tool_name="read"
+            ),
+        ],
+    )
+
+    report = harness.measure(tmp_path / "sessions", min_samples=1)
+
+    assert report["total_samples"] == 0
+    for row in report["categories"]:
+        assert row["calls"] == 0, row["category"]
+    # The spurious 999.0 s gate sample must not resurface in any check.
+    checks = {check["id"]: check for check in report["checks"]}
+    assert checks["no_run_over_120s"]["passed"] is True
+    assert "no_run_over_120s" not in report["failures"]
+
+
+@pytest.mark.parametrize("tool_name", ["read", "edit", "write", "grep"])
+def test_non_bash_tool_result_is_never_a_sample(harness, tmp_path, tool_name):
+    """A non-bash tool result that echoes a gate block injects no samples."""
+    poison = (
+        "run_tests: gate-subject pushed=abc123 checkout=in-place\n"
+        '"slot_wait_seconds": 999.0, "slot_lanes": [\n "full"\n]'
+    )
+    session = tmp_path / "sessions" / "--demo--" / "s1.jsonl"
+    _write_session(
+        session,
+        [
+            _non_bash_tool_call(
+                "t1", tool_name, {"path": "fixture"}, "2026-11-10T15:23:00Z"
+            ),
+            _tool_result(
+                "t1", poison, "2026-11-10T15:23:02.987Z", tool_name=tool_name
+            ),
+        ],
+    )
+
+    report = harness.measure(tmp_path / "sessions", min_samples=1)
+
+    assert report["total_samples"] == 0
+    gate = next(
+        row for row in report["categories"] if row["category"] == "dev_push_gate"
+    )
+    assert gate["calls"] == 0
+
+
+def test_generic_fixture_file_read_injects_no_samples(harness, tmp_path):
+    """Reading an arbitrary fixture file with run structure yields no samples."""
+    fixture = tmp_path / "fixture.txt"
+    fixture.write_text(
+        "run_tests: gate-subject pushed=deadbeef\n"
+        '"slot_wait_seconds": 42.0, "slot_lanes": [\n "full"\n]\n'
+        '"slot_wait_seconds": 3.5, "slot_lane": "fast"\n',
+        encoding="utf-8",
+    )
+    session = tmp_path / "sessions" / "--demo--" / "s1.jsonl"
+    _write_session(
+        session,
+        [
+            _non_bash_tool_call(
+                "read1", "read", {"path": str(fixture)}, "2026-11-10T15:23:00Z"
+            ),
+            _tool_result(
+                "read1",
+                fixture.read_text(encoding="utf-8"),
+                "2026-11-10T15:23:02.987Z",
+                tool_name="read",
+            ),
+        ],
+    )
+
+    report = harness.measure(tmp_path / "sessions", min_samples=1)
+
+    assert report["total_samples"] == 0
+    for row in report["categories"]:
+        assert row["calls"] == 0, row["category"]
+
+
+def test_bash_structural_marker_fallback_is_still_accepted(harness, tmp_path):
+    """A genuine bash result with no resolvable call record is still measured.
+
+    Guards against over-tightening the filter (SA-0MWB872IG007ZC7Y): a forked
+    or compacted log can lose the assistant ``toolCall`` while keeping the
+    bash ``toolResult``. That result carries ``toolName=bash`` and must still
+    fall back to the structural marker.
+    """
+    poison = (
+        "run_tests: gate-subject pushed=abc123 checkout=in-place\n"
+        '"slot_wait_seconds": 1.25, "slot_lanes": [\n "full"\n]'
+    )
+    session = tmp_path / "sessions" / "--demo--" / "s1.jsonl"
+    # No assistant toolCall record: the command is unresolvable.
+    _write_session(
+        session,
+        [_tool_result("orphan", poison, "2026-11-05T10:00:05Z")],
+    )
+
+    report = harness.measure(tmp_path / "sessions", min_samples=1)
+
+    gate = next(
+        row for row in report["categories"] if row["category"] == "dev_push_gate"
+    )
+    assert gate["calls"] == 1
+    assert gate["max_seconds"] == 1.25
+
+
+def test_result_with_no_tool_name_keeps_structural_fallback(harness, tmp_path):
+    """A result without a ``toolName`` field is still eligible (old logs)."""
+    block = _bare_run_tests_block(full=[5.0], fast=[])
+    session = tmp_path / "sessions" / "--demo--" / "s1.jsonl"
+    _write_session(
+        session,
+        [_tool_result("orphan", block, "2026-11-05T10:00:05Z", tool_name=None)],
+    )
+
+    report = harness.measure(tmp_path / "sessions", min_samples=1)
+
+    full = next(
+        row for row in report["categories"] if row["category"] == "run_tests_full"
+    )
+    assert full["calls"] == 1
+    assert full["max_seconds"] == 5.0
+
 
 
 def test_finish_samples_are_deduplicated_by_queued_at(harness, tmp_path):
@@ -543,10 +715,14 @@ def test_render_summary_keeps_each_statement_on_its_own_line(harness):
     lines = harness.render_summary(report).splitlines()
 
     assert lines == [
-        "window: 2026-11-01T00:00:00+00:00 .. 2026-11-05T00:00:00+00:00 "
-        "(since post-fix abc1234)",
-        "corpus: root=/tmp/sessions files_scanned=7 files_with_samples=3 "
-        "records_in_window=12 samples=5",
+        (
+            "window: 2026-11-01T00:00:00+00:00 .. 2026-11-05T00:00:00+00:00 "
+            "(since post-fix abc1234)"
+        ),
+        (
+            "corpus: root=/tmp/sessions files_scanned=7 files_with_samples=3 "
+            "records_in_window=12 samples=5"
+        ),
         "  [PASS] p50_under_120s: p50=1.00s",
         "  [N/A ] no_queued_notice_30s: no notices",
         "verdict: PASS",
@@ -575,6 +751,7 @@ def test_harness_is_free_of_unparenthesised_implicit_concatenation():
         ],
         capture_output=True,
         text=True,
+        check=False,
     )
 
     assert result.returncode == 0, (

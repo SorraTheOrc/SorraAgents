@@ -79,6 +79,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import configparser
 import contextlib
 import errno
 import functools
@@ -147,6 +148,25 @@ try:
     )
 except ModuleNotFoundError as _missing_shared:
     guard_shared_import(_missing_shared.name)
+
+try:
+    # Best-effort, read-only concurrent-actor attribution
+    # (WL-0MWR1OYAJ000UVJS). Kept soft/fail-open: evidence is a second,
+    # informational signal, so a partial skill install degrades to ``unknown``
+    # rather than blocking a finish.
+    from shared.concurrent_actor import (
+        actor_evidence_from_note as _actor_evidence_from_note,
+    )
+    from shared.concurrent_actor import (
+        annotate_excluded_notes as _annotate_actor_notes,
+    )
+    from shared.concurrent_actor import (
+        describe_concurrent_actor as _describe_concurrent_actor,
+    )
+except Exception:  # noqa: BLE001 -- broad by design: evidence must fail open
+    _describe_concurrent_actor = None  # pragma: no cover - partial install
+    _annotate_actor_notes = None  # pragma: no cover - partial install
+    _actor_evidence_from_note = None  # pragma: no cover - partial install
 
 try:
     # Fail-open self-referential-upstream warning (SA-0MVX35AUC003CNUD AC2/
@@ -2590,9 +2610,155 @@ def _path_is_expected_dirty(file_path: str, expected_dirty: tuple[str, ...]) -> 
     return False
 
 
+def _submodule_gitlink_sha(repo_root: str | Path, path: str) -> str | None:
+    """Return the index gitlink sha for *path*, or ``None`` when not a gitlink.
+
+    A submodule is recorded in the index with mode ``160000``; the sha is the
+    pinned submodule commit. ``None`` means *path* is not a tracked submodule.
+    """
+    result = run_cmd(
+        ["git", "ls-files", "--stage", "--", path],
+        cwd=str(repo_root),
+        capture=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        meta, _sep, listed = line.partition("\t")
+        fields = meta.split()
+        if fields and fields[0] == "160000" and listed.strip() == path:
+            return fields[1]
+    return None
+
+
+def _is_gitlink_surface(repo_root: str | Path, path: str) -> bool:
+    """True when *path* is a registered submodule (gitlink) of *repo_root*.
+
+    A submodule surfaces in the outer ``git status`` as a single bare entry
+    (`` M core``), never as the inner paths that actually changed. Only a
+    tracked gitlink (index mode ``160000``) is treated as expandable: an
+    untracked nested repository stays an opaque dirty path, so the guard is
+    never loosened for a plain directory that merely happens to contain a
+    ``.git`` (RISE-0MWOIAXAG008HMK3 AC2).
+    """
+    candidate = Path(repo_root) / path
+    if not candidate.is_dir():
+        return False
+    # A gitlink worktree checkout always carries a ``.git`` entry (a file for
+    # a real submodule, a directory for a plain clone in fixtures). Cheap
+    # pre-check so a normal dirty file never pays for a git subprocess.
+    if not (candidate / ".git").exists():
+        return False
+    return _submodule_gitlink_sha(repo_root, path) is not None
+
+
+def _submodule_pointer_moved(repo_root: str | Path, submodule_path: str) -> bool:
+    """True when the submodule's checked-out HEAD differs from its gitlink.
+
+    A moved pointer (the submodule was advanced or rewound, or the inner repo
+    is unreadable) is a genuine change surface: it can never be explained by
+    framework-materialised expected-dirty noise, so the classifier fails
+    closed rather than comparing inner paths (RISE-0MWOIAXAG008HMK3 AC2).
+    """
+    gitlink_sha = _submodule_gitlink_sha(repo_root, submodule_path)
+    if gitlink_sha is None:
+        return True  # cannot resolve the pin; fail closed
+    head = run_cmd(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(Path(repo_root) / submodule_path),
+        capture=True,
+        check=False,
+    )
+    if head.returncode != 0:
+        return True  # unreadable inner repo; fail closed
+    return head.stdout.strip() != gitlink_sha
+
+
+def _submodule_inner_paths(
+    repo_root: str | Path, submodule_path: str
+) -> list[str] | None:
+    """Outer-relative change paths reported *inside* a dirty submodule.
+
+    Reads the submodule's own ``git status`` and prefixes each inner path with
+    the submodule path so the caller can classify it against the worktree's
+    expected-dirty declaration (which is always outer-relative, e.g.
+    ``core/node_modules``).
+
+    Returns:
+        The inner change paths mapped to outer-relative form, or ``None`` when
+        the inner repository cannot be read. ``None`` and an empty list are
+        both treated by the caller as **fail closed**: an unreadable submodule
+        or a moved pointer (inner tree clean, gitlink advanced) is a genuine
+        change surface, never silently clean.
+    """
+    inner_root = Path(repo_root) / submodule_path
+    result = run_cmd(
+        ["git", "status", "--porcelain=v1"],
+        cwd=str(inner_root),
+        capture=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    prefix = submodule_path.rstrip("/")
+    paths: list[str] = []
+    for line in result.stdout.splitlines():
+        if line.startswith("##") or not line.strip():
+            continue
+        inner = line[3:].strip() if len(line) > 3 else ""
+        if " -> " in inner:
+            inner = inner.split(" -> ", 1)[1].strip()
+        if not inner:
+            continue
+        paths.append(f"{prefix}/{inner}")
+    return paths
+
+
+def _dirty_entry_is_change_surface(
+    repo_root: str | Path,
+    file_path: str,
+    expected_dirty: tuple[str, ...],
+) -> tuple[bool, list[str]]:
+    """Classify one outer ``git status`` entry against expected-dirty paths.
+
+    A plain path is a change surface unless it matches a declared
+    expected-dirty prefix. A dirty **submodule** (gitlink) entry is expanded
+    into its inner changes, mapped to outer-relative paths, and those inner
+    changes are classified instead — so a submodule whose only changes are
+    framework-materialised expected-dirty paths (``core/node_modules``) is
+    **not** a surface, while a genuine inner edit still is (and its inner
+    paths are reported for the operator).
+
+    Returns:
+        ``(is_surface, reported_paths)``. ``reported_paths`` is the outer path
+        for a plain surface, the offending inner paths for an expanded
+        submodule, and empty when the entry is not a surface.
+    """
+    if _path_is_expected_dirty(file_path, expected_dirty):
+        return False, []
+    if not _is_gitlink_surface(repo_root, file_path):
+        return True, [file_path]
+    if _submodule_pointer_moved(repo_root, file_path):
+        # The submodule's HEAD disagrees with its pin (advanced, rewound, or
+        # unreadable): a genuine change, never expected-dirty noise.
+        return True, [file_path]
+    inner = _submodule_inner_paths(repo_root, file_path)
+    if inner is None or not inner:
+        # Unreadable inner repo, or a moved submodule pointer with a clean
+        # inner tree: not explainable as expected-dirty noise, so stay
+        # fail-closed and name the bare submodule path.
+        return True, [file_path]
+    real = [p for p in inner if not _path_is_expected_dirty(p, expected_dirty)]
+    if real:
+        return True, real
+    return False, []
+
+
 def git_has_dirty_files(
     status_output: str | None = None,
     expected_dirty: tuple[str, ...] = (),
+    repo_root: str | Path | None = None,
 ) -> bool:
     """Check if there are uncommitted changes outside .worklog/.
 
@@ -2602,12 +2768,17 @@ def git_has_dirty_files(
             dirty and therefore do not count (e.g. ``.llm-wiki/``). Empty by
             default, so callers that do not opt in keep the original
             behaviour byte-for-byte.
+        repo_root: When supplied, a dirty **submodule** entry is expanded into
+            its inner changes and classified against *expected_dirty* (a
+            submodule whose only changes are expected-dirty paths is not a
+            change surface). When omitted, submodules stay opaque dirty paths
+            — the pre-existing behaviour.
 
     Returns:
         True if any non-.worklog, non-expected-dirty file is dirty.
     """
     if status_output is None:
-        status_output = git_status()
+        status_output = git_status(cwd=str(repo_root) if repo_root else None)
     for line in status_output.splitlines():
         # Skip branch info line
         if line.startswith("##"):
@@ -2616,11 +2787,21 @@ def git_has_dirty_files(
         file_path = line[3:].strip() if len(line) > 3 else ""
         if file_path.startswith(".worklog/"):
             continue
+        if not line.strip():
+            continue
+        if repo_root is not None:
+            # Submodule-aware classification: resolve a dirty gitlink to what
+            # actually changed inside it (RISE-0MWOIAXAG008HMK3 AC2).
+            is_surface, _ = _dirty_entry_is_change_surface(
+                repo_root, file_path, expected_dirty
+            )
+            if is_surface:
+                return True
+            continue
         # Skip project-declared expected-dirty paths (never a hard-fail).
         if _path_is_expected_dirty(file_path, expected_dirty):
             continue
-        if line.strip():
-            return True
+        return True
     return False
 
 
@@ -2887,7 +3068,10 @@ def _main_checkout_offending_paths(
     Returns:
         Sorted, de-duplicated list of paths (relative to *repo_root*) that are
         dirty outside ``.worklog/`` and not expected-dirty. Empty when the
-        checkout is clean or only expected-dirty paths are modified.
+        checkout is clean or only expected-dirty paths are modified. A dirty
+        submodule entry is expanded into its offending inner paths, so the
+        list names the file that actually changed rather than the bare
+        submodule (RISE-0MWOIAXAG008HMK3 AC2).
     """
     status_output = git_status(cwd=repo_root)
     paths: list[str] = []
@@ -2901,9 +3085,11 @@ def _main_checkout_offending_paths(
             file_path = file_path.split(" -> ", 1)[1].strip()
         if not file_path or file_path.startswith(".worklog/"):
             continue
-        if _path_is_expected_dirty(file_path, expected_dirty):
-            continue
-        paths.append(file_path)
+        is_surface, reported = _dirty_entry_is_change_surface(
+            repo_root, file_path, expected_dirty
+        )
+        if is_surface:
+            paths.extend(reported)
     return sorted(set(paths))
 
 
@@ -3245,62 +3431,85 @@ def _record_finish_own_churn(
 
 
 def _main_checkout_actor_evidence(
-    repo_root: str, worktree_path: str
+    repo_root: str, worktree_path: str, work_item_id: str = ""
 ) -> str:
     """Best-effort concurrent-actor evidence for the guard's abort message.
 
-    Sources, in order:
+    Delegates to the shared, read-only
+    :func:`shared.concurrent_actor.describe_concurrent_actor` helper so the
+    finish guard and every other consumer share one evidence contract instead
+    of duplicating it (WL-0MWR1OYAJ000UVJS). The helper names the likely owner
+    from the main checkout's and sibling worktrees' ``.implement_state.json``
+    files, one bounded ``wl`` claim lookup, the main-checkout lock holder and
+    live ``/proc`` sessions, and returns ``"unknown"`` when none is
+    discoverable.
 
-    1. other worktree state files (``.implement_state.json``) under the main
-       checkout — each names its owning work item and start time,
-    2. live processes whose ``/proc/<pid>/cwd`` resolves to the main
-       checkout root (Linux only; skipped elsewhere).
-
-    Returns ``"unknown"`` when no source yields evidence (the abort message
-    still fires — evidence is informative, never gating).
+    Attribution is informational only: the abort message still fires and the
+    guard verdict is unchanged whether an owner is named or not. The delegation
+    is fail-open — a missing helper or any error degrades to ``"unknown"`` and
+    is never raised into the verdict path.
 
     Args:
         repo_root: Absolute path to the main checkout.
         worktree_path: This finish run's own worktree (excluded from the
             evidence scan).
+        work_item_id: This finish run's own work item (excluded so the run
+            never names itself, e.g. via the lock it holds while finishing).
     """
-    own = str(Path(worktree_path).resolve())
-    evidence: list[str] = []
-    worktrees_dir = Path(repo_root) / ".worklog" / "worktrees"
+    if _describe_concurrent_actor is None:  # pragma: no cover - partial install
+        return "unknown"
     try:
-        state_files = sorted(worktrees_dir.glob("wl-*/.implement_state.json"))
-    except OSError:
-        state_files = []
-    for state_file in state_files:
-        try:
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if str(state_file.parent.resolve()) == own:
-            continue
-        evidence.append(
-            f"work item {data.get('work_item_id', '?')} "
-            f"(worktree {state_file.parent}, started "
-            f"{data.get('started_at', '?')})"
+        return _describe_concurrent_actor(
+            repo_root,
+            own_worktree=worktree_path,
+            own_work_item_id=work_item_id,
+            worklog_dir=str(Path(repo_root) / ".worklog"),
         )
-        if len(evidence) >= 5:
-            break
-    try:
-        root = str(Path(repo_root).resolve())
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            try:
-                cwd = os.readlink(f"/proc/{entry}/cwd")
-            except OSError:
-                continue
-            if str(Path(cwd).resolve()) == root:
-                evidence.append(f"pid {entry} with cwd in the main checkout")
-                if len(evidence) >= 8:
-                    break
-    except OSError:
-        pass
-    return "; ".join(evidence) if evidence else "unknown"
+    except Exception:
+        LOG.debug("Concurrent-actor evidence lookup failed", exc_info=True)
+        return "unknown"
+
+
+def _annotate_excluded_churn_notes(
+    notes: list[str], repo_root: str, worktree_path: str, work_item_id: str
+) -> tuple[list[str], str]:
+    """Append the documented actor second signal to excluded-churn notes.
+
+    The role-scoped guard excludes concurrent main-checkout churn from the
+    verdict but never silently: each note names the path and status code. This
+    adds the *likely actor* as an explicitly labelled second signal
+    (WL-0MWR1OYAJ000UVJS AC4) — it never changes the verdict and never replaces
+    the plumbing rule that produced the note. When no owner is discoverable the
+    appended signal says ``unknown`` explicitly, so the operator sees the
+    attribution attempt rather than an unexplained absence.
+
+    Args:
+        notes: The ``live_repo_excluded`` notes produced by the guard.
+        repo_root: Absolute path to the main checkout.
+        worktree_path: This finish run's own worktree.
+        work_item_id: This finish run's own work item.
+
+    Returns:
+        ``(annotated_notes, actor_evidence)``.
+
+    A note the guard already annotated carries the shared marker; its evidence
+    is adopted for every note (and no second lookup is spent), so the outer
+    guard's signal is never duplicated as it passes into the finish report
+    (WL-0MWR1P1F3008AH3V).
+    """
+    evidence = ""
+    if _actor_evidence_from_note is not None:
+        for note in notes:
+            evidence = _actor_evidence_from_note(note)
+            if evidence:
+                break
+    if not evidence:
+        evidence = _main_checkout_actor_evidence(
+            repo_root, worktree_path, work_item_id
+        )
+    if _annotate_actor_notes is not None:
+        return _annotate_actor_notes(notes, evidence), evidence
+    return [f"{note} [likely actor: {evidence}]" for note in notes], evidence
 
 
 def _main_checkout_guard_message(
@@ -3359,6 +3568,7 @@ def _verify_main_checkout(
     own_churn: list[str],
     expected_dirty: tuple[str, ...],
     stage: str,
+    work_item_id: str = "",
 ) -> list[str]:
     """Re-snapshot the main checkout and record a guard verify entry.
 
@@ -3375,6 +3585,8 @@ def _verify_main_checkout(
         own_churn: Paths changed by finish's own fast-forward.
         expected_dirty: Project-declared dirty path prefixes to exclude.
         stage: Verify stage label — one of :data:`VERIFY_STAGES`.
+        work_item_id: This finish run's own work item, excluded from the
+            concurrent-actor evidence so a run never names itself.
 
     Returns:
         The offending paths (empty list on pass).
@@ -3394,7 +3606,7 @@ def _verify_main_checkout(
     if violations:
         entry["offending"] = violations
         entry["actor_evidence"] = _main_checkout_actor_evidence(
-            repo_root, worktree_path
+            repo_root, worktree_path, work_item_id
         )
     guard["verifies"].append(entry)
     guard["verdict"] = entry["verdict"]
@@ -3698,7 +3910,11 @@ def git_worktree_add(
     Args:
         branch: Name for the new branch.
         worktree_path: Path for the worktree directory.
-        parent_branch: Source branch to fork from.
+        parent_branch: Source ref to fork from. May be a local branch name
+            (``dev``) or a fully-qualified remote-tracking ref
+            (``refs/remotes/origin/dev``). ``--track`` still records
+            ``branch.<new>.merge = refs/heads/<parent>``, so ``finish``'s
+            push-to-``dev`` path is unchanged.
 
     Returns:
         True if the worktree was created.
@@ -7376,6 +7592,200 @@ def _stale_shared_resolution(
     )
 
 
+def _newest_mtime(path: Path) -> float | None:
+    """Newest mtime (seconds) of *path* or of any file under it, else None.
+
+    The single mtime primitive shared by the start-time shared-build step and
+    the stale-resolution guard (WL-0MW8G1X3V007CGAE). A missing path yields
+    ``None`` so callers can distinguish "absent" from "old".
+    """
+    try:
+        if path.is_file():
+            return path.stat().st_mtime
+        if not path.is_dir():
+            return None
+    except OSError:
+        return None
+    newest: float | None = None
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for name in filenames:
+            try:
+                mtime = (Path(dirpath) / name).stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+    return newest
+
+
+def _shared_dist_freshness(shared_dir: Path) -> dict[str, Any]:
+    """Compare the newest ``src/**`` mtime with the newest ``dist/**`` mtime.
+
+    Mirrors ContextHub's ``isDistFresh()`` (``bench/wl-startup-perf.ts``):
+    the build is fresh when ``dist`` exists and its newest mtime is not older
+    than the newest source mtime. Returns ``fresh`` (bool), ``reason``
+    (``fresh`` / ``missing_dist`` / ``stale_dist``), ``dist_mtime`` and
+    ``newest_source_mtime`` (epoch seconds, or ``None``).
+    """
+    newest_source = _newest_mtime(shared_dir / "src")
+    dist_mtime = _newest_mtime(shared_dir / "dist")
+    if dist_mtime is None:
+        return {
+            "fresh": False,
+            "reason": "missing_dist",
+            "dist_mtime": None,
+            "newest_source_mtime": newest_source,
+        }
+    if newest_source is not None and dist_mtime < newest_source:
+        return {
+            "fresh": False,
+            "reason": "stale_dist",
+            "dist_mtime": dist_mtime,
+            "newest_source_mtime": newest_source,
+        }
+    return {
+        "fresh": True,
+        "reason": "fresh",
+        "dist_mtime": dist_mtime,
+        "newest_source_mtime": newest_source,
+    }
+
+
+def _shared_build_command(worktree_path: Path, shared_dir: Path) -> list[str] | None:
+    """Repo-appropriate command that rebuilds the workspace shared package.
+
+    Prefers the checkout's ``build:shared`` script (ContextHub's root
+    ``package.json`` runs ``cd packages/shared && npm run build``); falls back
+    to the shared package's own ``build`` script. ``None`` when neither is
+    declared — the step then reports ``no_build_script`` rather than guessing.
+    """
+    root_scripts = _read_package_json(worktree_path).get("scripts")
+    if isinstance(root_scripts, dict) and "build:shared" in root_scripts:
+        return ["npm", "run", "build:shared"]
+    shared_scripts = _read_package_json(shared_dir).get("scripts")
+    if isinstance(shared_scripts, dict) and "build" in shared_scripts:
+        return ["npm", "run", "build"]
+    return None
+
+
+def _run_shared_build(command: list[str], cwd: Path) -> Any:
+    """Run the shared-package build command (thin, patchable seam)."""
+    return run_cmd(
+        command, cwd=str(cwd), check=False, timeout=300, capture=True
+    )
+
+
+def _ensure_shared_build(
+    worktree_path: str, repo_root: str | None, resolution: dict[str, Any]
+) -> dict[str, Any]:
+    """Ensure the worktree's ``packages/shared/dist`` exists and is fresh.
+
+    Producer decision Q2=A (freshness-based, unconditional on the change set):
+    build when ``dist`` is missing or older than the newest ``src/**`` file;
+    skip when fresh; no-op for a repo without a workspace shared package. The
+    step only ever builds the worktree-resolved package (never the main
+    checkout), and stays best-effort like the node_modules link step: a build
+    failure does not abort ``start``, but the report records ONE actionable
+    diagnostic naming ``npm run build:shared`` so downstream gates fail with
+    that message instead of a cascade of import errors.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout (unused for the build;
+            kept for symmetry with the other start steps).
+        resolution: The :func:`_shared_resolution_check` result for this
+            worktree.
+
+    Returns:
+        The ``shared_build`` report block: ``applicable``, ``action``
+        (``built`` / ``skipped_fresh`` / ``skipped_unresolved`` /
+        ``no_build_script`` / ``not_applicable`` / ``failed``), ``success``,
+        ``message``, ``resolved_root``, ``dist_path``, ``command``,
+        ``dist_mtime`` and ``newest_source_mtime``.
+    """
+    wt = Path(worktree_path)
+    shared_dir = wt / SHARED_WORKSPACE_PACKAGE_DIR
+    block: dict[str, Any] = {
+        "applicable": bool(resolution.get("applicable")),
+        "action": "not_applicable",
+        "success": True,
+        "message": (
+            f"No workspace {SHARED_WORKSPACE_PACKAGE_NAME} package — "
+            "shared build step is a no-op."
+        ),
+        "resolved_root": resolution.get("expected_root"),
+        "dist_path": str(shared_dir / "dist"),
+        "command": None,
+        "dist_mtime": None,
+        "newest_source_mtime": None,
+    }
+    if not resolution.get("applicable"):
+        return block
+    if not resolution.get("ok"):
+        block["action"] = "skipped_unresolved"
+        block["message"] = (
+            f"{SHARED_WORKSPACE_PACKAGE_NAME} resolves outside this worktree "
+            f"({resolution.get('resolved_root') or '<missing>'}); not building "
+            "to avoid mutating the main checkout. Re-run `implement.py start` "
+            "from the main checkout to refresh the link farm."
+        )
+        return block
+    if not shared_dir.is_dir():
+        block["action"] = "skipped_missing_package"
+        block["message"] = (
+            f"No {SHARED_WORKSPACE_PACKAGE_DIR.as_posix()} directory in this "
+            "worktree — shared build step is a no-op."
+        )
+        return block
+
+    freshness = _shared_dist_freshness(shared_dir)
+    block["dist_mtime"] = freshness["dist_mtime"]
+    block["newest_source_mtime"] = freshness["newest_source_mtime"]
+    if freshness["fresh"]:
+        block["action"] = "skipped_fresh"
+        block["message"] = (
+            f"{SHARED_WORKSPACE_PACKAGE_NAME} dist is fresh — no rebuild."
+        )
+        return block
+
+    command = _shared_build_command(wt, shared_dir)
+    if command is None:
+        block["action"] = "no_build_script"
+        block["message"] = (
+            f"{SHARED_WORKSPACE_PACKAGE_NAME} dist is {freshness['reason']} but "
+            "no build script is declared (expected `npm run build:shared`)."
+        )
+        return block
+
+    block["command"] = command
+    build_cwd = shared_dir if command == ["npm", "run", "build"] else wt
+    try:
+        result = _run_shared_build(command, build_cwd)
+        returncode = int(result.returncode)
+        stderr = (result.stderr or "").strip()
+    except Exception as exc:  # pragma: no cover - defensive
+        returncode = 1
+        stderr = str(exc)
+    if returncode == 0:
+        block["action"] = "built"
+        block["message"] = (
+            f"Built {SHARED_WORKSPACE_PACKAGE_NAME} "
+            f"({freshness['reason']})."
+        )
+        return block
+
+    block["action"] = "failed"
+    block["success"] = False
+    detail = f" {stderr[:300]}" if stderr else ""
+    block["message"] = (
+        f"Failed to build {SHARED_WORKSPACE_PACKAGE_NAME}: dist is "
+        f"{freshness['reason']} and `npm run build:shared` exited "
+        f"{returncode}. Run `npm run build:shared` in {shared_dir} and re-run "
+        f"`implement.py start`.{detail}"
+    )
+    return block
+
+
 # Directories pruned by the nested node_modules discovery walk. ``.git`` and
 # ``.worklog`` are large/irrelevant trees; ``node_modules`` is pruned so the
 # walk never descends into (and therefore never mirrors) a dependency tree's
@@ -7421,6 +7831,201 @@ def _iter_nested_node_modules(repo_root: str) -> Iterator[tuple[str, str]]:
         yield rel_parent, os.path.join(rel_parent, "node_modules")
 
 
+def _iter_declared_submodule_paths(repo_root: str | None) -> tuple[str, ...]:
+    """Return the submodule paths declared by the main checkout's ``.gitmodules``.
+
+    A nested ``node_modules`` inside one of these paths belongs to a *gitlink*,
+    which is why the bootstrap ordering matters (SA-0MVTOR53E003IIEQ): a symlink
+    created there while the submodule is still unchecked makes
+    ``git submodule update --init`` refuse to clone ("destination path already
+    exists and is not an empty directory"), and a symlink created *after* the
+    init leaves the superproject reporting the submodule as modified unless the
+    path is ignored inside the submodule.
+
+    ``.gitmodules`` is read with :mod:`configparser` rather than a ``git``
+    subprocess so the callers stay subprocess-free on their hot path (the
+    submodule helper must issue exactly one ``git`` command: the update). A
+    malformed or unreadable file is logged and treated as "no submodules",
+    matching the fail-open contract.
+
+    Nested submodules are covered implicitly: a candidate path *under* a
+    declared path matches it as a prefix (:func:`_enclosing_submodule_path`).
+
+    Args:
+        repo_root: Absolute path to the main checkout, or None if unknown.
+
+    Returns:
+        Declared submodule paths in declaration order, repository-relative and
+        POSIX-normalised (e.g. ``("core",)``); empty when the repository has no
+        ``.gitmodules`` or it declares no ``path``.
+    """
+    if not repo_root:
+        return ()
+    gitmodules = Path(repo_root) / ".gitmodules"
+    if not gitmodules.is_file():
+        return ()
+
+    parser = configparser.ConfigParser(interpolation=None)
+    # Section names are quoted (``[submodule "core"]``) and git keys are
+    # case-insensitive; ``optionxform`` is left at its lowercase default.
+    try:
+        parser.read(gitmodules, encoding="utf-8")
+    except (configparser.Error, OSError, UnicodeDecodeError) as exc:
+        LOG.warning("Could not read submodule paths from %s: %s", gitmodules, exc)
+        return ()
+
+    paths: list[str] = []
+    for section in parser.sections():
+        if not section.lower().startswith("submodule "):
+            continue
+        rel = (parser.get(section, "path", fallback="") or "").strip()
+        rel = rel.replace("\\", "/").strip("/")
+        if rel and rel not in paths:
+            paths.append(rel)
+    return tuple(paths)
+
+
+def _enclosing_submodule_path(
+    rel_path: str, submodule_paths: tuple[str, ...]
+) -> str | None:
+    """Return the declared submodule path containing *rel_path*, if any.
+
+    Args:
+        rel_path: Repository-relative path to test (POSIX or OS separators).
+        submodule_paths: Declared submodule paths from
+            :func:`_iter_declared_submodule_paths`.
+
+    Returns:
+        The matching declared submodule path, or ``None`` when *rel_path* is
+        outside every submodule.
+    """
+    rel = rel_path.replace("\\", "/").strip("/")
+    for submodule_path in submodule_paths:
+        if rel == submodule_path or rel.startswith(submodule_path + "/"):
+            return submodule_path
+    return None
+
+
+def _first_unpopulated_submodule(
+    rel_path: str, submodule_paths: tuple[str, ...], worktree_root: Path
+) -> str | None:
+    """Return the first gitlink on the path to *rel_path* that has no checkout.
+
+    Every directory git clones a submodule into must be empty when
+    ``git submodule update --init`` runs, so a declared submodule path on the
+    way to *rel_path* that carries no ``.git`` entry is a clone target: nothing
+    may be created inside it (SA-0MVTOR53E003IIEQ).
+
+    Args:
+        rel_path: Repository-relative path being considered as a symlink parent.
+        submodule_paths: Declared submodule paths.
+        worktree_root: The worktree the entries would be created in.
+
+    Returns:
+        The first unpopulated declared submodule path on the way to *rel_path*,
+        or ``None`` when every declared submodule involved is checked out (or
+        none is involved).
+    """
+    rel = rel_path.replace("\\", "/").strip("/")
+    if not rel or rel == ".":
+        return None
+    parts = rel.split("/")
+    for index in range(1, len(parts) + 1):
+        prefix = "/".join(parts[:index])
+        if prefix in submodule_paths and not (
+            worktree_root / prefix / ".git"
+        ).exists():
+            return prefix
+    return None
+
+
+def _ensure_worktree_local_exclude_entry(
+    work_tree_dir: Path, entry: str
+) -> bool:
+    """Cover *entry* in *work_tree_dir*'s **own** git exclude file.
+
+    A ``.gitignore`` pattern written as ``node_modules/`` (trailing slash)
+    matches a directory but **not** a symlink, so a nested ``node_modules``
+    symlink inside a submodule surfaces as an untracked entry there and the
+    superproject then reports ``M <submodule>`` — a worktree that looks dirty
+    for no reason (SA-0MVTOR53E003IIEQ). Adding the bare name to the internal
+    exclude file hides it without touching a tracked ``.gitignore``.
+
+    Only ever call this with a **submodule** checkout: its exclude file is
+    work-tree-local (``<main>/.git/worktrees/<wt>/modules/<name>/info/exclude``
+    in a linked worktree). The superproject's ``info/exclude`` is the shared
+    main-checkout file and must never be written from a worktree.
+
+    Idempotent: an existing entry is left untouched.
+
+    Args:
+        work_tree_dir: Root of the checkout whose exclude file to update.
+        entry: The exclude entry to add (e.g. ``"node_modules"``).
+
+    Returns:
+        True when the entry is present afterwards, False on failure (logged at
+        ``WARNING``; never fatal).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-path", "info/exclude"],
+            cwd=str(work_tree_dir),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        LOG.warning(
+            "Could not locate the exclude file for %s: %s", work_tree_dir, exc
+        )
+        return False
+    if result.returncode != 0:
+        LOG.warning(
+            "Could not locate the exclude file for %s (rc=%d): %s",
+            work_tree_dir,
+            result.returncode,
+            result.stderr.strip(),
+        )
+        return False
+
+    raw_path = result.stdout.strip()
+    if not raw_path:
+        return False
+    exclude_path = Path(raw_path)
+    if not exclude_path.is_absolute():
+        exclude_path = (work_tree_dir / exclude_path).resolve()
+
+    try:
+        existing = (
+            exclude_path.read_text(encoding="utf-8")
+            if exclude_path.is_file()
+            else ""
+        )
+    except OSError as exc:
+        LOG.warning("Could not read %s: %s", exclude_path, exc)
+        return False
+    if entry in {line.strip() for line in existing.splitlines()}:
+        return True
+
+    try:
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        with exclude_path.open("a", encoding="utf-8") as handle:
+            if existing and not existing.endswith("\n"):
+                handle.write("\n")
+            handle.write(f"{entry}\n")
+    except OSError as exc:
+        LOG.warning("Could not update %s: %s", exclude_path, exc)
+        return False
+
+    LOG.info(
+        "Excluded %r in %s so the nested symlink keeps the worktree clean.",
+        entry,
+        exclude_path,
+    )
+    return True
+
+
 def _ensure_nested_node_modules_symlinks(
     worktree_path: str, repo_root: str | None
 ) -> int:
@@ -7437,13 +8042,22 @@ def _ensure_nested_node_modules_symlinks(
     For every nested ``node_modules`` directory discovered in the main checkout
     (:func:`_iter_nested_node_modules`) this creates
     ``<worktree>/<rel>/node_modules`` as a symlink to
-    ``<main-checkout>/<rel>/node_modules`` when BOTH conditions hold:
+    ``<main-checkout>/<rel>/node_modules`` when ALL of these conditions hold:
 
     - the worktree has no entry at that path (dir or symlink) — never
       overwrite; AND
     - the parent directory ``<worktree>/<rel>`` already exists — never
       fabricate a package directory the branch removed (avoids shadowing
-      branch state).
+      branch state); AND
+    - when the parent lies inside a declared submodule
+      (:func:`_iter_declared_submodule_paths`), that submodule is **checked
+      out** (its work tree has a ``.git``). A symlink inside an uninitialised
+      gitlink blocks ``git submodule update --init`` on the next ``start`` —
+      the bootstrap-ordering defect of SA-0MVTOR53E003IIEQ.
+
+    A link created inside a checked-out submodule is covered by that
+    submodule's own exclude file (:func:`_ensure_worktree_local_exclude_entry`)
+    so the superproject does not report the parent as modified.
 
     Best-effort only: a per-candidate failure is logged at ``WARNING`` and does
     not abort; remaining candidates are still processed. Symlinks only — the
@@ -7462,22 +8076,39 @@ def _ensure_nested_node_modules_symlinks(
 
     wt_root = Path(worktree_path)
     repo = Path(repo_root)
+    submodule_paths = _iter_declared_submodule_paths(repo_root)
     created = 0
 
     for rel_parent, rel_nm in _iter_nested_node_modules(repo_root):
         wt_nm = wt_root / rel_nm
+        wt_parent = wt_root / rel_parent
+        enclosing_submodule = _enclosing_submodule_path(rel_parent, submodule_paths)
+        unpopulated = _first_unpopulated_submodule(rel_parent, submodule_paths, wt_root)
         if os.path.lexists(wt_nm):
+            if enclosing_submodule is not None and unpopulated is None:
+                # Resume path: the link is already there, but an earlier run
+                # (or the pre-fix ordering) may not have covered it — otherwise
+                # the superproject reports `M <sub>` and the tree looks dirty.
+                _ensure_worktree_local_exclude_entry(wt_parent, wt_nm.name)
             LOG.info(
                 "Worktree already has %s; skipping nested node_modules symlink.",
                 wt_nm,
             )
             continue
-        wt_parent = wt_root / rel_parent
         if not wt_parent.is_dir():
             LOG.info(
                 "Worktree has no %s; skipping nested node_modules symlink "
                 "(would fabricate a package directory).",
                 wt_parent,
+            )
+            continue
+        if unpopulated is not None:
+            LOG.info(
+                "Skipping nested node_modules symlink at %s: submodule %s is not "
+                "checked out in the worktree, and a symlink inside the empty "
+                "gitlink would block `git submodule update --init`.",
+                wt_nm,
+                unpopulated,
             )
             continue
         main_nm = repo / rel_nm
@@ -7493,10 +8124,82 @@ def _ensure_nested_node_modules_symlinks(
             continue
         LOG.info("Symlinked %s -> %s", wt_nm, main_nm)
         created += 1
+        if enclosing_submodule is not None:
+            _ensure_worktree_local_exclude_entry(wt_parent, wt_nm.name)
 
     if created:
         LOG.info("Created %d nested node_modules symlink(s).", created)
     return created
+
+
+def _clear_placeholder_submodule_dirs(
+    worktree_path: str, repo_root: str | None
+) -> int:
+    """Remove bootstrap placeholders from unpopulated submodule directories.
+
+    A worktree created before the ordering fix (SA-0MVTOR53E003IIEQ) — or one
+    whose submodule init failed after a nested ``node_modules`` symlink had been
+    created — holds ``<worktree>/<sub>`` with nothing but a ``node_modules``
+    symlink and no ``.git``. Git then refuses to clone into it on every retry
+    ("destination path already exists and is not an empty directory"), so the
+    worktree can never repair itself.
+
+    This removes such a directory when it is **provably** a placeholder: it is
+    a declared submodule path, it has no ``.git`` entry (so nothing in it is
+    part of the submodule), and every entry in it is a ``node_modules``
+    symlink. Any other content is left untouched (logged at ``INFO``) and the
+    normal fail-open warning still reports the genuine conflict.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+        repo_root: Absolute path to the main checkout, or None if unknown.
+
+    Returns:
+        Number of placeholder directories removed.
+    """
+    removed = 0
+    wt_root = Path(worktree_path)
+    for rel in _iter_declared_submodule_paths(repo_root):
+        sub_dir = wt_root / rel
+        if sub_dir.is_symlink() or not sub_dir.is_dir():
+            continue
+        if os.path.lexists(sub_dir / ".git"):
+            # A real checkout — never touch it.
+            continue
+        try:
+            entries = sorted(sub_dir.iterdir())
+        except OSError as exc:  # pragma: no cover - defensive
+            LOG.warning("Could not inspect submodule path %s: %s", sub_dir, exc)
+            continue
+        is_placeholder = all(
+            entry.is_symlink() and entry.name == "node_modules" for entry in entries
+        )
+        if not is_placeholder:
+            LOG.info(
+                "Leaving %s untouched: it is not a bootstrap placeholder "
+                "(no .git and content we did not create).",
+                sub_dir,
+            )
+            continue
+        try:
+            for entry in entries:
+                entry.unlink()
+            sub_dir.rmdir()
+        except OSError as exc:
+            LOG.warning(
+                "Could not clear placeholder submodule directory %s: %s",
+                sub_dir,
+                exc,
+            )
+            continue
+        removed += 1
+        LOG.info(
+            "Cleared placeholder submodule directory %s (it held only "
+            "node_modules symlinks) so `git submodule update --init` can clone "
+            "into it.",
+            sub_dir,
+        )
+    return removed
 
 
 def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool:
@@ -7507,6 +8210,13 @@ def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool
     worktree so that downstream builds and tests see the expected submodule
     content.
 
+    It must run **before** the ``node_modules`` symlink passes
+    (SA-0MVTOR53E003IIEQ): a nested ``node_modules`` symlink created inside a
+    still-empty gitlink directory makes the clone fail, and because failures
+    are fail-open the worktree would silently keep an uninitialised submodule.
+    Any placeholder directory left by an older ordering is cleared first
+    (:func:`_clear_placeholder_submodule_dirs`).
+
     Best-effort only — submodule initialisation failure is **never fatal**.
     On failure a warning is logged and the worktree is left usable.
 
@@ -7515,8 +8225,7 @@ def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool
 
     Args:
         worktree_path: Absolute path to the worktree directory.
-        repo_root: Absolute path to the main checkout (unused but kept for
-            API symmetry with ``_ensure_node_modules_symlink``).
+        repo_root: Absolute path to the main checkout, or None if unknown.
 
     Returns:
         ``True`` if submodules were initialised (or there were none),
@@ -7527,6 +8236,10 @@ def _ensure_submodules(worktree_path: str, repo_root: str | None = None) -> bool
     if gitmodules and not gitmodules.is_file():
         LOG.info("No .gitmodules found at %s; skipping submodule init.", gitmodules)
         return False
+
+    # Self-heal a worktree left broken by the pre-fix ordering: a placeholder
+    # directory (only our node_modules symlink, no .git) blocks the clone.
+    _clear_placeholder_submodule_dirs(worktree_path, repo_root)
 
     try:
         result = subprocess.run(
@@ -7805,6 +8518,48 @@ def _restore_repo_state(repo_root: str) -> None:
     run_cmd(["git", "pull", "origin", DEFAULT_PARENT_BRANCH], cwd=repo_root, check=False)
 
 
+def _ahead_behind_counts(
+    repo_root: str, parent_branch: str = DEFAULT_PARENT_BRANCH
+) -> tuple[int | None, int | None]:
+    """Best-effort ``(ahead, behind)`` of local ``<parent>`` vs ``origin/<parent>``.
+
+    Uses ``git rev-list --left-right --count <local>...refs/remotes/origin/<parent>``.
+    Counts are never allowed to fail a refresh or a start: an unresolved ref or
+    a git failure yields ``(None, None)``.
+    """
+    result = run_cmd(
+        [
+            "git",
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"refs/heads/{parent_branch}...refs/remotes/origin/{parent_branch}",
+        ],
+        cwd=repo_root,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None, None
+    parts = result.stdout.split()
+    if len(parts) != 2:
+        return None, None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None, None
+
+
+def _add_sync_counts(
+    result: dict[str, Any], repo_root: str, parent_branch: str
+) -> dict[str, Any]:
+    """Attach ``ahead``/``behind`` to a refresh *result* when computable."""
+    ahead, behind = _ahead_behind_counts(repo_root, parent_branch)
+    if ahead is not None:
+        result["ahead"] = ahead
+        result["behind"] = behind
+    return result
+
+
 def _sync_parent_branch(
     repo_root: str, parent_branch: str = DEFAULT_PARENT_BRANCH
 ) -> dict[str, Any]:
@@ -7843,6 +8598,7 @@ def _sync_parent_branch(
         result["method"] = "skipped"
         result["success"] = True
         result["reason"] = "dirty_working_tree"
+        _add_sync_counts(result, repo_root, parent_branch)
         result["warning"] = (
             f"Skipped syncing parent branch {parent_branch}: "
             "dirty working tree detected."
@@ -7862,6 +8618,7 @@ def _sync_parent_branch(
         result["method"] = "skipped"
         result["success"] = True
         result["reason"] = "fetch_failed"
+        _add_sync_counts(result, repo_root, parent_branch)
         result["warning"] = (
             f"Skipped syncing parent branch {parent_branch}: "
             f"git fetch origin {parent_branch} failed. "
@@ -7881,6 +8638,7 @@ def _sync_parent_branch(
         result["method"] = "skipped"
         result["success"] = True
         result["reason"] = "cannot_determine_branch"
+        _add_sync_counts(result, repo_root, parent_branch)
         result["warning"] = "Could not determine current branch."
         LOG.info("%s", result["warning"])
         return result
@@ -7905,6 +8663,7 @@ def _sync_parent_branch(
             result["method"] = "skipped"
             result["success"] = True
             result["reason"] = "diverged"
+            _add_sync_counts(result, repo_root, parent_branch)
             result["warning"] = (
                 f"Skipped syncing parent branch {parent_branch}: "
                 f"local {parent_branch} has diverged from "
@@ -7923,6 +8682,7 @@ def _sync_parent_branch(
             result["method"] = "skipped"
             result["success"] = True
             result["reason"] = "merge_failed"
+            _add_sync_counts(result, repo_root, parent_branch)
             result["warning"] = (
                 f"Skipped syncing parent branch {parent_branch}: "
                 f"--ff-only merge failed (unexpected)."
@@ -7946,6 +8706,7 @@ def _sync_parent_branch(
             result["method"] = "skipped"
             result["success"] = True
             result["reason"] = "diverged_or_checked_out"
+            _add_sync_counts(result, repo_root, parent_branch)
             result["warning"] = (
                 f"Skipped syncing parent branch {parent_branch}: "
                 f"current branch is '{current_branch}'; the local "
@@ -8033,29 +8794,34 @@ def _resolve_start_base(
     parent_branch: str = DEFAULT_PARENT_BRANCH,
     refresh_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Resolve a safe worktree base: a **pushed tip**, never a local mutant.
+    """Resolve a safe worktree base: the **published tip**, never a local mutant.
 
-    ``phase_start`` forks a child worktree from the shared parent branch.
-    That branch is a *shared, locally-mutable* ref: a concurrent ``finish``
-    historically fast-forwarded it to an about-to-be-pushed commit inside its
-    write-then-restore window, so a ``start`` that resolved ``dev`` in that
-    window created its branch from an unpushed commit and permanently
-    grafted another item's commit onto it (WL-0MWFKDH78002T2CR AC3).
+    ``phase_start`` forks a child worktree from the shared parent branch, which
+    is a *locally-mutable* ref. Two distinct hazards motivated this helper:
 
-    This helper verifies that local ``parent_branch`` is a **known pushed
-    tip** — equal to the fetched ``refs/remotes/origin/<parent>``, or an
-    ancestor of it (stale-but-pushed). A local branch that carries commits
-    the remote does not have (ahead of, or diverged from, ``origin``) is
-    refused: ``start`` must not branch from it. ``phase_start`` aborts the
-    whole start on that verdict — no worktree, item released to ``open`` —
-    so a foreign commit can never become a new branch's base.
+    * a concurrent ``finish`` could park the local branch on an about-to-be-
+      pushed commit, so branching from it would graft that commit onto the new
+      branch (WL-0MWFKDH78002T2CR);
+    * a stale local branch (behind ``origin``) forks a worktree that is missing
+      published commits, so a driven child starts behind the published base
+      and needs a manual rebase before its first gate
+      (SA-0MWFFX49M0016KOK / AH-0MWFF40700014EE2).
 
-    Fail-open only when the remote tip cannot be resolved at all (a failed
-    fetch): the base cannot be *proven* unsafe and the historical local-base
-    fallback is preserved, exactly like the Step-6.5 refresh's own offline
-    contract. A ``refresh_result`` whose ``method == "synced"`` short-circuits
-    (the refresh already proved local == fetched origin, so no second fetch
-    or verdict is needed); otherwise the helper fetches itself — read-only,
+    Both are solved the same, graft-safe way: fork from the **fetched published
+    tip** ``refs/remotes/origin/<parent>`` whenever the local branch is not
+    equal to it (ahead-only, behind-only or diverged). Forking from the
+    published tip never contains an unpushed local commit and always carries
+    the published commits. The local ref is **never** moved — a diverged local
+    branch stays exactly as it is for the operator to reconcile.
+
+    The local branch itself is used as the base only when it equals the fetched
+    published tip (nothing to gain from the remote ref), or **fail-open** when
+    the remote tip cannot be resolved at all (a failed fetch / missing
+    remote-tracking ref): the base cannot be *proven* stale, so the historical
+    local-base fallback is preserved, exactly like the Step-6.5 refresh's own
+    offline contract. A ``refresh_result`` whose ``method == "synced"``
+    short-circuits (the refresh already proved local == fetched origin, so no
+    second fetch is needed); otherwise the helper fetches itself — read-only,
     never under the per-repository lock — so the verdict is grounded on a
     current remote-tracking ref even when the refresh skipped (lock held /
     dirty tree / divergence).
@@ -8067,21 +8833,26 @@ def _resolve_start_base(
             used to short-circuit the synced case.
 
     Returns:
-        Dict with ``method`` (``local_dev`` | ``refused``), ``base`` (the ref
-        to branch the worktree from, or ``None`` when refused), ``reason``
-        and, on refusal, a loud ``warning`` naming both tips and the remedy.
+        Dict with ``method`` (``local_dev`` | ``origin_fork``), ``ref`` and
+        ``base`` (the ref to branch the worktree from), ``reason``,
+        ``skipped_local`` (True when the local branch was not used) and, when
+        computable, ``ahead`` / ``behind`` counts.
     """
     if refresh_result and refresh_result.get("method") == "synced":
-        # The refresh just proved local == the fetched origin tip.
+        # The refresh just fast-forwarded local == the fetched origin tip.
         return {
             "method": "local_dev",
             "base": parent_branch,
+            "ref": parent_branch,
             "reason": "refresh_synced",
+            "skipped_local": False,
         }
     result: dict[str, Any] = {
         "method": "local_dev",
         "base": parent_branch,
+        "ref": parent_branch,
         "reason": "in_sync",
+        "skipped_local": False,
     }
     remote_ref = f"refs/remotes/origin/{parent_branch}"
     fetch_result = run_cmd(
@@ -8093,7 +8864,7 @@ def _resolve_start_base(
     if fetch_result.returncode != 0:
         result["reason"] = "fetch_failed"
         result["warning"] = (
-            f"Cannot verify that local {parent_branch} is a pushed tip: "
+            f"Cannot resolve the published tip of {parent_branch}: "
             f"git fetch origin {parent_branch} failed in {repo_root}. "
             f"Branching from local {parent_branch} anyway (fail-open, "
             f"matching the Step-6.5 refresh's offline fallback); re-run "
@@ -8108,44 +8879,34 @@ def _resolve_start_base(
     if not remote_tip:
         result["reason"] = "no_remote_tracking_ref"
         result["warning"] = (
-            f"Cannot verify that local {parent_branch} is a pushed tip: "
+            f"Cannot resolve the published tip of {parent_branch}: "
             f"{remote_ref} does not resolve after a successful fetch. "
             f"Branching from local {parent_branch} anyway (fail-open)."
         )
         LOG.warning("%s", result["warning"])
         return result
+    ahead, behind = _ahead_behind_counts(repo_root, parent_branch)
+    if ahead is not None:
+        result["ahead"] = ahead
+        result["behind"] = behind
     if local_tip == remote_tip:
         result["reason"] = "in_sync"
         return result
-    ancestor_result = run_cmd(
-        ["git", "merge-base", "--is-ancestor", local_tip, remote_ref],
-        cwd=repo_root,
-        check=False,
-    )
-    if ancestor_result.returncode == 0:
-        # Local dev is an ancestor of the remote tip: every local commit is
-        # published; the base is stale-but-pushed (safe).
+    # The local branch is not the published tip (behind-only, ahead-only or
+    # diverged). Fork from the published tip: always graft-safe and always
+    # carries the published commits. Never move the local ref.
+    result["method"] = "origin_fork"
+    result["base"] = remote_ref
+    result["ref"] = remote_ref
+    result["skipped_local"] = True
+    if ahead is None or behind is None:
+        result["reason"] = "local_not_published"
+    elif behind == 0:
+        result["reason"] = "ahead_only"
+    elif ahead == 0:
         result["reason"] = "behind_remote"
-        return result
-    result["method"] = "refused"
-    result["base"] = None
-    result["reason"] = "local_dev_not_a_pushed_tip"
-    result["warning"] = (
-        f"Refusing to create a worktree from local {parent_branch}: it is "
-        f"not a known pushed tip. local={local_tip}, "
-        f"origin/{parent_branch}={remote_tip}. A concurrent `finish` may "
-        f"have advanced it to an unpushed commit (WL-0MWFKDH78002T2CR) or "
-        f"the branch holds deliberate local commits. Resolve first, then "
-        f"re-run start:\n"
-        f"  1. Inspect: git -C {repo_root} log --oneline --graph "
-        f"--decorate --all -20\n"
-        f"  2. Verify nothing important is lost "
-        f"(git -C {repo_root} log {remote_ref}..{parent_branch})\n"
-        f"  3. Push the local commits, or discard them deliberately "
-        f"(git -C {repo_root} reset --hard {remote_ref}) — never without "
-        f"operator confirmation."
-    )
-    LOG.warning("%s", result["warning"])
+    else:
+        result["reason"] = "diverged"
     return result
 
 
@@ -8553,6 +9314,18 @@ SPAWN_FAILURE_KINDS: tuple[str, ...] = (
 #: ``No API key found for <provider>``. The pattern/credential text arrives
 #: inside the spawner reason because ``_default_session_spawner`` embeds the
 #: child's stderr tail and the pane spawner embeds the herdr reason.
+#:
+#: The third fragment is the **provider-stream** signature: Pi's
+#: ``mapStopReason`` (``openai-completions``) turns a raw
+#: ``finish_reason: "error"`` into the literal message
+#: ``Provider finish_reason: error`` and treats it as a fatal turn. Driven
+#: children run with ``--no-extensions``, so the ContextHub ``Worklog``
+#: recovery extension (which retries that reason in interactive sessions)
+#: never loads and the child exits non-zero; the drive layer must absorb it
+#: here (WL-0MWTZEDWG008YMGQ). ``Provider`` is Pi's fixed prefix, not a
+#: provider name. Deliberately narrow: it matches neither bare ``error`` nor
+#: the other ``finish_reason`` values (``content_filter``, ``length``,
+#: ``network_error``), so a genuine defect still hard-stops.
 SPAWN_INFRA_REASONS: tuple[tuple[str, str], ...] = (
     (
         "No models match pattern",
@@ -8569,6 +9342,18 @@ SPAWN_INFRA_REASONS: tuple[tuple[str, str], ...] = (
             "Provide the missing API key for the provider (`pi login` for "
             "it, or set its API-key environment variable), then re-run "
             "`implement.py drive`."
+        ),
+    ),
+    (
+        "finish_reason: error",
+        (
+            "The local model proxy returned an error stop reason "
+            "(`Provider finish_reason: error`) mid-stream — a transient "
+            "proxy/provider hiccup that usually clears on retry. Re-run "
+            "`implement.py drive`: the bounded `--infra-retry-limit` budget "
+            "re-spawns the same child in the same worktree. If it persists, "
+            "check the Local Proxy (http://192.168.0.199:8000/v1) and the "
+            "model it serves — retrying cannot fix an unservable model."
         ),
     ),
 )
@@ -8611,6 +9396,9 @@ def _spawn_failure_provider(reason: str) -> str | None:
     Only called once a :data:`SPAWN_INFRA_REASONS` fragment has matched, so a
     ``None`` return means the fragment carried no extractable provider — the
     caller reports the failure without a provider rather than inventing one.
+    The provider-stream signature (``Provider finish_reason: error``) always
+    returns ``None``: ``Provider`` is Pi's fixed literal prefix, not a
+    provider name.
 
     Args:
         reason: The spawner's failure reason.
@@ -8633,10 +9421,15 @@ def classify_spawn_failure(reason: Any) -> dict[str, Any]:
     The spawn-side counterpart of :func:`classify_finish_failure`
     (SA-0MWLDZ8ZN0030T15). A driven child session can die at startup because
     the configured model cannot be served (``No models match pattern
-    "MunitoAI/*"``, ``No API key found for …``); that is a transient
-    provider/model-resolution failure the drive loop may retry on its
-    infrastructure budget, whereas any other spawn failure is a genuine
-    defect that must hard-stop the chain.
+    "MunitoAI/*"``, ``No API key found for …``), or mid-stream because the
+    provider answered with a fatal ``finish_reason: "error"``
+    (``Provider finish_reason: error``); both are transient provider
+    failures the drive loop may retry on its infrastructure budget, whereas
+    any other spawn failure is a genuine defect that must hard-stop the
+    chain. Driven children run with ``--no-extensions``, so the interactive
+    recovery extension never sees the provider-stream stop — this drive-layer
+    classification is the only retry that can absorb it
+    (WL-0MWTZEDWG008YMGQ).
 
     Resolution rules:
 
@@ -8646,6 +9439,8 @@ def classify_spawn_failure(reason: Any) -> dict[str, Any]:
       timeout message;
     * ``kind == "infrastructure"`` only for an explicit
       :data:`SPAWN_INFRA_REASONS` fragment hit (case-insensitive substring);
+      the provider-stream fragment is the exact ``finish_reason: error``
+      signature, never the bare word ``error``;
     * anything else — including ``None``, ``""``, a traceback tail and any
       arbitrary message — is ``kind == "unknown"`` (fail-safe: ``unknown`` is
       never ``infrastructure``, so drive can never retry a real defect).
@@ -10334,6 +11129,19 @@ def _gate_failure_detail(test_result: dict[str, Any]) -> str:
     if mutation:
         sections.append(
             "Live-repo mutation detected:\n" + _tail_text(str(mutation))
+        )
+    # Excluded foreign churn never fails the gate, but a red gate must not drop
+    # it: a mutation and an excluded concurrent write can coexist, and the
+    # operator has to be able to tell them apart (WL-0MWR1P1F3008AH3V).
+    excluded_notes = [
+        str(n).strip()
+        for n in (test_result.get("live_repo_excluded") or [])
+        if str(n).strip()
+    ]
+    if excluded_notes:
+        sections.append(
+            "Excluded foreign churn (not counted in the verdict):\n"
+            + "\n".join(f"- {note}" for note in excluded_notes[:20])
         )
     facts = _render_gate_facts(_gate_facts(test_result, _gate_exit_code(test_result)))
     if facts:
@@ -12222,21 +13030,31 @@ def _phase_start_locked(
     # a fresh child session run the standard leaf workflow unchanged.
     resumed = _is_worktree(Path(abs_wt_path))
 
+    # Named on the start/resume comment so the base is always recorded (AC2).
+    worktree_base_note = f"local {parent_branch} (resumed existing worktree)"
     if resumed:
         LOG.info(
             "Worktree already exists at %s — resuming implementation",
             abs_wt_path,
         )
     else:
-        # AC3 (WL-0MWFKDH78002T2CR): the worktree base must be a **known
-        # pushed tip**, never a locally-mutable ``dev`` a concurrent finish
-        # could have parked on an unpushed commit. Positive evidence of
-        # unpushed local commits refuses the whole start (no worktree, item
-        # released to open); an unresolvable remote tip fails open, like the
-        # Step-6.5 refresh.
+        # Fork from the **published tip** whenever the local parent branch is
+        # not equal to it (ahead-only, behind-only or diverged): graft-safe and
+        # always carries the published commits, so a driven child never starts
+        # behind ``origin`` (SA-0MWFFX49M0016KOK). The local ref is never
+        # moved; an unresolvable remote tip fails open, like the Step-6.5
+        # refresh.
         base_resolution = _resolve_start_base(
             repo_root, parent_branch, refresh_result=refresh_result
         )
+        # Record the refresh outcome alongside the base decision
+        # (SA-0MWFFX49M0016KOK AC2): an operator reading the report or the
+        # start comment must be able to tell a deliberate origin fork from a
+        # refresh that was skipped (lock held, dirty checkout, diverged).
+        base_resolution["refresh"] = {
+            "method": refresh_result.get("method"),
+            "reason": refresh_result.get("reason"),
+        }
         report["steps"]["worktree_base"] = base_resolution
         if base_resolution["method"] == "refused":
             msg = (
@@ -12268,9 +13086,31 @@ def _phase_start_locked(
                 print(f"\n⛔ {msg}\n")
             return report
         worktree_base = base_resolution["base"] or parent_branch
+        base_ahead = base_resolution.get("ahead")
+        base_behind = base_resolution.get("behind")
+        counts = (
+            f", ahead {base_ahead} behind {base_behind}"
+            if base_ahead is not None
+            else ""
+        )
+        # Name a skipped refresh explicitly (SA-0MWFFX49M0016KOK AC2): the
+        # base-ref reason says why *this* ref was chosen, not whether the
+        # parent refresh ran. `ahead 0 behind 1` alone cannot distinguish a
+        # held lock from a clean fast-forward.
+        refresh_method = str(refresh_result.get("method") or "")
+        refresh_reason = refresh_result.get("reason") or refresh_method
+        refresh_note = (
+            f", refresh skipped: {refresh_reason}"
+            if refresh_method and refresh_method != "synced"
+            else ""
+        )
+        worktree_base_note = (
+            f"{worktree_base} ({base_resolution.get('reason', 'in_sync')}"
+            f"{counts}{refresh_note})"
+        )
         LOG.info(
-            "Creating worktree at %s from branch %s (verified pushed "
-            "tip: %s)...",
+            "Creating worktree at %s from base %s (verified published "
+            "ref: %s)...",
             abs_wt_path,
             worktree_base,
             base_resolution.get("reason", "in_sync"),
@@ -12320,6 +13160,18 @@ def _phase_start_locked(
                 print(format_json_output(report))
             return report
 
+    # Initialise git submodules in the worktree BEFORE the node_modules
+    # passes (git worktree add does not do this automatically). Ordering is
+    # load-bearing (SA-0MVTOR53E003IIEQ): a nested `node_modules` symlink
+    # created inside a still-empty gitlink directory makes
+    # `git submodule update --init` refuse to clone into it, and since that
+    # failure is fail-open the worktree would silently keep an uninitialised
+    # submodule that cannot build. Best-effort: a warning on failure, never
+    # fatal (SA-0MSN52GGN002B0AZ).
+    report["steps"]["submodules"] = {
+        "initialised": _ensure_submodules(abs_wt_path, _get_repo_root())
+    }
+
     # Materialise the worktree-local node_modules link farm (or, for repos
     # without a workspace package consumed by path, the previous
     # whole-directory symlink) so dist-spawning tests resolve dependencies
@@ -12346,12 +13198,24 @@ def _phase_start_locked(
     # Nested/workspace packages keep their own node_modules (e.g. a pi package
     # under .pi/packages/<pkg>); symlink those too so tools run from the
     # worktree resolve dependencies. Best-effort: never fatal
-    # (OSL-0MUFG3PJA00379CT).
+    # (OSL-0MUFG3PJA00379CT). Runs after submodule init so a gitlink is never
+    # handed a symlink it cannot clone over (SA-0MVTOR53E003IIEQ).
     _ensure_nested_node_modules_symlinks(abs_wt_path, _get_repo_root())
 
-    # Initialise git submodules in the worktree (git worktree add does not
-    # do this automatically). Best-effort: a warning on failure, never fatal.
-    _ensure_submodules(abs_wt_path, _get_repo_root())
+    # Ensure the worktree's workspace shared package is built and fresh
+    # (producer decision Q2=A: freshness-based, unconditional on the change
+    # set). A linked worktree has no gitignored ``packages/shared/dist``, so
+    # every TypeScript suite importing ``@worklog/shared`` would otherwise
+    # fail with N import errors. Best-effort and worktree-local only: a build
+    # failure is recorded as ONE actionable diagnostic, never a fatal start
+    # error (SA-0MWHUVJFO009R9EC).
+    shared_build_report = _ensure_shared_build(
+        abs_wt_path, _get_repo_root(), resolution_check
+    )
+    report["steps"]["shared_build"] = shared_build_report
+    report["shared_build"] = shared_build_report
+    if shared_build_report["action"] == "failed":
+        LOG.warning("%s", shared_build_report["message"])
 
     # The work item was already claimed (status-only) in Step 3; the stage
     # must be left untouched here. There is deliberately no second
@@ -12361,9 +13225,9 @@ def _phase_start_locked(
     wl_add_comment(
         work_item_id,
         (
-            f"Implementation resumed\n- Worktree: {abs_wt_path}\n- Branch: {branch}"
+            f"Implementation resumed\n- Worktree: {abs_wt_path}\n- Branch: {branch}\n- Base: {worktree_base_note}"
             if resumed
-            else f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}"
+            else f"Implementation started\n- Worktree: {abs_wt_path}\n- Branch: {branch}\n- Base: {worktree_base_note}"
         ),
     )
 
@@ -12829,6 +13693,7 @@ def phase_finish(
             own_churn=own_churn,
             expected_dirty=expected_dirty_paths(repo_root),
             stage=stage,
+            work_item_id=work_item_id,
         )
         if not violations:
             return
@@ -12881,6 +13746,7 @@ def phase_finish(
             own_churn=main_checkout_guard["own_churn"],
             expected_dirty=expected_dirty_paths(repo_root),
             stage=stage,
+            work_item_id=work_item_id,
         )
         if not violations:
             return violations
@@ -13125,6 +13991,27 @@ def phase_finish(
             _gate_attempt_record(test_attempts + 1, test_result)
         )
 
+    # Working-tree churn attributed to a concurrent session is excluded from
+    # the guard's verdict but is never silent: surface the note in the finish
+    # output and the JSON report so the operator can tell an excluded foreign
+    # change from a clean run (SA-0MUIJAHXS003M7BG AC3). Each note also carries
+    # the documented actor second signal (WL-0MWR1OYAJ000UVJS AC4): the likely
+    # owner when discoverable, else an explicit ``unknown``. Attribution is
+    # informational and never changes the verdict. The notes are attached to
+    # the result *before* the failure branch so a red gate reports the excluded
+    # foreign churn beside the mutation instead of dropping it
+    # (WL-0MWR1P1F3008AH3V).
+    excluded_churn = list(test_result.get("live_repo_excluded") or [])
+    if excluded_churn:
+        annotated_notes, actor_evidence = _annotate_excluded_churn_notes(
+            excluded_churn, repo_root, worktree_path, work_item_id
+        )
+        test_result["live_repo_excluded"] = annotated_notes
+        report["live_repo_excluded"] = annotated_notes
+        report["live_repo_actor_evidence"] = actor_evidence
+        for note in annotated_notes:
+            LOG.info("Live-repo guard note: %s", note)
+
     if not test_result["success"]:
         msg = (
             f"Tests failed after {max_retry} retries.\n\n"
@@ -13146,16 +14033,6 @@ def phase_finish(
         else:
             LOG.error(msg)
         return report
-
-    # Working-tree churn attributed to a concurrent session is excluded from
-    # the guard's verdict but is never silent: surface the note in the finish
-    # output and the JSON report so the operator can tell an excluded foreign
-    # change from a clean run (SA-0MUIJAHXS003M7BG AC3).
-    excluded_churn = list(test_result.get("live_repo_excluded") or [])
-    if excluded_churn:
-        report["live_repo_excluded"] = excluded_churn
-        for note in excluded_churn:
-            LOG.info("Live-repo guard note: %s", note)
 
     # ── Step 3a: Full-suite coverage stays at the dev-push gate ─────
     # (SA-0MVECQUGF0064U81 — defer full-suite testing to integration.) The
@@ -13899,7 +14776,10 @@ def phase_finish(
                                     exc, commit_hash, branch, worktree_path
                                 ),
                             )
-                            raise RuntimeError(
+                            # TRY004: isinstance() here dispatches an exception
+                            # class (control flow), not a value type, so raising
+                            # TypeError would be semantically wrong.
+                            raise RuntimeError(  # noqa: TRY004
                                 f"git push to dev transport lost: the SSH "
                                 f"connection closed before the ref update "
                                 f"after {exc.attempts} attempt(s), so a green "
@@ -19930,6 +20810,31 @@ def phase_drive(
                     "it recurs, apply the remedy: "
                     f"{spawn_classification['remedy']}",
                 )
+                # Record durable evidence that this attempt produced nothing
+                # *before* the retry ``continue`` (WL-0MWWBJJBD008TBPB): the
+                # re-run parent phase runs the placement guard immediately
+                # after this point, and without the record it cannot tell an
+                # unproductive child from one whose work landed in a live
+                # sibling worktree — a false ``_child_main_checkout_violation``
+                # that stops the drive. Mirror the budget-exhausted path
+                # below, recording only a child with no work of its own.
+                spawn_failure = None
+                if (
+                    _classify_child_worktree(
+                        child_id, worktree_path, parent_branch
+                    )
+                    in (CHILD_CLEAN, CHILD_NO_WORK)
+                ):
+                    spawn_failure = record_spawn_failure(
+                        worktree_path,
+                        child_id,
+                        reconciliation["reason"]
+                        or str(
+                            spawn_result.get("reason", "")
+                            or "session failed"
+                        ),
+                    )
+                entry["spawn_failure_recorded"] = spawn_failure is not None
                 sleeper(backoff)
                 continue
 
@@ -20179,17 +21084,155 @@ def _placement_path_listing(paths: list[str], parent_branch: str) -> str:
     )
 
 
+#: Directory-name pattern of a per-item worktree: ``wl-<WORK-ITEM-ID>-<slug>``
+#: (created by ``implement.py start``) and ``audit-exec-<WORK-ITEM-ID>`` (the
+#: audit runner's sandbox). Both name their owning work item, so a worktree
+#: path can be mapped back to the item whose session it belongs to
+#: (WL-0MWQLHDOS006CAIH). Untagged trees (``wl-test-ff``,
+#: ``/tmp/wl-base-check``) deliberately do not match: their ownership is
+#: unresolvable and the placement guards stay fail-closed for them.
+WORKTREE_DIR_ITEM_RE = re.compile(
+    r"^(?:wl|audit-exec)-(?P<item_id>[A-Z][A-Z0-9]{1,9}-[A-Z0-9]{2,})(?:-|$)"
+)
+
+
+def _worktree_path_to_item_id(worktree_path: str | Path) -> str | None:
+    """Map a per-item worktree path to the work item that owns it.
+
+    The reverse of the naming convention ``implement.py start`` and the audit
+    runner use (``<worktree-root>/wl-<ID>-<slug>`` and
+    ``<worktree-root>/audit-exec-<ID>``). It is the cheap half of the debris
+    filter: a leftover tree can only be attributed to a *terminal* item — and
+    so be discounted as a foreign change surface — when its owner is named in
+    the directory name.
+
+    Args:
+        worktree_path: Any path; only its final component is inspected.
+
+    Returns:
+        The owning work-item id, or ``None`` when the directory name carries
+        none (scratch trees such as ``wl-base-check`` or ``wl-test-ff``). A
+        ``None`` keeps the caller fail-closed.
+    """
+    match = WORKTREE_DIR_ITEM_RE.match(Path(worktree_path).name)
+    if match is None:
+        return None
+    return match.group("item_id")
+
+
+def _worktree_owner_is_terminal(worktree_path: str | Path) -> bool | None:
+    """Resolve whether the work item owning *worktree_path* is terminal.
+
+    A leftover worktree of a ``completed``/``in_review``/``done``/``deleted``
+    item has no live session to race, so its dirt can never be evidence that a
+    driven child wrote outside its own worktree (WL-0MWQLHDOS006CAIH). Every
+    unresolvable case — no work-item id in the directory name, ``wl show``
+    unavailable, or a lookup that returns another item — yields ``None`` so
+    the caller keeps counting the surface (**fail closed**).
+
+    Returns:
+        ``True`` when the owning item is terminal, ``False`` when it is live,
+        ``None`` when ownership cannot be resolved.
+    """
+    item_id = _worktree_path_to_item_id(worktree_path)
+    if not item_id:
+        return None
+    try:
+        item = wl_show(item_id)
+    except Exception:  # noqa: BLE001 — a failed lookup must never crash a gate
+        item = {}
+    if not item or str(item.get("id", "")) != item_id:
+        LOG.warning(
+            "Could not resolve the work item %s owning the registered "
+            "worktree %s; keeping it as a foreign change surface.",
+            item_id,
+            worktree_path,
+        )
+        return None
+    return _is_terminal_child(item)
+
+
+def _is_live_foreign_surface(
+    sibling: str | Path,
+    worktree_path: str | Path,
+    repo_root: str | Path,
+) -> bool:
+    """Whether a registered sibling worktree can evidence a stray write.
+
+    A dirty sibling only means "a child wrote outside its worktree" when the
+    surface could belong to a **live** session and is in scope for this
+    repository. Two kinds of surface never qualify (WL-0MWQLHDOS006CAIH):
+
+    1. **Out-of-scope debris.** A sibling outside the repository's worktree
+       root (``.worklog/worktrees/`` — scratch trees under ``/tmp``, ad-hoc
+       manual checks) is never a foreign change surface. The comparison is
+       only meaningful when the child's own worktree lives inside that root:
+       a child working elsewhere (custom ``--worktree-path``, an ad-hoc tree)
+       leaves the scope unknown, so nothing is filtered — the pre-existing
+       fail-closed behaviour is preserved.
+    2. **Terminal-owner debris.** A leftover tree whose owning work item is
+       terminal (``completed``/``in_review``/``done``/``deleted``) has no live
+       session to race; its dirt predates the run. Wherever it lives.
+
+    Unresolved ownership stays fail-closed (see
+    :func:`_worktree_owner_is_terminal`). The worklog lookup is reached only
+    from a dirty-surface scan, so the guards' fast paths (the child's own
+    worktree carries work; no dirty siblings) never pay for a ``wl``
+    subprocess.
+
+    Args:
+        sibling: The registered sibling worktree under consideration.
+        worktree_path: The child's own worktree root.
+        repo_root: The main checkout root.
+
+    Returns:
+        True when the sibling must still be treated as a foreign change
+        surface; False when it is stale debris.
+    """
+    root = Path(repo_root).resolve()
+    wt = Path(worktree_path).resolve()
+    sibling_path = Path(sibling).resolve()
+    worktree_root = (root / DEFAULT_WORKTREE_DIR).resolve()
+
+    child_in_root = wt == worktree_root or worktree_root in wt.parents
+    sibling_in_root = (
+        sibling_path == worktree_root or worktree_root in sibling_path.parents
+    )
+    if child_in_root and not sibling_in_root:
+        LOG.info(
+            "Ignoring registered worktree %s: it lies outside the "
+            "repository's worktree root %s, so it is stale scratch debris "
+            "and never evidence of a stray write.",
+            sibling_path,
+            worktree_root,
+        )
+        return False
+
+    terminal = _worktree_owner_is_terminal(sibling_path)
+    if terminal is None:
+        return True
+    if terminal:
+        LOG.info(
+            "Ignoring registered worktree %s: its owning work item %s is "
+            "terminal, so no live session can be raced there and its dirt "
+            "is never evidence of a stray write.",
+            sibling_path,
+            _worktree_path_to_item_id(sibling_path),
+        )
+        return False
+    return True
+
+
 def _registered_sibling_worktree_paths(
     worktree_path: str | Path,
     repo_root: str | Path,
 ) -> list[Path]:
     """Return the registered linked worktrees of *repo_root* other than the child's own.
 
-    A sibling worktree is any path git registers as a worktree of the same
-    repository, excluding the main checkout root and the child's own
-    worktree. It is the foreign write surface a driven child must never
-    touch — it belongs to another work item's session, so writing there
-    races that session and silently widens the epic (SA-0MW5FIJNQ002Z24I).
+    Excluding the child's own worktree, the registry is the candidate
+    sibling surface set — callers filter each candidate through
+    :func:`_is_live_foreign_surface` only once it is known to be dirty, so a
+    clean registry never costs a worklog lookup (WL-0MWQLHDOS006CAIH).
     A foreign repository checkout — even one reachable by path — is never
     listed, because the registry is scoped to *repo_root* itself
     (cross-checkout attribution, SA-0MVXVBZF2009HRRN).
@@ -20231,6 +21274,11 @@ def _sibling_worktree_containing(
     into a registered sibling is checked as its own write surface
     (SA-0MW5FIJNQ002Z24I).
 
+    The registry is returned **raw**: filtering a candidate through
+    :func:`_is_live_foreign_surface` costs a worklog lookup, so the caller
+    applies it only after the child's own work and the sibling's dirt have
+    been checked (WL-0MWQLHDOS006CAIH).
+
     Args:
         cur: The resolved current directory.
         repo_root: The main checkout root.
@@ -20260,7 +21308,9 @@ def _worktree_placement_violation(
     2. another change surface holds the work — the main checkout holds
        uncommitted changes outside ``.worklog/``, or the cwd resolves into a
        **registered sibling worktree** of the same repository that holds
-       changes (SA-0MW5FIJNQ002Z24I), and
+       changes (SA-0MW5FIJNQ002Z24I). Each surface is classified with its own
+       ``ignoreDirtyPaths`` declaration and a dirty submodule is expanded
+       into its inner changes (RISE-0MWOIAXAG008HMK3), and
     3. the worktree itself holds NO changes (no dirty files and no commits
        ahead of the parent branch) — i.e. the work was done in the main
        checkout or a sibling worktree, not the worktree.
@@ -20299,11 +21349,15 @@ def _worktree_placement_violation(
             wt, parent_branch, expected_dirty=expected_dirty_paths(str(wt))
         ):
             return None  # work lives in the worktree; sibling dirt is unrelated
+        # Resolve the *sibling's own* expected-dirty declaration, not the
+        # root repo's: a linked worktree is a checkout of the project and may
+        # carry its own ``ignoreDirtyPaths`` (RISE-0MWOIAXAG008HMK3 AC1).
+        sibling_expected = expected_dirty_paths(str(sibling))
         if _git_path_has_changes(
-            sibling, parent_branch, expected_dirty=root_expected
-        ):
+            sibling, parent_branch, expected_dirty=sibling_expected
+        ) and _is_live_foreign_surface(sibling, wt, root):
             offending = _main_checkout_offending_paths(
-                str(sibling), expected_dirty=root_expected
+                str(sibling), expected_dirty=sibling_expected
             )
             evidence = _placement_path_listing(offending, parent_branch)
             return (
@@ -20321,7 +21375,7 @@ def _worktree_placement_violation(
         # scan, which still applies when the work landed there instead.
 
     if not git_has_dirty_files(
-        git_status(cwd=str(root)), expected_dirty=root_expected
+        git_status(cwd=str(root)), expected_dirty=root_expected, repo_root=root
     ):
         return None  # main checkout clean; work must be in the worktree
 
@@ -20363,7 +21417,7 @@ def _git_path_has_changes(
         *parent_branch*; False when it is clean and has none.
     """
     if git_has_dirty_files(
-        git_status(cwd=str(path)), expected_dirty=expected_dirty
+        git_status(cwd=str(path)), expected_dirty=expected_dirty, repo_root=path
     ):
         return True
     ahead = run_cmd(
@@ -20399,7 +21453,12 @@ def _child_main_checkout_violation(
     1. the child is non-terminal (the caller enforces this),
     2. another change surface holds the work — the main checkout holds
        uncommitted changes outside ``.worklog/``, or a **registered sibling
-       worktree** of the same repository holds changes, and
+       worktree** of the same repository holds changes and is a *live*
+       surface (:func:`_is_live_foreign_surface` — stale debris from stale
+       scratch trees and terminal items is never evidence). Each surface is
+       classified with **its own** ``ignoreDirtyPaths`` declaration, and a
+       dirty submodule is expanded into its inner changes
+       (:func:`_dirty_entry_is_change_surface`, RISE-0MWOIAXAG008HMK3), and
     3. the child's worktree holds NO changes (no dirty files and no commits
        ahead of the parent branch) — so the work did not land in the worktree.
 
@@ -20463,16 +21522,30 @@ def _child_main_checkout_violation(
         return None
 
     offending = _main_checkout_offending_paths(str(root), expected_dirty=root_expected)
-    sibling_offending = [
-        (
-            sibling,
-            _main_checkout_offending_paths(
-                str(sibling), expected_dirty=root_expected
-            ),
+    sibling_offending: list[tuple[Path, list[str]]] = []
+    for sibling in _registered_sibling_worktree_paths(wt, root):
+        # Resolve the *sibling's own* expected-dirty declaration per surface —
+        # not the root repo's list. A linked worktree is a checkout of the
+        # project and may declare its own framework noise
+        # (RISE-0MWOIAXAG008HMK3 AC1).
+        sibling_expected = expected_dirty_paths(str(sibling))
+        # Cheap first (dirty scan), then the debris filter (path scope, then
+        # at most one worklog lookup), then the evidence listing: the fast
+        # paths never reach the worklog (WL-0MWQLHDOS006CAIH).
+        if not _git_path_has_changes(
+            sibling, parent_branch, expected_dirty=sibling_expected
+        ):
+            continue
+        if not _is_live_foreign_surface(sibling, wt, root):
+            continue
+        sibling_offending.append(
+            (
+                sibling,
+                _main_checkout_offending_paths(
+                    str(sibling), expected_dirty=sibling_expected
+                ),
+            )
         )
-        for sibling in _registered_sibling_worktree_paths(wt, root)
-        if _git_path_has_changes(sibling, parent_branch, expected_dirty=root_expected)
-    ]
     if not offending and not sibling_offending:
         return None  # no foreign change surface
 

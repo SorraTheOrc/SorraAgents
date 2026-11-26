@@ -87,6 +87,22 @@ export function buildAbortRestoreCommand(issueId, status, stage) {
 }
 
 /**
+ * Build the readback command that verifies an abort restore applied.
+ *
+ * Exported for testability. The restore is only treated as successful when
+ * this readback reports the restored status/stage — a bare ``wl update`` can
+ * be silently clobbered by a concurrent ``wl sync`` (last-writer-wins on a
+ * stale snapshot), leaving the item stranded at its audited or claimed state
+ * (SA-0MW7Z77KI005MK0B).
+ *
+ * @param {string} issueId - The work item id.
+ * @returns {string} The ``wl show`` command string.
+ */
+export function buildAbortReadbackCommand(issueId) {
+  return `wl show ${issueId} --json`;
+}
+
+/**
  * Check for a leftover audit state file and restore the work item
  * if the audit runner was killed before cleaning up.
  *
@@ -95,6 +111,14 @@ export function buildAbortRestoreCommand(issueId, status, stage) {
  * left behind. This function finds that file and restores the item — the
  * parent-process half of the abort-recovery contract
  * (SA-0MTRH8C5O005URGR).
+ *
+ * The restore is **verified and bounded** (SA-0MW7Z77KI005MK0B): after the
+ * identical ``wl update`` the persisted lifecycle is read back via
+ * ``wl show <id> --json``; if a concurrent ``wl sync`` clobbered the write
+ * the restore is re-applied once. An unverified restore is reported loudly
+ * (naming the item and the manual recovery command) and the state file is
+ * **retained** so a later gate run retries — it is deleted only after a
+ * verified restore.
  *
  * Boundaries are injectable (mirroring the other gate helpers) so unit
  * tests are hermetic — no live ``wl`` invocations.
@@ -107,7 +131,13 @@ export function buildAbortRestoreCommand(issueId, status, stage) {
  *   ``readFileSync``, ``unlinkSync``); defaults to ``node:fs``.
  * @param {(cmd: string) => string} [options.runCommand] - Command runner;
  *   defaults to ``execSync``.
- * @returns {boolean} True if a leftover state file was found and restored.
+ * @param {(issueId: string) => ({status: string, stage: string}|null)} [options.readBackState]
+ *   - Lifecycle readback; defaults to parsing ``wl show <id> --json`` through
+ *   ``runCommand`` (returns ``null`` when unparseable, e.g. a swallowed write).
+ * @param {number} [options.maxRestoreAttempts] - Total restore attempts
+ *   (1 initial + retries); defaults to 2 (one bounded retry).
+ * @returns {boolean} True if a leftover state file was found (restored or
+ *   retained for retry).
  */
 export function checkAndRestoreStuckAudit(workItemId, options = {}) {
   const {
@@ -116,7 +146,30 @@ export function checkAndRestoreStuckAudit(workItemId, options = {}) {
     runCommand = (cmd) => execSync(
       cmd, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
+    readBackState = null,
+    maxRestoreAttempts = 2,
   } = options;
+
+  // Default readback: run the same ``wl show <id> --json`` the audit runner
+  // uses and project status/stage. Any error/timeout means "unverified".
+  const readState = readBackState || ((id) => {
+    try {
+      const raw = runCommand(buildAbortReadbackCommand(id));
+      const data = JSON.parse(raw);
+      const wi = (data && data.workItem) || data || {};
+      return { status: wi.status, stage: wi.stage };
+    } catch (err) {
+      return null;
+    }
+  });
+
+  const removeFile = (stateFile) => {
+    try {
+      fsMod.unlinkSync(stateFile);
+    } catch (err) {
+      // Best-effort cleanup.
+    }
+  };
 
   // State file naming: .audit_state_<id>.json — matches audit_runner.py.
   const dirs = [
@@ -127,31 +180,71 @@ export function checkAndRestoreStuckAudit(workItemId, options = {}) {
 
   for (const dir of dirs) {
     const stateFile = join(dir, `.audit_state_${workItemId}.json`);
-    if (fsMod.existsSync(stateFile)) {
-      try {
-        const data = JSON.parse(fsMod.readFileSync(stateFile, 'utf-8'));
-        if (data.issue_id === workItemId && data.original_status) {
-          console.log(
-            `Aborted audit for ${workItemId}: restoring "${data.original_status}" "${data.original_stage || 'plan_complete'}".`,
-          );
-          runCommand(
-            buildAbortRestoreCommand(
-              data.issue_id, data.original_status, data.original_stage,
-            ),
-          );
-        }
-      } catch (err) {
-        // Best-effort: silently ignore corrupt state files.
-      } finally {
-        // Always remove the file, even if restore failed.
-        try {
-          fsMod.unlinkSync(stateFile);
-        } catch (err) {
-          // Best-effort cleanup.
-        }
-      }
+    if (!fsMod.existsSync(stateFile)) {
+      continue;
+    }
+    let data;
+    try {
+      data = JSON.parse(fsMod.readFileSync(stateFile, 'utf-8'));
+    } catch (err) {
+      // Corrupt state file: consume it (previous behaviour) — no restore.
+      removeFile(stateFile);
       return true;
     }
+    if (!data || data.issue_id !== workItemId || !data.original_status) {
+      // Foreign / malformed state file: consume it (previous behaviour).
+      removeFile(stateFile);
+      return true;
+    }
+
+    const status = data.original_status;
+    const stage = data.original_stage || 'plan_complete';
+    const restoreCmd = buildAbortRestoreCommand(
+      data.issue_id, status, stage,
+    );
+    console.log(
+      `Aborted audit for ${workItemId}: restoring "${status}" "${stage}".`,
+    );
+
+    let verified = false;
+    let lastActual = null;
+    const attempts = Math.max(1, maxRestoreAttempts);
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (attempt > 0) {
+        console.warn(
+          `Warning: abort restore for ${workItemId} was clobbered ` +
+          `(readback ${JSON.stringify(lastActual)}); retrying once.`,
+        );
+      }
+      try {
+        runCommand(restoreCmd);
+      } catch (err) {
+        // A failed update is not fatal here — the readback below decides.
+      }
+      lastActual = readState(data.issue_id);
+      if (
+        lastActual && lastActual.status === status &&
+        String(lastActual.stage || '') === String(stage)
+      ) {
+        verified = true;
+        break;
+      }
+    }
+
+    if (verified) {
+      removeFile(stateFile);
+    } else {
+      // Never silently lose the restore: keep the state file so a later gate
+      // run retries, and tell the operator exactly how to recover manually.
+      console.warn(
+        `Warning: could not verify the abort restore for ${workItemId} to ` +
+        `"${status}" "${stage}" after ${attempts} attempt(s) ` +
+        `(readback: ${JSON.stringify(lastActual)}); retaining ` +
+        `${stateFile} so a later gate run retries. Recover manually with: ` +
+        restoreCmd,
+      );
+    }
+    return true;
   }
   return false;
 }

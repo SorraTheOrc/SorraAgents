@@ -372,6 +372,17 @@ and `--thresholds FILE` combine; inline `--threshold` wins for duplicate keys.
 > red. Both mutations were reverted. No `CONTEXT_BUDGET_SKIP=1` bypass was
 > used at any point.
 >
+> **Stale-worktree debris note (2026-11-21, WL-0MWQLHDOS006CAIH):** documenting
+> the placement guard's live-surface filter (and the hygiene script's prune
+> remedy) in `skill/implement/SKILL.md` step 3 was accommodated **without**
+> raising any threshold: the note was kept to four lines and ~350 B of
+> duplicated prose was trimmed from the same file (the `StatusLifecycle`
+> Integration bullets, the orphaned `Retry taxonomy` fragment and the
+> belt-and-suspenders pointer, whose content lives in
+> `implement-skill-reference.md`). `skill_implement_md` measures 22,405 B
+> against the unchanged 22,425 B threshold, so the committed surface did not
+> regress; no `CONTEXT_BUDGET_SKIP=1` bypass was used.
+>
 > ### Enforcement (committed gate)
 >
 > The regression gate is enforced in two places:

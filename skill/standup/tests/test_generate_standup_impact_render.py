@@ -265,13 +265,53 @@ class TestFormattedReportRendering:
         assert SPOKEN_DATE_PATTERN.search(report.split("\n")[0]) is not None
         assert not re.search(r"\d{4}-\d{2}-\d{2}", report.split("\n")[0])
         for phrase in (
-            "Yesterday I completed work on",
+            "Since the last report, I completed",
             "Open critical items",
-            "Additional focus items for today",
+            "Key upcoming work includes",
             "Regressions",
             "Blockers",
         ):
             assert phrase in report, phrase
+
+    def test_report_headings_are_time_neutral(self):
+        """The fallback adopts the agent report's time-neutral framing.
+
+        No section heading carries a \"yesterday\"/\"today\" temporal token; the
+        deterministic fallback must not be a second, older-sounding voice
+        (SA-0MWNMRCYY0050LEP).
+        """
+        mod = _reload_standup()
+        item = _raw_item(
+            "SA-1",
+            "Faster deck setup",
+            _impact_description("Users set up a deck in one click."),
+        )
+        report = mod.format_report(_report_data(mod, [item]))
+
+        headings = [line for line in report.split("\n") if line.startswith("### ")]
+        assert headings, "report emitted no section headings"
+        for heading in headings:
+            assert re.search(r"\b(?:yesterday|today)\b", heading, re.IGNORECASE) is None, heading
+
+    def test__critical_five_plus_empty_additional_line_is_time_neutral(self):
+        """The empty-additional line no longer promises a one-day horizon."""
+        mod = _reload_standup()
+        criticals = [
+            _raw_item(
+                f"SA-C{i}",
+                f"Critical {i}",
+                _impact_description(f"Users unblock critical thing {i}."),
+                status="open",
+                stage="plan_complete",
+                priority="critical",
+            )
+            for i in range(5)
+        ]
+        report = mod.format_report(_report_data(mod, criticals))
+
+        assert "No additional items" in report
+        assert "my upcoming focus is entirely on critical work" in report
+        assert "my focus today" not in report
 
     def test_legacy_item_lines_are_sanitised(self):
         """Back-compat fallback lines must not leak ids or markdown either."""

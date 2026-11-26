@@ -76,10 +76,35 @@ instead of failing a test. Blind spots, pinned by
 ``TestWorkingTreeAttributionBoundaries`` in
 ``skill/shared/tests/test_git_sandbox.py`` and documented in
 ``docs/dev/test-isolation.md`` §8.5: masking a suite that reverts or deletes
-another session's *uncommitted* work, the deliberately retained clean→dirty
-false-positive direction, and invisible content-only changes to an
-already-dirty path. Derivation is git plumbing (``git status`` codes across
-the two snapshots), never a ``wl-*`` or path-name pattern.
+another session's *uncommitted* work, and invisible content-only changes to
+an already-dirty path. The clean→dirty direction is **role-scoped** by the
+rule below: full strength on the guarded root, tracked-file deletions only in
+the shared main checkout. Derivation is git plumbing (``git status`` codes
+across the two snapshots), never a ``wl-*`` or path-name pattern.
+
+Role-scoped main-checkout verdict (WL-0MWR1OXHX001KJC6)
+-----------------------------------------------------
+
+This plugin inherits the role-scoped rule straight from
+``diff_guarded_roots`` — it runs no comparison of its own. The guarded root
+keeps full clean→dirty sensitivity, while a clean→dirty path in the shared
+**main checkout** is verdict-bearing only when it reports a tracked-file
+deletion (``D`` in either status column, the 2026-10-26 ``packages/shared``
+wipe class). A sibling session's mid-run `` M``/``??``/``M `` write to the
+main checkout is therefore informational: it becomes an ``excluded: …`` note
+accumulated across tests and printed at session end, never a failure. Refs and
+config stay fully verdict-bearing on both roots.
+
+Actor second signal (WL-0MWR1OYAJ000UVJS, wired by WL-0MWR1P1F3008AH3V)
+-------------------------------------------------------------------------
+An excluded note names *what* was excluded — the checkout, path and status
+code — and additionally renders the labelled, informational likely owner of
+the shared main checkout (``[likely actor: …]``, or an explicit ``unknown``).
+The evidence comes from the shared ``concurrent_actor`` helper, loaded by file
+location like the git sandbox, and is looked up at most once per session (never
+in the per-test fingerprint path). It never changes the verdict: a mutation
+still fails and names every mutated checkout and path, with the discoverable
+owner appended when the main checkout itself is the mutated checkout.
 """
 
 from __future__ import annotations
@@ -104,6 +129,35 @@ def _load_git_sandbox() -> Any:
         raise RuntimeError(f"cannot load git sandbox helper from {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    return module
+
+
+def _load_concurrent_actor() -> Any | None:
+    """Load the shared actor helper by file location, or ``None``.
+
+    The guard is armed by file location (``conftest.py`` deliberately never
+    mutates ``sys.path``), so it cannot rely on a package import. The actor
+    signal is informational only: a partial install or a load failure degrades
+    to no annotation, never to a guard failure (WL-0MWR1P1F3008AH3V).
+    """
+    path = Path(__file__).resolve().parent / "concurrent_actor.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "_live_repo_concurrent_actor", path
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        return None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        # Register before execution: the helper uses ``@dataclass``, and
+        # ``dataclasses`` resolves the owning class's module through
+        # ``sys.modules`` while the class is being built (Python 3.14).
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    except Exception:  # noqa: BLE001 - evidence must fail open
+        sys.modules.pop(spec.name, None)
+        return None
     return module
 
 
@@ -132,12 +186,79 @@ class LiveRepoMutationGuard:
         #: concurrent session (never a failure) — accumulated across tests so
         #: re-baselining cannot drop them (SA-0MUIJAHXS003M7BG AC3).
         self.excluded: list[str] = []
+        #: Shared actor-evidence helper (loaded by file location, fail-open).
+        self._actor_module = _load_concurrent_actor()
+        #: Cached actor evidence so the bounded lookup runs at most once.
+        self._actor_evidence_cached: str | None = None
 
     def _record_excluded(self, diff: dict[str, Any]) -> None:
         """Accumulate the excluded-churn notes of *diff* (deduplicated)."""
         for note in self._gs.excluded_churn_notes(diff):
             if note not in self.excluded:
                 self.excluded.append(note)
+
+    # -- actor evidence ------------------------------------------------------
+
+    def _linked_main_checkout(self) -> Path | None:
+        """The shared main checkout of this worktree run, or ``None``.
+
+        A run started in an ordinary checkout has no foreign checkout to
+        attribute, so the actor signal is only rendered for a linked worktree
+        (where a sibling session may be writing the main checkout).
+        """
+        main = self._gs.main_checkout_root(self.root)
+        if main is None:
+            return None
+        main = Path(main).resolve()
+        return main if main != self.root else None
+
+    def _actor_evidence(self) -> str:
+        """Best-effort owner of the main checkout's churn, cached per session.
+
+        Delegates to the shared ``concurrent_actor`` helper (loaded by file
+        location, like the git sandbox) so the inner plugin and the outer
+        guard render one evidence contract rather than forking it. Computed
+        lazily — never in the per-test fingerprint path — and fail-open to
+        ``unknown``.
+        """
+        if self._actor_evidence_cached is not None:
+            return self._actor_evidence_cached
+        evidence = "unknown"
+        main = self._linked_main_checkout()
+        module = self._actor_module
+        if module is not None and main is not None:
+            try:
+                evidence = module.describe_concurrent_actor(
+                    main,
+                    own_worktree=self.root,
+                    own_work_item_id=module.work_item_id_from_state(self.root),
+                    worklog_dir=main / ".worklog",
+                )
+            except Exception:  # noqa: BLE001 - evidence must fail open
+                evidence = "unknown"
+        self._actor_evidence_cached = evidence
+        return evidence
+
+    def _excluded_notes_with_actor(self) -> list[str]:
+        """The accumulated notes, each carrying the labelled actor signal."""
+        notes = list(self.excluded)
+        module = self._actor_module
+        if module is None or not notes or self._linked_main_checkout() is None:
+            return notes
+        return module.annotate_excluded_notes(notes, self._actor_evidence())
+
+    def _mutation_actor_line(self, diff: dict[str, Any]) -> str:
+        """Name the discoverable owner when the main checkout is mutated."""
+        if self._linked_main_checkout() is None:
+            return ""
+        main_mutated = any(
+            entry.get("role") == self._gs.MAIN_CHECKOUT_ROLE
+            and (entry.get("diff") or {}).get("changed")
+            for entry in diff.get("roots", ())
+        )
+        if not main_mutated:
+            return ""
+        return f"\nConcurrent actor evidence: {self._actor_evidence()}"
 
     # -- hooks ---------------------------------------------------------------
 
@@ -179,7 +300,8 @@ class LiveRepoMutationGuard:
         self.offender = item.nodeid
         pytest.fail(
             f"live-repo mutation detected during {item.nodeid}:\n"
-            + self._gs.describe_guarded_diff(diff),
+            + self._gs.describe_guarded_diff(diff)
+            + self._mutation_actor_line(diff),
             pytrace=False,
         )
 
@@ -190,8 +312,10 @@ class LiveRepoMutationGuard:
         diff = self._gs.diff_guarded_roots(self.before, after)
         self._record_excluded(diff)
         # Informational, never a failure: an excluded foreign change must be
-        # distinguishable from a clean run (SA-0MUIJAHXS003M7BG AC3).
-        for note in self.excluded:
+        # distinguishable from a clean run (SA-0MUIJAHXS003M7BG AC3), and it
+        # says who likely wrote it instead of implying this run corrupted the
+        # checkout (WL-0MWR1OYAJ000UVJS, WL-0MWR1P1F3008AH3V).
+        for note in self._excluded_notes_with_actor():
             print(f"note: {note}", file=sys.stdout)
         if not diff["changed"]:
             return
@@ -200,7 +324,8 @@ class LiveRepoMutationGuard:
         print(
             "ERROR: live-repo mutation detected at session end"
             f" (last recorded test: {named}):\n"
-            + self._gs.describe_guarded_diff(diff),
+            + self._gs.describe_guarded_diff(diff)
+            + self._mutation_actor_line(diff),
             file=sys.stderr,
         )
 

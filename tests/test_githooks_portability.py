@@ -139,6 +139,19 @@ def _make_temp_repo(
 
     assert _run(["git", "init", "-q", "-b", "dev", "."], cwd=repo, env=env).returncode == 0
     _run(["git", "config", "core.hooksPath", ".githooks"], cwd=repo, env=env)
+    # ``wl sync``'s push-author-identity gate reads ``git config user.email``
+    # (not ``GIT_AUTHOR_EMAIL``/``GIT_COMMITTER_EMAIL``), so configure a real
+    # identity repo-locally. The sandboxed HOME still has no ``.config/pi``
+    # central hook install and no global git config — the AC2 portability
+    # contract is unaffected. Without this, every ``wl sync`` refuses with
+    # "git user.email is not set" and the AC3 push assertion fails
+    # (SA-0MWULUV3M009QC5W).
+    _run(["git", "config", "user.name", "Hook Test"], cwd=repo, env=env)
+    _run(
+        ["git", "config", "user.email", "hook-test@example.invalid"],
+        cwd=repo,
+        env=env,
+    )
     assert _run(["git", "add", "-A"], cwd=repo, env=env).returncode == 0
     commit = _run(["git", "commit", "-qm", "hook fixture"], cwd=repo, env=env)
     assert commit.returncode == 0, commit.stderr

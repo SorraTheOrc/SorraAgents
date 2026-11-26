@@ -23,18 +23,28 @@ capture fields:
 | ≤ 3 high-signal questions per round | § 1 |
 | Multiple-choice preferred, freeform allowed | § 2 |
 | **Recommended:** `<option>` — `<rationale>` | § 3 |
-| Producer-review handoff via `wl reviewed` | § 4 |
+| Producer-review handoff — genuine decisions only | § 4 |
 | Idempotent appendix recording | § 5 |
 | No invented requirements | § 6 |
 | Respect `.gitignore` | § 7 |
 
 ## Producer review handoff
 
-When an interview cannot proceed:
+The handoff is a **persistent hold** and is used only for a **genuine producer
+decision** (business rule, user-experience or product-strategy choice,
+budget/priority trade-off, anything outward-facing or expensive to reverse).
+Routine questions — answerable by repo research or a documented reasonable
+assumption — are recorded in the Appendix and the run continues; they never set
+the hold.
+
+When a genuine handoff is required:
 
 ```bash
 wl reviewed <work-item-id> true
 ```
+
+Rationale and worked examples:
+[routine-vs-producer-handoff.md](./routine-vs-producer-handoff.md).
 
 The consuming skill documents the handoff policy:
 

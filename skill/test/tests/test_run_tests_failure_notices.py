@@ -894,8 +894,10 @@ class TestRetryDiscardedDiagnostics:
 
         assert result["success"] is False
         assert [f["test_name"] for f in result["failures"]] == [
-            "tests/e2e/tutorial-1.browser.test.ts > main-street tutorial part 1 "
-            "> step 3"
+            (
+                "tests/e2e/tutorial-1.browser.test.ts > main-street tutorial part 1 "
+                "> step 3"
+            )
         ], "only the tutorial failure is a suite failure"
         assert len(result["discarded_failures"]) == 1
         assert (

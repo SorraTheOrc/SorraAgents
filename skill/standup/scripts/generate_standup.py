@@ -1122,7 +1122,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
     additional_lines = data.get("today_additional_tts") if data.get("today_additional_tts") is not None else data.get("today_additional", [])
     blocker_tts_lines = data.get("blockers_tts") if data.get("blockers_tts") is not None else data.get("blockers", [])
 
-    lines.append("### Yesterday I completed work on...")
+    lines.append("### Since the last report, I completed...")
     lines.append("")
     if yesterday_lines:
         lines.extend(_spoken_report_lines(yesterday_lines))
@@ -1138,7 +1138,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
         lines.append("  - No open critical items.")
     lines.append("")
 
-    lines.append("### Additional focus items for today")
+    lines.append("### Key upcoming work includes...")
     lines.append("")
     if additional_lines:
         lines.extend(_spoken_report_lines(additional_lines))
@@ -1146,7 +1146,7 @@ def format_report(data, browse_count=None, project_name: str | None = None):
         # If critical already consumed 5+, note that explicitly; otherwise no additional
         crit_count = data.get("today_critical_count", len(critical_lines))
         if crit_count >= 5:
-            lines.append("  - No additional items — my focus today is entirely on critical work.")
+            lines.append("  - No additional items — my upcoming focus is entirely on critical work.")
         else:
             lines.append("  - No additional focus items scheduled.")
     lines.append("")

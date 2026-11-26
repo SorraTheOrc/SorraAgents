@@ -76,16 +76,38 @@ hermetic suite never commits, checks out or reverts, so such a resolution is
 concurrent churn (a sibling session committing work it had already dirtied in
 the shared checkout) and is excluded from the verdict, reported instead as an
 informational note (``EXCLUDED_CHURN_NOTE_PREFIX``, AC1/AC3). Everything else
-stays a mutation (AC2): a path that was **clean at snapshot start** and is
-modified, deleted or created at snapshot end, and a path that is *still* dirty
-with a different status code. Derivations are status codes and snapshot
-provenance only — never a ``wl-*`` or path-name pattern (AC4).
+stays a mutation on the **guarded root** (AC2): a path that was **clean at
+snapshot start** and is modified, deleted or created at snapshot end, and a
+path that is *still* dirty with a different status code. The shared **main
+checkout** is role-scoped by the rule below (tracked-file deletions only).
+Derivations are status codes and snapshot provenance only — never a ``wl-*`` or
+path-name pattern (AC4).
 
 Pinned blind spots (AC4, ``TestWorkingTreeAttributionBoundaries``): a suite
 that reverts or deletes another session's *uncommitted* work is masked (the
-path was pre-dirty, so its resolution is attributed), the clean→dirty
-false-positive direction is deliberately retained, and a content-only change
-to an already-dirty path is invisible to a status-code surface.
+path was pre-dirty, so its resolution is attributed), and a content-only change
+to an already-dirty path is invisible to a status-code surface. The third
+boundary — the clean→dirty direction — is **role-scoped** by the rule below:
+the guarded root keeps it at full strength, while the shared main checkout
+narrows it to the tracked-file deletion class, so a suite modifying or adding a
+path in the main checkout is no longer caught there (see §8.5 blind spot #2 in
+``docs/dev/test-isolation.md``).
+
+**Role-scoped verdict (WL-0MWR1OXHX001KJC6).** The clean→dirty direction is
+further narrowed by root *role* in :func:`diff_guarded_roots` — the only place
+that knows each root's ``role``, so the outer guard and the inner plugin
+inherit it without forking. The **guarded root** is unchanged: every
+clean→dirty modification, deletion or creation is verdict-bearing, and a
+still-dirty path whose code changed is verdict-bearing. The shared **main
+checkout** is verdict-bearing only for the damage class the suite can
+plausibly cause — a newly dirty path whose end status code reports a
+tracked-file deletion (``D`` in either column, the 2026-10-26
+``packages/shared`` wipe). Its newly modified (`` M``/``M ``/``MM``),
+untracked (``??``), staged additions and deletion-free code transitions move
+to the excluded bucket and are rendered by :func:`excluded_churn_notes`. Refs
+and config stay fully verdict-bearing on **both** roots, and resolved
+pre-existing dirt is still excluded everywhere. Derivation remains git status
+codes plus the start snapshot — never a ``wl-*`` or path-name heuristic.
 
 **Own-checkout state surface (``state_changed_during_run``).**
 ``snapshot_own_checkout`` / ``compare_own_checkout_states`` snapshot the
@@ -183,6 +205,13 @@ NOTED_CONCURRENCY_EXCLUDED_REF_NAMESPACES: tuple[str, ...] = (
 #: (SA-0MUIJAHXS003M7BG AC3). Emitted — never silent — so a reviewer can tell
 #: an excluded foreign change from a clean run.
 EXCLUDED_CHURN_NOTE_PREFIX = "excluded: concurrently resolved working-tree change"
+
+#: A tracked-file deletion is the one working-tree shape the shared **main
+#: checkout** still treats as verdict-bearing once the role-scoped verdict
+#: narrows it (WL-0MWR1OXHX001KJC6): the 2026-10-26 ``packages/shared`` wipe
+#: class. ``D`` in either status column (`` D`` unstaged, ``D `` staged, ``DD``)
+#: reports that deletion; every other newly-dirty shape is informational there.
+TRACKED_DELETION_STATUS_MARKER = "D"
 
 #: Prefix of the informational note emitted when a ref difference is attributed
 #: to concurrent infrastructure churn and therefore excluded from the verdict
@@ -878,6 +907,83 @@ def fingerprint_guarded_roots(snapshot: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _reports_tracked_deletion(status_code: str) -> bool:
+    """True when a porcelain status code reports a tracked-file deletion.
+
+    ``D`` in either column (`` D``, ``D ``, ``DD``) is the one working-tree
+    shape the role-scoped main-checkout verdict retains
+    (WL-0MWR1OXHX001KJC6), keeping the 2026-10-26 ``packages/shared`` wipe
+    class verdict-bearing.
+    """
+    return TRACKED_DELETION_STATUS_MARKER in status_code
+
+
+def _role_scope_main_checkout_diff(
+    diff: dict[str, Any], role: str
+) -> dict[str, Any]:
+    """Narrow the main checkout's working-tree verdict to the deletion class.
+
+    Applied only to the :data:`MAIN_CHECKOUT_ROLE` entry of a
+    :func:`diff_guarded_roots` result, where the role is known. A newly dirty
+    path (``status.added``) or a still-dirty path whose code changed
+    (``status.changed``) is verdict-bearing only when its **end** status code
+    reports a tracked-file deletion (:func:`_reports_tracked_deletion`); every
+    other shape — `` M``, ``M ``, ``MM``, ``??``, staged additions and
+    deletion-free code transitions — moves to ``excluded.status.narrowed`` and
+    is rendered informationally by :func:`excluded_churn_notes`. Refs and
+    config are untouched, so they stay fully verdict-bearing, and resolved
+    pre-existing dirt (``excluded.status.removed``) is unaffected. The verdict
+    is recomputed from the retained categories; the guarded root and every
+    non-main role pass through unchanged.
+    """
+    if role != MAIN_CHECKOUT_ROLE:
+        return diff
+    status = diff.get("status", {})
+    added = status.get("added", {})
+    changed = status.get("changed", {})
+    retained_added = {
+        path: code for path, code in added.items() if _reports_tracked_deletion(code)
+    }
+    retained_changed = {
+        path: (old, new)
+        for path, (old, new) in changed.items()
+        if _reports_tracked_deletion(new)
+    }
+    narrowed = {
+        path: code for path, code in added.items() if not _reports_tracked_deletion(code)
+    }
+    # Report the *end* code of a narrowed transition: that is the state the
+    # checkout settled into, mirroring the ``added`` note shape.
+    narrowed.update(
+        {
+            path: new
+            for path, (_old, new) in changed.items()
+            if not _reports_tracked_deletion(new)
+        }
+    )
+    if not narrowed:
+        return diff
+    diff["status"] = {"added": retained_added, "changed": retained_changed}
+    excluded = diff.setdefault("excluded", {})
+    excluded_status = excluded.setdefault("status", {})
+    merged = dict(excluded_status.get("narrowed", {}))
+    merged.update(narrowed)
+    excluded_status["narrowed"] = merged
+    refs = diff.get("refs", {})
+    config = diff.get("config", {})
+    diff["changed"] = bool(
+        retained_added
+        or retained_changed
+        or refs.get("added")
+        or refs.get("removed")
+        or refs.get("moved")
+        or config.get("added")
+        or config.get("removed")
+        or config.get("changed")
+    )
+    return diff
+
+
 def diff_guarded_roots(
     before: dict[str, Any],
     after: dict[str, Any],
@@ -892,6 +998,13 @@ def diff_guarded_roots(
     never fail the run) is treated as unchanged. Each root's ``diff`` carries
     its own attribution, so pass the whole result to
     :func:`excluded_churn_notes` to render the informational note (AC3).
+
+    The main checkout's working-tree verdict is **role-scoped** here (the only
+    place that knows each root's ``role``), through
+    :func:`_role_scope_main_checkout_diff`: a clean→dirty main-checkout path is
+    verdict-bearing only for the tracked-file deletion class, so a sibling
+    session's mid-run `` M``/``??``/``M `` write cannot fail an unrelated, clean
+    child (WL-0MWR1OXHX001KJC6). The guarded root keeps full sensitivity.
     """
     roots: list[dict[str, Any]] = []
     before_roots = before.get("roots", ())
@@ -899,6 +1012,7 @@ def diff_guarded_roots(
     changed = False
     for before_entry, after_entry in zip(before_roots, after_roots):
         diff = diff_snapshots(before_entry["snapshot"], after_entry["snapshot"])
+        diff = _role_scope_main_checkout_diff(diff, before_entry.get("role", ""))
         changed = changed or diff["changed"]
         roots.append(
             {
@@ -1109,7 +1223,11 @@ def diff_snapshots(
     verdict ignores: attributed working-tree resolutions (``status.removed``)
     and movement of a *noted* concurrency-excluded ref namespace
     (``refs``, SA-0MVV2W9610002CLW) — both rendered by
-    :func:`excluded_churn_notes`, never dropped silently.
+    :func:`excluded_churn_notes`, never dropped silently. A further
+    ``status.narrowed`` bucket is added by :func:`diff_guarded_roots` for the
+    shared main checkout's non-deletion churn (WL-0MWR1OXHX001KJC6); this
+    helper never populates it, so a bare :func:`diff_snapshots` call keeps the
+    full clean→dirty sensitivity.
     """
     if not before.get("git", True) or not after.get("git", True):
         return {
@@ -1222,15 +1340,21 @@ def diff_snapshots(
 
 
 def excluded_working_tree_churn(diff: dict[str, Any]) -> dict[str, str]:
-    """``path -> status code`` of working-tree differences excluded by attribution.
+    """``path -> status code`` of working-tree differences the verdict excludes.
 
-    These entries were non-clean at snapshot start and clean at snapshot end,
-    so the path was resolved during the run — concurrent churn that must not
-    fail the run (SA-0MUIJAHXS003M7BG AC1). They never appear in
-    ``diff["status"]`` and therefore never set ``diff["changed"]``, but they
-    are never silent either: :func:`excluded_churn_notes` renders them (AC3).
+    Two disjoint buckets are merged: ``removed`` entries were non-clean at
+    snapshot start and clean at snapshot end, so the path was resolved during
+    the run — concurrent churn that must not fail the run
+    (SA-0MUIJAHXS003M7BG AC1); ``narrowed`` entries are the shared main
+    checkout's non-deletion clean→dirty shapes, moved out of the verdict by the
+    role-scoped rule (WL-0MWR1OXHX001KJC6). Neither appears in
+    ``diff["status"]`` or sets ``diff["changed"]``, but they are never silent
+    either: :func:`excluded_churn_notes` renders them (AC3).
     """
-    return dict(diff.get("excluded", {}).get("status", {}).get("removed", {}))
+    excluded_status = diff.get("excluded", {}).get("status", {})
+    churn = dict(excluded_status.get("removed", {}))
+    churn.update(excluded_status.get("narrowed", {}))
+    return churn
 
 
 def excluded_ref_churn(diff: dict[str, Any]) -> dict[str, dict[str, Any]]:

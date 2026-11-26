@@ -40,9 +40,12 @@ output.
 
 `format_report()` (the script's own markdown output, written to
 `standups/YYYY_MM_DD.md`) is the deterministic fallback for scheduled,
-non-agent runs: the same five sections, one impact-first line per item. Use it
-when no agent is available to cluster and render; prefer the agent-rendered
-grouped narrative everywhere else.
+non-agent runs: the same five sections, one impact-first line per item, using
+the same **time-neutral headings** as the agent-rendered report — "Since the
+last report, I completed…" and "Key upcoming work includes…" — so the fallback
+is not a second, older-sounding voice. Use it when no agent is available to
+cluster and render; prefer the agent-rendered grouped narrative everywhere
+else.
 
 ## Usage
 

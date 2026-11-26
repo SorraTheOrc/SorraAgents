@@ -245,6 +245,18 @@ def _mocked_phase_finish(tmp_path: Path):
             )
         )
         stack.enter_context(patch.object(implement, "_surface_postfix_prose"))
+        # The main-checkout lock is shared by every finish-gate harness here:
+        # they all pin ``repo_root`` to ``/tmp/repo-root``, so two concurrent
+        # files contend on the same lock and the loser never reaches its
+        # assertions (SA-0MWS8ICOC001DZX1). Stub the boundary exactly as
+        # ``test_finish_interruption_recovery.py`` does; the lock's own
+        # behaviour is covered by ``test_finish_main_checkout_lock.py``.
+        stack.enter_context(
+            patch.object(
+                implement, "acquire_main_checkout_lock", return_value=(999, None)
+            )
+        )
+        stack.enter_context(patch.object(implement, "_release_main_checkout_lock"))
         stack.enter_context(
             patch.object(implement.StatusLifecycle, "update_status", update_status)
         )
@@ -279,6 +291,29 @@ def _run_finish(tmp_path: Path, *, json_output: bool, keep_worktree: bool = True
             keep_worktree=keep_worktree,
         )
     return report, mocks
+
+
+# ---------------------------------------------------------------------------
+# Lock isolation — a concurrent finish on the shared lock cannot turn this
+# harness red (SA-0MWS8ICOC001DZX1)
+# ---------------------------------------------------------------------------
+
+
+def test_finish_ignores_a_held_main_checkout_lock(tmp_path, held_main_checkout_lock):
+    """A genuinely held main-checkout lock is invisible to this harness.
+
+    This harness pins ``repo_root`` to the same ``/tmp/repo-root`` as the
+    other finish-gate harnesses, so a concurrent plain-leaf finish contended
+    on one lock file and the loser never reached its assertions
+    (SA-0MWS8ICOC001DZX1). The lock boundary is stubbed here (its behaviour
+    stays covered by ``test_finish_main_checkout_lock.py``), so the default
+    removal path still completes while the lock is genuinely held.
+    """
+    report, mocks = _run_finish(tmp_path, json_output=True, keep_worktree=False)
+
+    assert report["success"] is True, report["message"]
+    assert report["steps"]["main_checkout_lock"]["acquired"] is True
+    assert mocks["removal"].call_count == 1, "the asserted removal path must run"
 
 
 # ---------------------------------------------------------------------------

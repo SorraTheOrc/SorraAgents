@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.2.0 (2026-11-26)
+> **Release focus:** This release focuses on making the development workflow more reliable and trustworthy, with fixes that prevent flaky test failures, lock conflicts, and false audit verdicts under heavy load or concurrent sessions. It also improves release automation and reporting, including automatic versioning with approval, clearer timeout diagnostics, and standup summaries presented as short themed stories.
+### Features
+- Your daily standup is now a short, readable story grouped by theme, with one sentence per change and no IDs. (SA-0MW6ER1NX0094QCG)
+- Releases now get the right version number automatically, with your approval before any big bump. (SA-0MW978ONE008WMIB)
+- Release timeouts now tell you whether the suite or a busy machine caused the abort, so green builds aren't failed by host load. (SA-0MWEURUYL004I470)
+- Routine questions no longer stall prep work waiting on producer review. (SA-0MWUNYMLS003B52S)
+- A new weekly linter keeps agent skills lean and duplicate-free, with every change reviewed before it's applied. (SA-0MWFP1E9P0027EOE)
+- Audits now reuse proven test results instantly, so re-checks finish in seconds instead of rerunning the full suite. (SA-0MVEJI9US0070GDV)
+- Scheduled standup reports now use the same time-neutral wording as agent reports. (SA-0MWNMRCYY0050LEP)
+### Bug Fixes
+- Long syncs can no longer lose their lock, so concurrent updates are never overwritten. (SA-0MVL7YG2S009L6PU)
+- Concurrent finishes no longer fail the lock-ordering tests on busy machines. (SA-0MWS9JTRN00483DM)
+- Finish-gate test results are now reliable even when another session is running. (SA-0MWS8ICOC001DZX1)
+- Fixed a flaky test so full-suite runs no longer fail spuriously under heavy load. (SA-0MWRWM2ON008Z5YI)
+- Slot-wait reports no longer show fake 999s breaches, so pass/fail verdicts are trustworthy. (SA-0MWB872IG007ZC7Y)
+- Worklog sync now works reliably in sandboxed environments, so pushes won't fail unexpectedly. (SA-0MWULUV3M009QC5W)
+- Pushing dev after a release now works without manual workarounds. (SA-0MVZQVDUY0011DQD)
+- New tasks now start from the latest published code, so you won't hit avoidable errors or need manual fixes. (SA-0MWFFX49M0016KOK)
+- Audits no longer leave finished work looking unfinished when runs fail or are interrupted. (SA-0MW7Z77KI005MK0B)
+- Edits to TypeScript files now correctly select the affected tests, and fresh worktrees build shared code automatically. (SA-0MWHUUEQ20099624)
+- Changed-scope test runs now find local tools correctly, so a red result means real breakage. (SA-0MWWKLY8M009PD78)
+- Audits now build against the full project, so passing work is no longer wrongly blocked. (SA-0MW7Z6WRO00242Z3)
+- New worktrees with submodules now set up correctly on the first start, so builds work right away. (SA-0MVTOR53E003IIEQ)
+### Other
+- Keeps the game's codebase clean so updates stay stable and bug-free. (SA-0MW54FB49007Q7OT)
+- Merge gate failures now show why branch checks failed, making issues easier to diagnose. (SA-0MWD28TXD000ZO2F)
+- Cleared a false-positive code warning so it stops cluttering the audit queue. (SA-0MWB8W06O005FQHC)
+- Cleaned up leftover code warnings so future updates stay smooth and stable. (SA-0MWRQU7LC008HJBN)
+
 ## v0.1.29 (2026-11-21)
 > **Release focus:** This release focuses on improving the reliability and efficiency of agent sessions and automated testing, with fixes that prevent false failures, spurious review holds, and unnecessary retries while ensuring concurrent sessions and cross-repo audits complete correctly. It also enhances reporting with more natural standup prose and the option to turn standup reports into podcast episodes.
 ### Features

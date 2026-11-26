@@ -89,11 +89,12 @@ def test_base_is_local_dev_when_in_sync(tmp_path: Path):
     assert result["local_tip"] == base == result["remote_tip"], result
 
 
-def test_base_is_local_dev_when_behind_remote(tmp_path: Path):
-    """local ``dev`` behind ``origin/dev`` is stale-but-pushed: still safe.
+def test_base_forks_from_origin_when_behind_remote(tmp_path: Path):
+    """local ``dev`` behind ``origin/dev``: fork the published tip, not the stale local ref.
 
-    Every commit local ``dev`` holds is on the remote (an ancestor of the
-    fetched tip), so branching from it can never graft an unpushed commit.
+    A stale local base would leave the worktree behind published commits; the
+    published tip includes them, so AC3 (worktree already carries the fix)
+    holds without a manual rebase.
     """
     remote, main, _base = _repo_on_dev(tmp_path)
     # A sibling lands on origin/dev; local dev stays behind.
@@ -104,36 +105,37 @@ def test_base_is_local_dev_when_behind_remote(tmp_path: Path):
 
     result = implement._resolve_start_base(str(main), "dev")
 
-    assert result["method"] == "local_dev", result
-    assert result["base"] == "dev", result
+    assert result["method"] == "origin_fork", result
+    assert result["base"] == "refs/remotes/origin/dev", result
     assert result["reason"] == "behind_remote", result
+    assert result["behind"] >= 1, result
 
 
-def test_base_refuses_local_dev_with_unpushed_commits(tmp_path: Path):
-    """local ``dev`` ahead of ``origin/dev`` (an unpushed commit): REFUSE.
+def test_base_forks_from_origin_when_local_has_unpushed_commits(tmp_path: Path):
+    """local ``dev`` ahead of ``origin/dev``: fork the published tip (graft-safe).
 
     This is the exact finish-window shape: local ``dev`` carries a commit the
-    remote does not have. A worktree forked from it would graft that commit
-    onto the new branch. The helper never proposes a base.
+    remote does not have.  Forking from ``origin/dev`` never grafts that commit
+    onto the new branch, so the helper proposes the published tip and reports
+    the ahead/behind counts — the local ref is left untouched.
     """
-    remote, main, base = _repo_on_dev(tmp_path)
-    # Simulate a concurrent finish's write-then-restore window: local dev
-    # parked on an unpushed commit (WL-0MWFKDH78002T2CR).
+    remote, main, _base = _repo_on_dev(tmp_path)
     _commit(main, "foreign.txt", "f\n", "foreign unpushed commit")
-    assert _rev(main, "dev") != _rev(remote, "dev")
+    local_before = _rev(main, "dev")
+    assert local_before != _rev(remote, "dev")
 
     result = implement._resolve_start_base(str(main), "dev")
 
-    assert result["method"] == "refused", result
-    assert result["base"] is None, result
-    assert result["reason"] == "local_dev_not_a_pushed_tip", result
-    assert result["local_tip"] in result["warning"], result
-    assert result["remote_tip"] in result["warning"], result
+    assert result["method"] == "origin_fork", result
+    assert result["base"] == "refs/remotes/origin/dev", result
+    assert result["reason"] == "ahead_only", result
+    assert result["ahead"] >= 1, result
+    assert _rev(main, "dev") == local_before  # never force-updated
 
 
-def test_base_refuses_a_diverged_local_dev(tmp_path: Path):
-    """local ``dev`` diverged from ``origin/dev`` (rewritten/pushed-at): REFUSE."""
-    remote, main, _base = _repo_on_dev(tmp_path)
+def test_base_forks_from_origin_when_diverged(tmp_path: Path):
+    """local ``dev`` diverged from ``origin/dev``: fork the published tip."""
+    _remote, main, _base = _repo_on_dev(tmp_path)
     # Sibling lands on origin/dev, then our local dev is rewritten onto the
     # pre-sibling commit with a different history: diverged, not ahead/behind.
     _commit(main, "sibling.txt", "s\n", "sibling")
@@ -146,8 +148,9 @@ def test_base_refuses_a_diverged_local_dev(tmp_path: Path):
 
     result = implement._resolve_start_base(str(main), "dev")
 
-    assert result["method"] == "refused", result
-    assert result["reason"] == "local_dev_not_a_pushed_tip", result
+    assert result["method"] == "origin_fork", result
+    assert result["base"] == "refs/remotes/origin/dev", result
+    assert result["reason"] == "diverged", result
 
 
 def test_base_fails_open_when_the_fetch_fails(tmp_path: Path, monkeypatch):
@@ -312,24 +315,31 @@ _WORK_ITEM = {
 }
 
 
-def test_phase_start_refuses_a_worktree_from_unpushed_local_dev(tmp_path: Path):
-    """A mid-window local ``dev`` aborts the whole start (AC3/AC4).
+def test_phase_start_forks_from_origin_when_local_dev_has_unpushed_commits(
+    tmp_path: Path,
+):
+    """Local ``dev`` parked on an unpushed commit: fork ``origin/dev`` (never refuse).
 
-    Simulate the exact race of WL-0MWFKDH78002T2CR: local ``dev`` parked on a
-    commit ``origin/dev`` does not have. ``phase_start`` must refuse — no
-    worktree is created (the foreign commit can never become a branch base),
-    the item is released to ``open`` and a loud comment is posted.
+    Reproduces the WL-0MWFKDH78002T2CR finish-window shape, but the approved
+    policy is to fork the published tip rather than refuse: the worktree is
+    created from ``refs/remotes/origin/dev`` so the foreign commit can never
+    become the branch base, the item stays claimed, and the recorded base ref
+    names the published tip.
     """
-    remote, main, _base = _repo_on_dev(tmp_path)
+    _remote, main, _base = _repo_on_dev(tmp_path)
     _commit(main, "foreign.txt", "f\n", "unpushed foreign commit")
+    origin_tip = _rev(main, "origin/dev")
 
-    # The worktree path phase_start would create for this run.
-    wt_path = main / ".worklog" / "worktrees" / "wl-WL-TESTBASE-base-resolution"
     created: list[tuple] = []
     comments: list[str] = []
 
     def recording_worktree_add(branch, path, base):
         created.append((branch, Path(path), base))
+        gs.run_git(
+            main,
+            ["worktree", "add", "--track", "-b", branch, str(path), base],
+            check=True,
+        )
         return True
 
     def recording_add_comment(_work_item_id, comment, *args, **kwargs):
@@ -341,37 +351,34 @@ def test_phase_start_refuses_a_worktree_from_unpushed_local_dev(tmp_path: Path):
     ) as mocks, patch.object(
         implement, "git_worktree_add", side_effect=recording_worktree_add
     ):
-        # The harness mocks the comment writer; capture what it was handed so
-        # the "loud comment is posted" half of the refusal stays observable
-        # instead of being asserted against an always-empty list.
         mocks["wl_add_comment"].side_effect = recording_add_comment
         report = implement.phase_start(
             "WL-TESTBASE", json_output=True, no_refactor=True
         )
 
-    assert report["success"] is False, report
-    assert report.get("worktree_refused") is True, report
-    assert created == [], (
-        "no worktree may be created from an unpushed local dev; "
-        f"recorded worktree adds: {created}"
-    )
-    assert not wt_path.exists()
-    assert "not a known pushed tip" in report["message"], report["message"]
-    assert (
-        report["steps"]["worktree_base"]["reason"]
-        == "local_dev_not_a_pushed_tip"
-    ), report["steps"]["worktree_base"]
+    assert report["success"] is True, report
+    assert not report.get("worktree_refused"), report
+    assert len(created) == 1, created
+    branch, wt_path, base_ref = created[0]
+    assert base_ref == "refs/remotes/origin/dev", base_ref
+    assert report["steps"]["worktree_base"]["ref"] == "refs/remotes/origin/dev"
+    # The new branch is based on the published tip, never the foreign commit.
+    assert _rev(main, f"refs/heads/{branch}") == origin_tip
+    assert _rev(wt_path) == origin_tip
 
-    # The claim is released to open — never left in_progress behind the
-    # refusal, so the item stays dispatchable.
+    # A successful origin-fork start keeps the claim — it is not released.
     open_calls = [
-        c for c in mocks["update_status"].call_args_list if c.args[1] == "open"
+        c
+        for c in mocks["update_status"].call_args_list
+        if len(c.args) > 1 and c.args[1] == "open"
     ]
-    assert open_calls, (
-        "the refused start must release the claim to open; "
+    assert not open_calls, (
+        "a successful origin-fork start must not release the claim; "
         f"status updates: {mocks['update_status'].call_args_list}"
     )
-    assert any("not a known pushed tip" in c for c in comments), comments
+    assert any("refs/remotes/origin/dev" in c for c in comments), comments
+    # Clean up the real worktree created by this test.
+    gs.run_git(main, ["worktree", "remove", "--force", str(wt_path)], check=True)
 
 
 def test_phase_start_bases_a_worktree_on_the_pushed_tip(tmp_path: Path):
@@ -380,7 +387,7 @@ def test_phase_start_bases_a_worktree_on_the_pushed_tip(tmp_path: Path):
     AC4 positive companion: with ``dev`` == ``origin/dev``, the created
     branch's base is exactly the pushed tip — never a foreign commit.
     """
-    remote, main, base = _repo_on_dev(tmp_path)
+    _remote, main, base = _repo_on_dev(tmp_path)
 
     created: list[tuple] = []
 

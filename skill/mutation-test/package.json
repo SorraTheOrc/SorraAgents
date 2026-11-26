@@ -1,0 +1,16 @@
+{
+  "name": "pi-mutation-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned Stryker Mutator toolchain for the SorraAgents mutation-test skill (read-only against the analysed project).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "stryker": "node_modules/@stryker-mutator/core/bin/stryker.js"
+  },
+  "dependencies": {
+    "@stryker-mutator/api": "10.1.1",
+    "@stryker-mutator/core": "10.1.1",
+    "@stryker-mutator/vitest-runner": "10.1.1"
+  }
+}

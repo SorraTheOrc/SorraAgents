@@ -56,7 +56,19 @@ node $(skill_path ship)/scripts/run-release.js --help
 
 # Pre-flight only: refresh in_review audits, then exit (no merge, no Code Freeze)
 node $(skill_path ship)/scripts/run-release.js --refresh-audits
+
+# Operator override: apply an explicit bump, skipping the bump evaluation
+node $(skill_path ship)/scripts/run-release.js --bump minor
 ```
+
+### `--bump` and the version bump evaluation
+
+`--bump patch|minor|major` keeps its original meaning and **precedence**: an
+explicit `--bump` is an operator override, so the agent skips the [version bump
+evaluation](#version-bump-evaluation) and forwards the flag unchanged to
+`release/merge-dev-to-main.sh` (whose own default remains `patch`). Without an
+explicit flag the agent evaluates the release and chooses the bump — patch
+automatically, minor/major only after producer approval in the session.
 
 ### Fail-fast argument handling
 
@@ -117,6 +129,91 @@ makeBranchName('SA-001', 'fix-login-bug');     // → 'wl-SA-001-fix-login-bug'
 validateBranchName('wl-SA-001-fix-login-bug'); // → { valid: true }
 isBranchBlocked('main');                       // → true
 ```
+
+## Version bump evaluation
+
+**Agent step 0 — runs before any gate and before any git mutation.** Judge the
+release's importance from the items being shipped and choose exactly one bump:
+`patch`, `minor` or `major`. A `patch` proceeds automatically; a `minor` or
+`major` is applied only after the producer approves it **in this PI session**.
+
+### Gather the evidence (read-only)
+
+```bash
+node $(skill_path ship)/scripts/release/bump-preflight.js
+node $(skill_path ship)/scripts/release/bump-preflight.js --json   # structured
+```
+
+The preflight lists every release candidate (`stage: in_review`) with its id,
+title, type, priority, `## Impact` (or user story) and a short description
+excerpt, plus the current version and the exact `patch`/`minor`/`major`
+outcomes. It gathers and renders only — no judgement, no mutation. An empty or
+unreadable candidate set reports `patch` with a warning and never blocks a
+release.
+
+### Judge the release (content-based rubric)
+
+Judge from the items' **content** — the `## Impact`, user story and description
+— and never from `issueType`, a label or a mechanical classifier:
+
+| Bump | When the release… | Typical evidence |
+| --- | --- | --- |
+| `patch` | only fixes, documents or maintains existing behaviour | bug fixes, docs, refactors, dependency/tooling chores |
+| `minor` | adds meaningful new capability without breaking existing behaviour | a new user-facing feature, command, flag, API or workflow step |
+| `major` | breaks, removes or incompatibly changes existing capability | removed/renamed command or flag, changed default behaviour, breaking API or file-format change |
+
+A `minor` needs at least one item whose Impact describes capability a user can
+newly do or see. A `major` needs evidence that existing users' behaviour or
+workflow changes incompatibly. When genuinely torn between patch and minor,
+propose minor: the producer can decline, whereas an under-claimed patch bump
+silently misrepresents the release.
+
+### Patch: auto-proceed
+
+No producer interaction. Run the release normally — `--bump patch` is the
+default of both `run-release.js` and `merge-dev-to-main.sh`.
+
+### Minor/major: ask the producer in the session
+
+Print the full justification before asking:
+
+- every contributing item's id and title, and why it warrants the bump;
+- the proposed `old → new` version (e.g. `0.1.29 → 0.2.0`);
+- the evidence used (the Impact/user-story text behind the call).
+
+Then **ask the producer in this session** and wait. Until the answer is
+received, apply **no** git mutation: no merge, no tag, no PR, no worklog close
+and no `run-release.js` invocation.
+
+- **Approved** → run the release with the approved bump:
+  `node $(skill_path ship)/scripts/run-release.js --bump <approved>`.
+- **Declined** → do not apply it. Record the decision and the producer's
+  preferred bump (usually `patch`) in the session output and in a
+  `wl comment add` on the release's work item (when one exists), then release
+  with the preferred bump.
+- **No producer available (headless / automated dispatch)** → never
+  self-approve. Record the justification, set `needsProducerReview` on the
+  release's work item (or comment and stop when there is no release item) and
+  **stop** without any git mutation.
+
+The pure rules (`shouldAskProducer`, `buildJustification`, `resolveApproval`)
+live in `$(skill_path ship)/scripts/release/bump-decision.js`, so the
+auto-proceed vs approval-pending decision is code rather than prose.
+
+### Record the decision
+
+Record the proposed bump, its justification and the producer's decision in the
+session output and — for an item-linked release — in a `wl comment add`
+comment, so the version choice stays auditable.
+
+### Overrides and interactions
+
+- An explicit `--bump <type>` is an operator **override**: it keeps its current
+  meaning and precedence and skips the evaluation entirely.
+- `--skip-checks` bypasses the branch/critical gates only; it does **not**
+  bypass the evaluation or the approval gate for a non-patch bump.
+- `--refresh-audits` refreshes audits and exits without merging — no bump is
+  evaluated or applied.
 
 ## Gating
 
@@ -181,6 +278,14 @@ tag and the origin/ancestor checks must hold before any item is closed
 ```bash
 node $(skill_path ship)/scripts/run-release.js
 ```
+
+**Agent step, before the script runs — version bump evaluation.** After any
+`--refresh-audits` pre-flight and *before* invoking the release script, the
+agent runs the read-only preflight (`release/bump-preflight.js`), judges the
+release from the shipped items' content and settles the bump: `patch` proceeds
+automatically, `minor`/`major` need the producer's in-session approval (see
+[Version bump evaluation](#version-bump-evaluation)). An explicit `--bump`
+overrides it. No git mutation happens before the choice is settled.
 
 0. **Locate the release script (fail-fast, SA-0MUIVIJFT0009ZNV)** — resolves the canonical release script (skill-level or repository-level) **before** the gating checks and exits 2 immediately if absent; no git or live-`wl` gate commands run.
 1. **Unmerged branches check** — abort if branches pending; `--skip-checks` bypasses.

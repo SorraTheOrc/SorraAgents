@@ -5,6 +5,12 @@
 // The --bump flag is passed through to the canonical release script
 // (merge-dev-to-main.sh) and controls which part of the semver is
 // incremented before the merge. Default is 'patch'.
+//
+// The bump itself is decided by the ship skill's "Version bump evaluation"
+// step (SA-0MW978ONE008WMIB): the agent judges the release from the shipped
+// items, `patch` proceeds automatically and `minor`/`major` need the
+// producer's in-session approval. This wrapper echoes the bump it forwards
+// (`Version bump: <type> …`) as a log-only line and adds no side effect.
 
 import {
   existsSync, realpathSync, mkdirSync, writeFileSync, rmSync, readFileSync,
@@ -1817,6 +1823,21 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
     return finish(2);
   }
   stepTimers['Step 0: locate release script'].stop();
+
+  // Decided-bump logging (SA-0MW978ONE008WMIB). Log-only, and deliberately
+  // *after* the missing-script fail-fast: that path must stay completely inert
+  // (no stdout, no git/`wl` commands — tests/unit/test-run-release.mjs). The
+  // ship skill's "Version bump evaluation" step chooses the bump and passes it
+  // as `--bump`; this wrapper continues to forward the flag unchanged
+  // (`releaseScriptForwardArgs`) and adds no git, tag, PR or worklog side
+  // effect. Without an explicit flag the merge script's own `patch` default
+  // applies, which is what the line reports.
+  const bumpFlagIndex = args.indexOf('--bump');
+  const decidedBump = bumpFlagIndex >= 0 ? args[bumpFlagIndex + 1] : 'patch';
+  console.log(
+    `Version bump: ${decidedBump}`
+    + (bumpFlagIndex >= 0 ? ' (explicit --bump)' : ' (default — no --bump given)'),
+  );
 
   // ── Step 1: Check for unmerged branches (gating step) ──────────────────
   startStep('Step 1: unmerged branch check');

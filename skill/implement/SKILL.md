@@ -5,8 +5,8 @@ description: "Write tests, docs, and code for a Worklog item via a deterministic
 
 ## Purpose
 
-Deterministic, step-by-step workflow for completing a Worklog work item
-through code, tests, and docs.
+Deterministic workflow for completing a Worklog work item through code,
+tests and docs.
 
 ## Inputs
 
@@ -47,46 +47,39 @@ sensitive values.
 ## StatusLifecycle Integration
 
 All status transitions go through the shared `StatusLifecycle` context manager
-([../shared/status_lifecycle.py](../shared/status_lifecycle.py)) — never
-ad-hoc status writes (`wl update --status`): always `StatusLifecycle`.
-`implement.py` uses it automatically (`phase_start` claims `in_progress`,
-`phase_finish` lands `completed`/`in_review`, `phase_abort` resets to `open`);
-manual: `StatusLifecycle.update_status(id, status, stage=…)`.
+([../shared/status_lifecycle.py](../shared/status_lifecycle.py)); never ad-hoc
+`wl update --status` (StatusLifecycle is the only path). `implement.py`
+uses it automatically (`phase_start` claims `in_progress`, `phase_finish` lands
+`completed`/`in_review`, `phase_abort` resets to `open`); manual:
+`StatusLifecycle.update_status(id, status, stage=…)`.
 
-- **Actively worked ⇒ `in_progress`** — guard with
-  `StatusLifecycle.require_claimed(<id>)`, resume with `ensure_claimed(<id>)`.
-- **Assignee release on every terminal outcome** — `finish` clears it with the
-  `completed`/`in_review` transition; every abort reset to `open` passes
-  `assignee=""`
-  ([assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)).
-- **Terminal status on both finish paths** — both persist it, then read back
-  and fail loudly if lost (`tests/test_finish_no_diff_status.py`).
+- **Actively worked ⇒ `in_progress`** — `require_claimed` / `ensure_claimed`.
+- **Assignee release on every terminal outcome** — `finish` clears it; every
+  abort reset to `open` passes `assignee=""`
+  ([invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant)).
+- **Terminal status on both finish paths** — persisted, read back, loud on loss
+  (`tests/test_finish_no_diff_status.py`).
 
 Deep detail:
 [reference — StatusLifecycle](../../docs/dev/implement-skill-reference.md#relocated-statuslifecycle-integration).
 
 ## No-op finish: refusal by default, `--verification-only` opt-in
 
-`finish` refuses a worktree with no commit **attributable to the item**: no
-push, no terminal write, no completion comment, `success: false` with
-`steps.commit.reason = "no_commit_no_signal"`, item released to `open`; the
-ambient `dev` HEAD is never named as this item's commit.
+`finish` refuses a worktree with no commit **attributable to the item**
+(`success: false`, `steps.commit.reason = "no_commit_no_signal"`): no push,
+terminal write or completion comment, and the item is released to `open`.
 
-- **Interrupted-push re-run.** A finish interrupted during its push leaves a
-  clean worktree whose commit already exists; re-running `finish` attributes
-  that **prior-run commit** (ahead of `origin/<parent_branch>`, message
-  references the item) and finalises normally. A genuinely work-less worktree
-  is still refused.
-- **Produce work (default).** A clean, commit-less worktree is unfinished work:
-  re-enter it, produce what the acceptance criteria require, re-run `finish`.
-- **Verification-only (opt-in).** `start <id> --verification-only` records the
+- **Interrupted-push re-run:** a clean worktree whose committing push was
+  interrupted is finalised by attributing that prior-run commit; a genuinely
+  work-less tree is still refused.
+- **Produce work (default):** a commit-less worktree is unfinished — re-enter
+  it and produce the work the ACs require, then re-run `finish`.
+- **Verification-only (opt-in):** `start <id> --verification-only` records the
   signal in `.implement_state.json`; `finish <id> --verification-only` supplies
-  it directly. Either pushes a no-op, writes the terminal status and reports
-  "no changes / no commit".
+  it, pushing a no-op and reporting "no changes".
 
-`drive`/`phase_parent` report a work-less (`no-work`) child
-`action: "not-finalisable"` — no `finish`, parent not advanced — while a
-`verification-only` opt-in keeps it finalisable. Deep detail:
+`drive`/`phase_parent` mark a `no-work` (or opt-in `verification-only`) child
+`not-finalisable` — no `finish`, parent not advanced. Deep detail:
 [reference — no-commit finalisation](../../docs/dev/implement-skill-reference.md#no-commit-finalisation-refusal-by-default---verification-only-opt-in).
 
 ## Project-local extensions
@@ -181,6 +174,12 @@ stash without explicit permission. `scripts/hygiene_check.sh` runs the same
 check periodically. Recovery playbook:
 [reference — dirty main-checkout recovery](../../docs/dev/implement-skill-reference.md#relocated-dirty-main-checkout-recovery-playbook).
 
+That run also reports **stale worktree debris** (trees outside
+`.worklog/worktrees/`, or owned by a terminal item) with the operator-only
+remedy `git worktree remove <path> && git worktree prune`. It is a notice,
+never an exit-code change: [rationale + placement-guard
+rule](../../docs/dev/worktree-isolation.md#stale-worktree-debris-the-prune-remedy).
+
 4. Understand the work item
 
 Fetch `wl show <work-item-id> --json`; read `description`, acceptance criteria
@@ -233,16 +232,17 @@ git worktree add --track -b wl-<WIP-id>-<short-slug> .worklog/worktrees/wl-<WIP-
 cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 ```
 
-> **`node_modules` is a worktree-local link farm:** `implement.py start`
-> materialises it as per-package symlinks (nested and workspace packages
-> resolve to the worktree itself; supersedes the whole-directory symlink,
-> SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** —
-> writes corrupt the shared install. Deep detail:
-> [reference — worktree creation](../../docs/dev/implement-skill-reference.md#relocated-step-5--create-a-worktree-from-dev-and-branch-inside-it).
-
-> **Git submodules are auto-initialised:** `implement.py start` runs
-> `git submodule update --init --recursive`. Failures produce a **WARNING**
-> but do not abort (best-effort); repos without `.gitmodules` are unaffected.
+> **`node_modules` is a worktree-local link farm:** `start` materialises
+> per-package and nested symlinks (supersedes whole-directory symlink,
+> SA-0MSGS763C006SM1B). **Do NOT run `npm install` inside a worktree** — it
+> corrupts the shared install. Submodules initialise before `node_modules`
+> (SA-0MVTOR53E003IIEQ; failures **WARNING**). Ref:
+> [reference](../../docs/dev/implement-skill-reference.md#relocated-step-5--create-a-worktree-from-dev-and-branch-inside-it).
+>
+> **Shared package built at start:** missing/stale `packages/shared/dist`
+> builds (no-op without it); failure is one `npm run build:shared` message
+> (SA-0MWHUVJFO009R9EC, WL-0MW3EDP6D002U6V4; helper shared with
+> WL-0MW8G1X3V007CGAE). See ContextHub `docs/dev/wl-shared-dist-diagnostic.md`.
 
 `implement.py start` handles the rest (idempotent resume, stale-resolution
 gate).
@@ -299,8 +299,8 @@ not the short-lived `start` subprocess, holds the child's per-child lock for
 the session's whole lifetime (`IMPLEMENT_CHILD_LOCK_TOKEN` re-entry, released
 on every spawner outcome); a killed driver is the residual window
 ([reference](../../docs/dev/implement-skill-reference.md#per-child-implementation-lock-sa-0mvq7vmrl00498yb)).
-`--infra-retry-limit N` (5; 2 s doubling to a 30 s cap) bounds finish
-retries. **Manual fallback:**
+`--infra-retry-limit N` (5; 2 s doubling to a 30 s cap) bounds finish and
+spawn retries. **Manual fallback:**
 `python3 $(skill_path implement)/scripts/implement.py parent <parent-id>` —
 no children = leaf; all-terminal children advance the parent to
 `completed`/`in_review`; otherwise `phase_parent` finishes children whose
@@ -347,7 +347,6 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   proceeds when released. Run it **once** — never in a `for attempt …;
   finish; wait_for_job.py` retry loop.
 
-  **Retry taxonomy (SA-0MW22SEMV00230O5):** § Bounded push loop.
 - Follow the mandatory **build → test → commit** order.
 - **Add the `## Impact` sentence before finishing.** A newly completed item's
   description must carry an `## Impact` section: one sentence describing the user-experience impact — not a technical summary.
@@ -361,9 +360,13 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   > worktree. Sync from the main checkout, then push with
   > `WORKLOG_SKIP_PRE_PUSH=1 git push origin HEAD:refs/heads/dev`.
 
-- **Post-push local parent branch sync:** `finish` fast-forwards the main
-  checkout's local `dev` to the pushed tip (safe-skip if dirty/diverged);
-  `start` refreshes it before `git worktree add`.
+- **Post-push parent sync / worktree base:** `finish` fast-forwards local
+  `dev` to the pushed tip; `start` refreshes it, then forks from
+  `refs/remotes/origin/<parent>` whenever the local parent is not that
+  published tip (behind/ahead/diverged) — never force-updating it — recording
+  `steps.worktree_base` (`method, ref, base, reason, skipped_local, ahead,
+  behind`) and naming the base + counts on the start/resume comment. A failed
+  fetch falls open to the local branch.
 - **Worktree removal ownership.** A plain leaf session removes its own tree
   with `implement.py cleanup <work-item-id>` as its **last** bash command; a
   driven child (`IMPLEMENT_DRIVE_ACTIVE=1`) — **do not remove your own
@@ -392,10 +395,6 @@ every abort/failure → `open` with `assignee=""`.
 
 No single orchestrator; use project-local build/test/linters
 ([reference](../../docs/dev/implement-skill-reference.md)).
-
-## Final cleanup (belt-and-suspenders)
-
-See [relocated detail](../../docs/dev/implement-skill-reference.md#relocated-final-cleanup-belt-and-suspenders).
 
 ## Final step: standardized end-of-session report
 

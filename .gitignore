@@ -30,6 +30,9 @@ scripts/tmux.windows.conf
 # Node / package artifacts
 node_modules
 package.json
+# The mutation-test skill pins its Stryker toolchain in a committed manifest +
+# lockfile (SA-0MV28WY5Q003N54O AC1/AC5); re-include only that manifest.
+!skill/mutation-test/package.json
 bun.lock
 .gitignore
 

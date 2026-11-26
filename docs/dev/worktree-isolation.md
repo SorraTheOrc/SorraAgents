@@ -370,7 +370,12 @@ session died before writing anything is exempt too: `phase_drive` records the
 failure in `<worktree>/.worklog/spawn-failure.json`, so the foreign dirt is
 pre-existing and unrelated and the child is reported startable again (the next
 `drive` re-spawns it) rather than failing the chain closed
-(SA-0MWGZ8NWP009QD8G). A **foreign
+(SA-0MWGZ8NWP009QD8G). The record is written on the budget-exhausted failure
+**and** immediately before an `infrastructure`-classified child is re-spawned
+on the retry budget, so the exemption applies from the moment of that
+classification: a transient provider failure never lets the re-run parent phase
+attribute a live sibling worktree's mid-flight work to the failed child
+(WL-0MWWBJJBD008TBPB). A **foreign
 repository checkout** — even one reachable by path — is never a sibling: only
 paths `git worktree list` registers for the child's own repository count
 (cross-checkout attribution). The ahead-count (rather than a HEAD comparison)
@@ -379,11 +384,64 @@ behind after unrelated commits landed on `dev` — on the "no work" side of the
 guard and on the "implement next" side of `phase_parent`
 (SA-0MVRN5Q67005H3M5).
 
+The guard only counts **live foreign surfaces**. A dirty sibling is evidence
+only when it could belong to a live session, so two classes are filtered out
+(`_is_live_foreign_surface`, WL-0MWQLHDOS006CAIH): a tree **outside** the
+repository's worktree root (`.worklog/worktrees/` — `/tmp` scratch trees,
+ad-hoc manual checks) when the child's own worktree lives inside that root,
+and a tree whose **owning work item is terminal** (`completed`, `in_review`,
+`done`, `deleted`), wherever it lives. Stale debris therefore never refuses a
+clean child again, while a child that really wrote into another **live** item's
+worktree still fails closed with the same message (the sibling root and its
+paths). Ownership is read from the worktree directory name (`wl-<ID>-<slug>`,
+`audit-exec-<ID>`) and resolved with one `wl show` per *dirty* sibling — the
+fast paths (the child's own worktree holds the work; no dirty siblings) never
+spawn one. Unresolvable ownership — an untagged directory name, `wl`
+unavailable, or an id that does not resolve — stays **fail-closed**, and every
+skipped surface is reported by one informational log line so an operator can
+see why a previously-blocking tree no longer blocks. Nothing is ever pruned
+here: the tree is still the operator's to remove (see
+[the prune remedy](#stale-worktree-debris-the-prune-remedy)).
+
 The finish-phase gate (`_worktree_placement_violation`) is cwd-sensitive and
 symmetric: when `finish` runs from a cwd that resolves into a registered
 sibling worktree, that sibling's changes are checked as its own write surface
 (own worktree with no work + dirty sibling ⇒ refusal naming both roots), with
-the main-checkout scan unchanged for every other cwd.
+the main-checkout scan unchanged for every other cwd — and the same live-surface
+filter applies, after the child's own worktree and the sibling's dirt have been
+checked.
+
+### Per-worktree expected-dirty declarations and submodule surfaces
+
+Every scanned surface is classified with **that worktree's own**
+`.pi/skills_extensions/implement/extension.json` → `ignoreDirtyPaths`
+declaration, not the root repository's list: `_child_main_checkout_violation`
+and the sibling branch of `_worktree_placement_violation` each call
+`expected_dirty_paths(<surface root>)`. A linked worktree is a checkout of the
+project, so a project's declaration therefore takes effect for the main
+checkout and for every sibling alike, and a sibling's declaration can never
+silently grant the main checkout an exemption (or vice versa). The
+declaration is **additive, never a blanket exemption**: a path that is not
+actually dirty is unaffected, and undeclared dirt in the same tree is still
+reported.
+
+A dirty **submodule** (gitlink) entry is classified by what changed *inside*
+it, not by its bare outer entry. `git status` reports a submodule as a single
+path (` M core`) and never names the inner change, so a path-prefix
+declaration could never match it. The guard therefore expands each dirty
+gitlink into its inner `git status` paths, maps them to outer-relative form
+(`core/node_modules`) and classifies those against the same declaration: a
+submodule whose only changes are expected-dirty paths (the worktree bootstrap's
+`core/node_modules` link farm) is **not** a change surface, while a genuine
+inner edit is still reported — by its inner path, not the bare submodule. A
+moved submodule pointer (the checked-out submodule HEAD differs from its index
+gitlink), an unreadable inner repository, or a clean inner tree with no
+explainable expected-dirty change stays **fail-closed** and is reported as the
+bare submodule path (RISE-0MWOIAXAG008HMK3 AC1/AC2).
+
+The declarations are pinned by
+`skill/implement/tests/test_drive_sibling_worktree_stray.py`
+(`TestPerWorktreeExpectedDirtyResolution`, `TestSubmoduleNoiseIsNotASurface`).
 
 ### Driven-child red-gate stop rule
 
@@ -397,6 +455,33 @@ instruction (`AGENTS_GLOBAL.md`, `skill/implement/SKILL.md`), and the extended
 placement guard above is its mechanical backstop — even a child that ignores
 the rule and starts the triaged item's implementation fails closed the moment
 it writes into the sibling worktree.
+
+### Stale worktree debris: the prune remedy
+
+A dirty sibling worktree is only counted as evidence when it could belong to a
+**live** session. Two classes of debris never block a clean child
+(WL-0MWQLHDOS006CAIH): a registered tree **outside** the repository's worktree
+root (`.worklog/worktrees/` — `/tmp` scratch trees, ad-hoc manual checks) and
+a tree whose **owning work item is terminal** (`completed`, `in_review`,
+`done`, `deleted`), wherever it lives. Unresolvable ownership — no work-item
+id in the directory name, or `wl show` unavailable — stays fail-closed, and the
+trees are never removed automatically.
+
+`scripts/hygiene_check.sh` reports both classes so the operator knows exactly
+what to remove, in text and in `--json`
+(`{"check":"debris_worktrees","status":"notice","outside_root":[…],"terminal_owner":[…],"remedy":…}`),
+and prints the remedy. The finding is a **notice**, not a warning: this check
+never raises the script's exit code, so every pre-existing check keeps its
+exit-code and warning semantics (a checkout may legitimately carry a registered
+tree outside the root, e.g. a manual experiment):
+
+```bash
+# Run from the main checkout; removal is an operator decision.
+git worktree remove <path> && git worktree prune
+```
+
+An owner that `wl show` cannot resolve is never guessed: such a tree is
+unreported here (fail-open) and keeps blocking the guard (fail-closed).
 
 ## The main checkout is a guarded surface
 

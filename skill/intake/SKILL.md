@@ -53,7 +53,8 @@ You are authoring a new Worklog work item for a feature or bug fix, following an
 - Do not create a work item for this intake process itself.
 - Follow the shared [interview conduct contract](../interview/SKILL.md) for
   all interview behaviour (question volume, multiple-choice preference,
-  explicit preferred option, producer-review handoff, Appendix recording).
+  explicit preferred option, routine-vs-genuine-handoff distinction, Appendix
+  recording).
 - All work-item descriptions and comments **must be written in Markdown**.
 - The goal is sufficient detail for a clear work item — not an exhaustive spec.
 - Do not include procedural next steps (e.g., "Proceed to planning") in the brief; progression is handled by stage transitions.
@@ -87,7 +88,7 @@ wording; cross-referenced here rather than restated).
 
 - **Before any other step**, claim the work item:
   ```bash
-  python3 $(skill_path intake)/scripts/intake.py start <work-item-id> --assignee Map
+  python3 $(skill_path intake)/scripts/intake.py start <work-item-id> --assignee Intake
   ```
   This must happen before any evaluation, context gathering, or preflight checks.
 
@@ -142,7 +143,7 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
 - If `<work-item-id>` was provided: review `issueType`; update if it doesn't match: `wl update <work-item-id> --issue-type <correct-type> --json`.
 - If no id was provided: extract a working title, infer the issue type (guide below), and create:
   ```bash
-  wl create --stage idea --status in_progress --title "<title>" --description "<seed-context>" --issue-type <type> --assignee Map --json
+  wl create --stage idea --status in_progress --title "<title>" --description "<seed-context>" --issue-type <type> --assignee Intake --json
   ```
   (Creation is not a status transition — the initial status is set at creation.) Remember the returned id.
 
@@ -178,8 +179,15 @@ If uncertain, fall back to the normal intake process (no auto-complete on border
 Follow the shared [interview conduct contract](../interview/SKILL.md) for all
 interview behaviour — question volume (≤ 3 high-signal questions per round),
 multiple-choice preferred with freeform allowed, the explicit preferred-option
-recommendation rule, the producer-review handoff via `wl reviewed`, and
+recommendation rule, the **routine-vs-genuine-handoff distinction**, and
 idempotent Appendix recording of questions/answers.
+
+**Producer-review handoff:** this skill defers to the shared contract's
+routine-vs-handoff rule. A **routine** question — one answerable by repo search
+or a documented reasonable assumption — is recorded in the Appendix and intake
+continues; it never sets the hold. Only a **genuine producer decision** calls
+`wl reviewed <work-item-id> true` and stops; `wl reviewed <work-item-id> false`
+releases the hold once the answer is recorded.
 
 **Intake-specific interview inputs:** Skip the interview when the seed context
 suffices to draft a clear brief. Otherwise use the interview to gather enough

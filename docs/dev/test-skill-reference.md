@@ -20,7 +20,9 @@ infrastructure, not agent-invoked ad-hoc runs, and are out of scope.
 
 The rule exists because only the test-skill runner populates the per-repo test
 cache (§0 Cached execution below; git state + 2h TTL) that the audit skill
-reads read-only via `query_cached()` to auto-verify execution-dependent ACs.
+reads read-only via `query_cached()` to auto-verify execution-dependent ACs
+(the audit reads GREEN entries with no practical time bound — see
+§0 Cached execution below).
 An ad-hoc run at the same git state is invisible to the cache and degrades
 audit verification to F3 auto-execution or an operator `--green-run HEAD`
 attestation.
@@ -100,6 +102,20 @@ hit the same entries because both resolve the same project root.
   audit runner whose PATH lacks the user-local bin directory). The path stays
   clean for callers that already have the directory configured (no duplicate
   entry).
+- **`node_modules/.bin` PATH augmentation for suite commands
+  (SA-0MWWKLY8M009PD78)**: every suite command `run_tests.py` spawns through
+  `_run_cmd` gets the checkout's absolute `<repo>/node_modules/.bin`
+  **prepended** to its child `PATH` (ahead of the `~/.local/bin`
+  normalisation above — npm's own ordering), when that directory exists. A
+  changed-scope run builds a direct `node_modules/.bin/vitest run <files>`
+  command; without the prepend a test that shells out to a local bin (`tsx`
+  etc.) failed with `sh: tsx: not found`, even though the same test passed
+  under `npm test` (which puts the directory on `PATH`). The prepend is
+  **existence-gated** (a pytest-only repo, or a checkout without installed
+  deps — the SorraAgents checkout itself — is a graceful no-op) and
+  **deduped** (an entry a launcher already put on `PATH` is moved, not
+  repeated). It is **env-only**: command strings and therefore per-repo cache
+  keys are byte-identical.
 
 #### Cache fingerprint contract (SA-0MVQHVHXI007PQAB, SA-0MVQHVKUH009VQMD)
 
@@ -362,10 +378,13 @@ Agents that only need summary information (e.g. release verification,
 read-only audits) should use `--summary` instead of re-running the suite.
 
 The **audit skill** consumes the cache directly (read-only, via
-`query_cached()`): when the full suite was run green at the audited git state
-within the TTL, the audit runner automatically verifies execution-dependent
-acceptance criteria (e.g. "full project test suite passes") without any
-operator attestation or re-execution (SA-0MSIU5HFI0024D7W). Suite commands
+`query_cached()`): when the full suite was run green at the audited git state,
+the audit runner automatically verifies execution-dependent acceptance
+criteria (e.g. "full project test suite passes") without any operator
+attestation or re-execution (SA-0MSIU5HFI0024D7W). For GREEN entries the audit
+accepts evidence at a matching git state with no practical time bound — the
+generic 2h TTL is not applied to the audit's read (SA-0MVEJI9US); non-zero-exit
+entries still expire after the short 5-minute failed-run TTL. Suite commands
 only cover node suite dirs that actually exist in the target repo
 (`tests/node`, `tests/cli`, `tests/unit` — missing dirs are skipped,
 SA-0MSJELL44009XYIL), so a repo whose layout diverges from that set can still
@@ -778,7 +797,12 @@ another log, a `python3` probe, a `cat` of the runner source) that reproduce
 is trusted only when its assistant `toolCall` command is a slot consumer
 (`run_tests.py`, `implement.py`, `git push`, `wait_for_job.py`); results with no
 resolvable command are kept only when the text carries a structural run marker.
-This is what stops a log-tail from inventing a > 120 s sample.
+Only a `bash` result (or one with no `toolName` field, as in older/forked logs)
+is eligible at all: a result produced by a non-bash tool — reading a fixture or
+source file, an `edit`, a `grep` — is never a run, however much run_tests.py
+structure its text echoes. This is what stops a log-tail *and* a `read` of this
+repository's own test fixtures (which contain `"slot_wait_seconds": 999.0` and a
+gate-provenance marker) from inventing a > 120 s sample.
 
 **Pass/fail (parent SA-0MVXUCGPK003G2KV AC3).** The report evaluates three
 thresholds and its exit status is non-zero on any failure:

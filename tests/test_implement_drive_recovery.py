@@ -2722,10 +2722,10 @@ class TestDriveVerdictEvidence:
 
         report = harness.run(finish_attempt_limit=3)
 
-        reset = [
+        reset = next(
             e for e in report["children_driven"]
             if e["result"] == "reset-for-retry"
-        ][0]
+        )
         assert "tests: tests_failed" in reset["message"]
         comments = [
             text for wid, text in harness.comments if wid == "SA-C1"
@@ -3408,9 +3408,16 @@ class TestSpawnInfraRetry:
             harness.mod._drive_infra_backoff_delay(2),
         ]
 
-        # AC7: no spawn-failure evidence for an attempt that never produced
-        # work (the retry owns the attempt), and the hold is never duplicated.
-        assert recorded == []
+        # AC7 (redefined by WL-0MWWBJJBD008TBPB): each retried attempt records
+        # spawn-failure evidence *before* the re-run parent phase, so the
+        # placement guard can exempt the still-clean child; the successful
+        # attempt records nothing and the hold is never duplicated.
+        assert len(recorded) == 2
+        assert {call[0][0] for call in recorded} == {"/wt/SA-C1"}
+        assert {call[0][1] for call in recorded} == {"SA-C1"}
+        assert all(
+            "No models match pattern" in call[0][2] for call in recorded
+        )
         assert [lock.acquired for lock in locks] == [1, 1, 1]
         assert [lock.released for lock in locks] == [1, 1, 1]
         # The retries were charged to the infra budget, not the session bound.
@@ -3476,8 +3483,11 @@ class TestSpawnInfraRetry:
         # The actionable remedy directive is present, not just the Pi error.
         assert "enabledModels" in report["message"]
         assert "infra-retry budget of 5" in report["message"]
-        # Only the exhausted (last) attempt records spawn-failure evidence.
-        assert len(recorded) == 1
+        # Every attempt records spawn-failure evidence before the re-run
+        # parent phase, including the exhausted one before the chain stop
+        # (WL-0MWWBJJBD008TBPB); the file is overwritten each time, so the
+        # last record is the chain-stop evidence.
+        assert len(recorded) == 6
 
     @pytest.mark.parametrize(
         "spawn_result",

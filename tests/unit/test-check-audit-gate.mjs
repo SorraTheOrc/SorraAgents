@@ -1844,6 +1844,7 @@ describe('checkAndRestoreStuckAudit - SIGKILL parent-side cleanup', () => {
       fsMod,
       unlinked,
       commands,
+      updateCommands: () => commands.filter((c) => c.startsWith('wl update ')),
       runCommand: (cmd) => { commands.push(cmd); return 'ok'; },
     };
   }
@@ -1874,11 +1875,14 @@ describe('checkAndRestoreStuckAudit - SIGKILL parent-side cleanup', () => {
       baseDir: '/tmp',
       fsMod: harness.fsMod,
       runCommand: harness.runCommand,
+      // Verified restore: the readback reflects the restored state.
+      readBackState: () => ({ status: 'completed', stage: 'in_review' }),
     });
     assert.equal(restored, true);
-    assert.equal(harness.commands.length, 1);
-    assert.match(harness.commands[0], /--status completed/);
-    assert.match(harness.commands[0], /--stage in_review/);
+    const updates = harness.updateCommands();
+    assert.equal(updates.length, 1);
+    assert.match(updates[0], /--status completed/);
+    assert.match(updates[0], /--stage in_review/);
   });
 
   test('removes the state file after restoring', async () => {
@@ -1895,9 +1899,113 @@ describe('checkAndRestoreStuckAudit - SIGKILL parent-side cleanup', () => {
       baseDir: '/tmp',
       fsMod: harness.fsMod,
       runCommand: harness.runCommand,
+      readBackState: () => ({ status: 'open', stage: 'plan_complete' }),
     });
     assert.deepEqual(harness.unlinked, [stateFile]);
     assert.equal(harness.fsMod.existsSync(stateFile), false);
+  });
+
+  test('retries the identical restore once when a concurrent wl sync clobbers it', async () => {
+    const mod = await import(MODULE_PATH);
+    const stateFile = join('/tmp', '.audit_state_SA-1.json');
+    const harness = makeHarness({
+      [stateFile]: JSON.stringify({
+        issue_id: 'SA-1',
+        original_status: 'completed',
+        original_stage: 'in_review',
+      }),
+    });
+    // First readback sees the stale (clobbered) state; the retry succeeds.
+    const readbacks = [
+      { status: 'open', stage: 'plan_complete' },
+      { status: 'completed', stage: 'in_review' },
+    ];
+    let i = 0;
+    const restored = mod.checkAndRestoreStuckAudit('SA-1', {
+      baseDir: '/tmp',
+      fsMod: harness.fsMod,
+      runCommand: harness.runCommand,
+      readBackState: () => readbacks[Math.min(i++, readbacks.length - 1)],
+    });
+    assert.equal(restored, true);
+    const updates = harness.updateCommands();
+    assert.equal(updates.length, 2, 'expected one bounded retry');
+    // The retry re-issues the identical restore command.
+    assert.equal(updates[0], updates[1]);
+    assert.deepEqual(harness.unlinked, [stateFile]);
+  });
+
+  test('retains the state file and warns when the restore cannot be verified', async () => {
+    const mod = await import(MODULE_PATH);
+    const stateFile = join('/tmp', '.audit_state_SA-1.json');
+    const harness = makeHarness({
+      [stateFile]: JSON.stringify({
+        issue_id: 'SA-1',
+        original_status: 'completed',
+        original_stage: 'in_review',
+      }),
+    });
+    const warns = [];
+    const origWarn = console.warn;
+    console.warn = (msg) => { warns.push(String(msg)); };
+    try {
+      const restored = mod.checkAndRestoreStuckAudit('SA-1', {
+        baseDir: '/tmp',
+        fsMod: harness.fsMod,
+        runCommand: harness.runCommand,
+        // A wl sync keeps clobbering every write (unverifiable restore).
+        readBackState: () => ({ status: 'open', stage: 'plan_complete' }),
+      });
+      assert.equal(restored, true);
+    } finally {
+      console.warn = origWarn;
+    }
+    assert.equal(harness.updateCommands().length, 2);
+    assert.deepEqual(harness.unlinked, [], 'the state file is retained for retry');
+    assert.equal(harness.fsMod.existsSync(stateFile), true);
+    const warning = warns.join('\n');
+    assert.match(warning, /could not verify the abort restore/);
+    assert.match(warning, /SA-1/);
+    assert.match(warning, /wl update SA-1 --status completed --stage in_review/);
+  });
+
+  test('verifies through the default wl show readback via runCommand', async () => {
+    const mod = await import(MODULE_PATH);
+    const stateFile = join('/tmp', '.audit_state_SA-1.json');
+    const harness = makeHarness({
+      [stateFile]: JSON.stringify({
+        issue_id: 'SA-1',
+        original_status: 'completed',
+        original_stage: 'in_review',
+      }),
+    });
+    const state = { status: 'open', stage: 'plan_complete' };
+    // Default readback path: runCommand runs `wl show`, so return JSON that
+    // reflects the applied update (a real-worklog model).
+    const runCommand = (cmd) => {
+      harness.commands.push(cmd);
+      if (cmd.startsWith('wl update ')) {
+        const s = /--status (\S+)/.exec(cmd);
+        const t = /--stage (\S+)/.exec(cmd);
+        if (s) state.status = s[1];
+        if (t) state.stage = t[1];
+        return 'ok';
+      }
+      if (cmd.startsWith('wl show ')) {
+        return JSON.stringify({ workItem: { id: 'SA-1', ...state } });
+      }
+      return 'ok';
+    };
+    const restored = mod.checkAndRestoreStuckAudit('SA-1', {
+      baseDir: '/tmp',
+      fsMod: harness.fsMod,
+      runCommand,
+    });
+    assert.equal(restored, true);
+    assert.deepEqual(harness.unlinked, [stateFile]);
+    // One update followed by at least one `wl show --json` readback.
+    assert.equal(harness.updateCommands().length, 1);
+    assert.ok(harness.commands.some((c) => c === 'wl show SA-1 --json'));
   });
 
   test('never restores when the state file belongs to another item', async () => {
@@ -1934,6 +2042,26 @@ describe('checkAndRestoreStuckAudit - SIGKILL parent-side cleanup', () => {
     assert.equal(harness.commands.length, 0);
     assert.deepEqual(harness.unlinked, [stateFile]);
   });
+});
+
+test('no ship script restores directly from the abort state file (single verified helper)', async () => {
+  // F3 AC3: every consumer of the abort state file routes through
+  // checkAndRestoreStuckAudit in check-audit-gate.js. A bare restore copy in
+  // any other ship script would reintroduce the unverified lost-update path.
+  const { readdirSync } = await import('node:fs');
+  const dir = join(REPO_ROOT, 'skill', 'ship', 'scripts');
+  const offenders = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.js') || name === 'check-audit-gate.js') continue;
+    const text = readFileSync(join(dir, name), 'utf-8');
+    if (text.includes('.audit_state_') || text.includes('original_status')) {
+      offenders.push(name);
+    }
+  }
+  assert.deepEqual(
+    offenders, [],
+    `ship scripts restoring the abort state directly: ${offenders.join(', ')}`,
+  );
 });
 
 describe('attemptAuditRemediation - abort-recovery cleanup after the runner', () => {

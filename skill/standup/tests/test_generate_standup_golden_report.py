@@ -54,12 +54,17 @@ HEADER_RE = re.compile(
 
 #: Fixed section headings, in rendering order.
 SECTION_HEADINGS = [
-    "### Yesterday I completed work on...",
+    "### Since the last report, I completed...",
     "### Open critical items",
-    "### Additional focus items for today",
+    "### Key upcoming work includes...",
     "### Regressions",
     "### Blockers",
 ]
+
+#: Temporal heading tokens ("Yesterday"/"today", case-insensitive) the fallback
+#: renderer must no longer emit — it speaks with the same time-neutral framing
+#: as the agent-rendered report (SA-0MWNMRCYY0050LEP).
+TEMPORAL_HEADING_RE = re.compile(r"\b(?:yesterday|today)\b", re.IGNORECASE)
 
 #: Work item ids in every shape a spoken line must not carry.
 BARE_ID_RE = re.compile(r"\b[A-Z]{2,}-\d[A-Z0-9]{6,}\b")
@@ -201,6 +206,23 @@ def test_no_work_item_ids_appear_anywhere():
     assert "SA-" not in report
 
 
+def test_no_temporal_heading_tokens_survive():
+    """The fallback speaks with time-neutral headings, not yesterday/today.
+
+    The agent-rendered report (SKILL.md) frames completed work as "since the
+    last report" and upcoming work as "key upcoming work includes".  The
+    deterministic fallback must not keep the stock temporal framing
+    (SA-0MWNMRCYY0050LEP).
+    """
+    mod = _reload_standup()
+    report = _fixed_report(mod)
+
+    headings = [line for line in report.split("\n") if line.startswith("### ")]
+    assert headings == SECTION_HEADINGS
+    for heading in headings:
+        assert TEMPORAL_HEADING_RE.search(heading) is None, heading
+
+
 def test_impact_first_sentences_with_legacy_fallback():
     mod = _reload_standup()
     report = _fixed_report(mod)
@@ -226,7 +248,7 @@ def test_impact_first_sentences_with_legacy_fallback():
 #: Everything after the (date-dependent) header, byte for byte.
 GOLDEN_BODY = (
     "\n"
-    "### Yesterday I completed work on...\n"
+    "### Since the last report, I completed...\n"
     "\n"
     "  - Impact-aware report rendering — Users now hear what each change gave "
     "them, not what was built.\n"
@@ -237,7 +259,7 @@ GOLDEN_BODY = (
     "  - Recover the stalled dispatcher — Users get their queued work moving "
     "again without a restart.\n"
     "\n"
-    "### Additional focus items for today\n"
+    "### Key upcoming work includes...\n"
     "\n"
     "  - Sort the review queue — Users can scan the review queue at a glance.\n"
     "\n"

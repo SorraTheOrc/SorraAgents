@@ -34,13 +34,29 @@ a delimited block in human mode.
   {"ignoreDirtyPaths": [".llm-wiki/"]}
   ```
 
-  - `git_has_dirty_files(status_output, expected_dirty=...)` skips a dirty
-    path matching a declared prefix. It defaults to no exemption, so callers
-    that do not opt in keep the original behaviour.
+  - `git_has_dirty_files(status_output, expected_dirty=..., repo_root=...)`
+    skips a dirty path matching a declared prefix. It defaults to no
+    exemption, so callers that do not opt in keep the original behaviour.
   - `phase_start` passes the project's declaration to the dirty-tree safety
     gate; `_worktree_placement_violation()` and `_child_main_checkout_violation()`
     pass it to the placement gates (via `_main_checkout_offending_paths()` and
     `_git_path_has_changes()`).
+  - **Per-surface resolution.** The placement guards resolve the declaration
+    for **each scanned surface** — `expected_dirty_paths(<surface root>)` — so
+    a linked worktree is classified with *its own*
+    `.pi/skills_extensions/implement/extension.json`, not the root repo's list
+    (RISE-0MWOIAXAG008HMK3 AC1). A declaration is additive: undeclared dirt in
+    the same tree is still reported.
+  - **Submodule-aware surfaces.** When a `repo_root` is supplied,
+    `git_has_dirty_files`/`_main_checkout_offending_paths` expand a dirty
+    submodule (gitlink) entry into its inner `git status` paths, map them to
+    outer-relative form and classify those against the same declaration
+    (`_dirty_entry_is_change_surface`). A submodule whose only changes are
+    expected-dirty paths (e.g. the `core/node_modules` worktree-bootstrap link
+    farm) is therefore not a change surface, while a genuine inner edit is
+    reported by its inner path. A moved submodule pointer, an unreadable inner
+    repo, or a clean-but-unexplained inner tree stays fail-closed
+    (RISE-0MWOIAXAG008HMK3 AC2).
   - The declaration cannot relax the `.worklog/` skip, the stash hygiene
     gate, or the build → test → commit order. Any unexpected dirty path still
     stops the workflow.
@@ -160,7 +176,73 @@ documented locally only.
 extension from driven children, removing its provider-error auto-retry/notify
 path. This is accepted because driven children are headless, the same exclusion
 is already accepted for audit calls, and the implement skill manages its own
-loop.
+loop. Since WL-0MWTZEDWG008YMGQ the drive layer replaces that lost retry for
+the transient ``Provider finish_reason: error`` stop (see below).
+
+### The lost provider-error retry is replaced at the drive layer (WL-0MWTZEDWG008YMGQ)
+
+``--no-extensions`` removes a retry the child would otherwise get. In an
+interactive session the ContextHub ``Worklog`` recovery extension classifies a
+mid-stream ``finish_reason: "error"`` as a retryable ``SERVER_ERROR`` and
+retries it (WL-0MUQO8AEE003G1Z2). A driven child never loads that extension,
+so a transient provider reply reaches Pi core, which treats an error stop
+reason as a **fatal turn** and exits the session non-zero. Nothing in the
+child retries or degrades — the session simply dies.
+
+The mechanism, end to end:
+
+1. ``_default_session_spawner`` runs
+   ``pi -p "/skill:implement <child-id>" --approve --no-extensions``.
+2. ``--no-extensions`` disables extension discovery, so the recovery
+   extension is not loaded.
+3. Pi's ``mapStopReason`` (``openai-completions``) maps
+   ``finish_reason: "error"`` to the literal ``Provider finish_reason: error``
+   and ``stopReason: "error"``; the agent loop throws and the turn ends
+   fatally.
+4. The session exits non-zero; ``_default_session_spawner`` reports the
+   stderr tail as the spawn reason.
+5. Before this change ``classify_spawn_failure`` classified that reason
+   ``unknown``, so the drive chain hard-stopped and the operator had to
+   re-run ``implement.py drive`` by hand.
+
+Since this change, ``SPAWN_INFRA_REASONS`` carries the exact provider-stream
+fragment ``finish_reason: error``, so ``classify_spawn_failure`` reports
+``infrastructure`` and ``phase_drive`` re-spawns the **same** child in the
+**same** worktree on the shared ``--infra-retry-limit`` budget (exponential
+backoff, durable child comment). The classification is deliberately narrow:
+
+- It matches the full ``finish_reason: error`` signature, never the bare word
+  ``error`` or the other ``finish_reason`` values (``content_filter``,
+  ``length``, ``network_error``), so a genuine defect — a traceback, a red
+  gate, a timeout — still classifies ``unknown`` and hard-stops.
+- ``Provider`` is Pi's fixed literal prefix, not a provider name, so the
+  classifier does not fabricate a provider (``provider`` is ``None``); the
+  remedy names the Local Proxy and the model it serves instead.
+- The ``timed out`` precedence is unchanged: a timeout that happens to echo
+  provider text stays ``unknown``.
+
+**Layering (deliberate, not a double retry).** The recovery extension retries
+the reason for *interactive* sessions; the drive classifier retries it for
+``--no-extensions`` *children*. A single session only ever runs one of the two
+layers, so the retries cannot compound.
+
+### Recovery-cost measurement (WL-0MWTZEDWG008YMGQ AC4)
+
+Measured before/after on the same 7-child epic (``WL-0MWTAD1KM0081UUD``) and
+pinned by a deterministic harness (``TestDriveRetriesProviderStreamFailure`` in
+``skill/implement/tests/test_drive_sibling_worktree_stray.py``):
+
+| Scenario | Before | After |
+|---|---|---|
+| One transient reply, 7-child epic | 1 hard-stopped spawn → operator re-runs ``implement.py drive`` (measured: 25+ manual re-runs over ~5.3 h; one child needed 20 consecutive failed spawns) | 1 extra bounded re-spawn in the same worktree; the epic proceeds in the same ``drive`` invocation |
+| Persistent provider failure | n/a (hard-stop on the first reply) | consumes ``--infra-retry-limit`` (default 5) with backoff, then hard-stops naming the proxy/model — still bounded |
+| Genuine defect (traceback/red gate) | 1 spawn, hard-stop | 1 spawn, hard-stop (unchanged — fail-safe floor) |
+
+The harness is deterministic: an injected spawner fails ``k`` times with
+``Provider finish_reason: error`` then succeeds, and the test asserts
+``k + 1`` spawns in the same worktree with ``k`` ``infra-retry`` entries. A
+genuine defect in the same harness costs exactly one spawn and never touches
+the infra budget.
 
 ## Why drive reconciles terminal children after a session timeout (SA-0MVHXWLPG007OQVN)
 
@@ -404,6 +486,77 @@ teardown. The mechanism is documented in the conftest docstring; this note
 records *why* the suite must be deterministic under either ambient state — the
 parent-driven full-suite gate is exactly where a real driven chain's audit
 verdict is computed.
+
+## Stale worktree debris is never evidence (WL-0MWQLHDOS006CAIH)
+
+The placement guards above scan **every** registered sibling worktree, which
+is what caught the stray child of SA-0MW5FIJNQ002Z24I — but a checkout also
+accumulates debris that never changes: `/tmp/wl-*` scratch trees from old
+manual checks, and the leftover trees of work items that are already
+`completed`/`deleted`. Because that debris is dirty forever, **every**
+subsequent clean child in that checkout was refused until an operator pruned
+the trees by hand (observed on the epic drive `WL-0MW50EHZ6007QBPB`: four
+unrelated surfaces named for a clean child).
+
+### What counts as a live foreign surface
+
+`_is_live_foreign_surface(sibling, worktree_path, repo_root)` decides, in this
+order, and is applied at both `_child_main_checkout_violation` and
+`_worktree_placement_violation` (via `_sibling_worktree_containing`'s caller):
+
+1. **Out of scope ⇒ never evidence.** A sibling outside the repository's
+   worktree root (`.worklog/worktrees/`, `DEFAULT_WORKTREE_DIR`) is scratch
+   debris. The comparison is only meaningful when the child's own worktree
+   lives inside that root; a child working elsewhere (a custom
+   `--worktree-path`, an ad-hoc tree — as in the regression fixtures) leaves
+   the scope unknown, so nothing is filtered and the pre-fix fail-closed
+   behaviour is kept.
+2. **Terminal owner ⇒ never evidence.** The owning work item is read from the
+   directory name (`_worktree_path_to_item_id`: `wl-<ID>-<slug>`,
+   `audit-exec-<ID>`) and resolved with `wl_show` in
+   `_worktree_owner_is_terminal`, which answers live / terminal / unresolved. A
+   `completed`/`in_review`/`done`/`deleted` owner has no live session to race,
+   so its dirt predates the run — wherever the tree lives.
+3. **Everything else is evidence.** A dirty, in-scope sibling of a
+   **non-terminal** item still fails the run closed with the unchanged
+   message naming the sibling and its paths.
+
+Unresolved ownership is **fail-closed**: an untagged directory name
+(`wl-test-ff`), an unavailable `wl`, or a lookup that returns another item
+keeps the surface as evidence and logs a warning. Each skipped surface emits
+one `LOG.info` line naming the tree and the reason, so an operator can see why
+a previously-blocking tree no longer blocks. Nothing is ever removed
+programmatically — the tree stays the operator's decision.
+
+**Bounded cost.** The filter runs only for a sibling that is already known to
+be dirty, and the worklog lookup only for an in-scope dirty sibling: the
+child's own worktree carrying work, or a registry with no dirty trees, still
+costs no `wl` subprocess.
+
+### The prune remedy (`scripts/hygiene_check.sh`)
+
+The hygiene script reports both debris classes — in text and in `--json`
+(`{"check":"debris_worktrees","status":"notice","outside_root":[…],
+"terminal_owner":[…],"remedy":…}`) — and prints the remedy, which only an
+operator may run:
+
+```bash
+git worktree remove <path> && git worktree prune
+```
+
+The finding is a **notice**: it never raises the script's exit code, so every
+pre-existing check keeps its exit-code and warning semantics. Owner lookups
+run on a bounded thread pool (a few dozen leftover trees resolve in about a
+second), and an unresolvable owner is never guessed — unreported here
+(fail-open), still fail-closed in the guard.
+
+Regression coverage:
+`skill/implement/tests/test_drive_sibling_worktree_stray.py`
+(`TestWorktreeItemOwnership`, `TestChildMainCheckoutViolationDebrisFilter`,
+`TestPlacementViolationDebrisFilter`, `TestPhaseParentIgnoresStaleDebris`,
+`TestDebrisSkipIsReported`) and `tests/test_implement_stash_hygiene.py`
+(`TestDebrisWorktreeReports`). Documentation of record:
+[worktree isolation](worktree-isolation.md#the-placement-guard).
 
 ## Assignee release when a kill cannot run an exit hook (SA-0MVVF75ZA007XNKB)
 
@@ -877,10 +1030,12 @@ in `children_driven`:
    provider/model-resolution failure (SA-0MWLDZBTF004LJFP): when
    `_reconcile_spawn_failure` proves the child non-terminal and
    `classify_spawn_failure` classifies the spawn reason `infrastructure`
-   (an unservable `enabledModels` pattern, a missing API key), the driver
+   (an unservable `enabledModels` pattern, a missing API key, or a transient
+   `Provider finish_reason: error` — WL-0MWTZEDWG008YMGQ), the driver
    re-spawns the **same** child in its **same** worktree after the same
    backoff. That retry records `result: "infra-retry"` with `step: "spawn"`,
-   the spawner `reason`, the `attempt` number, the extracted `provider` and
+   the spawner `reason`, the `attempt` number, the extracted `provider`
+   (absent for the provider-stream signature, which names no provider) and
    a `message` naming the provider and model; it never creates a second
    worktree, never re-records spawn-failure evidence for an attempt that
    produced no work, and is charged to the infra budget rather than the
@@ -2033,17 +2188,38 @@ checkout**, so the main checkout's own churn is never a failure:
 - `refs/worklog/*` (worklog tooling refs).
 
 Working-tree churn is attributed rather than excluded wholesale
-(SA-0MUIJAHXS003M7BG): a path that was **already dirty at run start** and is
-clean at run end was resolved during the run (a sibling session committing work
-it had itself dirtied in the shared checkout), so it does not fail the run. It
-is never silent — the run result carries the note
+(SA-0MUIJAHXS003M7BG), and the attribution is **role-scoped** by root
+(WL-0MWR1OXHX001KJC6) in the shared `diff_guarded_roots`: a path that was
+**already dirty at run start** and is clean at run end was resolved during the
+run (a sibling session committing work it had itself dirtied in the shared
+checkout), so it does not fail the run on **either** root. A path in the
+**guarded root** that becomes dirty from a clean start is still a mutation
+(delete/modify/create), and so is a path that stays dirty with a different
+status code. The shared **main checkout** narrows that direction to the damage
+class a suite can plausibly cause — a **tracked-file deletion** (`D` in either
+column, the 2026-10-26 `packages/shared` wipe class): a newly dirty ` M`,
+`M `, `MM`, `??` or staged-addition path there is excluded as
+concurrent-session churn. Refs and config stay fully verdict-bearing on both
+roots. The excluded entries are never silent: the run result carries the note
 (`excluded: concurrently resolved working-tree change in <checkout>: <path>
-[<code>]`) and `implement.py finish`'s test gate logs it
+[<code>]`), both buckets are named in the result's `excluded.status`
+(`removed` for resolved pre-existing dirt, `narrowed` for the main checkout's
+non-deletion shapes), and `implement.py finish`'s test gate logs it
 (`Live-repo guard note: …`) plus records it in the JSON report under
-`live_repo_excluded`. A path that becomes dirty from a clean start is still a
-mutation (delete/modify/create), and so is a path that stays dirty with a
-different status code. Full rule and pinned blind spots: §8.5 of
-[test-isolation.md](test-isolation.md).
+`live_repo_excluded`. Full rule, the excluded-bucket JSON contract and the
+pinned blind spots: §8.5 of [test-isolation.md](test-isolation.md).
+
+**What a finish-time excluded note means.** A `live_repo_excluded` note on a
+finish report is the gate's record of churn it **attributed away**: foreign
+working-tree movement in the main checkout (or a resolved pre-dirty path) that
+did **not** fail the run and did **not** block the push. It is informational —
+the gate's verdict is derived from the plumbing rule above, never from the note
+— and it names the checkout, path and status code plus the likely owner
+(`[likely actor: …]`, or the explicit `unknown` fallback described under
+*Concurrent-actor evidence*). A genuine mutation is **not** reported as a note:
+`live_repo_mutation` still fails the finish gate and is still classified
+`GATE_FAILURE_INFRASTRUCTURE` (`kind: infrastructure`), naming every mutated
+checkout and path, so a red gate can never be mistaken for excluded churn.
 
 A **failure names the mutated checkout and every mutated path in it**, e.g.:
 
@@ -2166,11 +2342,13 @@ stage, aborting or advisory:
   `completed`/`in_review`) and the audit trail survives the status reset.
 - **Message content.** The abort message names the stage, **every** offending
   path (`<path> [<code>]`, capped at 20 lines plus `… and N more`), the
-  concurrent-actor evidence available at runtime (other worktree
-  `.implement_state.json` entries, live processes whose cwd is the main
+  concurrent-actor evidence available at runtime (the main checkout's and
+  sibling worktrees' `.implement_state.json` entries, one bounded `wl` claim
+  lookup, the main-checkout lock holder, live processes whose cwd is the main
   checkout, or `unknown`) and the recovery command (`git checkout -- <path>`
   / `git restore <path>`), so an agent hitting the abort can act without
-  spelunking.
+  spelunking. The evidence comes from the read-only shared helper
+  `skill/shared/concurrent_actor.py` (see *Concurrent-actor evidence* below).
 
 Pre-existing dirty files present in the baseline snapshot and project-declared
 expected-dirty paths are never a failure.
@@ -2229,6 +2407,57 @@ Proven by `skill/implement/tests/test_finish_cross_checkout_attribution.py`
 (`test_violations_own_churn_allow_list_never_hides_deletion`,
 `test_violations_own_churn_list_only_matches_listed_paths`).
 
+### Concurrent-actor evidence (second signal)
+
+When the guard records a failure it appends a **concurrent-actor evidence**
+string to the failure note (`verifies[].actor_evidence`, and the abort message's
+`Concurrent actor evidence:` line), and each excluded-churn note carries the
+same signal (`[likely actor: …]`) wherever it is rendered: `run_tests.py`'s text
+output and `live_repo_excluded` JSON notes, the inner plugin's session output,
+and `finish`'s report (`report["live_repo_excluded"]` /
+`report["live_repo_actor_evidence"]`). `finish` adopts a note the guard already
+annotated instead of looking the evidence up a second time
+(WL-0MWR1P1F3008AH3V). The evidence is produced by the read-only shared helper
+`skill/shared/concurrent_actor.py` (`describe_concurrent_actor`,
+`annotate_excluded_notes`), so the outer guard, the inner plugin and the finish
+report share one contract instead of duplicating a probe.
+
+Sources, in priority order, each optional:
+
+1. **`.implement_state.json`** — the main checkout's own state file and its
+   registered sibling worktrees' state files
+   (`<main>/.worklog/worktrees/*/.implement_state.json`). A state file is a
+   candidate only when its `repo_root` resolves to this main checkout and its
+   `worktree_path` lives inside it; this run's own worktree and item are
+   excluded so a finish never names itself.
+2. **Claimed items** — one **bounded** `wl list --status in-progress` lookup
+   (`DEFAULT_WL_LOOKUP_TIMEOUT_SECONDS`, `DEFAULT_WL_LOOKUP_LIMIT`), filtered
+   to items with a non-empty assignee. The lookup is skipped entirely when the
+   repository has no initialised `.worklog` store, so a hermetic fixture never
+   resolves an unrelated ambient store.
+3. **Main-checkout lock holder** — `RepoLock.read_holder()` /
+   `describe_holder()` metadata, consulted only when the holder records a live
+   pid and a work item that is not this run's own (finish holds this lock).
+4. **Live processes** — pids whose `/proc/<pid>/cwd` resolves to the main
+   checkout (Linux only, bounded). These name a session rather than a work item
+   and are appended beside a named owner.
+
+**Informational only.** The verdict is derived solely from the git-plumbing
+rule above; actor evidence never turns a green run red or a red run green and
+never excuses a tracked-file deletion. It is a **documented second signal**,
+never a substitute for the plumbing rule and never a path-name or `wl-*`
+heuristic. When no single owner is discoverable — no state file, several
+candidate owners, unreadable JSON, or a lock held by an unrelated process — the
+helper returns the explicit string `unknown`. Every error degrades to `unknown`
+and is never raised into the verdict path. The helper runs at most once per
+guarded run, when a guard builds a note or failure message (never in the
+per-test fingerprint path); it adds no subprocess to the per-test guard path.
+Pinned by
+`skill/shared/tests/test_concurrent_actor.py` (the four required `unknown`
+fallbacks and the bounded/read-only contract) and
+`skill/implement/tests/test_finish_main_checkout_guard.py` (the finish-side
+delegation and note annotation).
+
 ### Fail-closed `repo_root` resolution
 
 `_resolve_main_repo_root` **derives** the main checkout instead of trusting
@@ -2264,7 +2493,7 @@ that asserts observable behaviour (no source greps).
 |---|---|---|---|---|
 | `_snapshot_main_checkout` / `_main_checkout_status_map` | nothing — `git status --porcelain=v1` read only | `repo_root` | confined (read-only) | `test_finish_write_surface_confinement.py::test_guard_surfaces_leave_the_checkout_byte_identical` |
 | `_verify_main_checkout` / `_main_checkout_guard_violations` | nothing — re-snapshot plus an in-memory verdict | `repo_root` | confined (read-only; never restores a foreign deletion) | `test_finish_write_surface_confinement.py::test_guard_verify_reports_a_foreign_deletion_without_touching_it` |
-| `_main_checkout_actor_evidence` | nothing — `.implement_state.json` and `/proc/<pid>/cwd` reads | `repo_root` | confined (read-only) | `test_finish_write_surface_confinement.py::test_guard_surfaces_leave_the_checkout_byte_identical` |
+| `_main_checkout_actor_evidence` / `describe_concurrent_actor` | nothing — `.implement_state.json` reads, the lock file's diagnostic metadata, one bounded `wl list` lookup and `/proc/<pid>/cwd` reads | `repo_root` | confined (read-only; the `wl` store is only queried when initialised) | `test_finish_write_surface_confinement.py::test_guard_surfaces_leave_the_checkout_byte_identical`, `skill/shared/tests/test_concurrent_actor.py::test_helper_is_read_only` |
 | `_fast_forward_local_dev_for_push` | `git fetch` / `checkout` / `merge --ff-only` — refs and working tree | `repo_root` | confined — every git call uses `cwd=repo_root` | `test_finish_write_surface_confinement.py::test_main_checkout_git_operations_only_run_in_repo_root` |
 | `_restore_local_dev_after_failed_push` | `git reset --merge` / `git update-ref` | `repo_root` | confined — same `cwd` rule | `test_finish_write_surface_confinement.py::test_main_checkout_git_operations_only_run_in_repo_root` |
 | `_sync_parent_branch` | `git fetch` / `merge --ff-only` on the shared branch | `repo_root` | confined — same `cwd` rule | `test_finish_write_surface_confinement.py::test_main_checkout_git_operations_only_run_in_repo_root` |
@@ -2396,7 +2625,9 @@ Concurrency contract:
   (`_sync_parent_branch_locked`), **fail-open**: it waits at most
   `IMPLEMENT_START_LOCK_TIMEOUT` (default 30 s) and then skips the refresh with
   a warning naming the lock (`reason: "lock_held"`) — a start is never blocked
-  or failed by a concurrent finish, and the local branch remains a valid base.
+  or failed by a concurrent finish, and the base is then resolved from the
+  published tip whenever the local branch is stale — see
+  [Worktree base-ref resolution](#worktree-base-ref-resolution-start).
   The abort-path `_restore_repo_state` is deliberately unlocked: it runs in a
   process that may already hold the lock, and a dying process releases the
   lock itself.
@@ -2442,6 +2673,53 @@ metadata, SIGKILL crash release, cross-checkout independence, `phase_finish`
 refusal/success, hygiene script JSON + human output) and
 `tests/test_implement_finish_concurrent_orphan.py` (dev-ref window scenarios,
 including the bounded-wait timeout message and the `start` refresh window).
+
+## Worktree base-ref resolution (`start`)
+
+`phase_start` forks the child worktree from the **published tip**, not from a
+possibly-stale local parent branch (SA-0MWFFX49M0016KOK / AH-0MWFF40700014EE2):
+
+- **Equal to `origin/<parent>` → local branch.** When the local parent branch
+  equals the fetched `refs/remotes/origin/<parent>` (an in-sync checkout, or a
+  refresh that just fast-forwarded it), the worktree forks from the local
+  branch — it *is* the published tip.
+- **Otherwise → `refs/remotes/origin/<parent>`.** When the local parent branch
+  differs from the published tip — **behind-only**, **ahead-only** or
+  **diverged** — the worktree forks from the remote-tracking ref. This is
+  always graft-safe (the new branch contains no unpushed local commit) and
+  always carries the published commits, so a driven child starts on the
+  published base and needs no manual rebase before its first changed-scope
+  gate (AC3).
+- **Never force-update the local ref.** A diverged (or ahead-only) local parent
+  is left exactly as it is for the operator to reconcile; `start` only chooses
+  a different base.
+- **Fail-open.** A failed fetch or a missing `refs/remotes/origin/<parent>`
+  leaves the local branch as the base, exactly like the Step-6.5 refresh's
+  offline contract — a start is never blocked by an unreachable remote.
+
+`report["steps"]["worktree_base"]` records the decision:
+`{method: "local_dev" | "origin_fork", ref, base, reason, skipped_local,
+ahead, behind, refresh}` where `refresh` is `{method, reason}` copied from the
+parent-branch refresh (`{"synced", null}` for a completed fast-forward, or
+`{"skipped", "lock_held"}` and friends). `reason` is one of `refresh_synced`,
+`in_sync`, `fetch_failed`, `no_remote_tracking_ref`, `behind_remote`,
+`ahead_only`, `diverged` or `local_not_published` (counts unavailable);
+`skipped_local` is `true` only for `origin_fork`. The start/resume worklog
+comment names the same base ref and, when the local branch was skipped, its
+`reason` plus the `ahead`/`behind` counts — and, when the refresh itself did
+not run, the skip reason (`refresh skipped: lock_held`), so a deliberate
+`origin` fork is never confused with a failed refresh. `git_worktree_add` accepts a fully-qualified
+remote-tracking base ref; `--track` still records
+`branch.<new>.merge = refs/heads/<parent>`, so `finish`'s push-to-`dev` path is
+unchanged.
+
+The parent-branch refresh (`_sync_parent_branch`) reports the same `ahead` /
+`behind` counts (via `git rev-list --left-right --count`) on every safe-skip
+path where they are computable — `dirty_working_tree`, `fetch_failed`,
+`cannot_determine_branch`, `diverged`, `merge_failed` and
+`diverged_or_checked_out` — alongside its `reason` and `warning`. Counts are
+best-effort: an unavailable count leaves the field absent and never fails the
+refresh.
 
 ## Measuring finish lock contention (SA-0MWFK10NH006QI7E)
 
@@ -2658,8 +2936,11 @@ permanently grafted another item's commit onto its branch. The advance is
 deferred until the commit is a known ``refs/remotes/origin/dev`` tip, so a
 failed/refused push leaves local ``dev`` **provably unchanged** from its
 pre-finish value (``restore` reasons report ``no_advance_to_undo``), and
-``phase_start`` independently refuses to branch from a ``dev`` that is not a
-pushed tip (`_resolve_start_base`). The three cooperating guarantees, all
+``phase_start`` independently forks from the published
+``refs/remotes/origin/dev`` whenever the local ``dev`` is not that tip
+(``_resolve_start_base``, see
+[Worktree base-ref resolution](#worktree-base-ref-resolution-start)). The
+three cooperating guarantees, all
 inside the per-repository lock where the push runs:
 
 | Step | Helper | Report key | Guarantee |
@@ -3855,12 +4136,70 @@ cd .worklog/worktrees/wl-<WIP-id>-<short-slug>
 > WL-0MQRBT8BS00355AB incident class) and is no longer needed: the link farm
 > makes the worktree's own build visible to its gate.
 
-> **Git submodules are auto-initialised:** `implement.py start` runs
-> ``git submodule update --init --recursive`` inside the new worktree (SA-0MSN52GGN002B0AZ).
+> **Git submodules are auto-initialised, before the `node_modules` passes:**
+> `implement.py start` runs ``git submodule update --init --recursive`` inside the
+> new worktree (SA-0MSN52GGN002B0AZ) **before** it materialises the root link farm
+> or any nested ``node_modules`` symlink (SA-0MVTOR53E003IIEQ). A nested
+> ``node_modules`` symlink created inside a still-empty gitlink makes the clone
+> fail ("destination path already exists and is not an empty directory"), and that
+> failure is fail-open, so the worktree silently kept an uninitialised submodule
+> and every build died on the submodule's imports. See
+> [submodule bootstrap ordering](#relocated-submodule-bootstrap-ordering-sa-0mbtor53e003iieq).
 > Failures produce a ``WARNING`` log message but **do not abort** — the worktree
 > remains usable (best-effort). Repos without ``.gitmodules`` are unaffected.
 
+**Shared-package build at start (SA-0MWHUVJFO009R9EC, WL-0MW3EDP6D002U6V4).**
+Because the link farm points `@worklog/shared` at the worktree's own
+`packages/shared`, and `dist/` is gitignored, a fresh worktree has no build
+output and every TypeScript import of the package fails until someone builds by
+hand. `start` runs `_ensure_shared_build` after the link step:
+freshness-based and unconditional on the change set (producer decision Q2=A) —
+it builds `packages/shared/dist` when it is missing or older than the newest
+`packages/shared/src/**` file, skips when fresh, and is a no-op for a repo
+without a workspace shared package. It only ever builds the worktree's own
+copy (never the main checkout) and only when the worktree resolves the package
+locally. The single `_newest_mtime` / `_shared_dist_freshness` helper is
+shared with the stale-resolution guard (WL-0MW8G1X3V007CGAE). The step is
+best-effort: a build failure does not abort `start`, but the report records one
+actionable diagnostic naming `npm run build:shared` and the resolved
+`packages/shared` path (`report["steps"]["shared_build"]`, mirrored as
+`shared_build`) — never a cascade of import errors. Regression pins:
+`skill/implement/tests/test_worktree_shared_build.py`.
+
 See [AGENTS_GLOBAL](../../AGENTS_GLOBAL.md#implement-the-work-item).
+
+### Relocated: Submodule bootstrap ordering (SA-0MVTOR53E003IIEQ)
+
+The start phase orders its bootstrap passes as
+``submodules → root node_modules link farm → nested node_modules symlinks``.
+The order is a correctness requirement, not a preference:
+
+- ``git worktree add`` materialises a submodule (gitlink) as an **empty**
+  directory, so a nested-symlink pass that runs first fills ``<wt>/<sub>/``
+  with ``node_modules`` and ``git submodule update --init`` then refuses to
+  clone (``destination path … already exists and is not an empty directory``).
+- The submodule step is fail-open (SA-0MSN52GGN002B0AZ AC2), so a failed clone
+  only warns: ``start`` reported success while the worktree held an
+  uninitialised submodule and every ``tsc``/build died on its imports. The
+  defect recurred four times across ``tce-the-rising`` child sessions
+  (RISE-0MVZBUE5R0026M95, RISE-0MVTOVFW2009MOLJ, RISE-0MVZDTLEH002KS29,
+  RISE-0MWRUYNTF0028CS2).
+- A nested symlink **inside** a checked-out submodule is allowed (the submodule
+  may own dependencies the root install lacks) but is covered by the
+  submodule's own ``info/exclude``: the reference ``node_modules/`` pattern has
+  a trailing slash and matches a *directory*, never a *symlink*, so without the
+  exclude entry the superproject reports ``M <sub>`` and the worktree looks
+  dirty.
+- A resumed worktree left broken by the old ordering is self-healed: a declared
+  submodule directory holding **only** ``node_modules`` symlinks and no
+  ``.git`` is cleared before the clone. Any other content is left untouched (the
+  fail-open warning then reports the genuine conflict).
+
+Implementation: ``_iter_declared_submodule_paths`` (``.gitmodules`` read with
+``configparser``, no extra subprocess), ``_enclosing_submodule_path``,
+``_ensure_worktree_local_exclude_entry`` and
+``_clear_placeholder_submodule_dirs``. Regression suite:
+``tests/test_implement_submodule_ordering.py``.
 
 ### Relocated: Step 6.1 — Parent recursion (epic/parent items only)
 
@@ -4296,10 +4635,15 @@ Guards (deterministic, in `phase_parent`):
   blocker to continue the chain.
 - **Worktree placement guard** — a non-terminal child whose worktree holds no
   work (no dirty files, no commits ahead of the parent branch) while the main
-  checkout is dirty outside `.worklog/` — **or a registered sibling worktree
-  of the same repository holds changes** (SA-0MW5FIJNQ002Z24I) — has written
-  outside its own worktree; the phase fails closed with the offending
+  checkout is dirty outside `.worklog/` — **or a registered, live sibling
+  worktree of the same repository holds changes** (SA-0MW5FIJNQ002Z24I) — has
+  written outside its own worktree; the phase fails closed with the offending
   surfaces (and does not advance the parent) instead of silently proceeding.
+  A sibling only counts as a **live foreign surface**
+  (`_is_live_foreign_surface`, WL-0MWQLHDOS006CAIH): stale debris — a tree
+  outside the repository's worktree root, or one whose owning work item is
+  terminal — is never evidence (see
+  [stale worktree debris](#stale-worktree-debris-is-never-evidence-wl-0mwqlhdos006caih)).
   A child whose last session died before producing any work is exempt: the
   driver's recorded spawn-failure evidence
   (`<worktree>/.worklog/spawn-failure.json`) makes the foreign dirt
@@ -4587,9 +4931,9 @@ runs reported success.
   cannot switch, the helper **refuses loudly** (`local_dev_diverged`,
   `commit_not_based_on_remote_tip`, `fetch_failed`, `checkout_failed`)
   instead of silently skipping — so an unsafe advance is never taken and the
-  refusal is reported rather than swallowed. `start` independently refuses to
-  branch from a `dev` that is not a known pushed tip (`_resolve_start_base`,
-  `local_dev_not_a_pushed_tip`).
+  refusal is reported rather than swallowed. `start` independently forks from
+  `refs/remotes/origin/dev` whenever the local `dev` is not that known pushed
+  tip (`_resolve_start_base`), so the worktree base is never an unpushed commit.
 - **Nothing to reverse on a failed push.** Because the advance is deferred
   until after the push succeeds, a failed/refused push finds nothing to undo:
   `_restore_local_dev_after_failed_push` reports `no_advance_to_undo` and
@@ -4681,9 +5025,9 @@ idempotent — it re-verifies commit → ancestry → status and marks the item
 conflicts: resolve them, commit, push, and re-run `finish`. Second, when the
 post-push fast-forward reports `local_dev_diverged` because the **main
 checkout's local `dev` carries commits `origin/dev` does not have** (the
-defect family of WL-0MWFKDH78002T2CR — a concurrent `start` now refuses to
-branch from such a `dev` via `_resolve_start_base`, and `finish` never
-advances an unpushed commit):
+defect family of WL-0MWFKDH78002T2CR — a concurrent `start` now forks from
+`refs/remotes/origin/dev` rather than branch from such a `dev` via
+`_resolve_start_base`, and `finish` never advances an unpushed commit):
 
 ```bash
 git -C <main-checkout> log --oneline origin/dev..dev   # what is local-only
