@@ -59,8 +59,30 @@ const SKILL_PR_POLLER_CANDIDATES = [
 // must fail the release loudly after a bounded time instead of blocking
 // indefinitely — the Code Freeze marker stays set for the whole run, so an
 // unbounded spawn means an unbounded project-wide freeze (SA-0MSDX3KTV0092B7N).
-// Overridable via SHIP_RELEASE_TIMEOUT_MS (operators/tests).
-const RELEASE_SCRIPT_TIMEOUT_MS = Number(process.env.SHIP_RELEASE_TIMEOUT_MS) || 600000;
+//
+// The default is 60 min. The canonical merge script runs the **full test suite
+// on the merged dev→main tree** before bumping/tagging/pushing; the observed
+// Step 5 runtime on this repository is ≈ 1 982 s (~33 min), so the previous
+// 600 s default guaranteed a kill on every release (SA-0MWXIXV2R008MRT3).
+// Overridable via SHIP_RELEASE_TIMEOUT_MS (operators/tests); the bound from
+// SA-0MSDX3KTV0092B7N is retained, only widened.
+const DEFAULT_RELEASE_SCRIPT_TIMEOUT_MS = 60 * 60 * 1000; // 3 600 000 ms
+export const RELEASE_SCRIPT_TIMEOUT_MS = resolveReleaseScriptTimeout();
+
+/**
+ * Resolve the release-script timeout, honouring the SHIP_RELEASE_TIMEOUT_MS
+ * override. Exported so unit tests can assert the default and the override
+ * without spawning a release.
+ *
+ * @param {NodeJS.ProcessEnv} [env=process.env] - Environment to read from.
+ * @returns {number} Timeout in milliseconds.
+ */
+export function resolveReleaseScriptTimeout(env = process.env) {
+  const override = Number(env.SHIP_RELEASE_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0
+    ? override
+    : DEFAULT_RELEASE_SCRIPT_TIMEOUT_MS;
+}
 
 // ── Code Freeze marker (contract: WL-0MSBU4KMA004PKSR) ──────────────────────
 
@@ -1522,6 +1544,191 @@ export function syncDevWithMain(options = {}) {
   }
 }
 
+// ── recoverFromReleaseTimeout ────────────────────────────────────────────────
+/**
+ * Recover the repository after a release-script spawn timeout.
+ *
+ * On a timeout the merge script may have created a `release/dev-to-main-*`
+ * branch and left the main checkout on it. This function:
+ *
+ * 1. Restores the start branch (no `reset --hard` — local commits are preserved;
+ *    if the start branch has diverged, the operator is warned).
+ * 2. Identifies orphan release branches by diffing the pre-run branch list
+ *    against the current branch list (not by glob — concurrent runs must not
+ *    interfere, SA-0MWXIXV2R008MRT3).
+ * 3. Deletes each orphan that is unpushed and not backed by an open PR.
+ * 4. Returns structured data for the timeout error message.
+ *
+ * @param {string|null} startBranch - Branch that was checked out before the
+ *   merge script spawned.
+ * @param {string[]} preRunBranches - Local branch names before the merge
+ *   script ran.
+ * @returns {{ restoredBranch: string|null, restoreFailed: boolean,
+ *   deletedBranches: string[], skippedBranches: Array<{name: string, reason: string}>,
+ *   finalHead: string|null }}
+ */
+export function recoverFromReleaseTimeout(startBranch, preRunBranches) {
+  const deletedBranches = [];
+  const skippedBranches = [];
+  let restoredBranch = null;
+  let restoreFailed = false;
+
+  // --- Step 1: Restore the start branch ---
+  if (startBranch) {
+    try {
+      const result = execSync(`git rev-parse --verify ${shellQuote(startBranch)}`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      if (result) {
+        execSync(`git checkout ${shellQuote(startBranch)}`, {
+          encoding: 'utf-8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        restoredBranch = startBranch;
+        // Warn if the start branch has local commits not on origin (those
+        // commits are preserved — recovery never resets).
+        try {
+          const logResult = execSync(
+            `git log --oneline ${shellQuote(`origin/${startBranch}`)}..${shellQuote(startBranch)}`,
+            { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+          );
+          if (logResult.trim()) {
+            console.warn(
+              `Warning: "${startBranch}" has local commits not on origin; ` +
+              'they are preserved — re-run the release from a clean state.',
+            );
+          }
+        } catch {
+          // No origin ref (or unreachable remote) — nothing to compare.
+        }
+      }
+    } catch {
+      restoreFailed = true;
+      console.warn(
+        `Failed to restore start branch "${startBranch}"; ` +
+        'orphan cleanup will still run.',
+      );
+    }
+  }
+
+  // --- Step 2: Identify orphan branches by pre/post diff ---
+  let currentBranches = [];
+  try {
+    const branchOutput = execSync('git branch --format="%(refname:short)"', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    currentBranches = (branchOutput || '')
+      .split(/\r?\n/)
+      .map(b => b.trim())
+      .filter(b => b.length > 0);
+  } catch {
+    currentBranches = [];
+  }
+
+  const preSet = new Set(preRunBranches);
+  const orphans = currentBranches.filter(b => !preSet.has(b));
+
+  // --- Step 3: Delete safe orphans ---
+  for (const branch of orphans) {
+    // Only delete `release/dev-to-main-*` branches created by the merge script.
+    if (!branch.startsWith('release/dev-to-main-')) continue;
+
+    // Check whether the branch exists on origin. `--exit-code` gives three
+    // states: 0 = found, 2 = not found, anything else = could not verify.
+    // A branch that exists on origin, or whose origin state cannot be
+    // verified, is never deleted (conservative recovery).
+    let originState = 'unknown';
+    try {
+      execSync(`git ls-remote --exit-code --heads origin ${shellQuote(branch)}`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      originState = 'present';
+    } catch (err) {
+      originState = err && err.status === 2 ? 'absent' : 'unknown';
+    }
+
+    if (originState === 'present') {
+      skippedBranches.push({ name: branch, reason: 'exists on origin' });
+      continue;
+    }
+    if (originState === 'unknown') {
+      skippedBranches.push({
+        name: branch,
+        reason: 'could not verify origin state',
+      });
+      continue;
+    }
+
+    // Check whether the branch backs an open PR. Only a definitive "no open
+    // PR" answer permits deletion; an unavailable `gh` or a query failure
+    // leaves the branch in place.
+    let prState = 'unknown';
+    try {
+      const prOutput = execSync(
+        `gh pr list --head ${shellQuote(branch)} --state open --json url`,
+        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+      const parsed = JSON.parse((prOutput || '').trim() || '[]');
+      prState = Array.isArray(parsed) && parsed.length > 0 ? 'present' : 'absent';
+    } catch {
+      prState = 'unknown';
+    }
+
+    if (prState === 'present') {
+      skippedBranches.push({ name: branch, reason: 'backs an open PR' });
+      continue;
+    }
+    if (prState === 'unknown') {
+      skippedBranches.push({
+        name: branch,
+        reason: 'could not verify open-PR state',
+      });
+      continue;
+    }
+
+    // Safe to delete — remove locally
+    try {
+      execSync(`git branch -D ${shellQuote(branch)}`, {
+        encoding: 'utf-8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      deletedBranches.push(branch);
+    } catch {
+      skippedBranches.push({
+        name: branch,
+        reason: 'failed to delete locally',
+      });
+    }
+  }
+
+  return {
+    restoredBranch,
+    restoreFailed,
+    deletedBranches,
+    skippedBranches,
+    finalHead: readCurrentBranch(),
+  };
+}
+
+/**
+ * Read the branch currently checked out, or null if HEAD is detached/unreadable.
+ *
+ * @returns {string|null}
+ */
+function readCurrentBranch() {
+  try {
+    return execSync('git rev-parse --abbrev-ref HEAD', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 // ── waitForPRMerge ───────────────────────────────────────────────────────────
 
 /**
@@ -1950,6 +2157,34 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   // means the state could not be read; post-release steps then fail closed.
   const preRunTags = snapshotReleaseTags();
 
+  // Snapshot the start branch and local branch list so that, on a spawn
+  // timeout, the wrapper can restore the checkout and identify orphan
+  // release branches created by this run (SA-0MWXIXV2R008MRT3).
+  let startBranch;
+  try {
+    startBranch = execSync('git rev-parse --abbrev-ref HEAD', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    // A detached HEAD reports "HEAD" — there is no branch to restore.
+    if (startBranch === 'HEAD') startBranch = null;
+  } catch {
+    startBranch = null;
+  }
+  let preRunBranches = [];
+  try {
+    const branchOutput = execSync('git branch --format="%(refname:short)"', {
+      encoding: 'utf-8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    preRunBranches = (branchOutput || '')
+      .split(/\r?\n/)
+      .map(b => b.trim())
+      .filter(b => b.length > 0);
+  } catch {
+    preRunBranches = [];
+  }
+
   // Wrapper-only flags (e.g. --skip-checks) must not reach the merge script,
   // which rejects unknown arguments (SA-0MSKYGAWJ0009M3P).
   const forwardedArgs = releaseScriptForwardArgs(args);
@@ -1964,11 +2199,41 @@ async function runReleaseImpl(cliArgs = [], projectRoot) {
   // marker is cleared by the caller's finally on every exit path (exit code
   // 10, see SKILL.md).
   if (child.error && child.error.code === 'ETIMEDOUT') {
-    console.error(
+    const {
+      restoredBranch, restoreFailed, deletedBranches, skippedBranches, finalHead,
+    } = recoverFromReleaseTimeout(startBranch, preRunBranches);
+    const parts = [
       `Release script timed out after ${Math.round(RELEASE_SCRIPT_TIMEOUT_MS / 1000)}s ` +
-      'and was terminated. The Code Freeze marker has been cleared. ' +
-      'Check for partially-created branches/PRs/refs, then re-run the release.'
-    );
+      'and was terminated.',
+      'The Code Freeze marker has been cleared.',
+    ];
+    if (restoredBranch) {
+      parts.push(`The main checkout was restored to the "${restoredBranch}" branch.`);
+    } else if (restoreFailed) {
+      parts.push(
+        `The start branch could not be restored` +
+        (startBranch ? ` ("${startBranch}")` : '') +
+        `; the checkout is now on "${finalHead || 'a detached HEAD'}" — recover it manually.`,
+      );
+    } else {
+      parts.push('The start branch could not be determined; no branch restore was attempted.');
+    }
+    if (deletedBranches.length > 0) {
+      parts.push(`Orphan branch(es) deleted: ${deletedBranches.join(', ')}.`);
+    }
+    if (skippedBranches.length > 0) {
+      const reasons = skippedBranches.map(
+        b => `"${b.name}" (${b.reason})`,
+      );
+      parts.push(
+        'Orphan branch(es) left in place (pushed, PR-backed, or unverifiable): ' +
+        `${reasons.join('; ')}.`,
+      );
+    }
+    if (finalHead && restoredBranch && finalHead !== restoredBranch) {
+      parts.push(`Post-recovery HEAD is "${finalHead}".`);
+    }
+    console.error(parts.join(' '));
     return finish(10);
   }
 

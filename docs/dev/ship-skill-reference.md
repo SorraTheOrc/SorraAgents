@@ -73,7 +73,7 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 7 | Critical-items gate failure (critical items not in terminal state) |
 | 8 | Worklog-ref gate failure (worklog refs present) |
 | 9 | Producer-review gate failure — top-level `in_review` item(s) flagged for producer review (`needsProducerReview != false`) |
-| 10 | Release script timed out (killed after `SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
+| 10 | Release script timed out and was terminated (`SHIP_RELEASE_TIMEOUT_MS`, default 3 600 s = 60 min; the merge script's full-suite step takes ≈ 1 982 s). The wrapper restores the start branch and deletes this run's orphan `release/dev-to-main-*` branch when it is unpushed and PR-free, reporting exactly what it restored and deleted (or refused, with the reason) |
 | 11 | Release merge verification failed (close-work-items step refused — no verified dev→main merge) |
 | 12 | Final-validation gate failure — top-level or **uncovered child** `in_review` item(s) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation (children covered by a passing `in_review` parent audit, or excluded because the parent is deleted/non-`in_review`, never block) |
 | 13 | Invalid argument — an unrecognised flag or a missing value; wrapper usage printed and nothing executed |

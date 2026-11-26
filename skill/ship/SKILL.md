@@ -253,7 +253,7 @@ While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/
 | 7 | Critical-items gate failure |
 | 8 | Worklog-ref gate failure |
 | 9 | Producer-review gate failure — top-level `in_review` item(s) flagged for producer review (`needsProducerReview != false`) |
-| 10 | Release script timed out (`SHIP_RELEASE_TIMEOUT_MS`, default 600s) |
+| 10 | Release script timed out and was terminated (`SHIP_RELEASE_TIMEOUT_MS`, default 3 600 s = 60 min; the canonical merge script's full-suite step takes ≈ 1 982 s). The wrapper then restores the checkout to the branch it started on and deletes this run's orphan `release/dev-to-main-*` branch when it is unpushed and not backed by an open PR, naming what it restored and what it deleted (or refused to delete, with the reason) in the message |
 | 11 | Release merge verification failed (no verified dev→main merge) |
 | 12 | Final-validation gate failure — top-level or **uncovered child** `in_review` item(s) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation (children covered by a passing `in_review` parent audit, or excluded because the parent is deleted/non-`in_review`, never block) |
 | 13 | Invalid argument — an unrecognised flag or a missing value; wrapper usage printed and nothing executed (no gate, merge, `wl`, git mutation or notification) |
