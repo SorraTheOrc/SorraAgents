@@ -183,6 +183,7 @@ class TestExecutionWorktree:
             head = subprocess.run(
                 ["git", "rev-parse", "HEAD"], cwd=str(worktree),
                 capture_output=True, text=True, env=fixture_git_env(),
+                check=False,
             ).stdout.strip()
             # The worktree is detached at origin/dev — NOT the dirty HEAD.
             assert head == scenario.origin_dev

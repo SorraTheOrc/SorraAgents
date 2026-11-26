@@ -131,6 +131,7 @@ from scripts.failure_notice import FailureNotice
 from scripts.pi_utils import extract_pi_text, extract_pi_text_with_fallback
 
 try:
+    from shared.claim_release import should_release_assignee
     from shared.git_sandbox import git_env_for_repo, scrub_repository_overrides
     from shared.process_semaphore import (
         DEFAULT_MAX_WORKERS,
@@ -171,18 +172,19 @@ from test_cache import (
     run_cached,
 )
 
-#: Audit-specific acceptance window for GREEN cached full-suite runs.
-#: The generic ``DEFAULT_TTL_SECONDS`` (2h) is kept for suite runs elsewhere;
-#: the audit instead accepts gate-produced evidence (the dev-push pre-push
-#: hook/`ship` release gate full runs, SA-0MVECQUGF0064U81) for up to 24h at
-#: the SAME git state, so auditing an item pushed yesterday — or a re-audit,
-#: or an audit after HEAD drifted — reuses the cached green run instead of
-#: F3 auto-executing a fresh full suite. The git-state key still guarantees
-#: the tree is byte-identical to the proven run; the window only guards
-#: environmental drift (deps/infra). Failed runs are NOT extended: the cache
-#: trims non-zero-exit entries to the short 5-minute TTL
-#: (FAILED_RUN_TTL_SECONDS) regardless of this value.
-AUDIT_CACHE_TTL_SECONDS = 24 * 60 * 60
+#: No practical time bound for GREEN cached full-suite runs.
+#:
+#: The audit accepts GREEN cached full-suite evidence at a matching git state
+#: without any time limit. Code identity is guaranteed by the git-state cache
+#: key (byte-identical tree); environmental drift is caught fresh at the next
+#: dev-push gate and by the `ship` release gate before anything ships
+#: (SA-0MVECQUGF0064U81). This removes needless F3 re-executions for
+#: re-audits, backlog audits, and audits at a HEAD that has since drifted.
+#:
+#: Failed (non-zero-exit) entries are NOT extended: the cache trims them to
+#: the short 5-minute TTL (FAILED_RUN_TTL_SECONDS) regardless of this value,
+#: so a transient infra failure is never re-served as current evidence.
+AUDIT_CACHE_TTL_SECONDS = float("inf")
 
 # ---------------------------------------------------------------------------
 # Recursion guard: LIVE_REPO_GUARD_ACTIVE propagation (SA-0MUG47DYG006TV40)
@@ -1346,6 +1348,60 @@ applied update is harmless.
 
 _STATUS_RESTORE_RETRY_DELAY_S = 0.5
 """Base delay (seconds) between status-restore retries; grows linearly."""
+
+_STATUS_SETTLE_DELAY_S = 0.5
+"""Bounded settle interval (seconds) before the post-write re-verification.
+
+A concurrent ``wl sync`` (pull -> merge -> push, last-writer-wins on a stale
+snapshot) can overwrite a verified restore *after* its readback succeeded.
+Restore paths therefore sleep this bounded interval, re-read the persisted
+lifecycle, and re-apply the identical write once when it was clobbered
+(SA-0MW7Z77KI005MK0B). The interval is deliberately short: it closes the
+settle window without adding measurable audit duration (restore paths only —
+the happy-path 'Yes' advance is never re-read). Override with
+``AUDIT_STATUS_SETTLE_DELAY`` (seconds; ``0`` disables the settle sleep for
+tests).
+"""
+
+AUDIT_STATUS_SETTLE_DELAY_ENV = "AUDIT_STATUS_SETTLE_DELAY"
+
+_STATUS_SETTLE_MAX_REAPPLIES = 1
+"""Bounded re-applies of the identical terminal write after a settle clobber.
+
+One extra write is enough to recover from a single lost update (the observed
+race) while keeping the retry budget finite (SA-0MW7Z77KI005MK0B). A restore
+that still cannot be verified is reported loudly and exits non-zero — never a
+silent success.
+"""
+
+
+def _resolve_settle_delay() -> float:
+    """Resolve the settle-window delay, honouring ``AUDIT_STATUS_SETTLE_DELAY``.
+
+    Invalid or negative values fall back to :data:`_STATUS_SETTLE_DELAY_S`
+    with a warning (never blocks an audit). ``0`` is a valid value that
+disables the settle sleep (used by deterministic race tests).
+    """
+    raw = os.environ.get(AUDIT_STATUS_SETTLE_DELAY_ENV)
+    if raw is None or not raw.strip():
+        return _STATUS_SETTLE_DELAY_S
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f"Warning: invalid {AUDIT_STATUS_SETTLE_DELAY_ENV} value "
+            f"{raw!r}; using default {_STATUS_SETTLE_DELAY_S}",
+            file=sys.stderr,
+        )
+        return _STATUS_SETTLE_DELAY_S
+    if value < 0:
+        print(
+            f"Warning: {AUDIT_STATUS_SETTLE_DELAY_ENV} must be >= 0, got "
+            f"{value}; using default {_STATUS_SETTLE_DELAY_S}",
+            file=sys.stderr,
+        )
+        return _STATUS_SETTLE_DELAY_S
+    return value
 
 _SCANNING_BLOCK = (
     "SCANNING — When you need to look something up, use the bounded helpers:\n"
@@ -12278,6 +12334,19 @@ def _integrate_into_dev(ctx: _AuditContext,
                     evidence.append(proc.stderr.strip())
                     return False, "\n".join(evidence) + "\nIntegration failed: cherry-pick conflicts."
 
+        # Populate tracked submodules BEFORE the node_modules symlink and the
+        # build (ordering hazard SA-0MVTOR53E003IIEQ; SA-0MW7Z6WRO00242Z3).
+        # ``git worktree add`` never populates a tracked gitlink, so a repo
+        # that vendors a submodule (e.g. tce-the-rising's ``core/``) would
+        # build against an empty directory and fail — marking
+        # execution-dependent ACs ``partial`` on a tree that is green in the
+        # real, populated checkout. Fail-open: a repo without ``.gitmodules``
+        # is unaffected and a failed init never aborts the audit.
+        if _ensure_worktree_submodules(worktree_path):
+            evidence.append("submodules initialised in integration worktree")
+        else:
+            evidence.append("submodule initialisation skipped/failed (best-effort)")
+
         # Build + test (build → test → commit order per AGENTS.md).
         # node_modules is shared via symlink (implement-skill convention,
         # SA-0MSGS763C006SM1B): never npm-install inside a worktree.
@@ -12411,19 +12480,22 @@ def _looks_like_sha(value: str) -> bool:
     return bool(_SHA_LIKE_RE.match((value or "").strip()))
 
 
-def _ensure_execution_worktree_submodules(worktree_path: Path) -> bool:
-    """Initialise git submodules inside a fresh execution worktree.
+def _ensure_worktree_submodules(worktree_path: Path) -> bool:
+    """Initialise git submodules inside a fresh audit worktree.
 
+    Shared by both audit worktrees: the F3 **execution** worktree
+    (``audit-exec-<id>``, SA-0MW4ZRLSI005PHL6) and the merge-gate
+    **integration** worktree (``audit-merge-<id>``, SA-0MW7Z6WRO00242Z3).
     Mirrors ``implement.py::_ensure_submodules`` (SA-0MSN52GGN002B0AZ): a
     ``git worktree add`` leaves a tracked gitlink's submodule directory
-    empty, so a project whose suite imports a submodule (e.g.
-    tce-the-rising's ``core/``) fails every suite command at startup. Run
-    **before** the ``node_modules`` symlink (ordering hazard
-    SA-0MVTOR53E003IIEQ).
+    empty, so a project whose build or suite imports a submodule (e.g.
+    tce-the-rising's ``core/``) fails at startup — a false negative on a
+    tree that builds green in the populated checkout. Run **before** the
+    ``node_modules`` symlink (ordering hazard SA-0MVTOR53E003IIEQ).
 
-    Best-effort: a failure never aborts the audit — the execution worktree
-    is then no worse than the launch checkout. Returns ``True`` when
-    submodules were initialised (or there are none).
+    Best-effort: a failure never aborts the audit — the worktree is then
+    no worse than the launch checkout. Returns ``True`` when submodules
+    were initialised (or there are none).
     """
     if not (worktree_path / ".gitmodules").is_file():
         return True
@@ -12535,7 +12607,7 @@ def _create_execution_worktree(owning_root: Path, runner: Runner,
             f"(detached at origin/dev {dev_sha[:10]})"
         )
         # Submodules BEFORE the node_modules symlink (SA-0MVTOR53E003IIEQ).
-        if _ensure_execution_worktree_submodules(worktree_path):
+        if _ensure_worktree_submodules(worktree_path):
             evidence.append("submodules initialised in execution worktree")
         else:
             evidence.append("submodule initialisation skipped/failed (best-effort)")
@@ -12567,8 +12639,13 @@ def _remove_execution_worktree(owning_root: Path | None, runner: Runner,
         return
     try:
         runner(["git", "worktree", "remove", "--force", str(worktree_path)])
-    except Exception:  # noqa: BLE001 -- cleanup best-effort
-        pass
+    except Exception as exc:  # noqa: BLE001 -- cleanup best-effort
+        # S110 (SA-0MWQKFSUR0041FXV): surface the failure instead of a silent
+        # ``pass``; the audit still fails open and never aborts on cleanup.
+        print(
+            f"Execution worktree cleanup failed for {worktree_path}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def _launch_checkout_divergence(owning_root: Path, runner: Runner,
@@ -13001,9 +13078,57 @@ def _build_merge_gate_failure_report(ctx: _AuditContext) -> str:
     return "\n".join(lines)
 
 
+def _claim_audit_lifecycle(ctx: _AuditContext) -> None:
+    """Write the abort state file, claim ``in_progress`` and register signals.
+
+    Called by :func:`cmd_issue` INSIDE its guarded ``try`` region
+    (SA-0MW7Z77KI005MK0B F2 AC4). Doing the claim here — rather than at the
+    tail of :func:`_phase_gate` — means an exception raised immediately
+    after the claim (audit-lease acquisition, checkpoint-store open) or a
+    ``KeyboardInterrupt`` still runs the terminal lifecycle and restores the
+    captured pre-audit state. The gate's early-return paths (freshness skip,
+    pre-flight refusal) return before this runs, so they never claim.
+
+    Ordering mirrors the original inline block: the pre-audit state file is
+    written BEFORE the ``in_progress`` claim so a SIGKILL leaves the parent
+    process enough information to restore the item; the SIGTERM/SIGINT
+    handlers are registered AFTER the claim so an interrupt restores it.
+    """
+    state_path = _write_audit_state_file(
+        ctx.issue_id, ctx.original_status, ctx.original_stage,
+        worklog_dir=ctx.worklog_dir,
+    )
+    ctx.abort_state_path = state_path
+
+    # A completed/done item is already terminal and cannot be claimed with the
+    # `in-progress` status: the worklog rejects `in-progress`/`done` as an
+    # incompatible status/stage pair (SA-0MUWKGW9W004QXQZ). The claim is
+    # status-only and sets no assignee, so it never establishes a scheduling
+    # hold and never overwrites a pre-existing claim.
+    if ctx.original_stage != "done":
+        _run_wl(
+            ctx.runner,
+            ["wl", "update", ctx.issue_id, "--status", "in_progress", "--json"],
+            worklog_dir=ctx.worklog_dir,
+        )
+
+    # Python's default SIGTERM disposition skips ``finally`` blocks, and
+    # SIGKILL cannot be caught; the handler restores the pre-audit state and
+    # re-raises, and the parent-process state-file check covers SIGKILL.
+    ctx.abort_deactivate = _register_abort_signal_handlers(
+        ctx.issue_id, ctx.original_status, ctx.original_stage,
+        state_path, worklog_dir=ctx.worklog_dir,
+    )
+
+
 def _phase_gate(ctx: _AuditContext, code_root: str | None = None) -> int | None:
-    """Phase 1 — launch-context resolution, model/green-run resolution, original
-    status capture, freshness gates, and the in_progress claim.
+    """Phase 1 — launch-context resolution, model/green-run resolution,
+    original status capture and the freshness gates.
+
+    The ``in_progress`` claim (with its abort state file and signal handlers)
+    is applied by :func:`_claim_audit_lifecycle` called from ``cmd_issue``
+    INSIDE its guarded region (SA-0MW7Z77KI005MK0B F2 AC4), so this gate
+    never claims on its early-return paths.
 
     Returns an exit code for early-abort paths (fresh-skip, pre-flight
     refusal) — cmd_issue returns it directly without touching the
@@ -13586,49 +13711,15 @@ def _phase_gate(ctx: _AuditContext, code_root: str | None = None) -> int | None:
         return 1
 
     # ------------------------------------------------------------------
-    # Abort-recovery state file (SA-0MTRH8C5O005URGR).
-    # Write the pre-audit state BEFORE claiming in_progress so that if
-    # the process is killed (SIGKILL) the parent process can restore the
-    # work item to its original state.
+    # Abort-recovery state file, the ``in_progress`` claim and the
+    # SIGTERM/SIGINT handlers are applied by ``cmd_issue`` INSIDE its
+    # guarded region (SA-0MW7Z77KI005MK0B F2 AC4). Deferring them past the
+    # gate's early-return paths (freshness skip, pre-flight refusal) keeps
+    # those paths claim-free, while an exception raised immediately after
+    # the claim — audit-lease acquisition, checkpoint-store open, or an
+    # interrupt — still restores the captured pre-audit state via the
+    # terminal lifecycle. See ``_claim_audit_lifecycle``.
     # ------------------------------------------------------------------
-    state_path = _write_audit_state_file(
-        issue_id, original_status, original_stage,
-        worklog_dir=worklog_dir,
-    )
-    ctx.abort_state_path = state_path
-
-    # ------------------------------------------------------------------
-    # Status lifecycle: set in_progress on entry (verdict-driven on exit)
-    # ------------------------------------------------------------------
-    # A completed/done item is already terminal and cannot be claimed with
-    # the `in-progress` status: the worklog rejects `in-progress`/`done` as
-    # an incompatible status/stage pair, which previously made re-auditing a
-    # terminal item fail before the pipeline started. There is nothing to
-    # claim for a done item, so skip the claim and let the verdict-driven
-    # terminal lifecycle keep/restore `done` (SA-0MUWKGW9W004QXQZ).
-    #
-    # The claim is status-only and sets no assignee, so it never establishes a
-    # scheduling hold and never overwrites a pre-existing claim (the
-    # status-neutral claim convention documented in AGENTS_GLOBAL.md). The
-    # release of the audit agent's own claim happens on the terminal-write path
-    # below (SA-0MVVF6Y38004T5OZ).
-    if original_stage != "done":
-        _run_wl(runner,
-                ["wl", "update", issue_id, "--status", "in_progress", "--json"],
-                worklog_dir=worklog_dir)
-
-    # ------------------------------------------------------------------
-    # Register SIGTERM/SIGINT signal handlers (SA-0MTRH8C5O005URGR).
-    # Python's default SIGTERM disposition terminates without running
-    # finally blocks, and SIGKILL cannot be caught at all.  The handler
-    # restores the pre-audit status and re-raises so the process still
-    # terminates normally.  SIGKILL is handled by the parent-process
-    # state-file check on exit.
-    # ------------------------------------------------------------------
-    ctx.abort_deactivate = _register_abort_signal_handlers(
-        issue_id, original_status, original_stage,
-        state_path, worklog_dir=worklog_dir,
-    )
 
     # Sync the resolved gate state back into the context for later phases.
     ctx.owning_root = owning_root
@@ -17237,58 +17328,271 @@ def _coerce_valid_status_stage(status, stage):
     return effective_status, coerced_stage
 
 
-def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> None:
-    """Best-effort restore of the captured pre-audit state after a failed
-    terminal transition (WL-0MSWFRM800073Y81).
+def _release_assignee_flags(
+    runner: Runner,
+    issue_id: str,
+    worklog_dir: str | None,
+) -> list[str]:
+    """Return ``["--assignee", ""]`` when *issue_id* holds a releasable claim.
+
+    Reuses the shared claim-release predicate
+    (:func:`shared.claim_release.should_release_assignee`) rather than
+    re-deriving the release rule, so the audit's restore writes can never
+disagree with ``StatusLifecycle`` about what a claim is (assignee-release
+    invariant). The release is the safe default when the readback fails or the
+    item carries no ``assignee`` field (the write is a no-op when the claim is
+    already empty), so a stranded claim can never survive a restore.
+    """
+    try:
+        data = _run_wl(
+            runner, ["wl", "show", issue_id, "--json"],
+            worklog_dir=worklog_dir,
+        )
+    except RuntimeError:
+        return ["--assignee", ""]
+    item = data.get("workItem") if isinstance(data, dict) else None
+    if not isinstance(item, dict):
+        item = data if isinstance(data, dict) else {}
+    return _claim_release_flags_for_item(item)
+
+
+def _claim_release_flags_for_item(item: dict) -> list[str]:
+    """Claim-release flags for an already-fetched work-item payload.
+
+    Split out of :func:`_release_assignee_flags` so the CAS guard
+    (SA-0MWFMV31W00532T3 AC5) can share the single ``wl show`` read that
+    decides both the claim release and the conditional-write expectation.
+    """
+    # Fail-safe: release unless the item explicitly reports an empty claim.
+    if "assignee" not in item or should_release_assignee(item):
+        return ["--assignee", ""]
+    return []
+
+
+def _lifecycle_cmd_side_effect_flags(cmd: Sequence[str]) -> list[str]:
+    """Flags in *cmd* that change something beyond the lifecycle write itself.
+
+    A restore/re-assert command may also carry producer-review or similar
+    flags; when it does, the write is never redundant even if the item already
+    matches the target status/stage (those flags still have to land).
+    """
+    allowed = {"--status", "--stage", "--assignee", "--json"}
+    return [
+        flag for flag in cmd
+        if flag.startswith("--") and flag not in allowed
+    ]
+
+
+def _guard_restore_cmd(
+    ctx: _AuditContext,
+    cmd: Sequence[str],
+    expected_status: str,
+    expected_stage: str,
+) -> tuple[list[str] | None, bool]:
+    """Add CAS flags to a restore write, or report it as redundant (AC5).
+
+    Restore writes must never blind-overwrite a lifecycle they did not
+    observe, and must never re-issue a write that would change nothing. This
+    helper performs ONE ``wl show`` read and returns:
+
+    * ``(None, True)`` — the item already carries the expected status/stage
+      and holds no releasable claim, and the command carries no other
+      side-effect flag (e.g. ``--needs-producer-review``), so the write would
+      be a no-op. The caller skips it (no redundant write, no CAS round-trip).
+    * ``(cmd_with_cas, False)`` — ``--if-status``/``--if-stage`` pinned to the
+      state just observed, so a concurrent writer that moved the item makes
+      the write fail with ``stale`` (the caller re-reads and retries) instead
+      of clobbering it.
+    * ``(cmd, False)`` — the read failed or carried no lifecycle: the write
+      stays unconditional and the existing readback verification still
+      governs. Never a silent success.
+    """
+    try:
+        data = _run_wl(
+            ctx.runner, ["wl", "show", ctx.issue_id, "--json"],
+            worklog_dir=ctx.worklog_dir,
+        )
+    except RuntimeError:
+        return None, False
+    item = data.get("workItem") if isinstance(data, dict) else None
+    if not isinstance(item, dict):
+        item = data if isinstance(data, dict) else {}
+    status = str(item.get("status") or "")
+    stage = str(item.get("stage") or "")
+    claim_flags = _claim_release_flags_for_item(item)
+    side_effect_flags = _lifecycle_cmd_side_effect_flags(cmd)
+    if (
+        status and stage and not claim_flags and not side_effect_flags
+        and _lifecycle_state_matches(expected_status, expected_stage, (status, stage))
+    ):
+        return None, True
+    if not status or not stage:
+        return None, False
+    flags = list(cmd)
+    insert_at = len(flags) - 1 if flags and flags[-1] == "--json" else len(flags)
+    flags[insert_at:insert_at] = [
+        "--if-status", status, "--if-stage", stage,
+    ]
+    return flags, False
+
+
+def _verified_lifecycle_update(
+    ctx: _AuditContext,
+    expected_status: str,
+    expected_stage: str,
+    *,
+    extra_flags: Sequence[str] = (),
+    settle: bool = True,
+    cas: bool = False,
+) -> bool:
+    """Apply, verify and settle-check a lifecycle write for *ctx*.
+
+    Writes ``expected_status``/``expected_stage`` (plus *extra_flags*) via
+    ``ctx.runner``, verifies the persisted state through an independent
+    ``wl show`` readback with bounded retries, then — for restore writes
+    (*settle* True) — re-reads after a bounded settle interval and
+    re-applies the identical write once if a concurrent ``wl sync`` clobbered
+    it (SA-0MW7Z77KI005MK0B).
+
+    Returns True only when the persisted lifecycle was verified; an
+    unverified write is never reported as success.
+    """
+    base_cmd = [
+        "wl", "update", ctx.issue_id,
+        "--status", expected_status,
+        "--stage", expected_stage,
+        *_release_assignee_flags(ctx.runner, ctx.issue_id, ctx.worklog_dir),
+        *extra_flags,
+        "--json",
+    ]
+    # The command actually sent (CAS-guarded) is rebuilt from the pristine
+    # *base_cmd* on every attempt: re-guarding an already-guarded command would
+    # duplicate ``--if-status``/``--if-stage`` and make the write invalid.
+    cmd = base_cmd
+    last_error: Exception | None = None
+    for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
+        try:
+            cmd = base_cmd
+            if cas:
+                guarded, redundant = _guard_restore_cmd(
+                    ctx, base_cmd, expected_status, expected_stage,
+                )
+                if redundant:
+                    # The item already carries the target state and holds no
+                    # claim: the write would change nothing (AC5).
+                    return True
+                if guarded is not None:
+                    cmd = guarded
+            _run_wl(ctx.runner, cmd, worklog_dir=ctx.worklog_dir)
+            actual = _read_item_lifecycle_state(
+                ctx.runner, ctx.issue_id, ctx.worklog_dir,
+            )
+            if _lifecycle_state_matches(expected_status, expected_stage, actual):
+                last_error = None
+                break
+            last_error = RuntimeError(
+                f"lifecycle write not applied: expected "
+                f"status={expected_status!r} stage={expected_stage!r}, "
+                f"readback status={actual[0] if actual else None!r} "
+                f"stage={actual[1] if actual else None!r}"
+            )
+        except RuntimeError as exc:
+            last_error = exc
+        if attempt < _STATUS_RESTORE_MAX_ATTEMPTS - 1:
+            time.sleep(_STATUS_RESTORE_RETRY_DELAY_S * (attempt + 1))
+    if last_error is not None:
+        return False
+    if settle:
+        return _settle_verify_lifecycle(
+            ctx, cmd, expected_status, expected_stage,
+        )
+    return True
+
+
+def _settle_verify_lifecycle(
+    ctx: _AuditContext,
+    cmd: Sequence[str],
+    expected_status: str,
+    expected_stage: str,
+) -> bool:
+    """Re-verify a restore after a bounded settle, re-applying once if clobbered.
+
+    A concurrent ``wl sync`` is last-writer-wins on a stale snapshot: it can
+    overwrite a restore *after* the immediate readback confirmed it. This
+    sleeps :func:`_resolve_settle_delay` seconds, re-reads the persisted
+    lifecycle and, when a mismatch is observed, re-applies the identical
+    write up to :data:`_STATUS_SETTLE_MAX_REAPPLIES` times before declaring
+    failure. Returns True when the final readback matches.
+    """
+    delay = _resolve_settle_delay()
+    for attempt in range(_STATUS_SETTLE_MAX_REAPPLIES + 1):
+        if delay > 0:
+            time.sleep(delay)
+        actual = _read_item_lifecycle_state(
+            ctx.runner, ctx.issue_id, ctx.worklog_dir,
+        )
+        if _lifecycle_state_matches(expected_status, expected_stage, actual):
+            return True
+        if attempt < _STATUS_SETTLE_MAX_REAPPLIES:
+            print(
+                f"Warning: restore of {ctx.issue_id} to "
+                f"({expected_status}/{expected_stage}) was clobbered after a "
+                f"verified write (readback: {actual!r}); re-applying once "
+                "(concurrent wl sync).",
+                file=sys.stderr,
+            )
+            try:
+                _run_wl(ctx.runner, cmd, worklog_dir=ctx.worklog_dir)
+            except RuntimeError as exc:
+                print(
+                    f"Warning: re-apply of the restore for {ctx.issue_id} "
+                    f"failed: {exc}",
+                    file=sys.stderr,
+                )
+    return False
+
+
+def _restore_pre_audit_state_on_failure(ctx: _AuditContext) -> int:
+    """Verified restore of the captured pre-audit state after a failed
+    terminal transition (WL-0MSWFRM800073Y81, SA-0MW7Z77KI005MK0B).
 
     After a verification failure the item's state is uncertain (partial
-    application, silently-swallowed update, or a wl error). Restoring the
-    captured pre-audit status/stage — itself verified by a readback — keeps
-    the item observable and consistent; any residual failure is logged
-    loudly rather than silently ignored. Falls back to ``open``/``plan_complete``
-    only when the pre-audit state could not be captured.
+    application, silently-swallowed update, a wl error, or a concurrent
+    ``wl sync`` lost update). Restoring the captured pre-audit status/stage —
+    itself verified through a readback with bounded retries and a settle
+    re-check — keeps the item observable and consistent. Falls back to
+    ``open``/``plan_complete`` only when the pre-audit state could not be
+    captured.
 
     If the captured (status, stage) pair is invalid (e.g. ``blocked`` +
     ``in_review``), ``_coerce_valid_status_stage`` keeps the status but
     coerces the stage to a valid default, so the restore never fails due to
     an incompatible combination.
+
+    Returns 0 only when the restore was applied AND verified; non-zero when
+    the restore could not be verified, so the caller can exit non-zero rather
+    than report a silent success.
     """
     safe_status, safe_stage = _coerce_valid_status_stage(
         ctx.original_status, ctx.original_stage,
     )
-    # Raw ``wl update`` durable write: there is no StatusLifecycle exit here to
-    # inherit the release-by-default, so the audit claim is released explicitly.
-    cmd = [
-        "wl", "update", ctx.issue_id,
-        "--status", safe_status,
-        "--stage", safe_stage,
-        "--assignee", "",
-        "--json",
-    ]
-    try:
-        _run_wl(ctx.runner, cmd, worklog_dir=ctx.worklog_dir)
-    except RuntimeError as exc:
-        print(
-            f"Error: failed to restore pre-audit state for {ctx.issue_id}: {exc}",
-            file=sys.stderr,
-        )
-        return
-    actual = _read_item_lifecycle_state(ctx.runner, ctx.issue_id, ctx.worklog_dir)
-    if _lifecycle_state_matches(safe_status, safe_stage, actual):
+    if _verified_lifecycle_update(ctx, safe_status, safe_stage, cas=True):
         print(
             f"Restored {ctx.issue_id} to pre-audit state "
             f"({safe_status}/{safe_stage}).",
             file=sys.stderr,
         )
-    else:
-        print(
-            f"Error: restore of {ctx.issue_id} to pre-audit state "
-            f"({safe_status}/{safe_stage}) could not be verified "
-            f"(readback: {actual!r}). Recover manually with "
-            f"`wl update {ctx.issue_id} --status {safe_status} "
-            f"--stage {safe_stage}`.",
-            file=sys.stderr,
-        )
+        return 0
+    actual = _read_item_lifecycle_state(ctx.runner, ctx.issue_id, ctx.worklog_dir)
+    print(
+        f"Error: restore of {ctx.issue_id} to pre-audit state "
+        f"({safe_status}/{safe_stage}) could not be verified "
+        f"(readback: {actual!r}). Recover manually with "
+        f"`wl update {ctx.issue_id} --status {safe_status} "
+        f"--stage {safe_stage}`.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _is_terminal_lifecycle(status, stage) -> bool:
@@ -17506,6 +17810,19 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # must never fire on the 'no'/restore/fallback branches
     # (SA-0MUR7Y3BJ004FGPP AC3; the SA-0MU2OY1N9000XL2H scope guard).
     cascade_authorised = False
+    # Set True on branches that RESTORE the captured pre-audit state (the
+    # failure/fallback-tainted and cascade-suppressed paths). Only restore
+    # writes get the settle re-verification after a verified readback
+    # (SA-0MW7Z77KI005MK0B); the happy-path 'Yes' advance makes no extra
+    # read, so it never regresses audit duration.
+    restore_write_expected = False
+    # Set True on the same branches plus the deliberate explicit-'No'
+    # demotion: those writes are CAS-guarded against the lifecycle observed
+    # immediately before them and are skipped outright when the item already
+    # carries the target state, so a restore never blind-overwrites a
+    # concurrent writer and never re-writes a no-op (SA-0MWFMV31W00532T3 AC5).
+    # The 'Yes' advance stays unguarded (AC6: no extra read on the happy path).
+    cas_guard_expected = False
     try:
         # Infra-fallback provenance: a "No" derived from infrastructure-
         # failure fallbacks must restore, never demote. The flag does NOT
@@ -17568,6 +17885,8 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                 "--json",
             ]
             expected_status, expected_stage = safe_status, safe_stage
+            restore_write_expected = True
+            cas_guard_expected = True
         elif ctx.audit_verdict == "yes":
             # Advance to the review queue. Keep a terminal 'done' stage.
             # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6 / Q2=C): a
@@ -17639,6 +17958,8 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                     "--json",
                 ]
                 expected_status, expected_stage = safe_status, safe_stage
+                restore_write_expected = True
+                cas_guard_expected = True
                 print(
                     f"Cascade-audit: suppressed demotion for {ctx.issue_id} "
                     f"(was {ctx.original_stage}; verdict 'No' is from "
@@ -17652,6 +17973,7 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                     "--assignee", "", "--json",
                 ]
                 expected_status, expected_stage = "open", "plan_complete"
+                cas_guard_expected = True
                 # Independent failing audit flags the producer queue
                 # (SA-0MVR9B1UH002BUST AC3): every independent top-level
                 # 'No' — merge-gate-blocked or ordinary — surfaces the item,
@@ -17704,9 +18026,24 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
     # silently: transient wl failures AND verification mismatches are
     # retried, then surfaced loudly with a non-zero exit. The update is
     # idempotent, so retrying after a partially-applied update is harmless.
+    # The CAS-guarded command is rebuilt from *base_restore_cmd* on every
+    # attempt (re-guarding an already-guarded command would duplicate the CAS
+    # flags and make the write invalid); the guarded form that landed is kept
+    # for the settle re-apply.
+    base_restore_cmd = restore_cmd
     last_error: Exception | None = None
     for attempt in range(_STATUS_RESTORE_MAX_ATTEMPTS):
         try:
+            if cas_guard_expected:
+                guarded, redundant = _guard_restore_cmd(
+                    ctx, base_restore_cmd, expected_status, expected_stage,
+                )
+                if redundant:
+                    # Already in the target state and no claim to release:
+                    # the write would change nothing (AC5).
+                    last_error = None
+                    break
+                restore_cmd = guarded if guarded is not None else base_restore_cmd
             _run_wl(ctx.runner, restore_cmd, worklog_dir=ctx.worklog_dir)
             actual = _read_item_lifecycle_state(
                 ctx.runner, ctx.issue_id, ctx.worklog_dir
@@ -17724,6 +18061,27 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             last_error = exc
         if attempt < _STATUS_RESTORE_MAX_ATTEMPTS - 1:
             time.sleep(_STATUS_RESTORE_RETRY_DELAY_S * (attempt + 1))
+
+    # Settle re-verification (SA-0MW7Z77KI005MK0B): a concurrent ``wl sync``
+    # is last-writer-wins on a stale snapshot and can overwrite a restore
+    # AFTER its immediate readback confirmed it, leaving the item at a stale
+    # open/plan_complete. Restore writes are re-read after a bounded settle
+    # interval and re-applied once if clobbered. The happy-path 'Yes' advance
+    # and the deliberate explicit-'No' demotion skip this (no extra read).
+    if last_error is None and restore_write_expected:
+        if not _settle_verify_lifecycle(
+            ctx, restore_cmd, expected_status, expected_stage,
+        ):
+            actual = _read_item_lifecycle_state(
+                ctx.runner, ctx.issue_id, ctx.worklog_dir,
+            )
+            last_error = RuntimeError(
+                "restore was clobbered after a verified write and could not "
+                f"be re-established: expected status={expected_status!r} "
+                f"stage={expected_stage!r}, readback "
+                f"status={actual[0] if actual else None!r} "
+                f"stage={actual[1] if actual else None!r}"
+            )
 
     if last_error is not None:
         # Never a silent success: surface the failure loudly, restore the
@@ -18112,15 +18470,24 @@ def cmd_issue(issue_id: str, persist: bool = True,
     if rc is not None:
         return rc
 
-    # Cross-host audit lease (LP-0MW96A9GW009KVF7, parent AC1/AC2): acquire
-    # the proxy's audit-tier lease for the lifetime of this run. Fail-open —
-    # a missing lease (proxy down / saturated after bounded retries) proceeds
-    # under legacy per-host guards, never blocks the audit.
-    audit_lease_begin(issue_id)
-
-    ctx.checkpoint = _open_checkpoint_store(ctx, checkpoint_dir, no_checkpoint)
-
     try:
+        # SA-0MW7Z77KI005MK0B F2 AC4: the in_progress claim (with its abort
+        # state file and signal handlers) moves INSIDE the guarded region so
+        # an exception raised immediately after it — audit-lease acquisition,
+        # checkpoint-store open, or an interrupt — still runs the terminal
+        # lifecycle and restores the captured pre-audit state. The gate's own
+        # early-return paths (freshness skip, pre-flight refusal) already
+        # returned above, so they never claim.
+        _claim_audit_lifecycle(ctx)
+
+        # Cross-host audit lease (LP-0MW96A9GW009KVF7, parent AC1/AC2): acquire
+        # the proxy's audit-tier lease for the lifetime of this run. Fail-open —
+        # a missing lease (proxy down / saturated after bounded retries) proceeds
+        # under legacy per-host guards, never blocks the audit.
+        audit_lease_begin(issue_id)
+
+        ctx.checkpoint = _open_checkpoint_store(ctx, checkpoint_dir, no_checkpoint)
+
         # The fetch phase (SA-0MT456M27001LRTL) runs the Phase 1 merge gate
         # at its very start (before the code-quality scan, children-stage
         # check, or surface AC assessment): the item's work must be merged
@@ -18224,6 +18591,21 @@ def cmd_issue(issue_id: str, persist: bool = True,
             print(json.dumps({"error": str(exc)}, indent=2))
         else:
             print(f"Error: {exc}", file=sys.stderr)
+        rc = 1
+
+    except Exception as exc:  # noqa: BLE001 -- setup failure; restore below
+        # A failure while starting the audit after the ``in_progress`` claim
+        # (audit-lease acquisition, checkpoint-store open, or any unexpected
+        # error) is never allowed to leave the item claimed: log it, set a
+        # non-zero exit, and let the finally block restore the pre-audit
+        # state (SA-0MW7Z77KI005MK0B F2 AC4).
+        if ctx.json_mode:
+            print(json.dumps({"error": str(exc)}, indent=2))
+        else:
+            print(
+                f"Error: audit setup failed for {issue_id}: {exc}",
+                file=sys.stderr,
+            )
         rc = 1
 
     finally:

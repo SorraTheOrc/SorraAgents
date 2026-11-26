@@ -56,6 +56,35 @@ python3 -m pytest tests/dev/test_smoke.py -v -k critical
 3. The merge to `main` should **only** be performed when the full suite
    reports success.
 
+## Hang abort vs host contention
+
+The runner that executes the project suite bounds every stage with a
+wall-clock timeout: a stage that never returns is aborted with exit code
+**124** and a `[hang-timeout]` diagnostic instead of stalling the gate
+indefinitely. That abort is **not** a red suite and is **never auto-retried**
+— a hang must surface rather than be masked.
+
+The `[hang-timeout]` block reports the aborted **stage**, the configured
+**bound**, the **elapsed** wall time, the **delta** over the bound, and the
+host **load average** at abort plus the **core count**. Read the load first:
+
+- **Load far above the core count** (e.g. `load 38.4 over 16 cores`) ⇒ host
+  contention, not a code defect. A green suite can exceed its bound purely
+  because the machine is saturated (concurrent suite runs, a Monte-Carlo
+  sweep, etc.). The abort is deliberately not retried; re-run the suite once
+  the host is quiet rather than bisecting a green tree.
+- **Load near zero with a large overrun** ⇒ a genuine hang. Investigate the
+  named stage: a browser-stage hang is usually a starved
+  `requestAnimationFrame` loop or an undestroyed `Phaser.Game`; a unit-stage
+  hang is a synchronous loop in test/engine code that `testTimeout` cannot
+  preempt.
+
+So a contended-host abort means **re-run on a quiet host**, and a genuine
+hang means **fix the cause**. Neither is a "red suite" failure to chase with
+test bisection. Tracked as SA-0MWEURUYL004I470; the cache-resume path that
+avoids a full re-run of an unchanged tree after a unit-stage abort is
+SA-0MWEURY420040OMD.
+
 ## Re-running after a fix
 
 If the suite fails:

@@ -92,6 +92,41 @@ def _child(child_id: str, *, stage: str, status: str = "in_progress",
     return child
 
 
+def _assert_cas_lifecycle_write(updates, *, status, stage, producer_flag=None):
+    """Assert the terminal lifecycle write's contract, CAS guard included.
+
+    AC5 (SA-0MWFMV31W00532T3): restore/demotion writes carry
+    ``--if-status``/``--if-stage`` so they can never blind-overwrite a
+    concurrent writer. The exact CAS *values* (the pair equals the state read
+    immediately before the write) are pinned by
+    ``test_audit_runner_restore_race.py::TestRestoreCasGuards``, which drives a
+    harness with full control of the observed lifecycle; here the guard's
+    presence and the unchanged lifecycle contract are what matter.
+    """
+    assert updates, "expected at least one wl update command"
+    cmd = updates[-1]
+    if cmd[:1] == ["wl"] and len(cmd) >= 3 and cmd[1] == "--worklog-dir":
+        cmd = ["wl"] + cmd[3:]
+
+    def value(command, flag):
+        return command[command.index(flag) + 1] if flag in command else None
+
+    assert cmd[:3] == ["wl", "update", "TEST-1"], cmd
+    assert value(cmd, "--status") == status, cmd
+    assert value(cmd, "--stage") == stage, cmd
+    assert value(cmd, "--assignee") == "", cmd
+    if producer_flag is None:
+        assert "--needs-producer-review" not in cmd, cmd
+    else:
+        assert value(cmd, "--needs-producer-review") == producer_flag, cmd
+    assert value(cmd, "--if-status"), cmd
+    assert value(cmd, "--if-stage"), cmd
+    assert cmd[-1] == "--json", cmd
+
+
+
+
+
 class TestChildExemptionSnapshot:
     """AC1/AC3/AC5: the parent's closure decision honours the pre-audit
     child-exemption snapshot captured before any child re-audit runs."""
@@ -357,11 +392,9 @@ class TestCascadeNoSideEffectDemotion:
                 report="Ready to close: No\n\n## Summary\nunverifiable AC.",
                 status="completed", stage="in_review",
             )
-        assert self._last_update(updates) == [
-            "wl", "update", "TEST-1",
-            "--status", "completed", "--stage", "in_review",
-            "--assignee", "", "--json",
-        ]
+        _assert_cas_lifecycle_write(
+            updates, status="completed", stage="in_review",
+        )
 
     def test_cascade_no_verdict_restores_done_child(self):
         """AC2: a cascade-triggered 'No' on a completed/done child keeps the
@@ -375,11 +408,9 @@ class TestCascadeNoSideEffectDemotion:
                 report="Ready to close: No\n\n## Summary\nunverifiable AC.",
                 status="completed", stage="done",
             )
-        assert self._last_update(updates) == [
-            "wl", "update", "TEST-1",
-            "--status", "completed", "--stage", "done",
-            "--assignee", "", "--json",
-        ]
+        _assert_cas_lifecycle_write(
+            updates, status="completed", stage="done",
+        )
 
     def test_independent_no_verdict_demotes_in_review_child(self):
         """AC3: an audit NOT triggered by a parent cascade keeps the normal
@@ -396,11 +427,9 @@ class TestCascadeNoSideEffectDemotion:
                 report="Ready to close: No\n\n## Summary\ngenuine gap.",
                 status="completed", stage="in_review",
             )
-        assert self._last_update(updates) == [
-            "wl", "update", "TEST-1",
-            "--status", "open", "--stage", "plan_complete",
-            "--assignee", "", "--needs-producer-review", "yes", "--json",
-        ]
+        _assert_cas_lifecycle_write(
+            updates, status="open", stage="plan_complete", producer_flag="yes",
+        )
 
     def test_cascade_no_verdict_demotes_pre_review_child(self):
         """AC3: a cascade-triggered 'No' on a child that was already
@@ -417,11 +446,9 @@ class TestCascadeNoSideEffectDemotion:
                 report="Ready to close: No\n\n## Summary\ngenuine gap.",
                 status="open", stage="plan_complete",
             )
-        assert self._last_update(updates) == [
-            "wl", "update", "TEST-1",
-            "--status", "open", "--stage", "plan_complete",
-            "--assignee", "", "--needs-producer-review", "yes", "--json",
-        ]
+        _assert_cas_lifecycle_write(
+            updates, status="open", stage="plan_complete", producer_flag="yes",
+        )
 
     def test_cascade_yes_verdict_still_advances(self):
         """AC2 guard: the cascade suppression only affects 'No' verdicts — a

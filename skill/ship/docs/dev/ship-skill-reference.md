@@ -110,6 +110,7 @@ marker (`…`) when it exceeds the limit.
 
 | Step | Description | Blocking? |
 |------|-------------|-----------|
+| 0 | Version bump evaluation (agent-run, before any git mutation) — read-only preflight, then `patch` auto-proceeds / `minor`/`major` need in-session producer approval (headless runs stop for producer review); an explicit `--bump` overrides it (SA-0MW978ONE008WMIB) | Yes |
 | 1 | Pre-flight checks (`gh`, `wl`, clean worktree) | Yes |
 | 2 | Critical-priority items check (exit 7 if non-terminal) | Yes |
 | 2.5 | Final validation sweep — top-level + uncovered children, parent-coverage aware (exit 12) | Yes |

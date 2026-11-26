@@ -321,20 +321,26 @@ class TestStructural:
             "submodule init helper must be called AFTER the worktree is created"
         )
 
-    def test_phase_start_calls_submodules_after_node_modules_symlink(self):
-        """Submodule init must run AFTER node_modules preparation.
+    def test_phase_start_calls_submodules_before_node_modules_symlink(self):
+        """Submodule init must run BEFORE node_modules preparation.
 
-        SA-0MVPI400Y001FOM1 replaced the direct ``_ensure_node_modules_symlink``
-        call at the phase_start insertion point with ``_prepare_node_modules``;
-        submodule initialisation must still follow it.
+        SA-0MVTOR53E003IIEQ reversed the original ordering: a nested
+        ``node_modules`` symlink created inside a still-empty gitlink makes
+        ``git submodule update --init`` refuse to clone into it ("destination
+        path already exists and is not an empty directory"). Because submodule
+        failures are fail-open the worktree then silently kept an
+        uninitialised submodule. Ordering regression guards live in
+        ``tests/test_implement_submodule_ordering.py``; this one keeps the
+        original contract test honest about the direction.
         """
         assert self.SOURCE
         nm_idx = self.SOURCE.index("_prepare_node_modules(abs_wt_path")
         sub_idx = self.SOURCE.index("_ensure_submodules(abs_wt_path")
         assert nm_idx != -1
         assert sub_idx != -1
-        assert sub_idx > nm_idx, (
-            "submodule init helper must be called AFTER node_modules preparation"
+        assert sub_idx < nm_idx, (
+            "submodule init helper must be called BEFORE node_modules "
+            "preparation (SA-0MVTOR53E003IIEQ)"
         )
 
     def test_helper_defined(self):

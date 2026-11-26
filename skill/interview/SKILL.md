@@ -48,17 +48,67 @@ producer via `wl reviewed`.
 
 ### 4. Producer-review handoff
 
-When the agent cannot proceed without producer input (clarifying questions
-unanswered, critical information missing), mark the work item as needing
-producer review:
+Producer review is a **persistent hold**: a flagged item is skipped by the
+dispatcher until the producer clears it. Flagging is therefore reserved for a
+**genuine handoff** — a decision only the producer can make. Routine questions
+the agent can settle itself must never park the item.
 
-```bash
-wl reviewed <work-item-id> true
-```
+Rationale, provenance evidence and the full worked example:
+[docs/dev/routine-vs-producer-handoff.md](../../docs/dev/routine-vs-producer-handoff.md).
 
-This flags the item so the producer knows attention is required. The agent
-should **STOP** and wait for the producer's response. Once answers are
-received, continue the interview or proceed.
+#### Routine questions vs genuine handoff
+
+| Category | Examples | Agent action |
+|----------|----------|--------------|
+| **Routine question** | Implementation detail, technical constraint, existing-code pattern, which file to touch, how to test a prose rule | Research the repo or take a documented reasonable assumption, record it in the Appendix (§ 5) and continue |
+| **Genuine producer handoff** | Business rule, user-experience or product-strategy choice, budget/priority trade-off — anything only the producer can decide | Call `wl reviewed <work-item-id> true`, then STOP and wait for the producer |
+
+Two questions decide the category:
+
+1. **Can the repo or the work item answer it?** If yes it is routine — search,
+   then record the answer and its evidence in the Appendix.
+2. **Would a wrong assumption be cheap to reverse?** If yes it is routine —
+   assume, record the assumption, continue. If a wrong guess would be expensive
+   or outward-facing, it is a genuine handoff.
+
+A routine answer or assumption is recorded in the Appendix (§ 5) as a normal
+entry. Marking an entry `OPEN QUESTION` does **not** by itself make it a
+handoff: the flag is set only by an explicit `wl reviewed` call for a genuine
+decision.
+
+#### Worked example — routine question (no flag)
+
+> Plan needs to know how to test a prose-only rule.
+>
+> - Q: "How should a prose-only skill rule be tested?" — Answer (agent,
+>   research): "A documentation-contract test plus a behavioural test of the
+>   flag." Research: inspected the shared test suite; no existing prose tests.
+>
+> The agent records the entry in the Appendix and continues planning. It does
+> **not** call `wl reviewed`; `needsProducerReview` stays `false`.
+
+#### Worked example — genuine handoff (flag and stop)
+
+> Intake reaches a product choice it cannot settle.
+>
+> - Q: "Should the billing export keep the legacy CSV column order?"
+>   **Recommended:** keep it — the least disruptive option.
+>
+> No repo evidence can settle this, and a wrong guess would change a
+> customer-facing contract, so it is a genuine handoff:
+>
+> ```bash
+> wl reviewed <work-item-id> true
+> ```
+>
+> The agent records the question in the Appendix, marks it `OPEN QUESTION`,
+> **STOP**s and waits for the producer. Once the answer is received the agent
+> continues the interview and releases the hold (`wl reviewed <work-item-id>
+> false`).
+
+**Consuming skills:** `plan` and `intake` inherit this rule by reference to
+this contract. They must not restate a laxer version that flags routine
+questions.
 
 ### 5. Appendix recording (idempotent)
 

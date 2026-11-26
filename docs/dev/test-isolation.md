@@ -461,8 +461,11 @@ Genuine mutations still fail the guard and name the offending test:
 - a rewritten local-config key outside the excluded set (e.g. `user.name`,
   `core.bare`, `branch.dev.remote`);
 - a deleted tracked file or an added untracked file **that was clean at
-  snapshot start** (a path that was already dirty and is resolved later is
-  attributed to concurrent churn — see §8.5);
+  snapshot start**, **in the guarded root** (a path that was already dirty and
+  is resolved later is attributed to concurrent churn — see §8.5). The main
+  checkout keeps only the tracked-file deletion class of that bullet: a
+  clean→dirty modification or untracked creation there is informational, per
+  §8.5's role-scoped table;
 - a move of a monitored own-root branch (own-root branches other than the
   concurrency-excluded `refs/heads/dev` stay monitored).
 
@@ -522,18 +525,43 @@ passed, only two pre-dirty docs paths reported after a concurrent commit
 ``7de44be9`` landed inside the run window).
 
 **The rule (option (a), pre-existing-dirty attribution).** Start-of-run
-provenance, taken from the two ``git status --porcelain=v1 -uall`` snapshots:
+provenance, taken from the two ``git status --porcelain=v1 -uall`` snapshots,
+resolved per root **role** in ``diff_guarded_roots`` — the only function that
+knows each root's ``role``, so the outer guard and the inner plugin inherit one
+rule instead of forking it (WL-0MWR1OXHX001KJC6). The **guarded root** (the
+run's own checkout) keeps the rule at full strength; the shared **main
+checkout** is narrowed to the one damage class a suite can plausibly cause — a
+tracked-file deletion:
 
-| Snapshot difference | Verdict |
-|---|---|
-| path **present** at snapshot start, **absent** at session end | **excluded** — resolved during the run (a sibling commit/checkout of work it had itself dirtied); reported as an informational note |
-| path **absent** at snapshot start, **present** at session end (modified, deleted or newly created) | **mutation** — clean→dirty damage is suite-caused |
-| path present at both, with a **different status code** | **mutation** — no resolution is observable, so nothing is attributable |
+| Snapshot difference | Guarded root | Main checkout |
+|---|---|---|
+| path **present** at snapshot start, **absent** at session end | **excluded** — resolved during the run (a sibling commit/checkout of work it had itself dirtied); reported as an informational note | same — resolved pre-existing dirt is churn on both roots |
+| path **absent** at snapshot start, **present** at session end reporting a **tracked-file deletion** (``D`` in either column: `` D``/``D ``/``DD``) | **mutation** — full clean→dirty sensitivity | **mutation** — the 2026-10-26 ``packages/shared`` wipe class the protection exists for |
+| path **absent** at snapshot start, **present** at session end in any other shape (`` M``/``M ``/``MM``/``??``/``A ``) | **mutation** — full clean→dirty sensitivity | **excluded** — indistinguishable from a concurrent session's mid-run write; reported as an informational note with the discovered owner |
+| path present at both, with a **different status code** | **mutation** — no resolution is observable, so nothing is attributable | **mutation** only when the **end** code reports a tracked-file deletion; otherwise **excluded** (informational note) |
 
 The derivation is git plumbing only (status codes plus the start snapshot's own
-``status`` map) — never a ``wl-*`` or path-name pattern (AC4). The excluded
-paths are emitted as notes (``EXCLUDED_CHURN_NOTE_PREFIX`` in
-``skill/shared/git_sandbox.py``), never silently dropped:
+``status`` map) — never a ``wl-*`` or path-name pattern (AC4). Refs and config
+are untouched by the role scoping: a created/deleted/moved ref or a rewritten
+config key outside the documented namespaces stays verdict-bearing on **both**
+roots.
+
+**The excluded bucket (blast radius and JSON contract).** Two disjoint buckets
+live under ``excluded.status`` and never in ``diff["status"]`` or
+``diff["changed"]``:
+
+- ``excluded.status.removed`` — paths that were dirty at snapshot start and
+  clean at session end (resolved pre-existing dirt; the original rule);
+- ``excluded.status.narrowed`` — the main checkout's clean→dirty shapes that
+  are not a tracked-file deletion, recorded with the **end** status code (the
+  role-scoped rule). ``diff_guarded_roots`` populates this bucket; a bare
+  ``diff_snapshots`` call never does, so it keeps the full clean→dirty surface.
+
+``excluded_working_tree_churn`` merges both buckets for rendering, and
+``excluded_churn_notes`` emits every entry — never silently dropped — using
+``EXCLUDED_CHURN_NOTE_PREFIX`` from ``skill/shared/git_sandbox.py`` (the same
+prefix for both buckets; the bucket a path came from is what distinguishes a
+resolved path from narrowed churn in the JSON):
 
 ```text
 note: excluded: concurrently resolved working-tree change in /home/…/repo: docs/dev/test-isolation.md [ M]
@@ -541,7 +569,26 @@ note: excluded: concurrently resolved working-tree change in /home/…/repo: doc
 
 surfaced as ``live_repo_excluded`` (a list of notes) in the ``run_tests.py``
 result JSON, as ``note:`` lines in its text output, printed by the inner plugin
-at session end, and logged by ``implement.py finish``'s test gate.
+at session end, and logged by ``implement.py finish``'s test gate. Because both
+buckets share one renderer and one JSON key, the verdict's blast radius stays
+auditable from the run output alone; the bucket names in ``excluded.status`` are
+the stable contract a tool reads.
+
+**Actor attribution is a documented second signal, never a substitute.** The
+outer ``guarded_run_all``, the inner plugin and ``implement.py finish`` append
+``[likely actor: …]`` to every excluded-churn note using the read-only,
+best-effort ``skill/shared/concurrent_actor.py`` helper
+(WL-0MWR1OYAJ000UVJS, wired by WL-0MWR1P1F3008AH3V). The helper examines the
+main checkout's and sibling worktrees' ``.implement_state.json`` files, one
+bounded ``wl`` claim lookup, the main-checkout lock holder and live ``/proc``
+sessions, and falls back to the explicit string ``unknown`` when no single
+owner is discoverable. A real mutation still fails and names every mutated
+checkout and path, with the same evidence appended when the main checkout is
+the mutated checkout. The attribution is informational only — it never changes
+the verdict (a green run stays green, a red run stays red), it never excuses a
+tracked-file deletion, and it is never derived from a path name. The helper
+runs at most once per guarded run, when a note or failure message is built;
+the per-test guard path never invokes it and performs no attribution work.
 
 **Blind spots (accepted, pinned).**
 
@@ -551,19 +598,36 @@ at session end, and logged by ``implement.py finish``'s test gate.
    commit, so it is attributed away. Mitigations: the note names every
    excluded path, and the finish main-checkout guard (WL-0MVPADZ1Z000FOSG)
    remains a second net.
-2. **Retained clean→dirty false positive.** The exclusion deliberately does
-   not touch the incident direction: a path that becomes dirty from a clean
-   start still fails the run, even if a sibling (not the suite) created it.
+2. **Narrowed main-checkout surface.** The main checkout deliberately does not
+   fail the run when a suite **modifies or adds** a tracked or untracked path
+   there: a newly dirty `` M``/``M ``/``MM``/``??``/``A `` shape is
+   indistinguishable from a concurrent session's mid-run write, so it is
+   excluded and noted (``excluded.status.narrowed``). What the narrowing
+   removes is exactly that class: a suite writing into the shared main
+   checkout is no longer caught by the working-tree surface there (the
+   2026-11-13 incident was five such paths, three of them `` M``). Two nets
+   remain: (a) the **guarded root**'s unchanged full sensitivity — a suite
+   that writes into the run's own checkout still fails — and (b) the **finish
+   main-checkout guard** (WL-0MVPADZ1Z000FOSG family, including the
+   failure-path verifies SA-0MVXVERZ4009PPTH and SA-0MVXVBYXI000QMXM), which
+   snapshots and verifies the main checkout around ``implement.py finish`` and
+   aborts on every foreign change. Removing the main checkout from the gate's
+   surface entirely is the long-term alternative scoped as **isolated-worktree
+   verification** (WL-0MW4W15U500009D2); until that lands this narrowing is
+   interim.
 3. **Invisible content-only change to an already-dirty path.** A status-code
    surface never compared content, before or after this rule: an already-dirty
    path edited again keeps its code and yields no difference.
 
-Regression pins: ``TestWorkingTreeAttribution``,
-``TestWorkingTreeAttributionIncidents`` and
-``TestWorkingTreeAttributionBoundaries`` in
-``skill/shared/tests/test_git_sandbox.py`` (helper rule, the benign concurrent
-commit from a second actor, the delete/modify/create incident cases and the
-pinned boundaries), ``TestWorkingTreeAttributionNested`` in
+Regression pins: ``TestWorkingTreeAttribution`` and
+``TestWorkingTreeAttributionIncidents`` in
+``skill/shared/tests/test_git_sandbox.py`` (helper rule and the
+clean→dirty delete/modify/create cases on the guarded root),
+``TestWorkingTreeAttributionBoundaries`` (the guarded-root blind spots above),
+``TestMainCheckoutRoleScopedVerdict`` (the role contrast: main-checkout
+`` M``/``??``/``M `` informational, ``D ``/`` D`` still failing, the
+``excluded.status`` shape, guarded-root and refs unchanged),
+``TestWorkingTreeAttributionNested`` in
 ``tests/test_live_repo_mutation_guard.py`` (inner-plugin parity) and the
 ``live_repo_excluded`` tests in
 ``skill/test/tests/test_guarded_run_all.py`` (outer-guard parity, AC3 note).
@@ -589,6 +653,14 @@ incident class is now detected on a **separate, deliberately narrow surface**
   itself dirtied mid-run is churn, never a move — reported in
   `attributed`). An unfingerprintable checkout is fail-closed and never
   reported as movement.
+
+This surface is taken on the **guarded root's own checkout only**, so §8.5's
+role scoping of the shared main checkout does not reach it: a clean→dirty
+transition in the run's own checkout is still a move, pinned by
+`TestOwnCheckoutState::test_clean_to_dirty_on_the_guarded_root_is_a_move`
+(renamed with the role-scoped rule from
+`test_clean_to_dirty_is_a_retained_move_direction`, whose guarded-root
+behaviour the narrowing deliberately keeps).
 
 The test cache brackets every executed run with this snapshot pair
 (`skill/test_cache.py`); on `moved` it quarantines the verdict — no cache
@@ -914,6 +986,24 @@ layer, not a substitute for the rule above:
   defers worktree removal by design, so without it the test fails inside any
   driven session's own `finish` gate run — an environment-dependent failure of
   the same family as the ones this item fixes.
+
+#### Hook-like environments: `GIT_DIR` + `GIT_INDEX_FILE` (SA-0MVZQVDUY0011DQD)
+
+`tests/test_release_full_suite_gate.py` drives `merge-dev-to-main.sh` inside a
+throwaway fixture repo. Under the pre-push hook its fixture inherited the
+hook's `GIT_DIR` / `GIT_INDEX_FILE`, so the release script short-circuited and
+the stubbed suite runner never ran — the gate was red for every `dev` push.
+The module now routes both fixture construction (`run_git`) and the release
+subprocess (`fixture_git_env`) through the hermetic helpers, and its
+`TestHookLikeEnvironment` regression test runs the **whole** pipeline in a
+child process with an absolute `GIT_DIR` / `GIT_INDEX_FILE` leaked into the
+environment. The leak targets a throwaway **decoy** repository rather than the
+live checkout: a hermeticity regression in a pipeline that commits/merges
+would otherwise corrupt the live repo before the failure is reported, while
+the decoy gives an equivalent "real repository" leak with a safe blast radius.
+The test asserts the full-suite gate actually ran and the decoy was left
+untouched, so a `**os.environ` regression in `_run_release` (or a raw `_git`)
+fails it (verified by a red witness).
 
 ### 9.8 Per-work-item lock store isolation (SA-0MVWJ6U3J003TLRZ)
 

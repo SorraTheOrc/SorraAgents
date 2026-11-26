@@ -76,7 +76,14 @@ own branch stays monitored (SA-0MV8311B3005DNG8). The guard also covers the
 **main checkout** whenever the guarded root is a linked worktree — the two
 exclusions are applied per checkout, so a worktree-scoped run that unlinks a
 tracked file in the main checkout can no longer be reported green
-(WL-0MVPE2BY9001CR9O). See also the repo-root
+(WL-0MVPE2BY9001CR9O). The working-tree verdict is **role-scoped**
+(WL-0MWR1OXHX001KJC6): the guarded root keeps full clean→dirty sensitivity
+while a clean→dirty path in the shared main checkout is verdict-bearing only
+for a **tracked-file deletion** (`D` in either column — the 2026-10-26
+`packages/shared` wipe class); its modified (` M`, `M `, `MM`), untracked
+(`??`) and staged-addition shapes are excluded as concurrent-session churn and
+surfaced as `live_repo_excluded` notes
+(`docs/dev/test-isolation.md` §8.5). See also the repo-root
 ``conftest.py`` / ``skill/shared/live_repo_guard.py`` inner guard, which this
 outer guard stands down (SA-0MUG30J5F001L57H, SA-0MUH1MJL6003767Q).
 
@@ -115,6 +122,7 @@ import contextvars
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -135,11 +143,21 @@ if _SKILLS_ROOT_STR in sys.path:
     sys.path.remove(_SKILLS_ROOT_STR)
 sys.path.insert(0, _SKILLS_ROOT_STR)
 
+from shared.concurrent_actor import (
+    UNKNOWN as _ACTOR_UNKNOWN,
+)
+from shared.concurrent_actor import (
+    annotate_excluded_notes,
+    describe_concurrent_actor,
+    work_item_id_from_state,
+)
 from shared.git_sandbox import (
+    MAIN_CHECKOUT_ROLE,
     describe_guarded_diff,
     diff_guarded_roots,
     excluded_churn_notes,
     git_env_for_repo,
+    main_checkout_root,
     snapshot_guarded_roots,
 )
 from shared.process_semaphore import Semaphore, nested_semaphore_dir  # noqa: F401
@@ -418,6 +436,12 @@ _NODE_NOT_OK_RE = re.compile(r"^not ok\s+\d+\s*-\s*(.+)$", re.MULTILINE)
 
 TRACKED_SOURCE_EXTENSIONS = (".py", ".mjs", ".js", ".ts", ".tsx")
 
+#: TypeScript/TSX source extensions scanned by the import-graph expansion
+#: (:func:`_expand_by_ts_imports`). Kept separate from
+#: ``TRACKED_SOURCE_EXTENSIONS`` (which also covers Python/Node) so a change
+#: set with no TypeScript files never walks the TS graph.
+TS_SOURCE_EXTENSIONS = (".ts", ".tsx")
+
 #: Suffixes recognised as test files by the convention mapper. The
 #: TypeScript/JavaScript forms cover vitest (``*.test.ts`` / ``*.spec.ts``),
 #: which previously mapped to nothing and forced the full suite
@@ -604,13 +628,17 @@ def map_changed_to_tests(
        pytest (``test_*.py`` / ``*_test.py``), node (``*.test.mjs`` /
        ``*_test.mjs`` / ``*.spec.mjs``) and vitest/TypeScript
        (``*.test.ts`` / ``*.spec.ts``, plus the ``.js``/``.tsx`` variants).
-    2. **Import-graph expansion**: AST-scan every test file once; for each
-       changed module (dotted name derived from its path relative to the
-       project root), find test files whose import statements reference the
-       changed module OR any module that (transitively) imports it. This
-       catches indirect breakage — e.g. ``utils.py`` changed →
-       ``test_report.py`` imported via a chain. (Python only; the TypeScript
-       side uses the conservative stem convention.)
+    2. **Import-graph expansion**: scan every test file once; for each
+       changed module derive its name from its path relative to the project
+       root and find test files whose imports reference the changed module OR
+       any module that (transitively) imports it. This catches indirect
+       breakage — e.g. ``utils.py`` changed → ``test_report.py`` imported via
+       a chain. Python uses its AST (:func:`_expand_by_imports`); TypeScript
+       /TSX uses a static ``import``/``export … from`` scan
+       (:func:`_expand_by_ts_imports`), including barrel re-exports and the
+       TS-ESM ``.js``-specifier → ``.ts``-source mapping. Dynamic
+       ``import()``/``require()`` and path aliases are not resolved (static
+       statements only, over-match preferred to under-match).
 
     ``changed_files`` defaults to :func:`compute_changed_files` against the
     calling repo. Non-source changes (README, yaml, …) never map to tests
@@ -677,9 +705,14 @@ def map_changed_to_tests(
                 # Package init changed → every test under that package tree.
                 selected.add(test)
 
-    # 2. Import-graph expansion
+    # 2. Import-graph expansion (Python AST, then TypeScript static scan).
+    # Each language only walks its own graph when the change set touches that
+    # language, so a repo without TypeScript files (or a Python-only change
+    # set) pays nothing for the TS scan.
     if selected or _has_python_changes(changed):
         selected |= _expand_by_imports(root, all_tests, changed)
+    if _has_ts_changes(changed):
+        selected |= _expand_by_ts_imports(root, all_tests, changed)
 
     # Final existence filter: convention mapping scans the filesystem so its
     # entries exist, but a changed test file added directly above (or an
@@ -719,6 +752,10 @@ def _iter_test_files(root: Path) -> Iterator[str]:
 
 def _has_python_changes(changed: set[str]) -> bool:
     return any(p.endswith(".py") for p in changed)
+
+
+def _has_ts_changes(changed: set[str]) -> bool:
+    return any(p.endswith(TS_SOURCE_EXTENSIONS) for p in changed)
 
 
 def _expand_by_imports(
@@ -841,6 +878,172 @@ def _ast_imports(root: Path, test_file: str) -> set[str]:
             elif name:
                 imports.add(name)
     return imports
+
+
+#: Static TypeScript import/export specifiers. Two forms are understood:
+#: - value/type imports and re-exports, ``import … from 'x'`` /
+#:   ``export … from 'x'`` (including ``import type``, ``export type``,
+#:   ``export *`` and multi-line named lists);
+#: - side-effect imports, ``import 'x'``.
+#: ``[^'"]*?`` spans newlines (named lists wrap) but stops at the first
+#: quote, so it cannot run past the module specifier. Dynamic ``import('x')``
+#: and ``require('x')`` are deliberately not matched.
+_TS_FROM_SPECIFIER_RE = re.compile(
+    r"(?:^|\n)[ \t]*(?:import|export)\b[^'\"]*?\bfrom\s*['\"]([^'\"]+)['\"]"
+)
+_TS_SIDE_EFFECT_IMPORT_RE = re.compile(
+    r"(?:^|\n)[ \t]*import\s*['\"]([^'\"]+)['\"]"
+)
+
+
+def _path_to_ts_module(path: str) -> str | None:
+    """Repo-relative module key for a ``.ts``/``.tsx`` path (or ``None``).
+
+    ``src/github-sync.ts`` → ``src/github-sync``; ``src/foo/index.ts`` →
+    ``src/foo`` (TypeScript resolves a directory import to its index module).
+    """
+    p = Path(path)
+    if p.suffix not in TS_SOURCE_EXTENSIONS:
+        return None
+    parts = list(p.with_suffix("").parts)
+    if parts and parts[-1] == "index":
+        parts = parts[:-1]
+    if not parts:
+        return None
+    return "/".join(parts)
+
+
+def _resolve_ts_module_key(importer: str, specifier: str) -> str | None:
+    """Resolve a TypeScript import specifier to a repo-relative module key.
+
+    Relative specifiers resolve against the importing file. TypeScript's ESM
+    convention writes ``'../src/github-sync.js'`` for a ``.ts`` source, so a
+    known source/compiled extension is stripped and ``x.js`` maps to ``x.ts``
+    / ``x.tsx``. A trailing ``/index`` collapses to its directory (matching
+    TypeScript's directory-import resolution). Bare specifiers (packages,
+    path aliases) are returned verbatim and match only a changed module whose
+    own key is identical — path aliases are not resolved. Specifiers that
+    escape the repository resolve to ``None``.
+    """
+    if not specifier:
+        return None
+    if specifier.startswith("."):
+        joined = posixpath.normpath(
+            posixpath.join(posixpath.dirname(importer), specifier)
+        )
+    else:
+        joined = specifier
+    if joined in ("", ".", "..") or joined.startswith("../"):
+        return None
+    for ext in (".d.ts", ".tsx", ".ts", ".jsx", ".mjs", ".cjs", ".js"):
+        if joined.endswith(ext):
+            joined = joined[: -len(ext)]
+            break
+    joined = joined.removesuffix("/index")
+    return joined or None
+
+
+def _iter_ts_files(root: Path) -> Iterator[str]:
+    """Yield repo-relative paths of every ``.ts``/``.tsx`` file under *root*.
+
+    Prunes the same VCS/dependency/build directories as the test scan so the
+    graph never walks ``node_modules`` or ``dist``.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _TEST_SCAN_EXCLUDED_DIRS]
+        for filename in filenames:
+            if Path(filename).suffix in TS_SOURCE_EXTENSIONS:
+                rel = Path(dirpath, filename).relative_to(root)
+                yield rel.as_posix()
+
+
+def _ts_imports(root: Path, rel: str) -> set[str]:
+    """Return the resolved module keys imported/re-exported by *rel*.
+
+    Best-effort: a read/decode failure yields no imports (the run never
+    crashes on an unreadable file). Comments and string literals are not
+    stripped, so a commented-out import over-matches — acceptable under the
+    over-match-over-under-match contract.
+    """
+    try:
+        text = (root / rel).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    specifiers: set[str] = set()
+    for pattern in (_TS_FROM_SPECIFIER_RE, _TS_SIDE_EFFECT_IMPORT_RE):
+        for match in pattern.finditer(text):
+            specifiers.add(match.group(1))
+    resolved: set[str] = set()
+    for specifier in specifiers:
+        key = _resolve_ts_module_key(rel, specifier)
+        if key:
+            resolved.add(key)
+    return resolved
+
+
+def _expand_by_ts_imports(
+    root: Path,
+    all_tests: set[str],
+    changed: set[str],
+) -> set[str]:
+    """Static import graph: tests importing changed TypeScript modules.
+
+    Mirrors :func:`_expand_by_imports`'s BFS shape for ``.ts``/``.tsx``. Only
+    static ``import``/``export … from`` statements are followed (dynamic
+    ``import()``/``require()`` and path aliases are out of scope); an
+    ``export … from`` re-export counts as an edge, so a test importing a
+    barrel is selected when any module the barrel re-exports changes. Each
+    module is registered under its path-derived key and its basename (as the
+    Python expansion does) so both namespaces resolve. Over-matching is
+    preferred to under-matching: an extra test runs, never fewer.
+    """
+    changed_targets: set[str] = set()
+    for p in changed:
+        key = _path_to_ts_module(p)
+        if key is None:
+            continue
+        changed_targets.add(key)
+        changed_targets.add(Path(p).stem)
+    if not changed_targets:
+        return set()
+
+    # module key → directly-imported module keys, parsed once per file (both
+    # source and test files, so transitive edges through source modules are
+    # visible). Each node is registered under its path-derived key AND its
+    # basename.
+    module_imports: dict[str, set[str]] = {}
+    for ts_file in _iter_ts_files(root):
+        key = _path_to_ts_module(ts_file)
+        if key is None:
+            continue
+        imports = _ts_imports(root, ts_file)
+        module_imports[key] = imports
+        module_imports.setdefault(Path(ts_file).stem, imports)
+
+    # BFS: does module *m* (transitively) import module *target*?
+    def imports_module(m: str, target: str) -> bool:
+        seen: set[str] = set()
+        stack = [m]
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if cur == target:
+                return True
+            stack.extend(module_imports.get(cur, ()))
+        return False
+
+    affected: set[str] = set()
+    for test in all_tests:
+        test_key = _path_to_ts_module(test)
+        if test_key is None:
+            continue
+        for mod in module_imports.get(test_key, set()):
+            if any(mod == cm or imports_module(mod, cm) for cm in changed_targets):
+                affected.add(test)
+                break
+    return affected
 
 
 #: Stable reason strings returned by :func:`changed_scope_selection` when no
@@ -2690,7 +2893,7 @@ def _test_concurrency_slot(lane: str | None = None) -> Iterator[None]:
         ) from exc
 
 
-def _suite_command_env() -> dict[str, str]:
+def _suite_command_env(repo_root: Path | None = None) -> dict[str, str]:
     """Return the child environment for a suite command.
 
     Layers, in order:
@@ -2699,11 +2902,20 @@ def _suite_command_env() -> dict[str, str]:
        (:func:`test_runner.subprocess_env_with_scrubbed_overrides`) — a leaked
        ``GIT_DIR`` must not redirect real-git fixtures at the live checkout
        (F2, SA-0MUIA3OE40001QJX).
-    2. The resolved per-suite vitest worker bound as ``VITEST_MAX_WORKERS``
+    2. ``<repo_root>/node_modules/.bin`` prepended to PATH **ahead of** the
+       ``~/.local/bin`` normalisation (npm's own ordering), when *repo_root*
+       is supplied and that directory exists (SA-0MWWKLY8M009PD78). Without
+       it, a changed-scope ``node_modules/.bin/vitest run <files>`` command
+       cannot shell-spawn a local bin (``tsx`` etc.) and fails with
+       ``sh: tsx: not found``, while the same tests pass under ``npm test``
+       (which puts the directory on PATH). The prepend is existence-gated
+       and deduped, so it is a graceful no-op for pytest-only repos and
+       checkouts without installed deps.
+    3. The resolved per-suite vitest worker bound as ``VITEST_MAX_WORKERS``
        (SA-0MVE98T1M006A17T). An ambient value wins (it is re-exported
-       normalised); otherwise the calibrated default applies. This is the
-       only mutation, and it never leaks back into ``os.environ``.
-    3. A disk-backed ``TMPDIR`` resolved by the shared helper
+       normalised); otherwise the calibrated default applies. This never
+       leaks back into ``os.environ``.
+    4. A disk-backed ``TMPDIR`` resolved by the shared helper
        (:func:`shared.test_tmpdir.resolve_test_tmpdir`, F1
        SA-0MW3EN72O005BMIP) so a suite subprocess never exhausts a tiny
        tmpfs ``/tmp`` inode budget (SA-0MW2QED9M005FWOK). Resolved once per
@@ -2713,10 +2925,23 @@ def _suite_command_env() -> dict[str, str]:
 
     ``NODE_OPTIONS`` and every other unrelated variable are preserved, so
     consumer-provided vitest/NODE_OPTIONS plumbing keeps working. The
-    TMPDIR/VITEST changes are env-only — command strings and therefore cache
-    keys are byte-identical (SA-0MW3ENF32006BGN1 AC4).
+    PATH/TMPDIR/VITEST changes are env-only — command strings and therefore
+    cache keys are byte-identical (SA-0MW3ENF32006BGN1 AC4,
+    SA-0MWWKLY8M009PD78 AC5).
     """
     env = subprocess_env_with_scrubbed_overrides()
+    if repo_root is not None:
+        node_bin = Path(repo_root) / "node_modules" / ".bin"
+        if node_bin.is_dir():
+            node_bin_str = str(node_bin.resolve())
+            path_parts = env.get("PATH", "").split(os.pathsep)
+            # Prepend ahead of the ``~/.local/bin`` normalisation (npm's own
+            # ordering: ``node_modules/.bin`` first), deduped so an entry a
+            # launcher already put on PATH is moved, never repeated.
+            path_parts = [node_bin_str] + [
+                part for part in path_parts if part != node_bin_str
+            ]
+            env["PATH"] = os.pathsep.join(path_parts)
     env[TEST_VITEST_MAX_WORKERS_ENV] = str(_test_vitest_max_workers())
     env["TMPDIR"] = _resolved_test_tmpdir()
     return env
@@ -2780,7 +3005,9 @@ def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.Comple
     bare inherit of the parent environment, so a leaked ``GIT_DIR`` cannot
     redirect real-git test fixtures at the live checkout. It additionally
     carries the per-suite ``VITEST_MAX_WORKERS`` bound
-    (SA-0MVE98T1M006A17T) — see :func:`_suite_command_env`.
+    (SA-0MVE98T1M006A17T) and, when *cwd* holds ``node_modules/.bin``, that
+    directory prepended to PATH so a directly-invoked local bin can be found
+    (SA-0MWWKLY8M009PD78) — see :func:`_suite_command_env`.
     """
     log_repository_override_scrub()
     return subprocess.run(
@@ -2790,7 +3017,7 @@ def _run_cmd(cmd: list[str], cwd: Path, timeout: int = 600) -> subprocess.Comple
         text=True,
         timeout=timeout,
         check=False,
-        env=_suite_command_env(),
+        env=_suite_command_env(Path(cwd)),
     )
 
 
@@ -4277,13 +4504,59 @@ def run_summary(
     return result
 
 
+def _linked_main_checkout(project_root: Path) -> Path | None:
+    """The main checkout of a linked-worktree run, or ``None``.
+
+    A run started in an ordinary checkout shares that checkout with its own
+    session, so there is no *foreign* checkout to attribute churn to. Only a
+    linked worktree has a main checkout another session may be writing.
+    """
+    main = main_checkout_root(project_root)
+    if main is None:
+        return None
+    main = Path(main).resolve()
+    return main if main != project_root.resolve() else None
+
+
+def _main_checkout_actor_evidence(
+    project_root: Path, main_root: Path
+) -> str:
+    """Best-effort owner of the main checkout's concurrent churn.
+
+    Delegates to the shared, read-only ``describe_concurrent_actor`` helper
+    (WL-0MWR1OYAJ000UVJS) so the outer guard, the inner plugin and the finish
+    report share one evidence contract. The caller's own worktree and work item
+    are excluded. Fail-open: any error degrades to ``unknown`` and is never
+    raised into the verdict path.
+    """
+    try:
+        return describe_concurrent_actor(
+            main_root,
+            own_worktree=project_root,
+            own_work_item_id=work_item_id_from_state(project_root),
+            worklog_dir=main_root / ".worklog",
+        )
+    except Exception:  # noqa: BLE001 - evidence is diagnostic only
+        return _ACTOR_UNKNOWN
+
+
+def _main_checkout_changed(diff: dict[str, Any]) -> bool:
+    """True when the *main checkout* role itself carries verdict-bearing churn."""
+    return any(
+        entry.get("role") == MAIN_CHECKOUT_ROLE
+        and (entry.get("diff") or {}).get("changed")
+        for entry in diff.get("roots", ())
+    )
+
+
 def _detect_live_repo_mutation(
     project_root: Path,
     snapshot_before: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Evaluate the guarded run's checkout delta.
 
-    Returns ``{"mutation": <rendered diff or None>, "excluded": [<note>, ...]}``.
+    Returns ``{"mutation": <rendered diff or None>, "excluded": [<note>, ...],
+    "actor_evidence": <string>}``.
     Detect-only: it never prevents a mutation, it stops a corrupted checkout
     from being reported as a green suite (and therefore from being pushed).
     ``mutation`` is ``None`` for a non-git root (no-op) and when the guard was
@@ -4293,8 +4566,12 @@ def _detect_live_repo_mutation(
     attributed to a concurrent session and therefore cannot fail the run
     (SA-0MUIJAHXS003M7BG AC1/AC3) — the paths, the checkout and the status
     codes, so a reviewer can tell an excluded foreign change from a clean run.
-    The attribution rule itself lives in the shared ``git_sandbox`` helper, so
-    the inner ``live_repo_guard`` plugin cannot drift from it.
+    When the run started in a linked worktree each note also carries the
+    documented actor second signal (WL-0MWR1OYAJ000UVJS): the likely owner of
+    the shared main checkout, or an explicit ``unknown``
+    (WL-0MWR1P1F3008AH3V). The attribution rule itself lives in the shared
+    ``git_sandbox`` helper, so the inner ``live_repo_guard`` plugin cannot
+    drift from it; the actor is an added, informational signal only.
 
     The surface is **every checkout the guarded run can reach**
     (WL-0MVPE2BY9001CR9O): the guarded root plus, when the run started in a
@@ -4302,21 +4579,41 @@ def _detect_live_repo_mutation(
     store and a symlinked ``node_modules`` with the main checkout, so a
     root-only check reported a gutted main checkout as clean (the 2026-10-26
     `packages/shared` wipe). The message names the mutated checkout and every
-    mutated path in it.
+    mutated path in it, plus the discoverable concurrent owner when the main
+    checkout itself is the mutated checkout.
     """
     if snapshot_before is None:
-        return {"mutation": None, "excluded": []}
+        return {"mutation": None, "excluded": [], "actor_evidence": ""}
     snapshot_after = snapshot_guarded_roots(project_root)
     diff = diff_guarded_roots(snapshot_before, snapshot_after)
     excluded = excluded_churn_notes(diff)
+    main_root = _linked_main_checkout(project_root)
+    main_mutated = main_root is not None and _main_checkout_changed(diff)
+    # The bounded evidence lookup runs at most once per guarded run, and only
+    # when there is something to attribute (an excluded note or a mutation of
+    # the main checkout) — never in the per-test path and never on a clean run.
+    actor_evidence = ""
+    if main_root is not None and (excluded or main_mutated):
+        actor_evidence = _main_checkout_actor_evidence(project_root, main_root)
+        excluded = annotate_excluded_notes(excluded, actor_evidence)
     if not diff["changed"]:
-        return {"mutation": None, "excluded": excluded}
+        return {
+            "mutation": None,
+            "excluded": excluded,
+            "actor_evidence": actor_evidence,
+        }
     mutation = (
         "live-repo mutation detected: the test suite changed a guarded "
         f"checkout for {project_root}. The run is failed so a corrupted "
         "checkout cannot be pushed as green.\n" + describe_guarded_diff(diff)
     )
-    return {"mutation": mutation, "excluded": excluded}
+    if main_mutated:
+        mutation += f"\nConcurrent actor evidence: {actor_evidence}"
+    return {
+        "mutation": mutation,
+        "excluded": excluded,
+        "actor_evidence": actor_evidence,
+    }
 
 
 def guarded_run_all(
@@ -4377,7 +4674,10 @@ def guarded_run_all(
         ``live_repo_mutation`` set when the owned guard detected a mutation,
         and ``live_repo_excluded`` (informational notes) when working-tree
         churn was attributed to a concurrent session and excluded from the
-        verdict (SA-0MUIJAHXS003M7BG AC3).
+        verdict (SA-0MUIJAHXS003M7BG AC3). When the run started in a linked
+        worktree each note also carries the labelled actor second signal —
+        the likely owner of the shared main checkout, or an explicit
+        ``unknown`` (WL-0MWR1OYAJ000UVJS, WL-0MWR1P1F3008AH3V).
     """
     project_root = Path(cwd or REPO_ROOT).resolve()
 

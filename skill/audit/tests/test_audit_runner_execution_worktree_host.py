@@ -117,7 +117,7 @@ class TestCreateExecutionWorktree:
         calls: list[list[str]] = []
 
         with mock.patch.object(
-            audit_runner, "_ensure_execution_worktree_submodules",
+            audit_runner, "_ensure_worktree_submodules",
             return_value=True,
         ):
             path, evidence = audit_runner._create_execution_worktree(
@@ -145,7 +145,7 @@ class TestCreateExecutionWorktree:
         calls: list[list[str]] = []
 
         with mock.patch.object(
-            audit_runner, "_ensure_execution_worktree_submodules",
+            audit_runner, "_ensure_worktree_submodules",
             return_value=True,
         ):
             path, evidence = audit_runner._create_execution_worktree(
@@ -167,7 +167,7 @@ class TestCreateExecutionWorktree:
         calls: list[list[str]] = []
 
         with mock.patch.object(
-            audit_runner, "_ensure_execution_worktree_submodules",
+            audit_runner, "_ensure_worktree_submodules",
             return_value=True,
         ):
             path, evidence = audit_runner._create_execution_worktree(
@@ -208,3 +208,18 @@ class TestRemoveExecutionWorktree:
             tmp_path, lambda cmd: calls.append(list(cmd)), "",
         )
         assert calls == []
+
+    def test_remove_failure_is_logged_and_fail_open(self, tmp_path, capsys):
+        """S110 (SA-0MWQKFSUR0041FXV): a failing cleanup is reported on stderr
+        rather than silently swallowed, and never aborts the audit."""
+        worktree = tmp_path / ".worklog" / "worktrees" / "audit-exec-OSL-5"
+
+        def runner(cmd):
+            raise RuntimeError("git worktree remove exploded")
+
+        audit_runner._remove_execution_worktree(tmp_path, runner, str(worktree))
+
+        err = capsys.readouterr().err
+        assert "Execution worktree cleanup failed" in err
+        assert str(worktree) in err
+        assert "git worktree remove exploded" in err

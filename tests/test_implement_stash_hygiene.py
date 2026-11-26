@@ -23,7 +23,11 @@ from unittest.mock import MagicMock, patch
 # Ensure repo root is on path for imports
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SKILLS_ROOT = _REPO_ROOT / "skill"
-sys.path.insert(0, str(_SKILLS_ROOT))
+for _path in (str(_REPO_ROOT), str(_SKILLS_ROOT)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+from skill.shared import git_sandbox
 
 _IMPLEMENT_PY = _REPO_ROOT / "skill" / "implement" / "scripts" / "implement.py"
 _SKILL_MD = _REPO_ROOT / "skill" / "implement" / "SKILL.md"
@@ -271,19 +275,29 @@ class TestHygieneCheckScript:
         assert result.returncode == 0
         assert "Usage" in result.stdout or "usage" in result.stdout.lower()
 
-    def test_hygiene_script_accepts_json_flag(self):
-        """The hygiene check script should accept --json."""
-        # This should not crash (even if repo state isn't ideal)
-        result = subprocess.run(
-            ["bash", str(_HYGIENE_SCRIPT), "--json"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            cwd=str(_REPO_ROOT),
-            check=False,
-        )
-        # Script may fail if not in a git repo, but should parse args
+    def test_hygiene_script_accepts_json_flag(self, tmp_path: Path):
+        """The hygiene check script should accept --json.
+
+        Run against a bounded, seeded repository (never the live checkout) so
+        the result depends on the flag contract alone — not on this checkout's
+        stash/worktree count or on host load (SA-0MWRWM2ON008Z5YI). The
+        ``--json`` contract is one JSON object per non-blank line, each
+        carrying a ``check`` key.
+        """
+        repo = _seed_hygiene_repo(tmp_path / "repo")
+        bin_dir = _fake_wl(tmp_path / "bin", {})
+
+        result = _run_hygiene(repo, "--json", bin_dir=bin_dir)
+
+        # The script may warn (exit 1) or error (exit 2), but must parse args.
         assert result.returncode in (0, 1, 2)
+        payloads = [
+            json.loads(line) for line in result.stdout.splitlines() if line.strip()
+        ]
+        assert payloads, "expected at least one JSON line from --json output"
+        for payload in payloads:
+            assert isinstance(payload, dict), payload
+            assert "check" in payload, payload
 
 
 # ===========================================================================
@@ -386,3 +400,261 @@ class TestImplementPyStartIntegration:
         """The implement.py module docstring should document the stash flag."""
         content = _IMPLEMENT_PY.read_text(encoding="utf-8")
         assert "--allow-orphaned-stashes" in content
+
+
+# ===========================================================================
+# Tests: Debris worktree reports (WL-0MWQLHDOS006CAIH AC3)
+# ===========================================================================
+#
+# The hygiene path is where an operator learns *which* stale trees to remove.
+# Until this item it only reported worktrees whose branch had been deleted, so
+# the three ``/tmp/wl-*`` scratch trees and the leftover tree of the already
+# ``deleted`` item that refused a clean epic child were invisible here.
+#
+# Contract: `scripts/hygiene_check.sh` reports, in text *and* `--json`,
+#   (a) registered worktrees outside the repository's worktree root
+#       (``.worklog/worktrees/``), and
+#   (b) worktrees whose owning work item is terminal,
+# and prints the prune remedy ``git worktree remove <path> && git worktree
+# prune``. Reporting is read-only (nothing is ever pruned) and fail-open (an
+# unresolvable owner or a missing ``wl`` reports nothing rather than guessing).
+# Existing checks, their JSON entries and the exit-code contract are unchanged.
+
+
+def _seed_hygiene_repo(root: Path) -> Path:
+    """A real repository on ``dev`` with one commit and no stashes."""
+    git_sandbox.init_repo(root)
+    (root / ".gitignore").write_text(".worklog/\n", encoding="utf-8")
+    (root / "README.md").write_text("base\n", encoding="utf-8")
+    git_sandbox.commit_all(root, "base")
+    return root
+
+
+def _add_hygiene_worktree(repo: Path, path: Path, name: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return git_sandbox.add_worktree(repo, path, name, base="dev")
+
+
+def _fake_wl(bin_dir: Path, items: dict[str, dict]) -> Path:
+    """Install a ``wl`` stub that resolves the given work items."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "wl"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"ITEMS = {items!r}\n"
+        "args = [a for a in sys.argv[1:] if not a.startswith('--')]\n"
+        "if 'show' not in args:\n"
+        "    print('{}')\n"
+        "    raise SystemExit(0)\n"
+        "wid = args[args.index('show') + 1]\n"
+        "item = ITEMS.get(wid)\n"
+        "if item is None:\n"
+        "    print(json.dumps({'success': False, 'error': 'not found'}))\n"
+        "    raise SystemExit(1)\n"
+        "print(json.dumps({'success': True, 'workItem': item}))\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return bin_dir
+
+
+def _run_hygiene(
+    repo: Path, *args: str, bin_dir: Path | None = None
+) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    if bin_dir is not None:
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    return subprocess.run(
+        ["bash", str(_HYGIENE_SCRIPT), "--repo-root", str(repo), *args],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        check=False,
+    )
+
+
+def _json_checks(stdout: str) -> dict[str, list[dict]]:
+    """Group the script's one-JSON-object-per-line output by check name."""
+    grouped: dict[str, list[dict]] = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        payload = json.loads(line)
+        grouped.setdefault(payload.get("check", ""), []).append(payload)
+    return grouped
+
+
+class TestDebrisWorktreeReports:
+    """AC3: outside-root and terminal-owner worktrees, plus the remedy."""
+
+    def test_text_report_names_both_debris_classes_and_the_remedy(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _seed_hygiene_repo(tmp_path / "repo")
+        outside = _add_hygiene_worktree(
+            repo, tmp_path / "scratch" / "wl-SA-OUTSIDE00001", "wl-SA-OUTSIDE00001"
+        )
+        (outside / "scratch-marker.js").write_text("x\n", encoding="utf-8")
+        leftover = _add_hygiene_worktree(
+            repo,
+            repo / ".worklog" / "worktrees" / "wl-SA-TERMINAL0001-slug",
+            "wl-SA-TERMINAL0001-slug",
+        )
+        (leftover / "index.ts").write_text("x\n", encoding="utf-8")
+        bin_dir = _fake_wl(
+            tmp_path / "bin",
+            {
+                "SA-TERMINAL0001": {
+                    "id": "SA-TERMINAL0001",
+                    "title": "Finished",
+                    "status": "completed",
+                }
+            },
+        )
+
+        result = _run_hygiene(repo, bin_dir=bin_dir)
+
+        assert str(outside) in result.stdout
+        assert str(leftover) in result.stdout
+        assert "owning work item" in result.stdout
+        assert "SA-TERMINAL0001" in result.stdout
+        assert "git worktree remove" in result.stdout
+        assert "git worktree prune" in result.stdout
+        # Reporting only: nothing was pruned.
+        assert outside.exists()
+        assert leftover.exists()
+
+    def test_json_report_is_additive_and_machine_readable(
+        self, tmp_path: Path
+    ) -> None:
+        repo = _seed_hygiene_repo(tmp_path / "repo")
+        outside = _add_hygiene_worktree(
+            repo, tmp_path / "scratch" / "wl-SA-OUTSIDE00001", "wl-SA-OUTSIDE00001"
+        )
+        (outside / "scratch-marker.js").write_text("x\n", encoding="utf-8")
+        leftover = _add_hygiene_worktree(
+            repo,
+            repo / ".worklog" / "worktrees" / "wl-SA-TERMINAL0001-slug",
+            "wl-SA-TERMINAL0001-slug",
+        )
+        bin_dir = _fake_wl(
+            tmp_path / "bin",
+            {
+                "SA-TERMINAL0001": {
+                    "id": "SA-TERMINAL0001",
+                    "title": "Finished",
+                    "status": "deleted",
+                }
+            },
+        )
+
+        result = _run_hygiene(repo, "--json", bin_dir=bin_dir)
+
+        checks = _json_checks(result.stdout)
+        debris = checks["debris_worktrees"][0]
+        assert debris["status"] == "notice"
+        assert [entry["path"] for entry in debris["outside_root"]] == [str(outside)]
+        assert [entry["path"] for entry in debris["terminal_owner"]] == [
+            str(leftover)
+        ]
+        assert debris["terminal_owner"][0]["work_item"] == "SA-TERMINAL0001"
+        assert debris["terminal_owner"][0]["status"] == "deleted"
+        assert "git worktree remove" in debris["remedy"]
+        # The pre-existing checks keep their entries.
+        for name in (
+            "orphaned_stashes",
+            "dirty_checkout",
+            "orphaned_worktrees",
+            "main_checkout_lock",
+            "tracked_deletions",
+            "self_referential_upstream",
+        ):
+            assert name in checks, name
+
+    def test_clean_checkout_reports_no_debris(self, tmp_path: Path) -> None:
+        repo = _seed_hygiene_repo(tmp_path / "repo")
+        bin_dir = _fake_wl(tmp_path / "bin", {})
+
+        result = _run_hygiene(repo, "--json", bin_dir=bin_dir)
+
+        debris = _json_checks(result.stdout)["debris_worktrees"][0]
+        assert debris["status"] == "ok"
+        assert result.returncode == 0
+
+    def test_a_live_inside_root_worktree_is_not_debris(self, tmp_path: Path) -> None:
+        repo = _seed_hygiene_repo(tmp_path / "repo")
+        _add_hygiene_worktree(
+            repo,
+            repo / ".worklog" / "worktrees" / "wl-SA-LIVEITEM0001-slug",
+            "wl-SA-LIVEITEM0001-slug",
+        )
+        bin_dir = _fake_wl(
+            tmp_path / "bin",
+            {
+                "SA-LIVEITEM0001": {
+                    "id": "SA-LIVEITEM0001",
+                    "title": "Live",
+                    "status": "in-progress",
+                }
+            },
+        )
+
+        result = _run_hygiene(repo, "--json", bin_dir=bin_dir)
+
+        debris = _json_checks(result.stdout)["debris_worktrees"][0]
+        assert debris["status"] == "ok"
+
+    def test_an_unresolvable_owner_is_never_guessed(self, tmp_path: Path) -> None:
+        """Fail-open: no ``wl`` answer means no terminal claim."""
+        repo = _seed_hygiene_repo(tmp_path / "repo")
+        _add_hygiene_worktree(
+            repo,
+            repo / ".worklog" / "worktrees" / "wl-SA-UNKNOWN00001-slug",
+            "wl-SA-UNKNOWN00001-slug",
+        )
+        bin_dir = _fake_wl(tmp_path / "bin", {})
+
+        result = _run_hygiene(repo, "--json", bin_dir=bin_dir)
+
+        debris = _json_checks(result.stdout)["debris_worktrees"][0]
+        assert debris["status"] == "ok"
+        assert debris["terminal_owner"] == []
+
+    def test_debris_is_reported_without_changing_the_exit_code(
+        self, tmp_path: Path
+    ) -> None:
+        """The finding is a notice: existing exit codes stay authoritative.
+
+        A checkout may legitimately carry a registered tree outside the
+        worktree root (a manual experiment), so debris never escalates the
+        script's exit code on its own.
+        """
+        clean_repo = _seed_hygiene_repo(tmp_path / "clean-repo")
+        clean = _run_hygiene(
+            clean_repo, bin_dir=_fake_wl(tmp_path / "bin-clean", {})
+        )
+        assert clean.returncode == 0
+
+        debris_repo = _seed_hygiene_repo(tmp_path / "debris-repo")
+        _add_hygiene_worktree(
+            debris_repo,
+            tmp_path / "scratch" / "wl-SA-OUTSIDE00001",
+            "wl-SA-OUTSIDE00001",
+        )
+        debris = _run_hygiene(
+            debris_repo, bin_dir=_fake_wl(tmp_path / "bin-debris", {})
+        )
+        assert debris.returncode == 0
+        assert "git worktree remove" in debris.stdout
+        assert "Hygiene check completed with warnings" not in debris.stdout
+
+        # An existing warning still governs the exit code.
+        (debris_repo / "README.md").write_text("dirty\n", encoding="utf-8")
+        dirty = _run_hygiene(
+            debris_repo, bin_dir=_fake_wl(tmp_path / "bin-dirty", {})
+        )
+        assert dirty.returncode == 1
+        assert "Hygiene check completed with warnings" in dirty.stdout

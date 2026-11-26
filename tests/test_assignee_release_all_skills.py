@@ -1626,6 +1626,28 @@ NON_TERMINAL_ENTRY_POINTS: dict[str, dict[str, str]] = {
             "cmd_abort, all covered by matrix rows"
         ),
     },
+    "audit/scripts/audit_runner.py": {
+        "_release_assignee_flags": (
+            "helper that builds the --assignee release flag from the shared "
+            "claim-release predicate (shared.claim_release."
+            "should_release_assignee); its terminal counterpart is "
+            "_restore_pre_audit_state_on_failure, a RELEASE_EXERCISES row"
+        ),
+        "_claim_release_flags_for_item": (
+            "helper that computes the --assignee release flags for an already "
+            "fetched work-item payload through the same shared claim-release "
+            "predicate (shared.claim_release.should_release_assignee); it "
+            "performs no write itself — its callers (_release_assignee_flags "
+            "and the CAS guard used by the restore/demotion writes) apply the "
+            "flags through terminal writes covered by RELEASE_EXERCISES rows"
+        ),
+        "_lifecycle_cmd_side_effect_flags": (
+            "read-only classifier (AST false positive): it only *inspects* a "
+            "built wl argv for flags outside {--status, --stage, --assignee, "
+            "--json} so a no-op restore write can be skipped; it sends no "
+            "command and mutates nothing, so it has no terminal outcome"
+        ),
+    },
 }
 
 #: Entry points whose terminal release is asserted by a skill-local test

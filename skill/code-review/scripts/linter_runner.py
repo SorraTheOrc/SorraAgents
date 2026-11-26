@@ -241,7 +241,7 @@ def _run_eslint_findings_check(
         A list of finding dicts.
     """
     cmd = ["eslint", str(root), "-f", "json", "--quiet"]
-    result = runner(cmd)
+    result = _invoke_pinned(runner, cmd, root)
 
     if result.returncode not in (0, 1):
         return []
@@ -290,7 +290,7 @@ def _run_ruff_check(
         "--output-format", "json",
         "--quiet",
     ]
-    result = runner(cmd)
+    result = _invoke_pinned(runner, cmd, root)
 
     if result.returncode not in (0, 1):
         return []
@@ -422,6 +422,27 @@ def _run_subprocess(cmd: list[str], cwd: str | Path | None = None) -> subprocess
         )
 
 
+def _invoke_pinned(runner: Callable, cmd: list[str], root: Path) -> Any:
+    """Invoke *runner* with the subprocess cwd pinned to *root*.
+
+    A linter resolves relative path arguments (and its config discovery)
+    against the **child** process cwd, so leaving the inherited cwd in place
+    ties a scan to wherever the caller happens to stand and can emit ghost
+    ``E902 No such file or directory`` findings for files that exist under
+    ``root`` (WL-0MWVZEZXC00748QD, WL-0MWVZF57Y005VOKN).
+
+    A cmd-only test double (or legacy call site) that rejects the ``cwd``
+    keyword is retried without it, so the pin never breaks an injectable
+    runner that cannot take one.
+    """
+    try:
+        return runner(cmd, cwd=str(root))
+    except TypeError as exc:
+        if "cwd" not in str(exc):
+            raise
+        return runner(cmd)
+
+
 def _commit_changes(
     root: Path,
     linter_name: str,
@@ -494,7 +515,7 @@ def _run_linter_fix_mode(
     """
     # Step 1: Run fix
     cmd = fix_cmd_builder(root)
-    result = runner(cmd)
+    result = _invoke_pinned(runner, cmd, root)
 
     if result.returncode not in (0, 1):
         return [], False
@@ -509,7 +530,7 @@ def _run_linter_fix_mode(
 
     # Step 4: Rescan
     cmd = rescan_cmd_builder(root)
-    result = runner(cmd)
+    result = _invoke_pinned(runner, cmd, root)
 
     findings = rescan_parser(result)
     return findings, bool(applied)
@@ -767,7 +788,7 @@ def run_markdownlint(
     if fix:
         # Run markdownlint with --fix to auto-fix issues
         cmd = ["markdownlint", "--fix", "--json", str(root)]
-        result = runner(cmd)
+        result = _invoke_pinned(runner, cmd, root)
 
         # markdownlint may exit 0 or 1; check if fixes were applied by
         # looking at git changes
@@ -776,11 +797,11 @@ def run_markdownlint(
 
         # Re-scan to get remaining issues
         cmd = ["markdownlint", "--json", str(root)]
-        result = runner(cmd)
+        result = _invoke_pinned(runner, cmd, root)
     else:
         # Normal check mode
         cmd = ["markdownlint", "--json", str(root)]
-        result = runner(cmd)
+        result = _invoke_pinned(runner, cmd, root)
 
     findings: list[dict[str, Any]] = []
     if result.returncode not in (0, 1):
@@ -859,7 +880,7 @@ def run_shellcheck(
 
     for shell_file in shell_files:
         cmd = ["shellcheck", "-f", "json", str(shell_file)]
-        result = runner(cmd)
+        result = _invoke_pinned(runner, cmd, root)
 
         if result.returncode not in (0, 1):
             continue
@@ -929,7 +950,7 @@ def run_dotnet_format(
     if fix:
         # Auto-format mode: run without --verify-no-changes
         cmd = ["dotnet", "format", str(root), "--verbosity", "quiet"]
-        result = runner(cmd)
+        result = _invoke_pinned(runner, cmd, root)
 
         # Check if changes were made by looking at git status
         status = _run_subprocess(["git", "status", "--porcelain"], cwd=root)
@@ -939,11 +960,11 @@ def run_dotnet_format(
 
         # Re-scan for remaining issues (should be none after fix, but check)
         cmd = ["dotnet", "format", str(root), "--verify-no-changes", "--verbosity", "quiet"]
-        result = runner(cmd)
+        result = _invoke_pinned(runner, cmd, root)
     else:
         # Normal check mode
         cmd = ["dotnet", "format", str(root), "--verify-no-changes", "--verbosity", "quiet"]
-        result = runner(cmd)
+        result = _invoke_pinned(runner, cmd, root)
 
     findings: list[dict[str, Any]] = []
     if result.returncode not in (0, 1):
