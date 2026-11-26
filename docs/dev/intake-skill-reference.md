@@ -70,6 +70,67 @@ order and `wl sync` failure modes.
 
 > **Precedence rule:** Operator-specified priority (via `--priority` flag or explicit directive) always takes absolute precedence over classification. Classification is a fallback only.
 
+## Autoplan pre-check (closing step)
+
+Intake's closing sequence applies the same effort/risk pre-check the plan skill
+uses, so an item that does not need planning is advanced to `plan_complete` at
+the end of intake instead of being left at `intake_complete` for a separate
+`/skill:plan` session that would only rubber-stamp it
+(SA-0MWXJWZ3T0062HBI).
+
+**Placement.** The step runs *after* the effort/risk estimate (step 10) and
+*before* the finishing step, via
+`intake.py autoplan <work-item-id>`. The estimate is therefore already stored
+on the item, and the pre-check reuses it rather than re-estimating.
+
+**Single-sourced decision logic (no extraction).** `intake.py` consumes the
+canonical `plan_if_needed` from `skill/plan/plan_helpers.py`, loading that file
+by path (cached in `sys.modules` as `intake_canonical_plan_helpers`) rather
+than via `import plan.plan_helpers`. The path load is deliberate: the
+repository root ships its own `plan/` package (`detection.py`, `wl_adapter.py`),
+so which `plan` wins depends on `sys.path` ordering — the full test suite puts
+the repo root first, the changed-scope gate puts the skills root first, and an
+installed skills tree has no repo-root `plan/` at all. Loading the single
+canonical file is deterministic in every layout and still executes the plan
+skill's own module. Extraction of the decision core into `skill/shared/` was
+considered and rejected: `plan` never imports `intake`, so there is no cycle,
+and reuse keeps the threshold constants (`DEFAULT_AUTOPLAN_EFFORT_SKIP` =
+`{Extra Small, Small}`, `DEFAULT_AUTOPLAN_RISK_SKIP` = `{Low}`), the
+unknown→plan fallback and the existing plan CLI/tests untouched. Duplicating
+the thresholds in intake is forbidden — tests pin the loaded module to
+`skill/plan/plan_helpers.py` and assert the threshold sets come from it.
+
+**Helper availability.** If the canonical module cannot be loaded (damaged
+install), `intake.py` logs the failure and the pre-check degrades to the
+`error` decision — planning still runs, and intake's `start`/`finish`/`abort`
+commands keep working.
+
+**Decision handling.**
+
+| Helper decision | Intake action | Stage after the step |
+|---|---|---|
+| `skip` (effort ≤ Small **and** risk `Low`) | `StatusLifecycle.update_status(id, "open", stage="plan_complete", assignee="")` + decision comment | `plan_complete` |
+| `plan` (above threshold) | comment only | `intake_complete` (unchanged) |
+| `error` / unknown effort-risk / helper exception | comment only | `intake_complete` (unchanged) |
+
+**Fail-safe rule.** Any outcome other than an explicit `skip` leaves the stage
+at `intake_complete`, so planning still runs. An unreadable work item
+(`wl show` failure) is never mutated, and an unrecognised stage value is
+reported as `no_op` rather than guessed at.
+
+**Idempotence rule.** The current stage is ranked against the stage
+progression (`idea` → `intake_complete` → `plan_complete` → `in_review` →
+`done`); at `plan_complete` or later the command returns `no_op` without
+calling the helper or writing anything, so re-running intake can never regress
+a stage. The decision comment carries a deterministic
+`intake-autoplan-decision:<hash>` marker, so re-runs post at most one comment
+per distinct decision.
+
+**Assignee release.** The skip path is a direct durable
+`StatusLifecycle.update_status(..., assignee="")` write (not a context-manager
+exit), so the release is explicit — per the
+[assignee-release invariant](../../AGENTS_GLOBAL.md#assignee-release-invariant).
+
 ## Finishing output template (full)
 
 # Objective

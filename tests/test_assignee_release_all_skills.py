@@ -1662,6 +1662,16 @@ COVERED_BY_SKILL_TESTS: dict[str, dict[str, str]] = {
             "skill/audit/tests/test_audit_runner_abort_recovery.py"
         ),
     },
+    "intake/scripts/intake.py": {
+        "cmd_autoplan": (
+            "intake closing autoplan pre-check: the skip path releases any "
+            "claim with an explicit StatusLifecycle.update_status(..., "
+            "assignee=\"\") write, asserted by "
+            "skill/intake/tests/test_intake_autoplan.py "
+            "(test_skip_releases_the_assignee); the plan/error/unknown paths "
+            "write nothing at all, so they can never establish a hold"
+        ),
+    },
 }
 
 #: Exact ``wl`` flags that set an assignee (prose mention does not count).

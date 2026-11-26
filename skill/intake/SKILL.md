@@ -66,6 +66,7 @@ All status transitions are managed by the shared `StatusLifecycle` context manag
 - **Claim** (before any other step): `python3 $(skill_path intake)/scripts/intake.py start <work-item-id> --assignee "<AGENT>"` — sets `status=in_progress`, prevents concurrent claims.
 - **Auto-complete** (skip full intake for sufficiently defined items): `python3 $(skill_path intake)/scripts/intake.py auto-complete <work-item-id>`.
 - **Finish**: `python3 $(skill_path intake)/scripts/intake.py finish <work-item-id> [--description-file <path>]`.
+- **Autoplan pre-check** (closing step): `python3 $(skill_path intake)/scripts/intake.py autoplan <work-item-id>`.
 - **Abort** (release on failure): `python3 $(skill_path intake)/scripts/intake.py abort <work-item-id>`.
 
 **Assignee release on completion.** Intake claims with the
@@ -259,14 +260,40 @@ This transitions `status=open`, `stage=intake_complete`.
   ```
   (Refer to `../effort-and-risk/SKILL.md` for details.)
 
-### 11. Finishing (must do as the final step only)
+### 11. Autoplan pre-check (must follow; after the estimate, before finishing)
+
+Decide whether this item needs a separate `/skill:plan` session. The decision
+comes from the plan skill's canonical helper — **never** re-derive the
+thresholds:
+
+```bash
+python3 $(skill_path intake)/scripts/intake.py autoplan <work-item-id>
+```
+
+Outcomes (JSON `action`):
+
+- `advanced` — the helper returned `skip` (effort `Extra Small`/`Small` **and**
+  risk `Low`): the stage is advanced to `plan_complete` with `status=open` and
+  the assignee released, and the decision is recorded as a comment. Do **not**
+  run `/skill:plan` for this item.
+- `unchanged` — the helper returned `plan`, `error`, or could not determine the
+  effort/risk: the stage stays at `intake_complete` so planning still runs. This
+  is the **fail-safe** path — an item is never skipped silently.
+- `no_op` — the item is already at `plan_complete` (or later) or carries an
+  unrecognised stage: nothing is written, so re-running intake never regresses
+  the stage (**idempotent**), and the decision comment is never duplicated.
+
+The step is safe to re-run at any time: it only ever advances a stage, never
+rewinds one, and it records at most one comment per distinct decision.
+
+### 12. Finishing (must do as the final step only)
 
 - `wl sync` to sync changes.  > **Note:** on a repo with **no commits yet** `wl sync` fails (unborn HEAD) — create an initial commit (`git commit --allow-empty -m "chore: initial"`) or use `wl sync --no-push`. See `docs/dev/worklog-sync.md`.
 - `wl show <work-item-id>` (not --json); remove temp files (`.worklog/tmp/intake-draft-<title>-<work-item-id>.md`).
 - Output a structured summary (`# Objective` headline, `# Acceptance Criteria` list, `# Effort and Risk` sizing; full template in [docs/dev/intake-skill-reference.md](../../docs/dev/intake-skill-reference.md)). The AC list always includes: at least one testing/validation criterion; "All related documentation is updated to reflect the changes, including code comments, README, and any relevant wiki or docs site entries."; and "Full project test suite must pass with the new changes."  > **Note:** CHANGELOG.md is **excluded** — managed by the ship skill's release pipeline. Do not include CI/CD pipeline tests.
 - Finish with "This completes the Intake process for <work-item-id> <work-item-title>"
 
-### 12. Error/abort handling
+### 13. Error/abort handling
 
 If the intake process fails or is interrupted before completion:
 
