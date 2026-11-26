@@ -30,13 +30,27 @@ export const DISCORD_NOTIFY_LOG_ENV = 'DISCORD_NOTIFY_LOG';
  * never touches the network.
  */
 export const STUB_DISCORD_NOTIFY_SOURCE = `// Recording stub — no network I/O.
-export async function sendReleaseNotification({ version, prUrl, projectRoot } = {}) {
+export async function sendReleaseNotification(release = {}, options = {}) {
+  const { version, prUrl, projectRoot } = release;
   const logPath = process.env.${DISCORD_NOTIFY_LOG_ENV};
   if (logPath) {
     const { appendFileSync } = await import('node:fs');
     appendFileSync(
       logPath,
-      JSON.stringify({ version, prUrl, projectRoot, stubbed: true }) + '\\n',
+      JSON.stringify({
+        version,
+        prUrl,
+        projectRoot,
+        // Provenance is recorded (never enforced) by the stub so a test can
+        // pin that a recovery path supplied explicit \`tagCreatedByThisRun\`
+        // while the fail-closed default stays in the real module
+        // (SA-0MV0QEI3Q0063KH3 / SA-0MWXMTSKH0085UZZ).
+        provenance: {
+          tagCreatedByThisRun: options.tagCreatedByThisRun,
+          hasPreRunTags: options.preRunTags !== undefined,
+        },
+        stubbed: true,
+      }) + '\\n',
     );
   }
   return { success: true, notified: false, stubbed: true };
