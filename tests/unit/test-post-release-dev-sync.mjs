@@ -165,10 +165,10 @@ describe('syncDevWithMain (hermetic)', () => {
 //   * The result records the number of attempts made (`result.attempts`) so a
 //     caller can report how much retrying happened.
 //
-// These cases are `{ todo: true }` until the retry implementation lands — the
-// `node:test` red-first analogue of `pytest.mark.xfail(strict=True)` used by
-// SA-0MW3GCHEL001G8CP — so the changed-scope gate stays green. The
-// implementation item removes the markers.
+// These cases were written red-first (`{ todo: true }`, the `node:test`
+// analogue of `pytest.mark.xfail(strict=True)` used by SA-0MW3GCHEL001G8CP)
+// and the markers were removed by the retry implementation
+// (SA-0MWXMTQ4Q001N0WJ).
 
 const SYNC_SEQUENCE = [
   'git fetch origin --prune',
@@ -267,7 +267,6 @@ describe('syncDevWithMain (retry policy)', () => {
   for (const { label, text } of TRANSPORT_SIGNATURES) {
     test(
       `retries a transport-class failure: ${label}`,
-      { todo: true },
       async () => {
         const mod = await import(RUN_RELEASE_PATH);
         const { run, calls } = makeFakeRunner({ 'git fetch origin --prune': 1 }, text);
@@ -278,14 +277,17 @@ describe('syncDevWithMain (retry policy)', () => {
         assert.equal(result.success, true, `expected a retried success, got: ${result.message}`);
         assert.equal(result.attempts, 2, 'one initial attempt plus one retry');
         assert.deepEqual(sleeps, [10], 'one backoff before the single retry');
-        assert.deepEqual(calls, [...SYNC_SEQUENCE, ...SYNC_SEQUENCE]);
+        assert.deepEqual(
+          calls,
+          ['git fetch origin --prune', ...SYNC_SEQUENCE],
+          'a failing fetch aborts attempt 1 there; the retry replays the full sequence',
+        );
       },
     );
   }
 
   test(
     'an unrecognised failure is not retried (allowlist: fail closed)',
-    { todo: true },
     async () => {
       const mod = await import(RUN_RELEASE_PATH);
       const { run, calls } = makeFakeRunner(
@@ -305,7 +307,6 @@ describe('syncDevWithMain (retry policy)', () => {
 
   test(
     'retries transport failures then succeeds, recording 3 attempts and increasing delays',
-    { todo: true },
     async () => {
       const mod = await import(RUN_RELEASE_PATH);
       const { run } = makeFakeRunner(
@@ -325,12 +326,11 @@ describe('syncDevWithMain (retry policy)', () => {
 
   test(
     'defaults to 3 attempts with exponential backoff and honours the overrides',
-    { todo: true },
     async () => {
       const mod = await import(RUN_RELEASE_PATH);
 
       const alwaysFails = makeFakeRunner(
-        { 'git fetch origin --prune': 99 },
+        { 'git push origin dev': 99 },
         TRANSPORT_SIGNATURES[0].text,
       );
       const defaults = makeRecordingSleep();
@@ -346,7 +346,7 @@ describe('syncDevWithMain (retry policy)', () => {
       );
 
       const overridden = makeFakeRunner(
-        { 'git fetch origin --prune': 99 },
+        { 'git push origin dev': 99 },
         TRANSPORT_SIGNATURES[0].text,
       );
       const tuned = makeRecordingSleep();
@@ -367,7 +367,6 @@ describe('syncDevWithMain (retry policy)', () => {
   for (const { label, text, command } of DETERMINISTIC_FAILURES) {
     test(
       `does not retry a deterministic failure: ${label}`,
-      { todo: true },
       async () => {
         const mod = await import(RUN_RELEASE_PATH);
         const { run, calls } = makeFakeRunner({ [command]: 5 }, text);
@@ -393,7 +392,6 @@ describe('syncDevWithMain (retry policy)', () => {
 
   test(
     'each retry restarts the full sequence from a fresh git fetch',
-    { todo: true },
     async () => {
       const mod = await import(RUN_RELEASE_PATH);
       const { run, calls } = makeFakeRunner(

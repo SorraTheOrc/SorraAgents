@@ -1499,50 +1499,175 @@ export function runPostReleaseCleanup(options = {}) {
 // ── syncDevWithMain ──────────────────────────────────────────────────────────
 
 /**
+ * Strict allowlist of transport-class failure signatures for the post-release
+ * `dev` sync (SA-0MWXMTQ4Q001N0WJ, parent SA-0MWXIY8D2001DGZ0 AC3).
+ *
+ * The 2026-11-26 release (v0.2.0) landed on `main` while its single
+ * `git push origin dev` failed with "Connection to github.com closed by remote
+ * host" — a transient fault a retry would have absorbed. Classification is an
+ * allowlist because the sync sequence is NOT idempotent (`git merge`,
+ * `git push`): an unrecognised failure is never replayed (fail closed), so a
+ * merge conflict, a rejected push or a missing ref aborts on the first attempt.
+ * Mirrored by `TRANSPORT_SIGNATURES` / `DETERMINISTIC_FAILURES` in
+ * tests/unit/test-post-release-dev-sync.mjs.
+ *
+ * @type {ReadonlyArray<RegExp>}
+ */
+export const TRANSPORT_ERROR_PATTERNS = Object.freeze([
+  // Connection dropped mid-transfer.
+  /connection (?:to \S+ )?closed by remote host/i,
+  /connection reset by peer/i,
+  /remote end hung up unexpectedly/i,
+  // Git transport / HTTP layer.
+  /rpc failed/i,
+  /early eof/i,
+  // TLS / proxy.
+  /ssl_error|ssl routines|tlsv1 alert|gnutls_handshake|certificate verify failed/i,
+  /received http code \d+ from proxy|proxy after connect|connect tunnel failed/i,
+  // DNS resolution.
+  /could not resolve host|temporary failure in name resolution|name or service not known|getaddrinfo|enotfound/i,
+  // Timeouts.
+  /timeout was reached|operation timed out|timed out|curl 28/i,
+]);
+
+/** The full sync sequence; every attempt replays all of it from the fetch. */
+const SYNC_COMMANDS = Object.freeze([
+  'git fetch origin --prune',
+  'git checkout dev',
+  'git merge origin/main',
+  'git push origin dev',
+]);
+
+const DEFAULT_SYNC_ATTEMPTS = 3;
+const DEFAULT_SYNC_BACKOFF_MS = 500;
+
+/**
+ * Collect the failure text of a failed command: stderr first, then the message.
+ *
+ * @param {unknown} err - The thrown error (execSync errors carry `stderr`).
+ * @returns {string} The combined failure text (empty for a bare throw).
+ */
+function syncFailureText(err) {
+  const stderr = /** @type {{ stderr?: unknown }} */ (err)?.stderr;
+  const stderrText = typeof stderr === 'string' ? stderr : stderr?.toString?.() || '';
+  const message = /** @type {{ message?: unknown }} */ (err)?.message;
+  const messageText = typeof message === 'string' ? message : '';
+  return [stderrText, messageText]
+    .map((text) => text.trim())
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
+ * Decide whether a failed sync command is a transient transport fault worth
+ * retrying. Fail closed: anything outside the allowlist is not retried.
+ *
+ * @param {unknown} err - The thrown error.
+ * @returns {boolean} `true` only for a recognised transport signature.
+ */
+export function isTransportError(err) {
+  const text = syncFailureText(err);
+  if (!text) return false;
+  return TRANSPORT_ERROR_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
+ * Default backoff: block without a dependency or a busy loop.
+ *
+ * @param {number} ms - Milliseconds to wait.
+ */
+function defaultSyncSleep(ms) {
+  if (!(ms > 0)) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
  * Sync the local `dev` branch with `main` after a successful release.
  *
- * Steps:
+ * Steps (replayed in full on every attempt):
  * 1. Fetch latest from origin
  * 2. Checkout `dev` (switches from the release branch back to dev)
  * 3. Merge `origin/main` into `dev` (fast-forward)
  * 4. Push `dev` to origin
+ *
+ * Transport-class failures (see `TRANSPORT_ERROR_PATTERNS`) are retried with
+ * exponential backoff — default 3 attempts, waiting `backoffMs * 2 ** (n - 1)`
+ * (500 ms, then 1000 ms) between them. Deterministic failures (merge conflict,
+ * non-fast-forward rejection, missing ref, anything unrecognised) abort on the
+ * first attempt because `git merge`/`git push` are not idempotent. Every retry
+ * restarts from the fresh `git fetch origin --prune`, so a replayed merge never
+ * compounds stale state.
  *
  * @param {object} [options] - Optional injection point (used by unit tests).
  * @param {(cmd: string) => string} [options.run] - Command runner; defaults
  *   to `execSync` with git's output streamed to stderr. Tests inject a fake
  *   runner to assert the command sequence without touching a real repository
  *   (SA-0MUY6U05F008RG86) — mirroring `verifyReleaseMerge`'s `options.run`.
- * @returns {{ success: boolean, message: string }}
+ * @param {number} [options.attempts=3] - Maximum attempts (must be >= 1).
+ * @param {number} [options.backoffMs=500] - Base backoff delay in ms.
+ * @param {(ms: number) => void} [options.sleep] - Backoff implementation;
+ *   tests inject a recorder so no test sleeps.
+ * @returns {{ success: boolean, message: string, attempts: number }} The
+ *   outcome, naming the attempt count and the last error on failure.
+ * @throws {RangeError} When `attempts` is not a positive integer or
+ *   `backoffMs` is negative.
  */
 export function syncDevWithMain(options = {}) {
   const run = options.run || ((cmd) => execSync(cmd, {
     encoding: 'utf-8',
     stdio: ['pipe', 'inherit', 'pipe'],
   }));
-  try {
-    console.log('\nSyncing dev branch with main...');
+  const sleep = options.sleep || defaultSyncSleep;
+  const attempts = options.attempts ?? DEFAULT_SYNC_ATTEMPTS;
+  const backoffMs = options.backoffMs ?? DEFAULT_SYNC_BACKOFF_MS;
 
-    // Step 1: Fetch latest
-    run('git fetch origin --prune');
+  if (!Number.isInteger(attempts) || attempts < 1) {
+    throw new RangeError(`syncDevWithMain: attempts must be a positive integer, got ${attempts}`);
+  }
+  if (!(backoffMs >= 0)) {
+    throw new RangeError(`syncDevWithMain: backoffMs must be >= 0, got ${backoffMs}`);
+  }
 
-    // Step 2: Checkout dev
-    run('git checkout dev');
+  console.log('\nSyncing dev branch with main...');
 
-    // Step 3: Merge main into dev
-    run('git merge origin/main');
+  let lastErrorText = '';
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      for (const command of SYNC_COMMANDS) {
+        run(command);
+      }
 
-    // Step 4: Push dev to origin
-    run('git push origin dev');
+      const message = attempt === 1
+        ? 'dev branch is now in sync with main and pushed to origin (1 attempt).'
+        : `dev branch is now in sync with main and pushed to origin after ${attempt} attempts.`;
+      console.log(message);
+      return { success: true, message, attempts: attempt };
+    } catch (err) {
+      lastErrorText = syncFailureText(err) || 'unknown error';
 
-    const message = 'dev branch is now in sync with main and pushed to origin.';
-    console.log(message);
-    return { success: true, message };
-  } catch (err) {
-    const errorMsg = `Failed to sync dev with main: ${err.stderr?.toString()?.trim() || err.message}`;
-    console.error(errorMsg);
-    return { success: false, message: errorMsg };
+      // Fail closed: only a recognised transport signature is replayed.
+      if (!isTransportError(err)) {
+        const errorMsg = `Failed to sync dev with main on attempt ${attempt}/${attempts}: ${lastErrorText}`;
+        console.error(errorMsg);
+        return { success: false, message: errorMsg, attempts: attempt };
+      }
+
+      if (attempt === attempts) {
+        const errorMsg = `Failed to sync dev with main after ${attempts} attempt(s); last error: ${lastErrorText}`;
+        console.error(errorMsg);
+        return { success: false, message: errorMsg, attempts: attempt };
+      }
+
+      const delay = backoffMs * (2 ** (attempt - 1));
+      console.warn(
+        `⚠ dev sync attempt ${attempt}/${attempts} hit a transport error (${lastErrorText}); retrying in ${delay} ms.`,
+      );
+      sleep(delay);
+    }
   }
 }
+
+
 
 // ── recoverFromReleaseTimeout ────────────────────────────────────────────────
 /**
@@ -2462,14 +2587,19 @@ export async function runVerifiedPostReleaseTail({
 
   // ── Sync dev with main (LAST, non-fatal) ───────────────────────────────
   // The release has landed; this is the only network-dependent step of the
-  // tail and it must never suppress the verified work above. A failure warns
-  // loudly, names the exact recovery command and leaves the exit code alone
-  // (exit code 5 is reserved and no longer emitted).
+  // tail and it must never suppress the verified work above. Transport-class
+  // failures are retried with exponential backoff inside `syncDevWithMain()`
+  // (SA-0MWXMTQ4Q001N0WJ); a failure that survives them warns loudly, names
+  // the exact recovery command and leaves the exit code alone (exit code 5 is
+  // reserved and no longer emitted). The attempt count is surfaced here so the
+  // release log and its timing report say how much retrying happened.
   const syncTimer = beginStep('Step 11: sync dev with main');
   const sync = syncDevWithMain();
   if (!sync.success) {
     console.warn(`\n⚠️  ${sync.message}`);
     console.warn('The release itself landed; recover the dev sync with: git push origin dev');
+  } else if (sync.attempts > 1) {
+    console.log(`  dev sync needed ${sync.attempts} attempts (transport errors retried).`);
   }
   endStep(syncTimer);
 

@@ -341,6 +341,10 @@ describe('run-release post-release tail order and non-fatal dev sync', () => {
         out.includes('Step 11: sync dev with main'),
         `the timing report should carry the dev-sync outcome, got:\n${out}`,
       );
+      assert.ok(
+        /3 attempt/.test(out),
+        `the dev-sync warning should name the attempt count, got:\n${out}`,
+      );
     },
   );
 
