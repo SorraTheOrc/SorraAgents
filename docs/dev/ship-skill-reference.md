@@ -64,6 +64,7 @@ removed manually by deleting `.worklog/code-freeze.json`.
 
 | Code | Meaning |
 |------|---------|
+| 0 | Success — a normal release completed, or (for `--finish-release <version>`) the verified post-release tail completed with no merge/PR/tag/bump/freeze |
 | 1 | General error |
 | 2 | Missing release script |
 | 3 | Unmerged branches found |
@@ -74,14 +75,16 @@ removed manually by deleting `.worklog/code-freeze.json`.
 | 8 | Worklog-ref gate failure (worklog refs present) |
 | 9 | Producer-review gate failure — top-level `in_review` item(s) flagged for producer review (`needsProducerReview != false`) |
 | 10 | Release script timed out and was terminated (`SHIP_RELEASE_TIMEOUT_MS`, default 3 600 s = 60 min; the merge script's full-suite step takes ≈ 1 982 s). The wrapper restores the start branch and deletes this run's orphan `release/dev-to-main-*` branch when it is unpushed and PR-free, reporting exactly what it restored and deleted (or refused, with the reason) |
-| 11 | Release merge verification failed (close-work-items step refused — no verified dev→main merge) |
+| 11 | Release merge verification failed (close-work-items step refused — no verified dev→main merge). Also the `--finish-release <version>` failure exit |
 | 12 | Final-validation gate failure — top-level or **uncovered child** `in_review` item(s) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation (children covered by a passing `in_review` parent audit, or excluded because the parent is deleted/non-`in_review`, never block) |
-| 13 | Invalid argument — an unrecognised flag or a missing value; wrapper usage printed and nothing executed |
+| 13 | Invalid argument — an unrecognised flag, a missing value, or an invalid/missing `--finish-release <version>`; wrapper usage printed and nothing executed |
 | 14 | No newly-created release tag — the released tag already existed before this run (or the pre-run tag snapshot could not be read); all post-release steps refused |
 
 **Missing-script fail-fast (SA-0MUIVIJFT0009ZNV):** `run-release.js` resolves the canonical release script **before** the gating checks. When no script exists it exits 2 immediately and runs no git or live-`wl` gate commands — keeping the missing-script safety path cheap, deterministic, and free of worklog side effects.
 
-**Argument fail-fast (SA-0MV0PZYMI004SUFR):** `parseReleaseArgs(argv)` validates the wrapper's CLI arguments before the Code Freeze marker, project-root resolution and every gate. `--help`/`-h` print `WRAPPER_USAGE` and exit 0; an unknown flag or a missing value exits 13 with usage. Documented wrapper flags (`--dry-run`, `--force`, `--work-item-id`, `--bump`, `--skip-checks`, `--refresh-audits`, `--skip-audit-remediation`) keep working, and an unknown flag can never be forwarded to `merge-dev-to-main.sh`.
+**Argument fail-fast (SA-0MV0PZYMI004SUFR):** `parseReleaseArgs(argv)` validates the wrapper's CLI arguments before the Code Freeze marker, project-root resolution and every gate. `--help`/`-h` print `WRAPPER_USAGE` and exit 0; an unknown flag, a missing value, or an invalid `--finish-release` version exits 13 with usage. Documented wrapper flags (`--dry-run`, `--force`, `--work-item-id`, `--bump`, `--skip-checks`, `--refresh-audits`, `--skip-audit-remediation`, `--finish-release`) keep working, and an unknown flag can never be forwarded to `merge-dev-to-main.sh`.
+
+**Partial-release recovery (`--finish-release <version>`, SA-0MWXMTSKH0085UZZ):** a release that landed on `main` but whose tail never ran cannot be finished by re-running the normal flow — the released tag already exists, so the newly-created-tag gate refuses it (exit 14). `runFinishReleaseAction(flags)` is the supported recovery: it runs **only** the verified post-release tail via `runVerifiedPostReleaseTail()` (verify merge → notify → close items → cleanup → sync `dev` last), with no merge, no PR, no tag creation, no version bump and no Code Freeze marker, and it exits **before** `setCodeFreezeMarker`/`runReleaseImpl` (mirroring the `--refresh-audits` pre-flight). Provenance comes from `verifyReleaseMerge()` (the tag exists on `origin` and is an ancestor of `origin/main`) instead of the pre-run tag snapshot, and the verified tail is passed explicit `{ tagCreatedByThisRun: true }`; the notification remains fail-closed by default, so the confirmed release is announced exactly once per run (a re-run re-announces — documented, accepted, no dedupe store). Closure is idempotent via the `Shipped in v<version>` marker. Exit codes: 0 success, 11 merge verification failed, 13 invalid/unknown argument (nothing executed).
 
 **Newly-created-tag gate (SA-0MV0PZYMI004SUFR):** `snapshotReleaseTags()` records `git tag --list` immediately before the merge script runs. At the verification step the released version is accepted only when `v<version>` was absent from that snapshot (`isNewlyCreatedTag(version, preRunTags)`); otherwise the wrapper exits 14 without running any post-release step. A `null` snapshot (unreadable git tags) fails closed. This is strictly additive to `verifyReleaseMerge` — both gates must pass before work items are closed.
 

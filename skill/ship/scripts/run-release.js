@@ -204,6 +204,8 @@ export const WRAPPER_USAGE = [
   '  --skip-checks               Bypass the pre-merge gating checks',
   '  --refresh-audits            Pre-flight only: refresh in_review audits, then exit',
   '  --skip-audit-remediation    Skip in-gate audit remediation (audits still required)',
+  '  --finish-release <version>  Recovery: run only the verified post-release tail for',
+  '                              an already-landed release (no merge/PR/tag/bump/freeze)',
 ].join('\n');
 
 // Boolean wrapper flags mapped to their parsed property name.
@@ -219,7 +221,26 @@ const BOOLEAN_FLAGS = {
 const VALUE_FLAGS = {
   '--work-item-id': 'workItemId',
   '--bump': 'bump',
+  '--finish-release': 'finishRelease',
 };
+
+// Semver-ish shape accepted by `--finish-release`: a numeric `major.minor.patch`
+// with optional leading `v` and optional pre-release/build suffix. Deliberately
+// permissive (the recovered release may carry a pre-release tag) but strict
+// enough to reject an accidental path/flag-as-value before any side effect.
+const SEMVERISH_PATTERN = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+
+/**
+ * Whether a value is a semver-ish release version accepted by
+ * `--finish-release`.
+ *
+ * @param {unknown} value - Candidate version string.
+ * @returns {boolean} True when the trimmed value matches `major.minor.patch`
+ *   with an optional leading `v` and optional suffix.
+ */
+export function isSemverishVersion(value) {
+  return typeof value === 'string' && SEMVERISH_PATTERN.test(value.trim());
+}
 
 /**
  * Strictly parse the wrapper's CLI arguments.
@@ -244,6 +265,7 @@ export function parseReleaseArgs(argv = []) {
     skipAuditRemediation: false,
     workItemId: null,
     bump: null,
+    finishRelease: null,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -265,6 +287,16 @@ export function parseReleaseArgs(argv = []) {
       continue;
     }
     return { action: 'error', message: `Unknown argument: ${arg}` };
+  }
+
+  // A `--finish-release` value that is not semver-ish is an argument error: the
+  // recovery path must never be entered with an invalid version, so nothing is
+  // executed (exit 13) before any git/worklog side effect.
+  if (flags.finishRelease !== null && !isSemverishVersion(flags.finishRelease)) {
+    return {
+      action: 'error',
+      message: `Invalid --finish-release version: ${flags.finishRelease}`,
+    };
   }
 
   return { action: 'run', flags };
@@ -2029,6 +2061,82 @@ function waitForPRChecksOutcome(prNumber, timeoutSeconds) {
   }
 }
 
+// ── runFinishReleaseAction ───────────────────────────────────────────────────
+
+/**
+ * Recovery entry point: finish a partially-applied release tail.
+ *
+ * A release can land on `main` (merge + PR + tag pushed) while its post-release
+ * tail never ran — the 2026-11-26 `v0.2.0` case — leaving shipped items at
+ * `completed/in_review` and the announcement unsent. Re-running
+ * `run-release.js` cannot fix this: the released tag already exists, so the
+ * newly-created-tag gate refuses the run (exit 14, SA-0MV13B5WO008CYXA) by
+ * design. `--finish-release <version>` is the supported recovery.
+ *
+ * Provenance is proven differently on this path. Instead of the pre-run tag
+ * snapshot (which can no longer prove *this* run created the tag), the release
+ * is verified by {@link verifyReleaseMerge} — the tag exists on `origin` and
+ * its commit is an ancestor of `origin/main` — inside the shared
+ * {@link runVerifiedPostReleaseTail}. When verification succeeds the tail is
+ * told `{ tagCreatedByThisRun: true }` explicitly, so the confirmed release is
+ * announced. `sendReleaseNotification` still fails closed by default, so a
+ * pre-existing tag is never announced on the normal path
+ * (SA-0MV0QEI3Q0063KH3).
+ *
+ * Nothing forward-looking happens here: no merge, no PR, no tag creation, no
+ * version bump and no Code Freeze marker. Re-running is idempotent for the
+ * closure (the `Shipped in v<version>` marker is honoured) but the notification
+ * is at-most-once — a re-run re-announces, which is documented and accepted
+ * (no dedupe store is added; explicitly out of scope).
+ *
+ * @param {object} [flags] - Parsed wrapper flags (`{ finishRelease, dryRun }`).
+ * @param {string|null} [projectRoot] - Project root; resolved lazily (default:
+ *   `resolveProjectRoot()`) only after the version validates, so an invalid
+ *   argument never touches git.
+ * @returns {Promise<number>} Exit code: 0 on success, 11 when merge
+ *   verification fails, 13 on an invalid argument (nothing executed).
+ */
+export async function runFinishReleaseAction(flags = {}, projectRoot = null) {
+  const requested = flags.finishRelease;
+  // Tolerate a leading `v` so `v0.2.0` and `0.2.0` both verify the same tag.
+  const version = typeof requested === 'string' ? requested.trim().replace(/^v/, '') : null;
+
+  // Validation runs before any project-root resolution/git access: an invalid
+  // version exits 13 with nothing executed, so the recovery path can never be
+  // entered half-way.
+  if (!version || !isSemverishVersion(version)) {
+    process.stderr.write(`Invalid --finish-release version: ${requested}\n\n${WRAPPER_USAGE}\n`);
+    return 13;
+  }
+
+  const root = projectRoot || resolveProjectRoot();
+  const dryRun = Boolean(flags.dryRun);
+  console.log(
+    `\nFinishing release v${version} (recovery: verified post-release tail only)`
+    + (dryRun ? ' — dry-run' : '')
+    + '...',
+  );
+
+  // The shared tail owns the ordering (verify → notify → close → cleanup →
+  // sync dev last) and the gating: when verification fails it performs no
+  // notification, closure, cleanup or sync, and the caller maps it to exit 11.
+  const tail = await runVerifiedPostReleaseTail({
+    version,
+    prUrl: null,
+    projectRoot: root,
+    dryRun,
+    provenance: { tagCreatedByThisRun: true },
+  });
+
+  if (!tail.verified) {
+    console.error('\nRefusing to finish the release tail (exit code 11).');
+    return 11;
+  }
+
+  console.log(`\nRelease v${version} tail completed.`);
+  return 0;
+}
+
 // ── runRelease ───────────────────────────────────────────────────────────────
 
 /**
@@ -2074,6 +2182,16 @@ export async function runRelease(cliArgs = []) {
   // Freeze marker, so a large backlog never freezes the project.
   if (parsed.flags.refreshAudits) {
     return runRefreshAuditsAction(cliArgs);
+  }
+
+  // Partial-release recovery (SA-0MWXMTSKH0085UZZ): `--finish-release <version>`
+  // runs ONLY the verified post-release tail for a release that already landed
+  // (verify merge → notify → close items → cleanup → sync dev last) — no merge,
+  // no PR, no tag creation, no version bump and no Code Freeze marker. Like the
+  // `--refresh-audits` pre-flight, it exits BEFORE `setCodeFreezeMarker` and
+  // `runReleaseImpl`, so a recovery run never freezes the project.
+  if (parsed.flags.finishRelease) {
+    return runFinishReleaseAction(parsed.flags);
   }
 
   const projectRoot = resolveProjectRoot();

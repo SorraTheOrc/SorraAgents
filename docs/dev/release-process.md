@@ -404,6 +404,64 @@ case:
    of patch) or delete the conflicting tag.
 3. Re-run the release script.
 
+## Partial Release Recovery (`--finish-release`)
+
+If a release **landed on `main`** (merge, PR and tag pushed) but its
+post-release tail never ran — the 2026-11-26 `v0.2.0` case — do **not** re-run
+the normal release. Re-running `run-release.js` cannot work: the released tag
+already exists, so the newly-created-tag gate refuses the run with exit **14**
+by design (SA-0MV13B5WO008CYXA). A partially-applied tail is finished with the
+supported recovery command:
+
+```bash
+node $(skill_path ship)/scripts/run-release.js --finish-release <version>
+# e.g. the 2026-11-26 recovery:
+node $(skill_path ship)/scripts/run-release.js --finish-release 0.2.0
+```
+
+Run it from the **main checkout**, not a worktree.
+
+### What it does
+
+It runs **only the verified post-release tail**, through the same
+`runVerifiedPostReleaseTail()` helper the normal release uses:
+
+1. **Verify the release merge** — the tag `v<version>` exists on `origin` and
+   its commit is an ancestor of `origin/main`. If this fails, the command exits
+   **11** and nothing downstream runs.
+2. **Discord notification** — the confirmed release is announced exactly once
+   per run, with explicit `{ tagCreatedByThisRun: true }` provenance.
+3. **Close work items** — `Shipped in v<version>` closure, idempotent: items
+   that already carry the marker are skipped.
+4. **Branch cleanup.**
+5. **Sync `dev` with `main`** (last, non-fatal).
+
+It performs **no merge, no PR, no tag creation, no version bump and no Code
+Freeze marker**, and it runs **before** every gating check, so it completes the
+tail even while other gates would fail.
+
+### Exit codes
+
+| Exit | Meaning |
+|------|---------|
+| 0 | The verified post-release tail completed |
+| 11 | Merge verification failed — nothing notified, closed, cleaned up or synced |
+| 13 | Invalid/unknown argument (including an invalid or missing version) — nothing executed |
+
+### Caveats
+
+- **Notification is at-most-once.** Re-running the command re-announces the
+  release. This is documented and accepted (no dedupe store is added —
+  explicitly out of scope), so run it once per recovery.
+- **Closure is idempotent.** Re-running does not re-close or re-annotate an item
+  already carrying the `Shipped in v<version>` marker.
+- **Provenance is verification-based.** Unlike a normal release (which proves
+  *this* run created the tag from a pre-run tag snapshot), the recovery path
+  proves the release landed via `verifyReleaseMerge()` and supplies
+  `{ tagCreatedByThisRun: true }` only after that verification succeeds. The
+  notifier still fails closed by default, so a pre-existing tag is never
+  announced on the normal path (SA-0MV0QEI3Q0063KH3).
+
 ## Rollback
 
 If a release introduces a critical issue:

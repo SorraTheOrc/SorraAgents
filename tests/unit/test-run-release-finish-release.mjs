@@ -19,10 +19,11 @@
  * shared event log, so the "only the tail ran" contract is asserted as both an
  * ordered subsequence (the tail) and an absence set (merge/PR/tag/bump).
  *
- * These cases are `{ todo: true }` until the recovery entry point lands (the
- * red-first analogue of `pytest.mark.xfail(strict=True)`, mirroring
- * SA-0MW3GCHEL001G8CP) so the changed-scope gate stays green. The
- * implementation item removes the markers.
+ * These cases were landed red-first as `{ todo: true }` (the analogue of
+ * `pytest.mark.xfail(strict=True)`, mirroring SA-0MW3GCHEL001G8CP) so the
+ * changed-scope gate stayed green before the entry point existed; the
+ * implementation item (SA-0MWXMTSKH0085UZZ) removed the markers so they now
+ * enforce the recovery contract.
  */
 
 import { test, describe } from 'node:test';
@@ -396,7 +397,6 @@ function assertNoForwardSideEffects(layout, events) {
 describe('--finish-release recovery entry point', () => {
   test(
     'parseReleaseArgs recognises --finish-release <version>',
-    { todo: true },
     () => {
       const parsed = parseReleaseArgs(['--finish-release', RECOVERY_VERSION]);
       assert.equal(parsed.action, 'run');
@@ -406,7 +406,6 @@ describe('--finish-release recovery entry point', () => {
 
   test(
     'a missing --finish-release value is an argument error',
-    { todo: true },
     () => {
       const parsed = parseReleaseArgs(['--finish-release']);
       assert.equal(parsed.action, 'error');
@@ -415,7 +414,6 @@ describe('--finish-release recovery entry point', () => {
 
   test(
     'an unknown flag is still an argument error',
-    { todo: true },
     () => {
       const parsed = parseReleaseArgs(['--finish-release', RECOVERY_VERSION, '--not-a-flag']);
       assert.equal(parsed.action, 'error');
@@ -424,7 +422,6 @@ describe('--finish-release recovery entry point', () => {
 
   test(
     'runs only the verified post-release tail and exits 0 (no merge/PR/tag/bump/freeze)',
-    { todo: true },
     () => {
       const layout = buildLayout({ gitMode: 'success' });
       const res = layout.run(['--finish-release', RECOVERY_VERSION]);
@@ -472,7 +469,6 @@ describe('--finish-release recovery entry point', () => {
 
   test(
     'a failed merge verification exits 11 with no notification and no close',
-    { todo: true },
     () => {
       const layout = buildLayout({ gitMode: 'not-ancestor' });
       const res = layout.run(['--finish-release', RECOVERY_VERSION]);
@@ -509,7 +505,6 @@ describe('--finish-release recovery entry point', () => {
 
   test(
     'a missing or invalid --finish-release argument exits 13 and executes nothing',
-    { todo: true },
     () => {
       for (const args of [
         ['--finish-release'],                         // missing value
@@ -537,7 +532,6 @@ describe('--finish-release recovery entry point', () => {
 
   test(
     're-running --finish-release is idempotent: already-shipped items are skipped and it still exits 0',
-    { todo: true },
     () => {
       const layout = buildLayout({ gitMode: 'success' });
 

@@ -57,6 +57,9 @@ node $(skill_path ship)/scripts/run-release.js --help
 # Pre-flight only: refresh in_review audits, then exit (no merge, no Code Freeze)
 node $(skill_path ship)/scripts/run-release.js --refresh-audits
 
+# Recovery: finish an already-landed release's post-release tail (no merge/PR/tag/bump/freeze)
+node $(skill_path ship)/scripts/run-release.js --finish-release <version>
+
 # Operator override: apply an explicit bump, skipping the bump evaluation
 node $(skill_path ship)/scripts/run-release.js --bump minor
 ```
@@ -115,6 +118,45 @@ guidance. Unlike `--skip-checks`, it does **not** bypass the unmerged-branches,
 critical-items, worklog-refs, producer-review, or final-validation gates. It is
 not forwarded to the merge script. Typical use: run `--refresh-audits` first,
 then `--skip-audit-remediation` for the release so no gate ever spawns an audit.
+
+### Partial-release recovery (`--finish-release <version>`)
+
+A release can land on `main` — merge, PR and tag pushed — while its
+post-release tail never ran, leaving shipped items at `completed/in_review` and
+the announcement unsent (the 2026-11-26 `v0.2.0` case). Re-running the normal
+release cannot fix this: the released tag already exists, so the
+[newly-created-tag gate](#newly-created-tag-gate-exit-14) refuses the run with
+exit **14** by design (SA-0MV13B5WO008CYXA).
+
+```bash
+node $(skill_path ship)/scripts/run-release.js --finish-release <version>
+```
+
+This recovery entry point runs **only the verified post-release tail** — verify
+merge → Discord notification → close work items → branch cleanup → sync `dev`
+last — through the shared `runVerifiedPostReleaseTail()` helper. It performs
+**no merge, no PR, no tag creation, no version bump and no Code Freeze marker**,
+and it exits **before** any gating check, so it can complete a partially-applied
+tail even while other gates would fail.
+
+Provenance is proven differently on this path. A normal release proves *this*
+run created the tag from a pre-run `git tag --list` snapshot; the recovery path
+cannot, because the tag already exists. Instead, `verifyReleaseMerge()` must
+prove the release landed — the tag `v<version>` exists on `origin` **and** its
+commit is an ancestor of `origin/main` — and only then is the tail told
+`{ tagCreatedByThisRun: true }` explicitly. `sendReleaseNotification` keeps
+failing closed by default, so a pre-existing tag is never announced on the
+normal path (SA-0MV0QEI3Q0063KH3); the recovery path announces only a
+*verified* release.
+
+**Idempotency.** Re-running is safe for the closure: items already carrying the
+`Shipped in v<version>` marker are skipped, never re-closed or re-annotated. The
+notification is at-most-once: a re-run re-announces, which is documented and
+accepted (no dedupe store is added — explicitly out of scope).
+
+Exit codes: **0** tail completed; **11** merge verification failed (nothing is
+notified, closed, cleaned up or synced); **13** invalid/unknown argument
+(nothing executed).
 
 For programmatic access to internal helpers (used by the implement workflow),
 import the modules from the skill directory resolved via `skill_path` (e.g.
@@ -244,6 +286,7 @@ While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/
 
 | Code | Meaning |
 |------|---------|
+| 0 | Success — a normal release completed, or (for `--finish-release <version>`) the verified post-release tail completed with no merge/PR/tag/bump/freeze |
 | 1 | General error |
 | 2 | Missing release script |
 | 3 | Unmerged branches found |
@@ -254,9 +297,9 @@ While a release runs, the ship skill sets a **Code Freeze marker** at `.worklog/
 | 8 | Worklog-ref gate failure |
 | 9 | Producer-review gate failure — top-level `in_review` item(s) flagged for producer review (`needsProducerReview != false`) |
 | 10 | Release script timed out and was terminated (`SHIP_RELEASE_TIMEOUT_MS`, default 3 600 s = 60 min; the canonical merge script's full-suite step takes ≈ 1 982 s). The wrapper then restores the checkout to the branch it started on and deletes this run's orphan `release/dev-to-main-*` branch when it is unpushed and not backed by an open PR, naming what it restored and what it deleted (or refused to delete, with the reason) in the message |
-| 11 | Release merge verification failed (no verified dev→main merge) |
+| 11 | Release merge verification failed (no verified dev→main merge). Also the `--finish-release <version>` failure exit: nothing is notified, closed, cleaned up or synced |
 | 12 | Final-validation gate failure — top-level or **uncovered child** `in_review` item(s) have missing/stale/failing audits or a producer-review flag after conservative auto-remediation (children covered by a passing `in_review` parent audit, or excluded because the parent is deleted/non-`in_review`, never block) |
-| 13 | Invalid argument — an unrecognised flag or a missing value; wrapper usage printed and nothing executed (no gate, merge, `wl`, git mutation or notification) |
+| 13 | Invalid argument — an unrecognised flag, a missing value, or an invalid/missing `--finish-release <version>`; wrapper usage printed and nothing executed (no gate, merge, `wl`, git mutation or notification) |
 | 14 | No newly-created release tag — the released version tag already existed before this run (or the pre-run tag snapshot could not be read); all post-release steps refused |
 
 **Missing-script fail-fast (SA-0MUIVIJFT0009ZNV):** `run-release.js` resolves the canonical release script **before** the gating checks. When no script exists it exits 2 immediately and runs no git or live-`wl` gate commands — keeping the missing-script safety path cheap, deterministic, and free of worklog side effects.

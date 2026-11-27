@@ -125,7 +125,18 @@ node skill/ship/scripts/run-release.js --dry-run
 
 # Execute the merge
 node skill/ship/scripts/run-release.js
+
+# Recovery: finish the post-release tail of an already-landed release
+# (no merge, PR, tag, version bump or Code Freeze marker)
+node skill/ship/scripts/run-release.js --finish-release <version>
 ```
+
+If a release lands on `main` but its post-release tail never ran, do not re-run
+the normal release (the existing tag trips the newly-created-tag gate, exit 14).
+Use `--finish-release <version>`: it verifies the merge via
+`verifyReleaseMerge()` and runs only the tail — notify, close work items, branch
+cleanup and sync `dev` — idempotently for the closure. See
+[docs/dev/release-process.md](docs/dev/release-process.md#partial-release-recovery---finish-release).
 
 Before merging, the release process runs local gates (worklog refs, audit
 readiness, critical items, producer review). Tests are run locally before

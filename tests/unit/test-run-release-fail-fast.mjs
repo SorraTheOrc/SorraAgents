@@ -334,6 +334,7 @@ describe('run-release: parseReleaseArgs', () => {
       skipAuditRemediation: true,
       workItemId: 'SA-123',
       bump: 'minor',
+      finishRelease: null,
     });
   });
 
@@ -348,6 +349,7 @@ describe('run-release: parseReleaseArgs', () => {
       skipAuditRemediation: false,
       workItemId: null,
       bump: null,
+      finishRelease: null,
     });
   });
 
