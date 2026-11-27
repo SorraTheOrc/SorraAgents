@@ -1329,3 +1329,85 @@ class TestCascadeOnPassingParentAudit:
         ):
             rc = audit_runner._apply_terminal_lifecycle(self._ctx(runner))
         assert rc == 0
+
+
+class TestProducerReviewFlagWrite:
+    """The terminal lifecycle writes the flag from the resolved decision.
+
+    SA-0MWJ8WGQD0073MG1 AC1/AC2/AC3: ``--needs-producer-review yes`` is
+    written only for a ``required`` decision. A ``preserved`` or ``untouched``
+    decision passes no flag argument at all — suppression means no write, and
+    the runner never clears the flag.
+
+    The decision predicate itself is covered by
+    ``test_audit_runner_producer_review.py`` (child SA-0MWJCDH5K002M5H5).
+    These tests drive the *write site* end-to-end through the same production
+    path: :func:`_apply_terminal_lifecycle` resolves the decision via
+    ``_resolve_producer_review_decision`` and must write — or not write — the
+    flag accordingly. The three contexts below resolve to each action with
+    production logic, so the write can never disagree with the decision.
+    """
+
+    _UNCHANGED_FINGERPRINT = "fp-unchanged-content"
+
+    def _ctx(self, runner, *, verdict="yes", prior_audit=None,
+             ship_triggered=False):
+        ctx = audit_runner._AuditContext(
+            issue_id="TEST-1", persist=True, timeout=None,
+            parent_timeout=None, pi_bin="pi", model=None,
+            model_source="default", runner=runner, json_mode=False,
+            debug_log=None, force=True, worklog_dir=None, batch_phase2=False,
+            green_run=None, audit_children=False, max_child_audits=None,
+            run_tests=False,
+        )
+        ctx.audit_verdict = verdict
+        ctx.audit_completed = True
+        ctx.original_status = "in_progress"
+        ctx.original_stage = "in_progress"
+        ctx.wi = {"id": "TEST-1", "parentId": None}
+        ctx.prior_audit = prior_audit
+        ctx.ship_triggered = ship_triggered
+        return ctx
+
+    def _apply(self, ctx):
+        with mock.patch.object(
+            audit_runner, "_cascade_descendants_terminal", return_value=0,
+        ):
+            rc = audit_runner._apply_terminal_lifecycle(ctx)
+        assert rc == 0
+        assert ctx.runner.updates, "expected a terminal lifecycle write"
+        cmd = ctx.runner.updates[-1]
+        # Strip the worklog-dir prefix StatusLifecycle injects in a worktree.
+        if cmd[:1] == ["wl"] and len(cmd) >= 3 and cmd[1] == "--worklog-dir":
+            cmd = ["wl"] + cmd[3:]
+        return cmd
+
+    def test_required_writes_the_flag(self):
+        """``required`` (never-reviewed passing audit) writes the flag."""
+        runner = _LifecycleStateRunner()
+        cmd = self._apply(self._ctx(runner))
+        assert "--needs-producer-review" in cmd
+        assert cmd[cmd.index("--needs-producer-review") + 1] == "yes"
+
+    def test_preserved_writes_no_flag(self):
+        """``preserved`` (reviewed unchanged pass) passes no flag argument.
+
+        Suppression is a no-write, never ``--needs-producer-review no``.
+        """
+        prior = {
+            "readyToClose": True,
+            "fingerprint": self._UNCHANGED_FINGERPRINT,
+            "currentFingerprint": self._UNCHANGED_FINGERPRINT,
+        }
+        runner = _LifecycleStateRunner()
+        cmd = self._apply(self._ctx(runner, prior_audit=prior))
+        assert "--needs-producer-review" not in cmd
+
+    def test_untouched_writes_no_flag(self):
+        """``untouched`` (ship-triggered verification pass) writes no flag.
+
+        Suppression is a no-write, never ``--needs-producer-review no``.
+        """
+        runner = _LifecycleStateRunner()
+        cmd = self._apply(self._ctx(runner, ship_triggered=True))
+        assert "--needs-producer-review" not in cmd

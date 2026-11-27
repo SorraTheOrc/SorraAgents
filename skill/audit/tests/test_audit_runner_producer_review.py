@@ -639,40 +639,50 @@ class TestProducerReviewReportMetadata:
 
 
 # ---------------------------------------------------------------------------
-# Ship-triggered runs (SA-0MW92TODX00064XQ AC1-AC4)
+# Ship-triggered runs (SA-0MW92TODX00064XQ; refined by SA-0MWJ8WGQD0073MG1)
 # ---------------------------------------------------------------------------
 #
 # A ``--ship-triggered`` audit is a release-automation verification run, NOT
-# an independent review: it must never write ``--needs-producer-review`` for
-# either a top-level 'Yes' or a top-level 'No' verdict (the flag is left
-# untouched, neither set nor cleared; ``SA-0MW92TODX00064XQ`` AC1/AC2/AC3).
+# an independent review. The only-when-failed-or-changed rule
+# (SA-0MWJ8WGQD0073MG1 AC1/AC2/AC3) narrows the original blanket suppression:
+# a *passing* verification of unchanged work writes no
+# ``--needs-producer-review`` (``untouched``), but a FAILING verification
+# (top-level 'No') still flags, and a passing verification whose audited
+# content changed since the last review still flags. The marker must never
+# swallow the failure signal or the content-change signal. Suppression always
+# means NO write — the runner never clears the flag.
 # Everything the ACs pin here is exercised against PRODUCTION code — the
 # decision predicate ``_resolve_producer_review_decision()`` with a
-# controlled ``_AuditContext`` (AC6 hermetic: no live ``wl``/audit-runner
-# calls, no re-implemented truth tables) and the terminal lifecycle's flag
-# write decision.
+# controlled ``_AuditContext`` (hermetic: no live ``wl``/audit-runner calls,
+# no re-implemented truth tables) and the terminal lifecycle's flag write
+# decision.
 #
-# Red-first convention: the implementing child SA-0MWJ7K962006646G adds the
-# flag to the ``issue`` parser and wires ``ctx.ship_triggered`` into
-# ``_resolve_producer_review_decision()``. Until it lands, the planned
-# ship-triggered assertions are guarded with an imperative ``pytest.xfail``
-# naming that child — the marker fires only while the suppression is absent
-# and disappears on its own once the implementation lands (established
-# red-first convention, cf. test_persist_audit_resilience.py). The
-# marker-absence assertions below are ORDINARY tests: they pin that an
-# unmarked run behaves exactly as today and that the marker cannot leak.
+# Red-first convention: the implementing child SA-0MWJCDQ3S003EY2R narrows
+# the marker carve-out to the unchanged pass, letting a ship-triggered 'No'
+# and a changed-content 'Yes' fall through to the flagging branches. Until it
+# lands, the planned boundary assertions are guarded with an imperative
+# ``pytest.xfail`` naming that child — the marker fires only while the old
+# blanket suppression is still in place and disappears on its own once the
+# implementation lands (established red-first convention, cf.
+# test_persist_audit_resilience.py). The marker-absence assertions below are
+# ORDINARY tests: they pin that an unmarked run behaves exactly as today and
+# that the marker cannot leak.
 
 _SHIP_TRIGGERED_REASON = "ship-triggered audit - flag untouched"
-_IMPLEMENT_SHIP_TRIGGERED = "SA-0MWJ7K962006646G"
+_IMPLEMENT_SHIP_TRIGGERED = "SA-0MWJCDQ3S003EY2R"
 
 
 class TestShipTriggeredReviewDecision:
-    """AC1/AC2/AC3: the marker suppresses only the flag write, at the
-    decision predicate (hermetic — controlled ``_AuditContext`` objects)."""
+    """AC1/AC2/AC3 (SA-0MWJ8WGQD0073MG1): the marker suppresses the flag
+    write only for a passing verification of unchanged work — never for a
+    failure or a content change (hermetic: controlled ``_AuditContext``)."""
 
     def test_ship_triggered_yes_never_reviewed_untouched(self):
-        """AC2: a ship-triggered top-level 'Yes' never requires a producer
-        decision — the flag is untouched instead of armed."""
+        """AC1 (SA-0MWJ8WGQD0073MG1): a ship-triggered top-level 'Yes' of
+        never-reviewed work has no prior review baseline, so neither AC1
+        branch (failed / changed since the last review) holds — the flag is
+        left untouched (the retained SA-0MW92TODX00064XQ verification
+        carve-out)."""
         ctx = _decision_ctx(ship_triggered=True)
         decision = audit_runner._resolve_producer_review_decision(ctx, "yes")
         if decision["action"] != audit_runner.PRODUCER_REVIEW_UNTOUCHED:
@@ -684,8 +694,9 @@ class TestShipTriggeredReviewDecision:
         assert decision["reason"] == _SHIP_TRIGGERED_REASON
 
     def test_ship_triggered_yes_reviewed_unchanged_untouched(self):
-        """AC1/AC2: even a would-be-preserved review is untouched under the
-        marker — the ship run is a verification, not a re-review."""
+        """AC1 (SA-0MWJ8WGQD0073MG1): a passing re-audit of unchanged,
+        already-reviewed work — including during a release — never arms the
+        flag; the ship run is a verification, not a re-review."""
         prior = {
             "readyToClose": True,
             "fingerprint": _FINGERPRINT,
@@ -701,18 +712,48 @@ class TestShipTriggeredReviewDecision:
         assert decision["action"] == audit_runner.PRODUCER_REVIEW_UNTOUCHED
         assert decision["reason"] == _SHIP_TRIGGERED_REASON
 
-    def test_ship_triggered_no_top_level_untouched(self):
-        """AC3: a ship-triggered independent top-level 'No' also leaves the
-        flag untouched — only the write is suppressed, never the demotion."""
+    def test_ship_triggered_no_top_level_requires(self):
+        """AC2 (SA-0MWJ8WGQD0073MG1): a ship-triggered independent top-level
+        'No' still resolves ``required`` — the carve-out never swallows the
+        failure signal.
+
+        This SUPERSEDES SA-0MW92TODX00064XQ AC1's 'No'-verdict suppression:
+        only a *passing* ship verification of unchanged work is suppressed;
+        a failing verification flags exactly as an independent audit would.
+        """
         ctx = _decision_ctx(ship_triggered=True)
         decision = audit_runner._resolve_producer_review_decision(ctx, "no")
-        if decision["action"] != audit_runner.PRODUCER_REVIEW_UNTOUCHED:
+        if decision["action"] != audit_runner.PRODUCER_REVIEW_REQUIRED:
             pytest.xfail(
-                "--ship-triggered suppression not implemented "
+                "ship-triggered failing verdict still suppresses the flag "
                 f"({_IMPLEMENT_SHIP_TRIGGERED})"
             )
-        assert decision["action"] == audit_runner.PRODUCER_REVIEW_UNTOUCHED
-        assert decision["reason"] == _SHIP_TRIGGERED_REASON
+        assert decision["action"] == audit_runner.PRODUCER_REVIEW_REQUIRED
+        assert decision["reason"] != _SHIP_TRIGGERED_REASON
+
+    def test_ship_triggered_change_fingerprint_requires(self):
+        """AC3 (SA-0MWJ8WGQD0073MG1): a ship-triggered 'Yes' whose stored
+        fingerprint differs from the current content fingerprint resolves
+        ``required`` — the marker never swallows the content-change signal.
+
+        The prior audit passed, but over different content; the release-gate
+        verdict is therefore re-reviewed exactly as an independent audit
+        would re-review it.
+        """
+        prior = {
+            "readyToClose": True,
+            "fingerprint": _CHANGED_FINGERPRINT,
+            "currentFingerprint": _FINGERPRINT,
+        }
+        ctx = _decision_ctx(prior_audit=prior, ship_triggered=True)
+        decision = audit_runner._resolve_producer_review_decision(ctx, "yes")
+        if decision["action"] != audit_runner.PRODUCER_REVIEW_REQUIRED:
+            pytest.xfail(
+                "ship-triggered content-change signal still suppressed "
+                f"({_IMPLEMENT_SHIP_TRIGGERED})"
+            )
+        assert decision["action"] == audit_runner.PRODUCER_REVIEW_REQUIRED
+        assert decision["reason"] != _SHIP_TRIGGERED_REASON
 
     def test_marker_absence_yes_never_reviewed_requires(self):
         """AC1/AC4: WITHOUT the marker a top-level 'Yes' behaves exactly as
@@ -773,8 +814,10 @@ class TestShipTriggeredReportMetadata:
 
 
 class TestShipTriggeredTerminalLifecycle:
-    """AC1/AC3: the terminal write follows the ship-triggered decision —
-    'Yes' still advances, 'No' still demotes, and neither writes the flag."""
+    """AC1/AC2 (SA-0MWJ8WGQD0073MG1): the terminal write follows the
+    resolved decision — 'Yes' on unchanged work advances without the flag,
+    while a failing 'No' demotes AND writes the flag (the carve-out never
+    swallows the failure signal)."""
 
     def _apply(self, ctx, verdict):
         ctx.audit_verdict = verdict
@@ -786,8 +829,9 @@ class TestShipTriggeredTerminalLifecycle:
         return updates[-1]
 
     def test_ship_triggered_yes_advances_without_flag(self):
-        """AC1: ship-triggered 'Yes' still advances to completed/in_review
-        but never writes --needs-producer-review."""
+        """AC1 (SA-0MWJ8WGQD0073MG1): a ship-triggered passing verification
+        of unchanged/never-reviewed work still advances to
+        completed/in_review but never writes --needs-producer-review."""
         ctx = _make_ctx(ship_triggered=True)
         ctx._calls = []
         cmd = self._apply(ctx, "yes")
@@ -800,18 +844,21 @@ class TestShipTriggeredTerminalLifecycle:
         assert cmd[cmd.index("--status") + 1] == "completed"
         assert cmd[cmd.index("--stage") + 1] == "in_review"
 
-    def test_ship_triggered_no_demotes_without_flag(self):
-        """AC3: ship-triggered 'No' still demotes to open/plan_complete but
-        never writes --needs-producer-review."""
+    def test_ship_triggered_no_demotes_and_flags(self):
+        """AC2 (SA-0MWJ8WGQD0073MG1): a ship-triggered 'No' still demotes to
+        open/plan_complete AND writes --needs-producer-review yes.
+
+        This SUPERSEDES SA-0MW92TODX00064XQ AC1's 'No'-verdict suppression at
+        the write site: the carve-out never swallows the failure signal."""
         ctx = _make_ctx(ship_triggered=True)
         ctx._calls = []
         cmd = self._apply(ctx, "no")
-        if _flag_written(cmd):
+        if not _flag_written(cmd):
             pytest.xfail(
-                "--ship-triggered suppression not implemented "
+                "ship-triggered failing verdict still suppresses the flag "
                 f"({_IMPLEMENT_SHIP_TRIGGERED})"
             )
-        assert not _flag_written(cmd)
+        assert _flag_written(cmd)
         assert cmd[cmd.index("--status") + 1] == "open"
         assert cmd[cmd.index("--stage") + 1] == "plan_complete"
 
