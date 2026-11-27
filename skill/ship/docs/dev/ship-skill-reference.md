@@ -137,9 +137,11 @@ it can never run unbounded. `--refresh-audits` is a wrapper-only flag (never
 forwarded to the merge script). The refresh's re-audits are **ship-triggered**
 (`audit_runner.py issue <id> --strict --ship-triggered`), so a pre-flight
 refresh — like the in-gate remediation, see Step 2 — never arms
-`needsProducerReview` on the very items the release is about to ship
-(SA-0MW92TODX00064XQ). The surfaced offline-refresh hint stays marker-free
-(operator-invoked).
+`needsProducerReview` for an unchanged passing re-audit of an item the release
+is about to ship, while a failing re-audit or a content-change re-audit still
+flags (SA-0MW92TODX00064XQ; SA-0MWJ8WGQD0073MG1 — see the audit-skill
+reference's *Producer-review flag lifecycle*). The surfaced offline-refresh
+hint stays marker-free (operator-invoked).
 
 ### Step 2: Audit readiness gate (exit 6)
 
@@ -187,14 +189,21 @@ runner failure `timeout` / `concurrency` / `provider` / `error`, so an
 infrastructure failure is distinguishable from a work verdict (surfaced as the
 `category` field on the blocking entry and in the reason text).
 
-**Ship-triggered marker (SA-0MW92TODX00064XQ):** every in-gate remediation
-re-audit includes `--ship-triggered`, so a release-gate verification re-audit —
-unlike an operator-invoked run — leaves `needsProducerReview` untouched for
-both `Yes` and `No` verdicts (the release never arms the producer queue it is
-itself gated on). The surfaced **manual remediation commands stay marker-free
-and independent**: `buildRemediationCommand()` emits `audit_runner.py issue
-<id> --strict` (no marker), the budget-exhausted/offline-refresh hint emits
-`audit_runner.py batch --strict` (no marker), and the content-freshness probe
+**Ship-triggered marker (SA-0MW92TODX00064XQ; SA-0MWJ8WGQD0073MG1):** every
+in-gate remediation re-audit includes `--ship-triggered`, so a release-gate
+verification re-audit — unlike an operator-invoked run — leaves
+`needsProducerReview` untouched **only for a passing verdict on unchanged
+work** (a prior passing audit with the same v2 content fingerprint, or
+never-reviewed work with no review baseline), so the release never re-arms the
+producer queue for work it is itself gated on. The marker never swallows a
+failure or change signal: a ship-triggered `No` verdict, or a ship-triggered
+`Yes` whose audited content changed since the last review, still sets
+`needsProducerReview` exactly as an independent audit would (the full truth
+table lives in the audit-skill reference, *Producer-review flag lifecycle*).
+The surfaced **manual remediation commands stay marker-free and independent**:
+`buildRemediationCommand()` emits `audit_runner.py issue <id> --strict` (no
+marker), the budget-exhausted/offline-refresh hint emits `audit_runner.py
+batch --strict` (no marker), and the content-freshness probe
 `audit_runner.py check-freshness <id> --json` accepts no marker — an
 operator-invoked remediation re-audit therefore flags independently exactly as
 an interactive audit would. The same contract applies to the pre-flight
