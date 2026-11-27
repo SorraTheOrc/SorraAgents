@@ -600,7 +600,7 @@ def test_finish_never_advances_local_dev_pre_push(tmp_path):
     to attribute, nothing can excuse a main-checkout mutation, and the item
     is released to open instead of silently finishing.
     """
-    with _finish_harness(tmp_path) as mocks:
+    with _finish_harness(tmp_path):
         fake = _snapshots([
             {},  # baseline
             {"docs/dev/implement-skill-reference.md": " M"},  # pre-push foreign dirt
