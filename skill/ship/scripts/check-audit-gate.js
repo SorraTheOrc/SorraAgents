@@ -949,6 +949,13 @@ export async function checkAuditReadyToClose(options = {}) {
       `wl audit-show ${workItemId} --json`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
+    // The ship-triggered marker marks this as a release-automation
+    // verification run. It suppresses the producer-review flag ONLY for a passing
+    // re-audit of unchanged work: a 'No' verdict still demotes the item out of
+    // the release set and flags it (audit_runner.py
+    // `_resolve_producer_review_decision`, SA-0MWJ8WGQD0073MG1 AC2). The gate
+    // never writes the flag itself — the runner is the single decision
+    // authority (SA-0MWJCDX79003103I).
     runAuditCommand = (runnerPath, workItemId, timeoutMs) => execSync(
       `python3 "${runnerPath}" issue ${workItemId} --strict --ship-triggered`,
       // Per-item timeout guard (SA-0MSUT8GQP004WSYN AC6 / R1): a hung audit

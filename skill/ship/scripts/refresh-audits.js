@@ -128,6 +128,10 @@ export async function refreshAudits(options = {}) {
       `wl audit-show ${workItemId} --json`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
     ),
+    // The ship-triggered marker suppresses the producer-review flag only
+    // for a passing re-audit of unchanged work — a 'No' verdict still demotes
+    // and flags in the runner, which is the single decision authority
+    // (SA-0MWJ8WGQD0073MG1 AC2, SA-0MWJCDX79003103I).
     runAuditCommand = (runnerPath, workItemId, timeoutMs) => execSync(
       `python3 "${runnerPath}" issue ${workItemId} --strict --ship-triggered`,
       // Per-item timeout, clamped to the remaining budget by the caller
