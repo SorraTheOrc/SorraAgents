@@ -198,6 +198,201 @@ STATE_CHANGED_EXIT_CODE = 75
 #: aggregate so gate classification and triage share one vocabulary.
 STATE_CHANGED_NOTICE_CODE = "state_changed_during_run"
 
+#: Exit status a bounded suite runner uses to report a wall-clock **hang**
+#: (``timeout(1)`` convention; TCE's ``vitest-run-with-retry.ts`` reports it).
+#: A hang is not a red suite: it produced no parsable verdict, so it must
+#: never destroy a green entry for the same tree (SA-0MWEURY420040OMD).
+ABORT_EXIT_CODE = 124
+
+#: Side-car file written next to a preserved green entry to record an abort
+#: observation. It lives inside the entry directory so it is mirrored by
+#: :func:`mirror_cache_entries` and removed with the entry's TTL expiry.
+ABORT_SIDECAR_FILENAME = "abort.json"
+
+#: Bound for the stdout/stderr tail carried on an abort side-car (keeps the
+#: side-car small; the full preserved output lives in the green entry).
+ABORT_OUTPUT_TAIL_CHARS = 2000
+
+
+def _no_abort_observation() -> dict[str, Any]:
+    """Return the stable "no abort observed" result fields.
+
+    An executed run (or an entry with no abort side-car) reports the same four
+    fields as a preserved-green hit so consumers never branch on their absence.
+    """
+    return {
+        "abort_observed": False,
+        "abort_exit_code": None,
+        "abort_completed_at": None,
+        "abort_notice": "",
+    }
+
+
+#: Result-summary markers that prove a non-zero run still produced a parsable
+#: verdict (so it is a genuine red run, never an abort). Patterns are anchored
+#: to line starts so incidental prose ("0 passed" in a log line) cannot be
+#: mistaken for a summary. Covers pytest (``N passed``), Vitest
+#: (``Test Files``/``Tests``) and TAP (``# pass``/``not ok``).
+_RESULT_SUMMARY_RE = re.compile(
+    r"^(?:"
+    r"(?:FAILED|ERROR)\s+"
+    r"|\d+ (?:passed|failed|error|errors|skipped|deselected|xfailed|xpassed|warnings?)"
+    r"|Test Files\s+\d"
+    r"|Tests\s+\d"
+    r"|# (?:pass|fail|tests)\s+\d+"
+    r"|not ok\s+\d+"
+    r")",
+    re.MULTILINE,
+)
+
+#: The bounded retry runner's final verdict line (``vitest-run-with-retry``):
+#: ``[vitest-runner] attempts=N status=S outcome=O …``. Its presence is a
+#: parsable verdict (e.g. ``coverage-failed`` exits non-zero with no failing
+#: test), so it makes a non-zero run RED rather than an abort — unless the
+#: outcome is ``hang`` or the status is :data:`ABORT_EXIT_CODE`.
+_VITEST_RUNNER_VERDICT_RE = re.compile(
+    r"^\[vitest-runner\] attempts=\d+ status=(?P<status>\S+) "
+    r"outcome=(?P<outcome>[a-z-]+)",
+    re.MULTILINE,
+)
+
+
+def _bounded_output_tail(text: str, limit: int = ABORT_OUTPUT_TAIL_CHARS) -> str:
+    """Return the last *limit* characters of *text* (empty for falsy input)."""
+    if not text:
+        return ""
+    text = text.rstrip()
+    return text if len(text) <= limit else text[-limit:]
+
+
+def is_abort_result(exit_code: int, stdout: str = "", stderr: str = "") -> bool:
+    """Whether a run result is an **abort** rather than a red verdict.
+
+    A hang/abort produced no usable verdict for the tree, so it must not be
+    allowed to destroy a green entry for an unchanged tree
+    (SA-0MWEURY420040OMD). An abort is:
+
+    * exit :data:`ABORT_EXIT_CODE` (``124``) — the bounded-runner hang;
+    * a negative exit code — killed by a signal (OOM kill, worker crash), so
+      the verdict is incomplete;
+    * any other non-zero exit whose combined output carries **no** parsable
+      result marker (pytest summary, Vitest ``Test Files``/``Tests``, TAP
+      ``# pass``/``not ok``, or a ``[vitest-runner]`` verdict line).
+
+    A genuine red run always exits non-zero *and* prints a parsable verdict
+    (a failing test, or the retry runner's ``coverage-failed`` verdict), so
+    it is never classified as an abort. A green run (exit 0) never is either.
+
+    Args:
+        exit_code: The command's exit status.
+        stdout: The command's captured stdout.
+        stderr: The command's captured stderr.
+
+    Returns:
+        True when the result is an abort with no usable verdict.
+    """
+    if exit_code == 0:
+        return False
+    if exit_code == ABORT_EXIT_CODE or exit_code < 0:
+        return True
+    combined = f"{stdout}\n{stderr}"
+    verdict = _VITEST_RUNNER_VERDICT_RE.search(combined)
+    if verdict is not None:
+        # A recorded verdict line is a parsable outcome: either an explicit
+        # hang (abort) or a genuine red run (e.g. ``coverage-failed``, which
+        # exits non-zero with no failing test).
+        return verdict.group("outcome") == "hang" or verdict.group(
+            "status"
+        ) == str(ABORT_EXIT_CODE)
+    return _RESULT_SUMMARY_RE.search(combined) is None
+
+
+def _abort_sidecar_path(entry_dir: Path) -> Path:
+    """Return the abort side-car path inside *entry_dir*."""
+    return entry_dir / ABORT_SIDECAR_FILENAME
+
+
+def _read_abort_sidecar(entry_dir: Path) -> dict[str, Any] | None:
+    """Read an abort side-car, or None when absent/corrupt/foreign."""
+    try:
+        data = json.loads(_abort_sidecar_path(entry_dir).read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != _CACHE_VERSION:
+        return None
+    return data
+
+
+def _abort_preservable_green(
+    entry_dir: Path,
+    *,
+    git_state: str,
+    scope: str,
+    test_type: str,
+    fingerprint_kind: str,
+    ttl: float,
+) -> dict[str, Any] | None:
+    """Return the existing entry's metadata when an abort must preserve it.
+
+    A green entry is preserved only when it is for the **same key** (the
+    entry directory already encodes command + state + type), records a green
+    verdict, matches the caller's identity fields and is within *ttl*. Every
+    other case — missing/corrupt/red/expired entry, or a mismatched identity —
+    returns None so the abort is stored normally and nothing is ever masked.
+    """
+    try:
+        meta = json.loads((entry_dir / "metadata.json").read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(meta, dict) or meta.get("version") != _CACHE_VERSION:
+        return None
+    if meta.get("git_state") != git_state:
+        return None
+    if meta.get("scope", "full") != scope:
+        return None
+    if meta.get("test_type", "full") != test_type:
+        return None
+    if meta.get("fingerprint_kind", FINGERPRINT_KIND_WORKTREE) != fingerprint_kind:
+        return None
+    try:
+        exit_code = int(meta.get("exit_code", 1))
+        completed_at = float(meta.get("completed_at", 0))
+    except (TypeError, ValueError):
+        return None
+    if exit_code != 0:
+        return None
+    if time.time() - completed_at > ttl:
+        return None
+    return meta
+
+
+def _abort_preserved_after_store(
+    entry_dir: Path, abort: bool, completed_at: float
+) -> bool:
+    """Whether *store* preserved a green entry instead of recording *abort*.
+
+    True only when *abort* was stored, the entry still holds a green verdict
+    and the abort side-car records this very run (same ``completed_at``). That
+    is exactly the case where the caller must report the green as preserved
+    rather than freshly written.
+    """
+    if not abort:
+        return False
+    try:
+        meta = json.loads((entry_dir / "metadata.json").read_text())
+        sidecar = json.loads(_abort_sidecar_path(entry_dir).read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(meta, dict) or not isinstance(sidecar, dict):
+        return False
+    try:
+        green = int(meta.get("exit_code", 1)) == 0
+        same_run = float(sidecar.get("completed_at", -1)) == float(completed_at)
+    except (TypeError, ValueError):
+        return False
+    return green and same_run
+
+
 DEFAULT_TTL_SECONDS = 2 * 60 * 60  # 2 hours (operator decision)
 # Non-zero-exit runs get a much shorter TTL (SA-0MSJELL44009XYIL): a failed
 # run may reflect a transient infra failure (e.g. /tmp disk quota) and must
@@ -771,6 +966,13 @@ def lookup(
     and ``cached: True``. ``interpreter`` names the concrete
     interpreter/executable recorded for a pytest run (empty for non-pytest
     commands and entries that predate the field).
+
+    A green entry preserved across an aborted run (SA-0MWEURY420040OMD)
+    carries its abort observation: ``abort_observed`` (bool),
+    ``abort_exit_code`` / ``abort_completed_at`` (the aborted run's values,
+    ``None`` when nothing was observed) and ``abort_notice`` (a human-readable
+    sentence). The green verdict is still served — the abort is reported
+    alongside it, never silently accepted as green.
     """
     entry_dir = _entry_dir(command, git_state, cwd or os.getcwd(), test_type)
     meta_path = entry_dir / "metadata.json"
@@ -825,7 +1027,44 @@ def lookup(
         "change_set_paths": list(meta.get("change_set_paths") or []),
         "verdict_origin": meta.get("verdict_origin", ""),
         "measured_tree": meta.get("measured_tree", ""),
+        # Abort observation (SA-0MWEURY420040OMD): a green entry preserved
+        # across a hang/abort carries the aborted run's exit code and time, so
+        # the served green verdict is never silent about the abort.
+        **_abort_observation(entry_dir),
         "cached": True,
+    }
+
+
+def _abort_observation(entry_dir: Path) -> dict[str, Any]:
+    """Return the abort-observation fields for a served entry.
+
+    Reads the entry's abort side-car (written when an abort would otherwise
+    have overwritten a green entry, SA-0MWEURY420040OMD). Always returns the
+    four fields — ``abort_observed`` is False when no side-car exists — so a
+    consumer sees a stable shape and never has to infer absence.
+    """
+    sidecar = _read_abort_sidecar(entry_dir)
+    if sidecar is None:
+        return _no_abort_observation()
+    exit_code = sidecar.get("exit_code")
+    completed_at = sidecar.get("completed_at")
+    try:
+        exit_code = int(exit_code)
+    except (TypeError, ValueError):
+        exit_code = None
+    try:
+        completed_at = float(completed_at)
+    except (TypeError, ValueError):
+        completed_at = None
+    return {
+        "abort_observed": True,
+        "abort_exit_code": exit_code,
+        "abort_completed_at": completed_at,
+        "abort_notice": (
+            f"a later run aborted (exit {exit_code if exit_code is not None else '?'})"
+            " on the same git state; the green verdict for the unchanged tree"
+            " was preserved — re-run on a quiet host to refresh it"
+        ),
     }
 
 
@@ -844,12 +1083,25 @@ def store(
     git_state_at_start: str = "",
     fingerprint_kind: str = FINGERPRINT_KIND_WORKTREE,
     extra_metadata: dict[str, Any] | None = None,
+    abort: bool = False,
+    ttl: float = DEFAULT_TTL_SECONDS,
 ) -> Path:
     """Persist a run result, replacing any existing entry for the same key.
 
     Writes stdout/stderr first, then metadata last (atomic each); a partial
     write is therefore treated as corrupt by :func:`lookup` and degrades to a
     fresh run.
+
+    *abort* (default ``False``) marks the result as a hang/abort rather than a
+    verdict (see :func:`is_abort_result`). When an abort would otherwise
+    overwrite a **green entry for the same key that is still within** *ttl*,
+    the green entry is left untouched and the abort is recorded in a side-car
+    (:data:`ABORT_SIDECAR_FILENAME`) instead — so an unchanged tree's green
+    verdict survives a contended-host hang and a re-run resumes from it
+    (SA-0MWEURY420040OMD). Every other case — red verdict, missing/expired
+    green, changed state — writes normally, so a real failure is never masked.
+    A normal (non-abort) store removes any stale side-car, because the fresh
+    verdict supersedes the earlier abort observation.
 
     *git_state* is the fingerprint **the entry is keyed on**. Callers that
     can serve the entry later (:func:`run_cached`) pass the *post-run* state,
@@ -890,9 +1142,44 @@ def store(
     Returns the entry directory path.
     """
     entry_dir = _entry_dir(command, git_state, cwd or os.getcwd(), test_type)
+    normalized = normalize_test_command(command)
+    completed = completed_at if completed_at is not None else time.time()
+
+    if abort:
+        preserved = _abort_preservable_green(
+            entry_dir,
+            git_state=git_state,
+            scope=scope,
+            test_type=test_type,
+            fingerprint_kind=fingerprint_kind,
+            ttl=ttl,
+        )
+        if preserved is not None:
+            # Preserve the green evidence; record the abort alongside it. The
+            # green's metadata/stdout/stderr are not touched, so a re-run
+            # within the TTL still serves the earlier green verdict.
+            _atomic_write(
+                _abort_sidecar_path(entry_dir),
+                json.dumps(
+                    {
+                        "version": _CACHE_VERSION,
+                        "command": normalized,
+                        "git_state": git_state,
+                        "scope": scope,
+                        "test_type": test_type,
+                        "fingerprint_kind": fingerprint_kind,
+                        "exit_code": int(exit_code),
+                        "completed_at": completed,
+                        "stdout_tail": _bounded_output_tail(stdout),
+                        "stderr_tail": _bounded_output_tail(stderr),
+                    },
+                    indent=2,
+                ),
+            )
+            return entry_dir
+
     entry_dir.mkdir(parents=True, exist_ok=True)
 
-    normalized = normalize_test_command(command)
     meta = {
         "version": _CACHE_VERSION,
         "command": normalized,
@@ -903,7 +1190,7 @@ def store(
         "fingerprint_kind": fingerprint_kind,
         "interpreter": interpreter,
         "exit_code": int(exit_code),
-        "completed_at": completed_at if completed_at is not None else time.time(),
+        "completed_at": completed,
     }
     if extra_metadata:
         for key, value in extra_metadata.items():
@@ -911,6 +1198,13 @@ def store(
     _atomic_write(entry_dir / "stdout.txt", stdout)
     _atomic_write(entry_dir / "stderr.txt", stderr)
     _atomic_write(entry_dir / "metadata.json", json.dumps(meta, indent=2))
+    # A fresh verdict supersedes any earlier abort observation.
+    try:
+        _abort_sidecar_path(entry_dir).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # pragma: no cover - defensive
+        LOG.warning("test cache: cannot remove the abort side-car (%s)", exc)
     return entry_dir
 
 
@@ -967,6 +1261,7 @@ def run_cached(
     fingerprint: str | None = None,
     track_change_set: bool = True,
     change_set_base_ref: str = "origin/dev",
+    abort_classifier: Callable[[int, str, str], bool] | None = None,
 ) -> dict[str, Any]:
     """Run *command* through the cache.
 
@@ -1024,6 +1319,20 @@ def run_cached(
     On a change-set hit the result carries ``reused_via_change_set: True`` and
     ``change_set_target_tree`` — the tree the reused verdict was actually
     measured on — while ``fingerprint_kind`` reports ``"change_set"``.
+
+    *abort_classifier* (default ``None``) classifies an executed result as a
+    **hang/abort** rather than a verdict: it is called once, only when the
+    command exits non-zero, with ``(exit_code, stdout, stderr)``. When it
+    returns True, the entry is stored as an abort
+    (``store(..., abort=True)``): if a green entry for the same key is still
+    within *ttl* it is preserved and the abort recorded alongside it, so a
+    contended-host hang does not force a full re-run of an unchanged tree
+    (SA-0MWEURY420040OMD). The run result reports ``abort_result`` (the
+    classification), ``abort_recorded`` (an abort verdict was recorded —
+    never under ``no_cache``) and ``green_preserved`` (a green entry was
+    preserved instead of overwritten). Without a classifier (the default, and
+    every pre-existing caller) behaviour is byte-for-byte unchanged: run
+    results are always stored as the current verdict.
 
     A change-set *hit* also mirrors the served verdict under the pushed tree's
     key, stamped ``verdict_origin="change_set_reuse"`` with the tree the suite
@@ -1155,6 +1464,27 @@ def run_cached(
     # (SA-0MVK154IE007OS3D AC2). Non-pytest commands record an empty string.
     interpreter = resolve_pytest_executable() if is_pytest_command(normalized) else ""
 
+    # A hang/abort produced no usable verdict (SA-0MWEURY420040OMD): classify
+    # it so store() can preserve a green entry instead of overwriting it. The
+    # classifier only runs on a non-zero exit and is fail-safe — an exception
+    # leaves the result treated as a normal verdict, never as an abort that
+    # could mask a real failure.
+    abort_result = False
+    if abort_classifier is not None and proc.returncode != 0:
+        try:
+            abort_result = bool(
+                abort_classifier(
+                    proc.returncode, proc.stdout or "", proc.stderr or ""
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - classification is advisory
+            LOG.warning(
+                "test cache: abort classifier failed (%s); treating the run "
+                "as a normal verdict",
+                exc,
+            )
+            abort_result = False
+
     if movement["moved"]:
         checkpoint = movement["checkout"]
         before_commit = movement["before_commit"]
@@ -1184,16 +1514,21 @@ def run_cached(
             "test_type": test_type,
             "interpreter": interpreter,
             "cached": False,
+            "abort_result": False,
+            "abort_recorded": False,
+            "green_preserved": False,
+            **_no_abort_observation(),
             "state_changed_during_run": notice,
         }
 
     git_state = git_state_before or ""
+    green_preserved = False
     if not no_cache:
         if fingerprint is not None:
             # An explicit fingerprint describes the tree the caller named; it
             # cannot be recomputed from the (possibly churned) worktree after
             # the run, so it keys the entry as-is.
-            store(
+            tree_entry = store(
                 normalized,
                 git_state,
                 cwd=cwd_str,
@@ -1206,6 +1541,11 @@ def run_cached(
                 interpreter=interpreter,
                 git_state_at_start=git_state_before or "",
                 fingerprint_kind=FINGERPRINT_KIND_TREE,
+                abort=abort_result,
+                ttl=ttl,
+            )
+            green_preserved = _abort_preserved_after_store(
+                tree_entry, abort_result, completed_at
             )
             # Mirror the same verdict under the change-set key so a later
             # rebase of the identical patch is served instead of re-executed
@@ -1231,6 +1571,8 @@ def run_cached(
                         "change_set_target_tree": change_set["target_tree"],
                         "change_set_paths": change_set["paths"],
                     },
+                    abort=abort_result,
+                    ttl=ttl,
                 )
         else:
             # Key the entry on the state the run left behind: that is the
@@ -1242,7 +1584,7 @@ def run_cached(
             git_state_after = _fingerprint_for_cache(cwd_str)
             if git_state_after is not None:
                 git_state = git_state_after
-                store(
+                worktree_entry = store(
                     normalized,
                     git_state_after,
                     cwd=cwd_str,
@@ -1254,6 +1596,11 @@ def run_cached(
                     test_type=test_type,
                     interpreter=interpreter,
                     git_state_at_start=git_state_before or "",
+                    abort=abort_result,
+                    ttl=ttl,
+                )
+                green_preserved = _abort_preserved_after_store(
+                    worktree_entry, abort_result, completed_at
                 )
 
     return {
@@ -1268,6 +1615,10 @@ def run_cached(
         "test_type": test_type,
         "interpreter": interpreter,
         "cached": False,
+        "abort_result": abort_result,
+        "abort_recorded": bool(abort_result and not no_cache),
+        "green_preserved": green_preserved,
+        **_no_abort_observation(),
         "state_changed_during_run": None,
     }
 
@@ -1428,6 +1779,9 @@ def summary_lines(
 
 
 __all__ = [
+    "ABORT_EXIT_CODE",
+    "ABORT_OUTPUT_TAIL_CHARS",
+    "ABORT_SIDECAR_FILENAME",
     "DEFAULT_TTL_SECONDS",
     "FAILED_RUN_TTL_SECONDS",
     "FINGERPRINT_KIND_CHANGE_SET",
@@ -1441,6 +1795,7 @@ __all__ = [
     "compute_change_set_state",
     "compute_git_state",
     "compute_tree_state",
+    "is_abort_result",
     "lookup",
     "mirror_cache_entries",
     "normalize_test_command",

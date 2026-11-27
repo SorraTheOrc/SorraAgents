@@ -169,6 +169,14 @@ execution-dependent ACs (SA-0MSIU5HFI0024D7W). Failed (non-zero-exit) runs use
 a short 5-minute TTL so transient infra failures are not re-served as current
 results (SA-0MSJELL44009XYIL).
 
+**Hang/abort preserves green (SA-0MWEURY420040OMD).** A hang/abort — exit
+`124`, a signal kill, or a non-zero exit with no parsable test result — never
+destroys the green entry for the same command + git state within the TTL. The
+green verdict is preserved and the abort recorded beside it (`abort.json`), so
+a re-run against the unchanged tree resumes green without re-executing, while
+the `green_preserved_after_abort` notice names the earlier abort. A red
+verdict, a changed tree or an expired TTL still executes and stores freshly.
+
 **Evidence runs must bypass the cache (`--no-cache`).** A cache hit is a
 *reused* verdict: nothing executed for the tree in front of you. Any run whose
 result is consumed as evidence — proving a RED witness fails before the fix and

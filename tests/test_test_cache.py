@@ -20,6 +20,8 @@ import test_cache
 from shared import git_sandbox as gs
 from shared.git_sandbox import fixture_git_env
 from test_cache import (
+    ABORT_EXIT_CODE,
+    ABORT_SIDECAR_FILENAME,
     DEFAULT_TTL_SECONDS,
     FAILED_RUN_TTL_SECONDS,
     FINGERPRINT_KIND_TREE,
@@ -30,6 +32,7 @@ from test_cache import (
     compute_change_set_state,
     compute_git_state,
     compute_tree_state,
+    is_abort_result,
     lookup,
     normalize_test_command,
     query_cached,
@@ -1810,3 +1813,267 @@ def test_change_set_tracking_can_be_disabled(change_set_repo: Path) -> None:
         cwd=str(repo),
         fingerprint_kind=test_cache.FINGERPRINT_KIND_CHANGE_SET,
     ) is None, "no change-set entry may be written when tracking is off"
+
+
+# ---------------------------------------------------------------------------
+# Hang/abort preservation of green entries (SA-0MWEURY420040OMD)
+# ---------------------------------------------------------------------------
+
+
+def _sidecar_path(git_repo: Path, command: str, git_state: str) -> Path:
+    """Resolve the abort side-car path for a command + state."""
+    return (
+        cache_dir(git_repo)
+        / _key_for(command, git_state)
+        / ABORT_SIDECAR_FILENAME
+    )
+
+
+def test_is_abort_result_classifies_hangs_signals_and_unparsed_exits() -> None:
+    """The abort classifier distinguishes hangs/infra from real red runs."""
+    # Exit 124 (bounded-runner hang) and signal kills are always aborts.
+    assert is_abort_result(ABORT_EXIT_CODE) is True
+    assert is_abort_result(ABORT_EXIT_CODE, "some partial output") is True
+    assert is_abort_result(-9) is True
+    # A green run is never an abort.
+    assert is_abort_result(0) is False
+    # A non-zero run WITH a parsable verdict is a genuine red run.
+    assert is_abort_result(1, "FAILED tests/test_a.py::test_a - assert 1 == 2") is False
+    assert is_abort_result(1, "5 failed, 3 passed in 1.2s") is False
+    assert is_abort_result(1, "Test Files  1 failed (1)\nTests  2 failed (2)") is False
+    assert is_abort_result(1, "# tests 3\n# pass 2\n# fail 1") is False
+    assert is_abort_result(1, "not ok 1 - broken") is False
+    # The retry runner's verdict is a parsable outcome even with no failing
+    # test (e.g. a coverage threshold), so it is red, never an abort.
+    assert (
+        is_abort_result(
+            1,
+            '[vitest-runner] attempts=1 status=1 outcome=coverage-failed args="x"',
+        )
+        is False
+    )
+    # A hang verdict is an abort even when reported with a non-124 status.
+    assert (
+        is_abort_result(
+            1, '[vitest-runner] attempts=1 status=1 outcome=hang args="x"'
+        )
+        is True
+    )
+    # A non-zero run with no parsable result is an infra abort.
+    assert is_abort_result(1, "ENOSPC: no space left on device") is True
+    assert is_abort_result(2, "") is True
+
+
+def test_abort_does_not_overwrite_a_green_entry(git_repo: Path) -> None:
+    """A hang/abort must preserve the green entry for the same tree."""
+    state = compute_git_state(str(git_repo))
+    store(
+        "pytest",
+        state,
+        cwd=str(git_repo),
+        stdout=SUCCESS_OUTPUT,
+        stderr="",
+        exit_code=0,
+    )
+    store(
+        "pytest",
+        state,
+        cwd=str(git_repo),
+        stdout="[hang-timeout] aborted\n",
+        stderr="",
+        exit_code=ABORT_EXIT_CODE,
+        abort=True,
+    )
+
+    entry = lookup("pytest", state, cwd=str(git_repo))
+    assert entry is not None
+    # The green verdict survives.
+    assert entry["exit_code"] == 0
+    assert entry["stdout"] == SUCCESS_OUTPUT
+    # And the abort is recorded alongside it, not silently discarded.
+    assert _sidecar_path(git_repo, "pytest", state).is_file()
+    assert entry["abort_observed"] is True
+    assert entry["abort_exit_code"] == ABORT_EXIT_CODE
+    assert entry["abort_completed_at"] is not None
+    assert entry["abort_notice"]
+
+
+def test_lookup_surfaces_the_abort_on_the_preserved_green(git_repo: Path) -> None:
+    """The served green carries the abort observation and a notice."""
+    calls: list[str] = []
+    runner = make_runner(calls)
+    first = run_cached("pytest", cwd=str(git_repo), runner=runner)
+    assert first["abort_observed"] is False
+    assert first["abort_notice"] == ""
+
+    # A later run aborts on the same state; the green must be preserved.
+    abort = run_cached(
+        "pytest",
+        cwd=str(git_repo),
+        force=True,
+        runner=make_runner([], "", exit_code=ABORT_EXIT_CODE),
+        abort_classifier=lambda code, out, err: is_abort_result(code, out, err),
+    )
+    assert abort["green_preserved"] is True
+
+    resumed = run_cached("pytest", cwd=str(git_repo), runner=make_runner([]))
+    assert resumed["cached"] is True
+    assert resumed["exit_code"] == 0
+    assert resumed["abort_observed"] is True
+    assert resumed["abort_exit_code"] == ABORT_EXIT_CODE
+
+
+def test_a_red_verdict_still_overwrites_a_green_entry(git_repo: Path) -> None:
+    """A genuine (non-abort) red verdict must replace the green entry."""
+    state = compute_git_state(str(git_repo))
+    store(
+        "pytest",
+        state,
+        cwd=str(git_repo),
+        stdout=SUCCESS_OUTPUT,
+        stderr="",
+        exit_code=0,
+    )
+    store(
+        "pytest",
+        state,
+        cwd=str(git_repo),
+        stdout="1 failed in 0.2s\n",
+        stderr="",
+        exit_code=1,
+        abort=False,
+    )
+    entry = lookup("pytest", state, cwd=str(git_repo))
+    assert entry is not None
+    assert entry["exit_code"] == 1
+    assert entry["abort_observed"] is False
+    assert not _sidecar_path(git_repo, "pytest", state).exists()
+
+
+def test_abort_with_no_prior_green_is_stored_normally(git_repo: Path) -> None:
+    """With no green to preserve, the abort itself becomes the current entry."""
+    calls: list[str] = []
+    result = run_cached(
+        "pytest",
+        cwd=str(git_repo),
+        runner=make_runner(calls, "no output\n", exit_code=ABORT_EXIT_CODE),
+        abort_classifier=lambda code, out, err: is_abort_result(code, out, err),
+    )
+    assert result["abort_result"] is True
+    assert result["green_preserved"] is False
+    entry = lookup("pytest", result["git_state"], cwd=str(git_repo))
+    assert entry is not None
+    assert entry["exit_code"] == ABORT_EXIT_CODE
+    assert entry["abort_observed"] is False
+
+
+def test_expired_green_is_not_preserved_by_an_abort(git_repo: Path) -> None:
+    """An abort must not resurrect a green entry that is past its TTL."""
+    state = compute_git_state(str(git_repo))
+    store(
+        "pytest",
+        state,
+        cwd=str(git_repo),
+        stdout=SUCCESS_OUTPUT,
+        stderr="",
+        exit_code=0,
+        completed_at=time.time() - DEFAULT_TTL_SECONDS - 60,
+    )
+    store(
+        "pytest",
+        state,
+        cwd=str(git_repo),
+        stdout="[hang-timeout] aborted\n",
+        stderr="",
+        exit_code=ABORT_EXIT_CODE,
+        abort=True,
+    )
+    entry = lookup("pytest", state, cwd=str(git_repo))
+    assert entry is not None
+    assert entry["exit_code"] == ABORT_EXIT_CODE  # the abort was written
+    assert entry["abort_observed"] is False
+
+
+def test_abort_under_a_different_git_state_leaves_the_green_untouched(
+    git_repo: Path,
+) -> None:
+    """An abort keyed on another state never touches this state's green."""
+    green_state = compute_git_state(str(git_repo))
+    store(
+        "pytest",
+        green_state,
+        cwd=str(git_repo),
+        stdout=SUCCESS_OUTPUT,
+        stderr="",
+        exit_code=0,
+    )
+    # A different state (different key) records its abort normally.
+    store(
+        "pytest",
+        "different-state",
+        cwd=str(git_repo),
+        stdout="[hang-timeout] aborted\n",
+        stderr="",
+        exit_code=ABORT_EXIT_CODE,
+        abort=True,
+    )
+    green = lookup("pytest", green_state, cwd=str(git_repo))
+    assert green is not None
+    assert green["exit_code"] == 0
+    assert green["abort_observed"] is False
+
+
+def test_a_fresh_green_store_clears_a_stale_abort_sidecar(git_repo: Path) -> None:
+    """A later green run supersedes the earlier abort observation."""
+    state = compute_git_state(str(git_repo))
+    store(
+        "pytest",
+        state,
+        cwd=str(git_repo),
+        stdout=SUCCESS_OUTPUT,
+        stderr="",
+        exit_code=0,
+    )
+    store(
+        "pytest",
+        state,
+        cwd=str(git_repo),
+        stdout="[hang-timeout]\n",
+        stderr="",
+        exit_code=ABORT_EXIT_CODE,
+        abort=True,
+    )
+    assert _sidecar_path(git_repo, "pytest", state).is_file()
+
+    store(
+        "pytest",
+        state,
+        cwd=str(git_repo),
+        stdout="fresh green run\n",
+        stderr="",
+        exit_code=0,
+    )
+    assert not _sidecar_path(git_repo, "pytest", state).exists()
+    entry = lookup("pytest", state, cwd=str(git_repo))
+    assert entry is not None
+    assert entry["stdout"] == "fresh green run\n"
+    assert entry["abort_observed"] is False
+
+
+def test_run_cached_without_an_abort_classifier_never_preserves(
+    git_repo: Path,
+) -> None:
+    """Pre-existing callers are byte-for-byte unchanged: no preservation."""
+    calls: list[str] = []
+    run_cached("pytest", cwd=str(git_repo), runner=make_runner(calls))
+    result = run_cached(
+        "pytest",
+        cwd=str(git_repo),
+        force=True,
+        runner=make_runner(calls, "no output\n", exit_code=ABORT_EXIT_CODE),
+    )
+    assert result["abort_result"] is False
+    assert result["green_preserved"] is False
+    entry = lookup("pytest", result["git_state"], cwd=str(git_repo))
+    assert entry is not None
+    assert entry["exit_code"] == ABORT_EXIT_CODE

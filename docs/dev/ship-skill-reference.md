@@ -562,6 +562,19 @@ python3 ../test/scripts/run_tests.py --force --json
 
 Cached results are valid for the same git state within the 2-hour TTL; a
 changed tree, expired TTL, or corrupt entry always triggers a fresh run.
+
+**Resuming after a hang abort (SA-0MWEURY420040OMD).** The release gate's
+full-suite step (`merge-dev-to-main.sh`, `--scope full --strict-git-env`)
+runs through the cached runner. A unit-stage hang or abort (exit **124**, a
+signal kill, or a non-zero exit with no parsable test result) does **not**
+destroy the green entry for the merged tree: the green verdict is preserved
+and the abort recorded alongside it. Re-running the release gate against the
+unchanged tree (same git state, within the TTL) **resumes green** — it serves
+the preserved green entry instead of re-executing `npm --silent test` — while
+the `green_preserved_after_abort` notice names the earlier abort so it is
+never silently accepted. A red verdict, a changed tree, or an expired TTL
+still executes and stores freshly, so a real failure is never masked. Use
+`--force` to force a fresh execution regardless of the preserved entry.
 This optional release test gate is wired via SA-0MSBXQZCG0078SEW.
 
 See [`docs/dev/release-tests.md`](release-tests.md) for local test commands.

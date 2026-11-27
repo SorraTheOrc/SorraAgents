@@ -339,6 +339,16 @@ fi
 # the tree that lands on main. Mirrors the pre-push hook's invocation
 # (`--scope full --strict-git-env`); the cached runner makes repeat
 # verification cheap. SHIP_TEST_SKIP=1 bypasses (not recommended).
+#
+# Hang-abort resume (SA-0MWEURY420040OMD): the cached runner keys on
+# command + git state with a 2-hour TTL. A unit-stage hang/abort (exit 124, a
+# signal kill, or a non-zero exit with no parsable test result) never
+# destroys a green entry for the same tree: the green verdict is preserved and
+# the abort recorded alongside it. So re-running this gate against the
+# unchanged merged tree resumes green (``green_preserved_after_abort`` names
+# the earlier abort rather than accepting it silently) instead of re-running
+# every stage. A red verdict, a changed tree, or an expired TTL still executes
+# and stores freshly — a real failure is never masked.
 if [[ "$DRY_RUN" != "true" && "${SHIP_TEST_SKIP:-}" != "1" ]]; then
   TEST_RUNNER=""
   if [[ -f "$REPO_ROOT/skill/test/scripts/run_tests.py" ]]; then

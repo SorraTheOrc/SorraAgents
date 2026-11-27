@@ -169,11 +169,13 @@ from shared.skill_extensions import (
 from shared.test_tmpdir import prune_stale_test_roots, resolve_test_tmpdir
 from shared.timing import Timer
 from test_cache import (
+    ABORT_EXIT_CODE,
     DEFAULT_TTL_SECONDS,
     STATE_CHANGED_EXIT_CODE,
     STATE_CHANGED_NOTICE_CODE,
     Runner,
     _default_runner,
+    is_abort_result,
     is_worktree_clean,
     query_cached,
     run_cached,
@@ -263,7 +265,15 @@ NOTICE_SUITE_TIMEOUT = "suite_timeout"
 #: so the runner and the cache cannot drift.
 NOTICE_STATE_CHANGED_DURING_RUN = STATE_CHANGED_NOTICE_CODE
 
-#: Stable code for the **non-fatal** resolution notice that a pinned
+#: Stable code for the **non-fatal** notice that a green verdict was served
+#: from the cache after an aborted (hang/killed) run on the same unchanged
+#: git state (SA-0MWEURY420040OMD). The preserved green entry is served *and*
+#: the earlier abort is named, so the gate never silently accepts an abort as
+#: green; ``success`` stays True and the exit status is unchanged (the tree's
+#: green verdict is still valid evidence within the TTL).
+NOTICE_GREEN_PRESERVED_AFTER_ABORT = "green_preserved_after_abort"
+
+#: Stable code for the **non-fatal** notice that a pinned
 #: ``.pi/test-config.json`` ``suiteCommands`` list does not cover some of the
 #: project's hidden skill test directories (SA-0MVQQ9NV4005UKYZ AC3). It is a
 #: notice, never a failure: the pinned list is still returned verbatim and the
@@ -2627,6 +2637,46 @@ def parse_failures_with_retry_verdict(
     return _parse_vitest_with_retry_verdict(output)
 
 
+def _abort_classifier_for(command: str) -> Callable[[int, str, str], bool]:
+    """Return a classifier deciding whether a run is a hang/abort.
+
+    The cache uses the verdict (``run_cached(abort_classifier=...)``) to
+    preserve a green entry instead of overwriting it with a no-verdict abort
+    (SA-0MWEURY420040OMD). Classification is **fail-safe for red runs**: a
+    non-zero exit that parsed any structured failure — or that carries the
+    retry runner's own verdict line (e.g. ``coverage-failed``, which exits
+    non-zero with no failing test) — is a genuine red verdict, never an
+    abort. Only exit 124 / a signal kill / a non-zero exit with no parsable
+    result is an abort, so a real failure can never be masked by preserved
+    green evidence.
+
+    Args:
+        command: The suite command whose output is being classified (selects
+            the failure parser).
+
+    Returns:
+        A callable ``(exit_code, stdout, stderr) -> bool``.
+    """
+
+    def classify(exit_code: int, stdout: str, stderr: str) -> bool:
+        if exit_code == 0:
+            return False
+        # A hang (124) or a signal kill is an abort regardless of output.
+        if exit_code == ABORT_EXIT_CODE or exit_code < 0:
+            return True
+        combined = f"{stdout}\n{stderr}"
+        failures, discarded = parse_failures_with_retry_verdict(command, combined)
+        if failures or discarded:
+            # A parsed test failure is a RED verdict — never an abort.
+            return False
+        # No parsable failures: fall back to the shared classifier, which also
+        # treats a retry-runner verdict line (coverage-failed, …) as a real
+        # (red) outcome rather than an abort.
+        return is_abort_result(exit_code, stdout, stderr)
+
+    return classify
+
+
 # ---------------------------------------------------------------------------
 # Suite execution
 # ---------------------------------------------------------------------------
@@ -3380,6 +3430,11 @@ def run_suite(
     overall_returncode = 0
     cached_flags: list[bool] = []
     cache_entries: list[dict[str, Any]] = []
+    #: Green verdicts served from the cache after an abort on the same tree
+    #: (SA-0MWEURY420040OMD): one mapping per preserved entry. Reported as a
+    #: non-fatal notice — the green verdict is valid evidence for the unchanged
+    #: tree, and the earlier abort is named rather than hidden.
+    abort_preserved_flags: list[dict[str, Any]] = []
     interpreters: set[str] = set()
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -3431,6 +3486,10 @@ def run_suite(
             # entries were reused.
             "cached": use_cache and all(cached_flags) if cached_flags else False,
             "cache_entries": cache_entries,
+            # Green preserved after an abort (SA-0MWEURY420040OMD): entries
+            # whose green verdict was served despite an earlier abort on the
+            # same unchanged tree. Empty on every other path.
+            "green_preserved_after_abort": list(abort_preserved_flags),
             # Mid-run checkout movement (SA-0MW3FF18I003KGZE): None on every
             # stable path; the flag dict {notice_code, checkout, before_commit,
             # after_commit, message} when the guarded checkout moved while a
@@ -3507,6 +3566,7 @@ def run_suite(
                     test_type=test_type,
                     fingerprint=fingerprint,
                     change_set_base_ref=base_ref,
+                    abort_classifier=_abort_classifier_for(cmd),
                 )
                 proc = SimpleNamespace(
                     stdout=run["stdout"], stderr=run["stderr"], returncode=run["exit_code"]
@@ -3515,6 +3575,19 @@ def run_suite(
                 state_changed_flag = run.get("state_changed_during_run")
                 if run["cached"]:
                     cache_entries.append(_cache_entry_metadata(run, cmd))
+                    # A green verdict served after an earlier abort on the same
+                    # git state (SA-0MWEURY420040OMD): report it as a non-fatal
+                    # notice so the gate never silently accepts an abort as
+                    # green.
+                    if run.get("abort_observed"):
+                        abort_preserved_flags.append(
+                            {
+                                "command": run.get("command") or cmd,
+                                "abort_exit_code": run.get("abort_exit_code"),
+                                "abort_completed_at": run.get("abort_completed_at"),
+                                "abort_notice": run.get("abort_notice", ""),
+                            }
+                        )
                 if run.get("interpreter"):
                     interpreters.add(run["interpreter"])
             else:
@@ -3603,6 +3676,26 @@ def run_suite(
             f"runner and discarded (not suite failures): {flaked}"
         )
 
+    # Green-preserved-after-abort notice (SA-0MWEURY420040OMD): a green verdict
+    # was served from the cache for an unchanged tree after an earlier hang or
+    # signal kill. Informational, never a failure — the tree's green verdict is
+    # still valid evidence within the TTL — but the abort is named so it is
+    # never silently accepted as green.
+    abort_notice = ""
+    abort_notice_code = ""
+    if abort_preserved_flags:
+        abort_notice_code = NOTICE_GREEN_PRESERVED_AFTER_ABORT
+        aborts = ", ".join(
+            f"{flag['command']} (exit {flag['abort_exit_code']})"
+            for flag in abort_preserved_flags
+        )
+        abort_notice = (
+            f"[{NOTICE_GREEN_PRESERVED_AFTER_ABORT}] the tree is unchanged "
+            f"within the cache TTL — the earlier abort(s) were served from the "
+            f"preserved green entry: {aborts}. The green verdict stands; re-run "
+            f"after a TTL refresh or with --force to execute afresh."
+        )
+
     result = _result(
         success=overall_returncode == 0 and not all_failures,
         returncode=overall_returncode,
@@ -3610,8 +3703,10 @@ def run_suite(
         command=command,
         failures=all_failures,
         discarded_failures=all_discarded,
-        notice=flagged_notice or discarded_notice,
-        notice_code=flagged_notice_code or discarded_notice_code,
+        notice=flagged_notice or discarded_notice or abort_notice,
+        notice_code=(
+            flagged_notice_code or discarded_notice_code or abort_notice_code
+        ),
         cached=use_cache and all(cached_flags) if cached_flags else False,
         state_changed_during_run=state_changed_detail,
     )
@@ -3757,6 +3852,10 @@ def run_all(
     #: aggregate so a consumer never loses the detail a suite-level notice
     #: references by code alone.
     state_changed_flags: list[dict[str, Any]] = []
+    #: Green-after-abort entries (SA-0MWEURY420040OMD): aggregated so a
+    #: consumer can see which cached green verdicts were served after an
+    #: earlier abort on the same unchanged tree.
+    green_preserved_flags: list[dict[str, Any]] = []
     with Timer("run_all") as _all_timer:
         for name in suites:
             with Timer(f"suite:{name}"):
@@ -3788,6 +3887,8 @@ def run_all(
                 all_failures.append({**failure, "suite": name})
             for discarded in result.get("discarded_failures") or []:
                 all_discarded.append({**discarded, "suite": name})
+            for preserved in result.get("green_preserved_after_abort") or []:
+                green_preserved_flags.append({**preserved, "suite": name})
             if result.get("notice"):
                 notices.append(result["notice"])
             if result.get("notice_code"):
@@ -3806,6 +3907,10 @@ def run_all(
         "discarded_failures": all_discarded,
         "notices": notices,
         "notice_codes": notice_codes,
+        # Green-after-abort (SA-0MWEURY420040OMD): the entries served as green
+        # after an earlier abort on the same unchanged tree. Informational —
+        # they never change ``success`` (the tree's verdict is still valid).
+        "green_preserved_after_abort": green_preserved_flags,
         # Moved-checkout flags (SA-0MW3FF18I003KGZE): the detail behind each
         # ``state_changed_during_run`` notice code.
         "state_changed_during_run": state_changed_flags,

@@ -77,6 +77,22 @@ hit the same entries because both resolve the same project root.
   failure (e.g. `/tmp` disk quota) is never re-served as a current result for
   the full TTL — it expires quickly and the next query/run re-executes fresh.
   Green runs keep the full 2-hour TTL.
+- **Hang/abort preserves green (SA-0MWEURY420040OMD)**: a hang/abort result
+  — exit **124** (the bounded suite runner's hang), a signal kill, or a
+  non-zero exit with no parsable test result — is classified by
+  `test_cache.is_abort_result()` and **never overwrites a green entry** for
+  the same command + git state within the TTL. Instead the green verdict is
+  kept and the abort is recorded in a side-car (`abort.json`) in the entry
+  directory. `lookup()`/`query_cached()` then serve the green verdict with
+  `abort_observed: true`, the abort's `abort_exit_code`/`abort_completed_at`
+  and an `abort_notice`; `run_suite()` reports it as the non-fatal
+  `green_preserved_after_abort` notice (plus a structured
+  `green_preserved_after_abort` list). A **genuine red run is never masked**:
+  a non-zero exit with a parsable verdict (a failing test, or the retry
+  runner's `coverage-failed` line) overwrites the green and stores normally,
+  as do a changed tree and an expired TTL. `run_cached()` applies this only
+  when the caller supplies `abort_classifier=`; every pre-existing caller is
+  byte-for-byte unchanged.
 - **Pipeline normalization**: output-filtering pipelines (e.g.
   `npm test 2>&1 | grep -E "Test Files|failed"`, `| tail -30`, `| head`,
   `| tee`) normalize to the underlying run and share one cache entry.

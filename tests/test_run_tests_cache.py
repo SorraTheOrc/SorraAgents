@@ -603,3 +603,108 @@ def test_strict_git_env_still_refuses_non_worktree_git_dir_from_worktree(
     code = run_main(["--suite", "pytest", "--strict-git-env", "--json"])
     assert code == 2
     assert "GIT_DIR" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Hang/abort preservation and resume (SA-0MWEURY420040OMD)
+# ---------------------------------------------------------------------------
+
+
+def _sequence_fake(monkeypatch: pytest.MonkeyPatch, responses: list[tuple[int, str]]):
+    """Replace rt._run_cmd with a fake yielding one (returncode, stdout) each."""
+    calls: list[str] = []
+
+    def fake(cmd: list[str], **kwargs):
+        calls.append(" ".join(cmd))
+        returncode, stdout = responses[min(len(calls) - 1, len(responses) - 1)]
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(rt, "_run_cmd", fake)
+    return calls
+
+
+def test_abort_preserves_green_and_resumes_without_executing(
+    cache_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A unit-stage hang must not force a full re-run of an unchanged tree.
+
+    Green run → forced re-run aborts (exit 124) → a plain re-run serves the
+    preserved green entry without executing and reports the abort
+    (SA-0MWEURY420040OMD AC1/AC2).
+    """
+    calls = _sequence_fake(
+        monkeypatch,
+        [
+            (0, SUMMARY_OUTPUT),
+            (124, "[hang-timeout] unit stage exceeded its bound\n"),
+        ],
+    )
+
+    # 1. First run executes and stores a green entry.
+    code, out = run_main_json(capsys, ["--suite", "pytest", "--json"])
+    assert code == 0
+    assert out["suites"]["pytest"]["cached"] is False
+    assert len(calls) == 1
+
+    # 2. A forced re-run aborts (124) on the same git state. The green entry
+    #    must survive, and the abort is still reported as non-green.
+    code, out = run_main_json(
+        capsys, ["--suite", "pytest", "--force", "--json"]
+    )
+    assert code == 1
+    assert out["suites"]["pytest"]["exit_code"] == 124
+    assert out["suites"]["pytest"]["success"] is False
+    assert len(calls) == 2
+
+    # 3. A plain re-run resumes from the preserved green entry WITHOUT
+    #    executing the suite, and names the earlier abort.
+    code, out = run_main_json(capsys, ["--suite", "pytest", "--json"])
+    assert code == 0
+    assert len(calls) == 2, "the preserved green must not re-execute the suite"
+    suite = out["suites"]["pytest"]
+    assert suite["cached"] is True
+    assert suite["success"] is True
+    assert suite["notice_code"] == rt.NOTICE_GREEN_PRESERVED_AFTER_ABORT
+    assert out["green_preserved_after_abort"], "the abort must be named"
+    assert out["green_preserved_after_abort"][0]["abort_exit_code"] == 124
+
+
+def test_coverage_failure_is_not_treated_as_an_abort(
+    cache_repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A non-zero verdict with no failing test (coverage-failed) is RED, not a hang.
+
+    Preserving green over it would mask a real gate failure
+    (CG-0MVL21CVM003VK5H); the abort classifier must treat the retry runner's
+    own verdict line as a genuine result.
+    """
+    coverage_output = (
+        "Test Files  3 passed (3)\n"
+        "Tests  12 passed (12)\n"
+        "[vitest-runner] attempts=1 status=1 outcome=coverage-failed "
+        'args="vitest run"\n'
+    )
+    calls = _sequence_fake(
+        monkeypatch,
+        [
+            (0, SUMMARY_OUTPUT),
+            (1, coverage_output),
+            (1, coverage_output),
+        ],
+    )
+
+    code, _ = run_main_json(capsys, ["--suite", "pytest", "--json"])
+    assert code == 0
+    # A forced re-run produces a coverage failure: it must overwrite the green.
+    code, out = run_main_json(capsys, ["--suite", "pytest", "--force", "--json"])
+    assert code == 1
+    assert not out["green_preserved_after_abort"]
+
+    # A plain re-run now serves that (failed) entry — never the green.
+    code, out = run_main_json(capsys, ["--suite", "pytest", "--json"])
+    assert code == 1
+    assert out["suites"]["pytest"]["success"] is False
+    assert out["suites"]["pytest"]["notice_code"] != (
+        rt.NOTICE_GREEN_PRESERVED_AFTER_ABORT
+    )
+    assert len(calls) == 2, "the red entry (within the short TTL) is served"

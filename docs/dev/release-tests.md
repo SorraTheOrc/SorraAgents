@@ -81,9 +81,32 @@ host **load average** at abort plus the **core count**. Read the load first:
 
 So a contended-host abort means **re-run on a quiet host**, and a genuine
 hang means **fix the cause**. Neither is a "red suite" failure to chase with
-test bisection. Tracked as SA-0MWEURUYL004I470; the cache-resume path that
-avoids a full re-run of an unchanged tree after a unit-stage abort is
-SA-0MWEURY420040OMD.
+test bisection. Tracked as SA-0MWEURUYL004I470.
+
+## Resuming after a hang abort (green cache preservation)
+
+The release gate runs the full suite through the **cached runner**
+(`run_tests.py`), keyed on command + git state with a 2-hour TTL. A
+hang/abort (exit **124**, or a non-zero exit with no parsable test result)
+used to overwrite the entry for that tree with `exit_code: 124`, so a retry
+re-ran every stage from scratch (SA-0MWEURY420040OMD). It no longer does:
+
+- A hang/abort **never destroys a green entry** for the same command + git
+  state that is still within the TTL. The green verdict is kept and the abort
+  is recorded in a side-car (`abort.json`) in the entry directory.
+- A **re-run against an unchanged tree resumes green**: the preserved green
+  entry is served without executing `npm --silent test`, *and* the earlier
+  abort is reported with the `green_preserved_after_abort` notice — the gate
+  never silently accepts an abort as green.
+- The preservation **never masks a real failure**: a red verdict, a changed
+  tree or an expired TTL still executes and stores freshly. A non-zero run
+  that yields a parsable verdict (a failing test, or the retry runner's
+  `coverage-failed` line) is red, not an abort.
+
+Operator summary: **the tree is unchanged within the TTL — a re-run resumes
+from the preserved green entry; an aborted run is always named.** If you want
+to force a fresh execution regardless, pass `--force` (or wait for the TTL to
+expire).
 
 ## Re-running after a fix
 
