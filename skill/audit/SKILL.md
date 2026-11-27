@@ -494,9 +494,14 @@ python3 $(skill_path report)/scripts/render_report.py <work-item-id> \
   [--next-action <review|plan|implement|...>]
 ```
 
-> **Note:** For the audit skill session, the verdict reflects the work item's state; the
-> report records the skill session's own success criteria (audit was performed). Work-item ACs are displayed
-> in the Use Cases section (SA-0MTQY7YM5009J6QR).
+> **Note:** The report's `## Acceptance Criteria` table records the **audit
+> session's** own deliverables (audit was performed, verdict recorded); the
+> work item's feature ACs are displayed in the **Use Cases** section
+> (SA-0MTQY7YM5009J6QR). The Conclusion is also **gated on the audit verdict**:
+> a failed audit (`Ready to close: No`) or a missing audit renders
+> `🚫 Not ready to ship` with an `Audit verdict:` reason line, even when every
+> session AC is `met`. So `✅ Ready to ship` always implies the audit passed
+> (SA-0MWIIOMY10054VJI).
 
 The script prints the rendered report to stdout — **paste it verbatim into
 your final response**, so the operator sees the report itself (not just the

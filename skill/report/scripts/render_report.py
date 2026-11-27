@@ -440,6 +440,38 @@ def _derive_session_status(acceptance_criteria):
     return "completed"
 
 
+def _effective_status(skill_name, acceptance_criteria, audit_verdict=None):
+    """Derive the report status, gating **audit** sessions on the audit verdict.
+
+    Every skill's status comes from the session's own acceptance criteria (all
+    ``met`` ⇒ ``completed``). For the audit skill the Conclusion must also
+    agree with the work item's audit verdict (SA-0MWIIOMY10054VJI): a failed or
+    missing audit can never render ``✅ Ready to ship``, because a readiness
+    claim implies the audit passed.
+
+    Returns ``(status, audit_reason)``:
+
+    * *status* — ``"completed"`` or ``"incomplete"`` (drives both the header and
+      the Conclusion, so the two can never disagree);
+    * *audit_reason* — ``None`` when the audit gate did not force the
+      incomplete verdict, otherwise ``"no"`` (failed audit) or ``"unknown"``
+      (no persisted audit). It names the reason line the Conclusion renders.
+
+    The audit gate **fails closed**: an unrecognised or missing verdict is
+    treated as ``unknown`` and blocks the success claim. Non-audit skills never
+    consult the audit verdict, so their output is unchanged.
+    """
+    session_status = _derive_session_status(acceptance_criteria)
+    if str(skill_name or "").strip().lower() != "audit":
+        return session_status, None
+    verdict = (
+        audit_verdict if audit_verdict in ("yes", "no", "unknown") else "unknown"
+    )
+    if verdict == "yes":
+        return session_status, None
+    return "incomplete", verdict
+
+
 # ─── Report rendering ──────────────────────────────────────────────────
 
 #: The rendered ``## Producer Actions`` placeholder when nothing is required.
@@ -489,6 +521,7 @@ def render_report(
     next_action: str = "review",
     use_cases=None,
     colour: bool | None = None,
+    audit_verdict: str | None = None,
 ) -> str:
     """Render the full canonical end-of-session report.
 
@@ -528,6 +561,14 @@ def render_report(
         :func:`colour_enabled`, so a pipe/file/plain-text sink receives no
         escape bytes and the verdict stays readable (AC3,
         SA-0MVYEZ3V3004AQXN).
+    audit_verdict : str or None
+        The resolved audit verdict (``"yes"``/``"no"``/``"unknown"``), used
+        to gate the Conclusion for the **audit** skill
+        (SA-0MWIIOMY10054VJI). Ignored for every other skill. ``None`` (or any
+        unrecognised value) fails closed as ``"unknown"`` for an audit report.
+        ``render_report_from_workitem`` resolves it from the work item's
+        ``auditResult``/``audit`` fields; direct callers of ``render_report``
+        for an audit session must supply it.
 
     Returns
     -------
@@ -536,8 +577,12 @@ def render_report(
     """
     lines = []
 
-    # Derive session status from AC verdicts
-    status = _derive_session_status(acceptance_criteria)
+    # Derive the report status from AC verdicts, gating audit sessions on the
+    # audit verdict so the Conclusion can never claim readiness when the audit
+    # failed or is missing (SA-0MWIIOMY10054VJI).
+    status, audit_reason = _effective_status(
+        skill_name, acceptance_criteria, audit_verdict,
+    )
 
     # Routine workflow progression is not a producer action
     # (SA-0MVNQ3RLW006XEFW): normalise before it reaches the report body.
@@ -613,10 +658,21 @@ def render_report(
         )
     else:
         lines.append(_red("🚫 Not ready to ship", use_colour))
-        lines.append(
-            f"{skill_name.title()} session for {work_item_id} ({title}) "
-            f"is incomplete."
-        )
+        if audit_reason == "no":
+            lines.append(
+                f"Audit verdict: Ready to close: No — see "
+                f"`wl audit-show {work_item_id} --json`."
+            )
+        elif audit_reason == "unknown":
+            lines.append(
+                f"Audit verdict: not run — no persisted audit for "
+                f"{work_item_id}."
+            )
+        else:
+            lines.append(
+                f"{skill_name.title()} session for {work_item_id} ({title}) "
+                f"is incomplete."
+            )
     lines.append("")
     lines.append("</end_session>")
 
@@ -639,11 +695,18 @@ def render_report_from_workitem(
     """Convenience wrapper: read metadata from a work-item dict and render.
 
     ``audit_result`` is the structured top-level ``auditResult`` from the
-    ``wl show --json`` envelope; it takes precedence over legacy fields.
+    ``wl show --json`` envelope; it takes precedence over legacy fields. The
+    audit verdict is resolved here (from data already fetched) and forwarded to
+    :func:`render_report` so an audit report's Conclusion agrees with its
+    Meta-Data ``Audit:`` line (SA-0MWIIOMY10054VJI).
     """
     metadata = render_metadata(
         work_item, children=children, audit_result=audit_result,
     )
+    # Resolve the audit verdict from data already fetched — no extra ``wl``
+    # calls — so the Conclusion agrees with the Meta-Data ``Audit:`` line
+    # (SA-0MWIIOMY10054VJI).
+    audit_verdict = _audit_verdict(work_item, audit_result)
     return render_report(
         skill_name=skill_name,
         work_item_id=work_item.get("id", "unknown"),
@@ -656,6 +719,7 @@ def render_report_from_workitem(
         next_action=next_action,
         use_cases=use_cases,
         colour=colour,
+        audit_verdict=audit_verdict,
     )
 
 

@@ -124,6 +124,27 @@ This completes the <skill_name> process for <id> (<title>).
 
 The default (`None`) is auto-detection (steps 2-5), which is what keeps
 agent-pasted reports escape-free.
+
+#### Audit verdict gate (SA-0MWIIOMY10054VJI)
+
+**`✅ Ready to ship` in the Conclusion implies the audit passed.** When the
+report is rendered by the **audit** skill (`--skill-name audit`, case-
+insensitive), the verdict is gated on the resolved audit verdict in addition to
+the session ACs:
+
+- audit `readyToClose: true` (legacy `Ready to close: Yes`) **and** every
+  session AC `met` ⇒ `✅ Ready to ship`;
+- audit `readyToClose: false` (legacy `Ready to close: No`) ⇒
+  `🚫 Not ready to ship`, followed by
+  ``Audit verdict: Ready to close: No — see `wl audit-show <id> --json`.``;
+- no persisted audit at all ⇒ `🚫 Not ready to ship` (fail closed), followed by
+  ``Audit verdict: not run — no persisted audit for <id>.``
+
+The header (`# Completed audit` / `# Incomplete audit`) derives from the same
+gated status, so the header and the Conclusion can never disagree. The verdict
+is resolved from data the renderer already fetches (`auditResult` or the legacy
+`audit` mirror) — no extra `wl` calls. Every other skill is unchanged: it never
+consults the audit verdict.
 - **Terminator**: the rendered report's final line is `</end_session>` on its own line (only for terminal sessions; question-ended sessions omit the report and the marker).
 
 ### Producer Actions
@@ -380,9 +401,12 @@ than stacking a second one.
 - `render_report(...)` → full report markdown. Accepts an optional
   ``use_cases`` parameter (list of strings or ``None``); when provided,
   a ``## Use Cases`` section is rendered between the title line and the
-  headline.
+  headline. The optional ``audit_verdict`` parameter
+  (``"yes"``/``"no"``/``"unknown"``) gates the Conclusion for the **audit**
+  skill (fails closed when omitted — see
+  [Audit verdict gate](#audit-verdict-gate-sa-0mwiiomy10054vji)).
 - `render_metadata(work_item, children=None, audit_result=None)` → the `## Meta-Data` bullet block. `audit_result` is the **top-level** `auditResult` object from the `wl show --json` envelope; when omitted, the legacy `workItem.auditResult` / `workItem.audit` fallbacks apply (see the precedence list above).
-- `render_report_from_workitem(work_item, *, skill_name, headline, acceptance_criteria, ..., children=None, audit_result=None, use_cases=None, colour=None)` → full report from an already-fetched work-item dict plus the envelope's structured `auditResult`.
+- `render_report_from_workitem(work_item, *, skill_name, headline, acceptance_criteria, ..., children=None, audit_result=None, use_cases=None, colour=None)` → full report from an already-fetched work-item dict plus the envelope's structured `auditResult`. It resolves the audit verdict and forwards it to `render_report`, so an audit report's Conclusion always agrees with its Meta-Data `Audit:` line.
 - `normalise_producer_actions(producer_actions)` → collapses routine-only
   producer actions to `None needed` (returning genuine blocking text
   verbatim) and writes **one** stderr diagnostic naming the discarded text.
