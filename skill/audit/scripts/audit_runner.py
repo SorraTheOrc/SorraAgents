@@ -2991,17 +2991,30 @@ def _resolve_producer_review_decision(ctx: _AuditContext,
       (SA-0MVZNECSD005XB42 AC2)
     - ``Yes`` on an audit-generated candidate-false-positive tracker chore →
       ``untouched`` (AC4)
-    - ship-triggered run (``--ship-triggered``) + top-level ``Yes`` or
-      ``No`` → ``untouched`` with reason "ship-triggered audit - flag
-      untouched" — the release's own verification re-audit never arms the
-      producer queue (SA-0MW92TODX00064XQ AC1/AC2/AC3); only ship-automated
-      invocations set the marker
+    - ship-triggered run (``--ship-triggered``) + top-level ``Yes`` of
+      **unchanged work** (reviewed unchanged, or never reviewed so there is
+      no prior review baseline) → ``untouched`` with reason "ship-triggered
+      audit - flag untouched": the release's own verification re-audit never
+      arms the producer queue (SA-0MW92TODX00064XQ AC1/AC2/AC3); only
+      ship-automated invocations set the marker
+    - ship-triggered ``Yes`` whose content changed since the last review →
+      falls through to the passing branch (preserved / candidate-false-
+      positive carve-outs intact) and normally ``required`` — the marker
+      never swallows the change signal (SA-0MWJ8WGQD0073MG1 AC3)
+    - ship-triggered ``No`` → falls through to the failing branch, so the
+      ordered carve-outs still apply (cascade-demotion-suppressed →
+      ``untouched``, child → ``untouched``, otherwise ``required``) — the
+      marker never swallows the failure signal (SA-0MWJ8WGQD0073MG1 AC2)
     - ``No`` + independent (not cascade-demotion-suppressed) + top-level →
       ``required`` regardless of ``merge_gate_blocker`` (AC3)
     - ``No`` + cascade-demotion-suppressed → ``untouched`` (producer Q2)
     - any verdict + child item → ``untouched`` (AC6, SA-0MSSVKYEW008PJ9H)
     - infrastructure failure / unparseable verdict / tainted ``No`` →
       ``untouched`` (producer Q3: neither set nor cleared)
+
+    The flag is therefore set **only when the audit failed for any reason,
+    or the audited content/code changed since the last producer review**
+    (SA-0MWJ8WGQD0073MG1 AC1/AC3).
 
     Resolved once before persistence (so the persisted report records the
     decision) and reused by ``_apply_terminal_lifecycle`` so the flag write
@@ -3011,6 +3024,13 @@ def _resolve_producer_review_decision(ctx: _AuditContext,
     fingerprint = (prior or {}).get("fingerprint")
     wi = ctx.wi
     top_level = not wi or not wi.get("parentId")
+    # Code/content-change signal, computed ONCE before the ship-triggered
+    # marker boundary is consulted: a prior review is stale unless a passing
+    # prior audit saw the same v2 content fingerprint with the flag already
+    # cleared (the existing preserved-review predicate, no new fingerprint
+    # logic). No prior audit → not stale: there is no review baseline to
+    # invalidate (SA-0MWJ8WGQD0073MG1 AC3).
+    review_stale = bool(prior) and not _producer_review_preserved(wi, prior)
 
     if verdict is None or ctx.script_failure is not None:
         return {
@@ -3031,14 +3051,18 @@ def _resolve_producer_review_decision(ctx: _AuditContext,
             "fingerprint": fingerprint,
         }
 
-    # Ship-triggered run (SA-0MW92TODX00064XQ AC1/AC2/AC3): a release-gate
-    # verification re-audit is NOT an independent review, so a top-level
-    # 'Yes' or 'No' leaves the producer-review flag untouched (neither set
-    # nor cleared). Only ship-automated invocations set the marker; every
-    # other lifecycle behaviour (the 'Yes' advance / 'No' demotion, the
-    # persisted report) is unchanged. Children remain covered by the child
-    # rule below.
-    if ctx.ship_triggered and top_level and verdict in ("yes", "no"):
+    # Ship-triggered marker boundary (SA-0MW92TODX00064XQ AC1/AC2/AC3,
+    # narrowed by SA-0MWJ8WGQD0073MG1 AC1/AC2/AC3): a release-gate
+    # verification re-audit is NOT an independent review, so it leaves the
+    # producer-review flag untouched ONLY when it is a passing top-level run
+    # over unchanged work (reviewed unchanged, or never reviewed). A failing
+    # 'No' and a 'Yes' whose content changed since the last review fall
+    # through to the branches below, so the marker never swallows the
+    # failure or change signal; the runner still never clears the flag —
+    # suppression is a non-write. Children remain covered by the child rule
+    # below.
+    if (ctx.ship_triggered and top_level and verdict == "yes"
+            and not review_stale):
         return {
             "action": PRODUCER_REVIEW_UNTOUCHED,
             "reason": "ship-triggered audit - flag untouched",
@@ -11793,9 +11817,12 @@ class _AuditContext:
     # Ship-automation marker (SA-0MW92TODX00064XQ): when True this run is a
     # release-gate verification re-audit, NOT an independent review, so
     # ``_resolve_producer_review_decision`` resolves ``untouched`` for a
-    # top-level 'Yes' or 'No' verdict and the ``--needs-producer-review``
-    # flag is never written (the write is suppressed, never cleared). Set
-    # from the ``--ship-triggered`` CLI flag by the ``issue`` command;
+    # passing top-level 'Yes' of unchanged work only. A failing 'No' and a
+    # 'Yes' whose audited content changed since the last producer review
+    # fall through to the independent-audit branches (SA-0MWJ8WGQD0073MG1
+    # AC1/AC2/AC3), so the marker never swallows either signal. The
+    # ``--needs-producer-review`` flag is only ever written, never cleared.
+    # Set from the ``--ship-triggered`` CLI flag by the ``issue`` command;
     # only ship-automated invocations set it.
     ship_triggered: bool = False
     # Audit test-failure mode (SA-0MW0JJ36Z000AF57). ``strict`` is resolved once
@@ -17889,19 +17916,24 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
             cas_guard_expected = True
         elif ctx.audit_verdict == "yes":
             # Advance to the review queue. Keep a terminal 'done' stage.
-            # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6 / Q2=C): a
-            # top-level item is flagged `--needs-producer-review yes` so the
-            # release gate blocks it until the producer explicitly reviews
-            # it — EXCEPT when the producer already reviewed this exact
-            # content (AC1: a prior passing audit with an unchanged v2
-            # content fingerprint), in which case the stored `false` is
-            # preserved and nothing is written. Child items are covered by
-            # their parent's review, so they are NOT flagged — the flag
-            # would flood the producer queue with redundant approvals
-            # (SA-0MSSVKYEW008PJ9H). In both cases the audit agent's own
-            # assignee claim is CLEARED (status-neutral claim,
-            # WL-0MV85WCJJ0087VMP / WL-0MV7W77AY005MGBL fix). Flags are
-            # inserted before the trailing --json (file convention:
+            # Restored flag semantics (WL-0MVAMS4RO000H3B0 F6 / Q2=C): the
+            # flag is written ONLY when the audit failed for any reason or
+            # the audited content/code changed since the last producer
+            # review (SA-0MWJ8WGQD0073MG1 AC1/AC3). A top-level item is
+            # therefore flagged `--needs-producer-review yes` so the release
+            # gate blocks it until the producer explicitly reviews it —
+            # EXCEPT when the producer already reviewed this exact content
+            # (AC1: a prior passing audit with an unchanged v2 content
+            # fingerprint), or when this run is a ship-triggered
+            # verification of unchanged/never-reviewed work (the marker
+            # boundary — a change signal falls through and still flags). In
+            # those cases the stored `false` is preserved and nothing is
+            # written. Child items are covered by their parent's review, so
+            # they are NOT flagged — the flag would flood the producer queue
+            # with redundant approvals (SA-0MSSVKYEW008PJ9H). In all cases
+            # the audit agent's own assignee claim is CLEARED (status-neutral
+            # claim, WL-0MV85WCJJ0087VMP / WL-0MV7W77AY005MGBL fix). Flags
+            # are inserted before the trailing --json (file convention:
             # --json last).
             # This is the sole authorisation for the descendant cascade
             # below — a passing verdict, not status/stage (AC3).
@@ -17974,13 +18006,15 @@ def _apply_terminal_lifecycle(ctx: _AuditContext) -> int:
                 ]
                 expected_status, expected_stage = "open", "plan_complete"
                 cas_guard_expected = True
-                # Independent failing audit flags the producer queue
+                # A failing audit flags the producer queue
                 # (SA-0MVR9B1UH002BUST AC3): every independent top-level
                 # 'No' — merge-gate-blocked or ordinary — surfaces the item,
-                # never clears an existing review. The cascade-suppressed
-                # 'No' (handled above) and child items stay untouched
-                # (producer Q2 / AC6). The decision drives the write so the
-                # persisted report and the flag never disagree.
+                # never clears an existing review, and a ship-triggered 'No'
+                # flags exactly the same way (the marker never swallows the
+                # failure signal, SA-0MWJ8WGQD0073MG1 AC2). The
+                # cascade-suppressed 'No' (handled above) and child items
+                # stay untouched (producer Q2 / AC6). The decision drives the
+                # write so the persisted report and the flag never disagree.
                 if producer_review["action"] == PRODUCER_REVIEW_REQUIRED:
                     restore_cmd = [
                         "wl", "update", ctx.issue_id,

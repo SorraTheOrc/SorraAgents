@@ -512,6 +512,11 @@ reviewed?"*. This section defines exactly when the audit runner writes it.
 
 ### Truth table
 
+The rule (SA-0MWJ8WGQD0073MG1 AC1/AC3): `needsProducerReview` is set **only**
+when the audit failed for any reason, or the audited content/code changed since
+the last producer review. A passing re-audit of unchanged work — including
+during a release — never sets it.
+
 | Verdict | Item | Review signal | `needsProducerReview` after the run |
 |---|---|---|---|
 | `Yes` | top-level | prior passing audit whose v2 fingerprint == current, flag `false` | **preserved** (writes no flag) |
@@ -521,7 +526,9 @@ reviewed?"*. This section defines exactly when the audit runner writes it.
 | `No` | top-level, independent | either | **`yes`** |
 | `No` | top-level, cascade-demotion-suppressed | either | **untouched** (producer decision Q2) |
 | `No` | child (has a parent) | either | **untouched** (SA-0MSSVKYEW008PJ9H) |
-| `Yes` / `No` | top-level, ship-triggered (`--ship-triggered`) | either | **untouched** — reason "ship-triggered audit - flag untouched" (SA-0MW92TODX00064XQ) |
+| `Yes` | top-level, ship-triggered (`--ship-triggered`) | unchanged work: prior passing audit with the same v2 fingerprint, **or** never reviewed (no review baseline) | **untouched** — reason "ship-triggered audit - flag untouched" (SA-0MW92TODX00064XQ; SA-0MWJ8WGQD0073MG1 AC1) |
+| `Yes` | top-level, ship-triggered | content changed since the last review (stored fingerprint differs) | **`yes`** — the marker never swallows the change signal (SA-0MWJ8WGQD0073MG1 AC3) |
+| `No` | top-level, ship-triggered | either (unless cascade-demotion-suppressed) | **`yes`** — the marker never swallows the failure signal (SA-0MWJ8WGQD0073MG1 AC2) |
 | any | any | infrastructure failure / unparseable verdict / tainted `No` | **untouched** (producer decision Q3) |
 
 The runner **never** writes `--needs-producer-review no` on any path: it may
@@ -581,18 +588,30 @@ review gate is a release-safety defect.
 A ship-triggered audit — the ship skill's Step-2 audit readiness gate, Step-6
 final-validation sweep, and pre-flight `--refresh-audits`, all of which invoke
 `audit_runner.py issue <id> --strict --ship-triggered` — is a release-gate
-**verification re-audit**, not an independent review. `_resolve_producer_review_decision`
-therefore resolves `PRODUCER_REVIEW_UNTOUCHED` with the reason
-`"ship-triggered audit - flag untouched"` for a top-level `Yes` *or* `No`
-verdict: the release's own verification never arms the producer queue and never
-clears a stored flag. Only the flag write is suppressed — `Yes` still advances
-to `completed`/`in_review`; `No` still demotes to `open`/`plan_complete`
-(subject to cascade-demotion suppression); the persisted report still records
-the verdict plus a `Producer review: untouched (ship-triggered audit - flag
-untouched)` metadata line (see *Recording the decision*). Marker-free
-(independent) runs are unchanged: an independent top-level `Yes` with a
-producer decision required still flags, and an independent top-level `No`
-still flags (parent AC2).
+**verification re-audit**, not an independent review. Its carve-out is scoped to
+the **unchanged pass** (SA-0MWJ8WGQD0073MG1 AC1/AC3):
+
+- a top-level `Yes` of unchanged work — a prior passing audit with the same v2
+  content fingerprint, or never-reviewed work with no review baseline —
+  resolves `PRODUCER_REVIEW_UNTOUCHED` with the reason
+  `"ship-triggered audit - flag untouched"`;
+- a top-level `Yes` whose stored fingerprint differs from the current content
+  fingerprint falls through to the normal passing branch and resolves
+  `required` (AC3 — the marker is consulted only after the change signal is
+  evaluated);
+- a top-level `No` falls through to the failing branch and resolves `required`
+  (AC2 — the marker never swallows the failure signal).
+
+The change signal is the existing preserved-review predicate
+(`_producer_review_preserved`), computed once before the marker check — no new
+fingerprint logic. Only the flag write is suppressed on the unchanged pass;
+`Yes` still advances to `completed`/`in_review`; `No` still demotes to
+`open`/`plan_complete` (subject to cascade-demotion suppression); the persisted
+report still records the verdict plus a `Producer review: untouched
+(ship-triggered audit - flag untouched)` metadata line (see *Recording the
+decision*). Marker-free (independent) runs are unchanged: an independent
+top-level `Yes` with a producer decision required still flags, and an
+independent top-level `No` still flags (parent AC2).
 
 The marker is set **only** by ship-automated invocations. Surfaced manual
 remediation commands (operator-invoked) — `buildRemediationCommand()`
