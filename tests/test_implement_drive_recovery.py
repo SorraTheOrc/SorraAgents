@@ -1577,7 +1577,14 @@ class TestNonTerminalResetForRetry:
             ["git", "status", "--porcelain=v1"], cwd=str(worktree),
             capture_output=True, text=True, check=True,
         )
-        assert status.stdout.strip() == ""
+        # ``.worklog/`` is the driver's own bookkeeping (the session baseline
+        # refreshed at the spawn boundary, SA-0MWL0XX88000E38K); it is never
+        # WIP and every dirty-path helper excludes it. Everything else must
+        # be clean.
+        remaining = [
+            line for line in status.stdout.splitlines() if ".worklog/" not in line
+        ]
+        assert remaining == []
         assert (repo / "main_dirty.txt").read_text() == "operator work\n"
 
     def test_reset_runs_at_most_once_per_child(
@@ -1633,6 +1640,9 @@ def commit_carrying_worktree(tmp_path):
     _git("config", "user.email", "test@test.com", cwd=repo)
     _git("config", "user.name", "Test", cwd=repo)
     (repo / "README.md").write_text("# Test\n")
+    # Mirror the real checkout: the driver's ``.worklog/`` bookkeeping (the
+    # session baseline) never dirties a tree (SA-0MWL0XX88000E38K).
+    (repo / ".gitignore").write_text(".worklog/\n")
     _git("add", "-A", cwd=repo)
     _git("commit", "-q", "-m", "Initial commit", cwd=repo)
     _git("branch", "dev", cwd=repo)

@@ -411,6 +411,45 @@ the main-checkout scan unchanged for every other cwd — and the same live-surfa
 filter applies, after the child's own worktree and the sibling's dirt have been
 checked.
 
+### Ambient-dirt baselines: pre-existing dirt is never a placement violation
+
+On its own the guard above has no notion of *time*: a dirty main checkout or a
+dirty sibling worktree looks the same whether it pre-dates the run or was
+written by the child. On a long-lived checkout that holds other items'
+in-flight work, that made `parent`/`drive` refuse the common case — a
+**never-spawned** child whose own worktree is still empty — for every epic
+until the ambient dirt was cleaned (SA-0MWL0XX88000E38K). The guard is
+therefore **baseline-aware**.
+
+Before a child's session can write, a *session baseline*
+(`_snapshot_foreign_surfaces`) records, for every foreign change surface (the
+main checkout plus each registered sibling worktree), the dirty paths, their
+porcelain status and the surface HEAD. It is persisted in
+`<worktree>/.worklog/session-baseline.json` — under `.worklog/`, so it is never
+mistaken for work — and it disappears with the worktree.
+
+- **When it is captured/refreshed.** `implement.py start` records it once the
+  child's worktree exists; `implement.py drive` refreshes it immediately
+  **before** each spawned session; `implement.py parent` reads it. A
+  never-spawned child with no record yet gets an **ambient** baseline recorded
+  the first time `parent` checks it, so pre-existing dirt is never attributed
+  to a child whose session has not started.
+- **What counts as a post-baseline write.** `_foreign_surface_offenders_since`
+  reports only what grew since the baseline: a dirty path that is **new**, a
+  path whose porcelain status changed (e.g. `??` → `A`), or a surface whose
+  HEAD gained commits ahead of the parent branch. Everything already present
+  in the baseline is exempt.
+- **Still fails closed.** A genuine post-baseline write — into the main
+  checkout or into another item's linked worktree — is still a placement
+  violation. The message names the offending paths, the offending sibling
+  root(s) and the child's own worktree, and says so when a surface only gained
+  commits.
+- **Never silently exempts.** A missing baseline is filled with an ambient one
+  (the never-spawned child); a corrupt, unreadable or foreign-child baseline is
+  **not** trusted, and the guard falls back to the legacy full scan. The
+  spawn-failure exemption above still applies unchanged, and only ever for a
+  child the driver recorded as having produced no work.
+
 ### Per-worktree expected-dirty declarations and submodule surfaces
 
 Every scanned surface is classified with **that worktree's own**

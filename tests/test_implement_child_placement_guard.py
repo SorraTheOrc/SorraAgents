@@ -186,9 +186,16 @@ class TestPhaseParentPlacementGuard:
     def test_fails_closed_when_child_wrote_to_main(
         self, implement_mod, worktree_env, scrubbed_env,
     ):
-        """AC3/AC4: a child that wrote to the main checkout fails the phase."""
+        """AC3/AC4: a child that wrote to the main checkout fails the phase.
+
+        A genuine stray happens *after* the child's session baseline, so the
+        baseline is established before the injected write (SA-0MWL0XX88000E38K).
+        """
         repo_root = worktree_env["repo_root"]
         worktree_dir = worktree_env["worktree_dir"]
+        implement_mod.record_session_baseline(
+            repo_root, str(worktree_dir), CHILD, "dev"
+        )
         (repo_root / "leaked_to_main.py").write_text("x = 1\n", encoding="utf-8")
 
         report = _run_phase_parent(

@@ -463,6 +463,50 @@ Regression coverage:
 `TestDriveRecordsSpawnFailureEvidence`) — real git fixture repositories, both
 `phase_parent` call sites, and the end-to-end drive→parent hand-off.
 
+### Ambient-dirt baselines (SA-0MWL0XX88000E38K)
+
+The spawn-failure exemption above covers a child whose **session died**. It
+does not cover the *other* false positive: a **never-spawned** child whose
+worktree is simply empty while the repository already holds unrelated
+in-flight work (a dirty main checkout and/or dirty sibling worktrees). The
+guard has no notion of time on its own, so it attributed that ambient dirt to
+the child and `parent`/`drive` refused the common case at the start of a
+child.
+
+The placement guard is therefore **baseline-aware**. `_snapshot_foreign_surfaces`
+captures, for every foreign surface (the main checkout plus each registered
+sibling worktree), the dirty paths, their porcelain status and the surface
+HEAD. `_foreign_surface_offenders_since` compares a fresh snapshot against
+the baseline and reports only paths/commits that are **new or changed since**
+the baseline. `_child_main_checkout_violation` takes an optional `baseline`:
+with one it reports only those post-baseline offenders, and with none it runs
+the legacy full scan unchanged (no existing caller regresses).
+
+- **`phase_start`** records the baseline (`record_session_baseline`) in
+  `<worktree>/.worklog/session-baseline.json` once the worktree exists and
+  before any session runs. Under `.worklog/`, it is never work
+  (`_classify_child_worktree` stays `CHILD_CLEAN`; `_has_worktree_changes`
+  stays false) and disappears with the worktree.
+- **`phase_drive`** refreshes the baseline immediately **before** each
+  spawned session, so everything that session writes is attributable on the
+  next `phase_parent` pass.
+- **`phase_parent`** supplies the persisted baseline to both
+  `_child_main_checkout_violation` call sites (the `skip-in-progress` path and
+  the `implement` path) via `_resolve_child_baseline`. When no record exists
+  yet (a never-spawned child) it records an **ambient** baseline first, so
+  pre-existing dirt is never attributed to that child.
+- **Fail-safe fallback.** A record that exists but is corrupt, unreadable or
+  names another child is never trusted: `_resolve_child_baseline` returns
+  `None` and the legacy full scan applies. The genuine post-baseline write
+  still fails closed, naming the offending paths, the offending sibling
+  root(s) and the child's own worktree.
+
+Regression coverage:
+`skill/implement/tests/test_drive_sibling_worktree_stray.py`
+(`TestForeignSurfaceSnapshotPrimitive`, `TestSessionBaselineRecord`,
+`TestNeverSpawnedChildIgnoresAmbientDirt`, `TestDriveSpawnsDespiteAmbientDirt`,
+`TestBaselineAwareGenuineStray`).
+
 ### The test suite is driven-session independent (SA-0MWJHN2I8005E7BK)
 
 The regression tests above call `phase_drive` directly: they play the parent
@@ -4663,7 +4707,12 @@ Guards (deterministic, in `phase_parent`):
   driver's recorded spawn-failure evidence
   (`<worktree>/.worklog/spawn-failure.json`) makes the foreign dirt
   pre-existing and unrelated, so the child is reported startable again and
-  the next `drive` re-spawns it (SA-0MWGZ8NWP009QD8G).
+  the next `drive` re-spawns it (SA-0MWGZ8NWP009QD8G). Pre-existing ambient
+  dirt is exempt too: a session baseline
+  (`<worktree>/.worklog/session-baseline.json`) recorded before the child's
+  session compares every foreign surface, so only a post-baseline write
+  fails closed (a never-spawned child gets an ambient baseline; see
+  [ambient-dirt baselines](#ambient-dirt-baselines-sa-0mwl0xx88000e38k)).
 - A parent with no children or all-terminal children behaves as today.
 
 Worktree isolation per child is preserved: every child is implemented in

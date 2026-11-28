@@ -543,6 +543,14 @@ STATE_FILE_NAME = ".implement_state.json"
 #: (SA-0MWGZ8NWP009QD8G / AH-0MWFHLDAS008YG0P).
 SPAWN_FAILURE_FILE = ".worklog/spawn-failure.json"
 
+#: Durable **session baseline**: the foreign change surfaces (the main
+#: checkout and each registered sibling worktree) captured *before* a child's
+#: session can write, so pre-existing ambient dirt is never attributed to that
+#: child (SA-0MWL0XX88000E38K). Like :data:`SPAWN_FAILURE_FILE` it lives under
+#: ``.worklog/`` — a prefix every dirty-path helper excludes — so the record can
+#: never be mistaken for work, and it disappears with the worktree.
+SESSION_BASELINE_FILE = ".worklog/session-baseline.json"
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -13314,6 +13322,16 @@ def _phase_start_locked(
     # spawn-failure evidence describes the *previous* session, which is why
     # this child is startable again (SA-0MWGZ8NWP009QD8G).
     clear_spawn_failure(abs_wt_path)
+    # Capture where the repository stood before any session can write, so
+    # pre-existing ambient dirt is never attributed to this child
+    # (SA-0MWL0XX88000E38K). ``phase_drive`` refreshes it at each spawn
+    # boundary; ``phase_parent`` records an ambient one for legacy worktrees.
+    report["steps"]["session_baseline"] = {
+        "recorded": record_session_baseline(
+            repo_root, abs_wt_path, work_item_id, parent_branch
+        )
+        is not None
+    }
 
     report["worktree_path"] = abs_wt_path
     report["branch"] = branch
@@ -16803,7 +16821,12 @@ def phase_parent(
                     return report
             elif worktree_path:
                 violation = _child_main_checkout_violation(
-                    cid, worktree_path, parent_branch
+                    cid,
+                    worktree_path,
+                    parent_branch,
+                    baseline=_resolve_child_baseline(
+                        cid, worktree_path, parent_branch
+                    ),
                 )
                 if violation:
                     return _fail_placement(cid, violation)
@@ -16864,7 +16887,12 @@ def phase_parent(
 
         if worktree_path:
             violation = _child_main_checkout_violation(
-                cid, worktree_path, parent_branch
+                cid,
+                worktree_path,
+                parent_branch,
+                baseline=_resolve_child_baseline(
+                    cid, worktree_path, parent_branch
+                ),
             )
             if violation:
                 return _fail_placement(cid, violation)
@@ -20728,6 +20756,17 @@ def phase_drive(
         _set_child_lock(lock)
         try:
             env = _child_session_env(worktree_path=worktree_path)
+            # Refresh the session baseline at the spawn boundary so every
+            # write this session makes is attributable on the next parent
+            # pass, while pre-existing ambient dirt stays exempt
+            # (SA-0MWL0XX88000E38K). Guarded on the directory: a fake/missing
+            # path must never turn a spawn into a hard error.
+            if Path(worktree_path).exists():
+                repo_root = _get_repo_root(worktree_path)
+                if repo_root:
+                    record_session_baseline(
+                        repo_root, worktree_path, child_id, parent_branch
+                    )
             LOG.info(
                 "Driving child %s (session %d/%d) in %s",
                 child_id, attempts[child_id], max_child_sessions,
@@ -21558,11 +21597,351 @@ def _git_path_has_changes(
     return True  # cannot compare (missing ref, git error); fail open
 
 
+# ---------------------------------------------------------------------------
+# Ambient-dirt session baseline (SA-0MWL0XX88000E38K)
+# ---------------------------------------------------------------------------
+#
+# The placement guard has no notion of time: it treated *any* dirty foreign
+# surface as evidence that the child wrote there. On a long-lived checkout
+# that holds other items' in-flight work, that made ``parent``/``drive``
+# refuse the common case — a never-spawned child whose own worktree is still
+# empty.
+#
+# The baseline records, before a child's session can write, the dirty paths
+# and HEAD of every foreign change surface (the main checkout and each
+# registered sibling worktree). A violation is then reported only for paths
+# or commits that are new/changed *since* the baseline. A genuine
+# post-baseline write still fails closed; pre-existing ambient dirt never
+# does.
+
+
+def _git_head_sha(path: Path) -> str:
+    """Return the current ``HEAD`` sha of *path*, or ``""`` when unreadable."""
+    result = run_cmd(
+        ["git", "rev-parse", "HEAD"], cwd=str(path), check=False, capture=True
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _git_commits_ahead(path: Path, parent_branch: str) -> int:
+    """Return how many commits *path*'s HEAD is ahead of *parent_branch*."""
+    result = run_cmd(
+        ["git", "rev-list", "--count", f"{parent_branch}..HEAD"],
+        cwd=str(path),
+        check=False,
+        capture=True,
+    )
+    if result.returncode != 0:
+        return 0
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return 0
+
+
+def _surface_status_map(
+    surface: Path, expected_dirty: tuple[str, ...]
+) -> dict[str, str]:
+    """Return ``{path: porcelain code}`` for a surface, filtered.
+
+    Excludes ``.worklog/`` and project-declared expected-dirty prefixes so the
+    map matches the offending-path scan. It lets the comparison detect a path
+    whose **status changed** (e.g. ``??`` → ``A``) even though it was already
+    dirty in the baseline.
+    """
+    entries = _main_checkout_status_map(str(surface))
+    return {
+        path: code
+        for path, code in entries.items()
+        if not _path_is_expected_dirty(path, expected_dirty)
+    }
+
+
+def _snapshot_foreign_surfaces(
+    repo_root: str | Path,
+    child_worktree: str | Path,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> dict[str, dict[str, Any]]:
+    """Capture the foreign change surfaces a child could write into.
+
+    Returns a deterministic, sorted mapping ``{surface_abs_path: {"dirty":
+    [repo-relative paths], "status": {path: code}, "head": "<sha>",
+    "ahead": <int>}}`` covering the main checkout and every registered sibling
+    worktree of the same repository. ``.worklog/`` paths and project-declared
+    expected-dirty paths are excluded from both ``dirty`` and ``status``. The
+    child's own worktree is never a foreign surface.
+
+    Args:
+        repo_root: Main checkout root.
+        child_worktree: The child's own worktree (excluded).
+        parent_branch: Branch used to count commits ahead per surface.
+
+    Returns:
+        Ordered mapping of resolved surface path → snapshot entry.
+    """
+    root = Path(repo_root).resolve()
+    wt = Path(child_worktree).resolve()
+    surfaces: list[Path] = [root]
+    surfaces.extend(_registered_sibling_worktree_paths(wt, root))
+    snapshot: dict[str, dict[str, Any]] = {}
+    for surface in sorted({p.resolve() for p in surfaces}, key=str):
+        expected = expected_dirty_paths(str(surface))
+        snapshot[str(surface)] = {
+            "dirty": _main_checkout_offending_paths(
+                str(surface), expected_dirty=expected
+            ),
+            "status": _surface_status_map(surface, expected),
+            "head": _git_head_sha(surface),
+            "ahead": _git_commits_ahead(surface, parent_branch),
+        }
+    return dict(sorted(snapshot.items()))
+
+
+def _foreign_surface_offenders_since(
+    baseline: dict[str, Any],
+    current: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the surfaces whose change surface grew since *baseline*.
+
+    For each surface in *current*: the dirty paths that are **new** since the
+    baseline or whose porcelain **status changed**, plus a surface that gained
+    commits ahead (``ahead`` increased). A surface absent from the baseline is
+    entirely new, so all of its dirty paths count.
+
+    Args:
+        baseline: A :func:`_snapshot_foreign_surfaces` mapping captured
+            earlier (or a persisted record carrying it under ``surfaces``).
+        current: The fresh snapshot to compare against.
+
+    Returns:
+        A list of ``{"surface": path, "paths": [...], "ahead_added": bool}``
+        for each surface that grew. Empty when nothing changed.
+    """
+    surfaces = baseline.get("surfaces", baseline)
+    if not isinstance(surfaces, dict):
+        return []
+    offenders: list[dict[str, Any]] = []
+    for surface, cur in current.items():
+        base = surfaces.get(surface)
+        cur_dirty = set(cur.get("dirty", []))
+        if base is None:
+            new_paths = sorted(cur_dirty)
+            status_changed: list[str] = []
+            ahead_added = bool(cur.get("ahead", 0))
+        else:
+            base_dirty = set(base.get("dirty", []))
+            new_paths = sorted(cur_dirty - base_dirty)
+            base_status = base.get("status", {}) or {}
+            cur_status = cur.get("status", {}) or {}
+            status_changed = sorted(
+                p
+                for p in cur_dirty & base_dirty
+                if cur_status.get(p) != base_status.get(p)
+            )
+            ahead_added = cur.get("ahead", 0) > base.get("ahead", 0)
+        offending = sorted(set(new_paths) | set(status_changed))
+        if offending or ahead_added:
+            offenders.append(
+                {
+                    "surface": surface,
+                    "paths": offending,
+                    "ahead_added": ahead_added,
+                }
+            )
+    return offenders
+
+
+def _session_baseline_path(worktree_path: str | Path) -> Path:
+    """Return the persisted session-baseline path inside a child's worktree."""
+    return Path(worktree_path) / SESSION_BASELINE_FILE
+
+
+def record_session_baseline(
+    repo_root: str | Path,
+    worktree_path: str | Path,
+    child_id: str,
+    parent_branch: str = DEFAULT_PARENT_BRANCH,
+) -> dict[str, Any] | None:
+    """Persist the foreign-surface baseline for *child_id* before a session.
+
+    Writes ``<worktree>/.worklog/session-baseline.json`` (a path every
+    dirty-path helper excludes), so the child stays ``CHILD_CLEAN``. The
+    record is refreshed immediately before each spawn so only a session's own
+    writes are attributable afterwards.
+
+    Args:
+        repo_root: Main checkout root.
+        worktree_path: The child's own worktree.
+        child_id: The owning child (a foreign record is never trusted).
+        parent_branch: Branch used for commit-ahead accounting.
+
+    Returns:
+        The persisted record, or ``None`` when the worktree does not exist or
+        the record cannot be written.
+    """
+    wt = Path(worktree_path)
+    if not wt.exists():
+        return None
+    # Best-effort: a bogus/unreadable repo root (or a transient git failure)
+    # must never turn a spawn into a hard error. A child without a record
+    # falls back to the legacy guard, which stays fail-closed.
+    try:
+        surfaces = _snapshot_foreign_surfaces(repo_root, wt, parent_branch)
+    except OSError as exc:
+        LOG.warning(
+            "Could not snapshot foreign surfaces for %s: %s", child_id, exc
+        )
+        return None
+    record = {
+        "child_id": child_id,
+        "parent_branch": parent_branch,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "surfaces": surfaces,
+    }
+    path = _session_baseline_path(wt)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(record, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError:
+        LOG.warning(
+            "Could not persist the session baseline for %s at %s", child_id, path
+        )
+        return None
+    return record
+
+
+def session_baseline_exists(worktree_path: str | Path) -> bool:
+    """Whether a session-baseline record is present in the worktree."""
+    return _session_baseline_path(worktree_path).exists()
+
+
+def read_session_baseline(
+    worktree_path: str | Path, child_id: str
+) -> dict[str, Any] | None:
+    """Read the persisted session baseline for *child_id*.
+
+    A missing, malformed or foreign-child record returns ``None`` so the
+    caller falls back to the legacy full guard — never a silent exemption.
+
+    Args:
+        worktree_path: The child's own worktree.
+        child_id: The owning child; a record naming another child is foreign.
+
+    Returns:
+        The persisted record, or ``None``.
+    """
+    path = _session_baseline_path(worktree_path)
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    if str(record.get("child_id", "")) != child_id:
+        return None
+    if not isinstance(record.get("surfaces"), dict):
+        return None
+    return record
+
+
+def _resolve_child_baseline(
+    child_id: str,
+    worktree_path: str,
+    parent_branch: str,
+) -> dict[str, Any] | None:
+    """Load a child's baseline, recording an ambient one for a fresh child.
+
+    A never-spawned child has no record yet: an ambient baseline is captured
+    now so pre-existing dirt is never attributed to it. A record that exists
+    but is corrupt or names another child is *not* replaced — returning
+    ``None`` makes the guard fall back to the legacy full scan.
+
+    Args:
+        child_id: The child being checked.
+        worktree_path: The child's own worktree.
+        parent_branch: Branch used for commit-ahead accounting.
+
+    Returns:
+        A baseline record/mapping, or ``None`` to signal the legacy guard.
+    """
+    baseline = read_session_baseline(worktree_path, child_id)
+    if baseline is not None:
+        return baseline
+    if session_baseline_exists(worktree_path):
+        # A corrupt/foreign record: fail open to the legacy guard rather than
+        # silently exempting the child.
+        return None
+    if not Path(worktree_path).exists():
+        return None
+    repo_root = _get_repo_root(str(worktree_path))
+    if not repo_root:
+        return None
+    return record_session_baseline(
+        repo_root, worktree_path, child_id, parent_branch
+    )
+
+
+def _format_baseline_violation(
+    child_id: str,
+    wt: Path,
+    root: Path,
+    offenders: list[dict[str, Any]],
+    parent_branch: str,
+) -> str:
+    """Render a post-baseline placement violation naming paths and roots.
+
+    Every offending surface is named with the paths that appeared since the
+    baseline (and a note when the surface only gained commits), and the
+    child's own worktree is always named so the operator knows where the work
+    belongs.
+    """
+    parts: list[str] = []
+    for offender in offenders:
+        surface = Path(offender["surface"])
+        paths = list(offender.get("paths") or [])
+        if surface.resolve() == root.resolve():
+            parts.append(
+                f"Child {child_id} produced changes in the main checkout at "
+                f"{root} instead of its worktree {wt} since its session "
+                f"baseline. The worktree has no changes (no dirty files and "
+                f"no commits ahead of {parent_branch}). Offending "
+                f"main-checkout paths:\n{_printable_path_listing(paths)}"
+            )
+            continue
+        ahead_note = (
+            f" The sibling gained commits ahead of {parent_branch} after "
+            f"the baseline."
+            if offender.get("ahead_added")
+            else ""
+        )
+        parts.append(
+            f"Child {child_id} produced changes in the sibling worktree "
+            f"{surface} instead of its worktree {wt} since its session "
+            f"baseline.{ahead_note} The worktree has no changes (no dirty "
+            f"files and no commits ahead of {parent_branch}), so the child's "
+            f"work did not land in its own worktree — `cwd` is not sufficient "
+            f"and a sibling worktree belongs to another work item. "
+            f"{_placement_path_listing(paths, parent_branch)}"
+        )
+    return (
+        "\n\n".join(parts)
+        + "\nThese changes appeared after the child's session baseline. "
+        + f"Move them into {wt} (or discard them), then re-run. A driven "
+        + "child MUST run every write/edit with a path that resolves inside "
+        + "its worktree."
+    )
+
+
 def _child_main_checkout_violation(
     child_id: str,
     worktree_path: str,
     parent_branch: str = DEFAULT_PARENT_BRANCH,
     repo_root: str | None = None,
+    baseline: dict[str, Any] | None = None,
 ) -> str | None:
     """Detect a child session that wrote outside its worktree.
 
@@ -21600,12 +21979,23 @@ def _child_main_checkout_violation(
     record, and only for a child that produced no work, so the genuine
     cross-worktree-write detection (SA-0MW5FIJNQ002Z24I) is unchanged.
 
+    When a **session baseline** is supplied
+    (:func:`record_session_baseline`), the foreign surfaces are compared
+    against it and only paths/commits that are new or changed since the
+    baseline are reported. Pre-existing ambient dirt is therefore never a
+    violation; a genuine post-baseline write still fails closed. With no
+    baseline the legacy full scan runs unchanged, so existing callers keep
+    their behaviour.
+
     Args:
         child_id: The child work item ID (named in the message).
         worktree_path: Absolute path to the child's worktree.
         parent_branch: Branch the worktree forked from (default: ``dev``).
         repo_root: Main checkout root (defaults to discovery from the
             worktree).
+        baseline: Optional session-baseline record (or raw surface mapping)
+            captured before the child's session could write. When ``None``
+            the legacy full guard runs.
 
     Returns:
         An actionable error message naming every offending surface (the
@@ -21644,6 +22034,40 @@ def _child_main_checkout_violation(
             child_id,
         )
         return None
+
+    # Baseline-aware comparison: only dirt that appeared *after* the child's
+    # session started is attributable to it. A never-spawned child's ambient
+    # dirt is captured by the baseline and never reported.
+    if baseline is not None:
+        try:
+            current = _snapshot_foreign_surfaces(root, wt, parent_branch)
+        except OSError as exc:
+            # Fail open to the legacy full scan rather than crash a gate.
+            LOG.warning(
+                "Could not snapshot foreign surfaces for %s (%s); falling "
+                "back to the legacy placement guard.",
+                child_id,
+                exc,
+            )
+            baseline = None
+    if baseline is not None:
+        offenders = _foreign_surface_offenders_since(baseline, current)
+        reportable: list[dict[str, Any]] = []
+        for offender in offenders:
+            surface = Path(offender["surface"]).resolve()
+            if surface == root.resolve():
+                reportable.append(offender)
+                continue
+            # Keep the debris filter: a new surface only counts when it is a
+            # live in-scope sibling (never out-of-root scratch or terminal
+            # debris, WL-0MWQLHDOS006CAIH).
+            if _is_live_foreign_surface(surface, wt, root):
+                reportable.append(offender)
+        if not reportable:
+            return None
+        return _format_baseline_violation(
+            child_id, wt, root, reportable, parent_branch
+        )
 
     offending = _main_checkout_offending_paths(str(root), expected_dirty=root_expected)
     sibling_offending: list[tuple[Path, list[str]]] = []

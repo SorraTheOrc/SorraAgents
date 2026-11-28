@@ -141,8 +141,12 @@ def _make_superproject(
         tmp_path / "repo", default_branch="master", sandbox_root=tmp_path
     )
     (repo / "README.md").write_text("# superproject\n", encoding="utf-8")
-    # Mirror the real checkout: the implement state file never dirties a tree.
-    (repo / ".gitignore").write_text(".implement_state.json\n", encoding="utf-8")
+    # Mirror the real checkout: the implement bookkeeping never dirties a
+    # tree (the state file, and the ``.worklog/`` session baseline that
+    # ``phase_start`` now records — SA-0MWL0XX88000E38K).
+    (repo / ".gitignore").write_text(
+        ".implement_state.json\n.worklog/\n", encoding="utf-8"
+    )
     git_sandbox.commit_all(repo, "initial commit")
 
     recorded_sha: str | None = None
@@ -475,7 +479,9 @@ class TestPhaseStartBootstrap:
             tmp_path / "plain", default_branch="master", sandbox_root=tmp_path
         )
         (repo / "README.md").write_text("# plain\n", encoding="utf-8")
-        (repo / ".gitignore").write_text(".implement_state.json\n", encoding="utf-8")
+        (repo / ".gitignore").write_text(
+            ".implement_state.json\n.worklog/\n", encoding="utf-8"
+        )
         git_sandbox.commit_all(repo, "initial")
         git_sandbox.run_git(repo, ["branch", "dev"], check=True)
 

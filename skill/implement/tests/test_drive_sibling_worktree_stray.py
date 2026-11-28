@@ -179,6 +179,23 @@ def _run_phase_parent(
     return report, status_calls, invoked
 
 
+def _establish_baseline(worktree: Path, child_id: str = CHILD_ID) -> dict:
+    """Record the session baseline ``phase_start``/``phase_drive`` write.
+
+    A *genuine* stray write happens **after** the baseline: establishing it
+    here keeps the guard's post-baseline semantics under test instead of the
+    ambient exemption a never-spawned child rightfully gets
+    (SA-0MWL0XX88000E38K).
+    """
+    repo_root = implement._get_repo_root(str(worktree))
+    assert repo_root, f"could not resolve the repo root for {worktree}"
+    record = implement.record_session_baseline(
+        repo_root, worktree, child_id, PARENT_BRANCH
+    )
+    assert record is not None
+    return record
+
+
 class TestDrivenChildStraysIntoSiblingWorktree:
     def test_sibling_write_is_detected_and_the_run_fails_closed(
         self, child_worktree: Path, sibling_worktree: Path
@@ -189,6 +206,7 @@ class TestDrivenChildStraysIntoSiblingWorktree:
         child's own worktree holds nothing. ``phase_parent`` must fail closed
         naming both roots and the offending sibling paths.
         """
+        _establish_baseline(child_worktree)
         (sibling_worktree / "stray.py").write_text(
             "x = 1\n", encoding="utf-8"
         )
@@ -212,6 +230,7 @@ class TestDrivenChildStraysIntoSiblingWorktree:
         # The stray child committed into the sibling worktree: no dirty files
         # exist to list, but the sibling is ahead of the parent branch — the
         # run still fails closed naming the sibling (no status mutation).
+        _establish_baseline(child_worktree)
         _commit(sibling_worktree, "stray-committed.py", branch_tag=SIBLING_ID)
 
         report, status_calls, invoked = _run_phase_parent(child_worktree)
@@ -422,6 +441,7 @@ class TestSpawnFailedChildIsStartableAgain:
         self, child_worktree: Path, sibling_worktree: Path
     ) -> None:
         """No weakening: the same dirt *without* evidence is a violation."""
+        _establish_baseline(child_worktree)
         (sibling_worktree / "stray.py").write_text("x = 1\n", encoding="utf-8")
 
         report, status_calls, invoked = _run_phase_parent(
@@ -438,6 +458,7 @@ class TestSpawnFailedChildIsStartableAgain:
     def test_evidence_naming_another_child_keeps_the_guard(
         self, child_worktree: Path, sibling_worktree: Path
     ) -> None:
+        _establish_baseline(child_worktree)
         (sibling_worktree / "stray.py").write_text("x = 1\n", encoding="utf-8")
         implement.record_spawn_failure(
             str(child_worktree), "SA-OTHERCHILD00001", SPAWN_FAILURE_REASON
@@ -1845,3 +1866,358 @@ class TestInfraRetryWithLiveSiblingWorktree:
         # Its own work short-circuits the guard first (condition 3), so the
         # sibling surface is never even attributed to it.
         assert violations == [None]
+
+
+# ---------------------------------------------------------------------------
+# Ambient-dirt baselines: a never-spawned child is not blamed for pre-existing
+# dirt (SA-0MWL0XX88000E38K)
+# ---------------------------------------------------------------------------
+#
+# Incident: ``implement.py drive <epic>`` refused the next child **before**
+# spawning any session because a dirty main checkout and several dirty sibling
+# worktrees (one owned by a still-open item) were attributed to the child. Its
+# own worktree was simply empty — its session had not started.
+#
+# Contract pinned here:
+#
+# - ``_snapshot_foreign_surfaces`` captures every foreign surface (the main
+#   checkout plus each registered sibling worktree) deterministically.
+# - ``_foreign_surface_offenders_since`` reports only paths/commits that are
+#   new or changed since the baseline.
+# - A never-spawned child (no baseline yet) has an ambient baseline recorded
+#   by ``phase_parent`` and is reported startable (parent AC1).
+# - ``phase_drive`` refreshes the baseline at the spawn boundary and names no
+#   unrelated sibling as an offender (parent AC3).
+# - A spawned session's post-baseline write still fails closed into the main
+#   checkout or a sibling worktree, even with other pre-existing dirt present
+#   (parent AC2).
+# - A missing/corrupt/foreign baseline falls back to the legacy full guard.
+
+
+class TestForeignSurfaceSnapshotPrimitive:
+    """The snapshot/comparison primitive is deterministic and precise."""
+
+    def test_snapshot_covers_main_and_registered_siblings(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (rooted_repo / "ambient-main.txt").write_text("x\n", encoding="utf-8")
+        (live / "ambient-sibling.ts").write_text("x\n", encoding="utf-8")
+
+        snapshot = implement._snapshot_foreign_surfaces(
+            rooted_repo, canonical_child, PARENT_BRANCH
+        )
+
+        assert str(rooted_repo) in snapshot
+        assert str(live) in snapshot
+        # The child's own worktree is never a foreign surface.
+        assert str(canonical_child) not in snapshot
+        assert snapshot[str(rooted_repo)]["dirty"] == ["ambient-main.txt"]
+        assert snapshot[str(live)]["dirty"] == ["ambient-sibling.ts"]
+        assert snapshot[str(rooted_repo)]["head"]
+        # Deterministic ordering keeps the persisted record byte-stable.
+        assert list(snapshot) == sorted(snapshot)
+
+    def test_only_new_dirt_is_reported_since_the_baseline(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (rooted_repo / "pre-existing-main.txt").write_text("x\n", encoding="utf-8")
+        (live / "pre-existing-sibling.ts").write_text("x\n", encoding="utf-8")
+        baseline = implement._snapshot_foreign_surfaces(
+            rooted_repo, canonical_child, PARENT_BRANCH
+        )
+
+        (rooted_repo / "new-main.txt").write_text("x\n", encoding="utf-8")
+        current = implement._snapshot_foreign_surfaces(
+            rooted_repo, canonical_child, PARENT_BRANCH
+        )
+        offenders = implement._foreign_surface_offenders_since(baseline, current)
+
+        by_surface = {o["surface"]: o for o in offenders}
+        assert set(by_surface) == {str(rooted_repo)}
+        assert by_surface[str(rooted_repo)]["paths"] == ["new-main.txt"]
+
+    def test_a_surface_that_gained_commits_is_an_offender(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        baseline = implement._snapshot_foreign_surfaces(
+            rooted_repo, canonical_child, PARENT_BRANCH
+        )
+
+        _commit(live, "sibling-commit.ts", branch_tag=LIVE_ITEM)
+        current = implement._snapshot_foreign_surfaces(
+            rooted_repo, canonical_child, PARENT_BRANCH
+        )
+        offenders = implement._foreign_surface_offenders_since(baseline, current)
+
+        by_surface = {o["surface"]: o for o in offenders}
+        assert str(live) in by_surface
+        assert by_surface[str(live)]["ahead_added"] is True
+
+
+class TestSessionBaselineRecord:
+    """The persisted record never counts as work and is never oversized."""
+
+    def test_baseline_record_never_counts_as_work(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        implement.record_session_baseline(
+            rooted_repo, canonical_child, CHILD_ID, PARENT_BRANCH
+        )
+
+        assert implement.session_baseline_exists(canonical_child)
+        # The record lives under ``.worklog/`` and must not turn the clean
+        # child into a dirty/ahead surface.
+        assert (
+            implement._git_path_has_changes(canonical_child, PARENT_BRANCH)
+            is False
+        )
+        assert (
+            implement._classify_child_worktree(
+                CHILD_ID, str(canonical_child), PARENT_BRANCH
+            )
+            == implement.CHILD_CLEAN
+        )
+        snapshot = implement._snapshot_foreign_surfaces(
+            rooted_repo, canonical_child, PARENT_BRANCH
+        )
+        assert all(
+            not p.startswith(".worklog/")
+            for entry in snapshot.values()
+            for p in entry["dirty"]
+        )
+
+    def test_a_foreign_child_record_is_never_trusted(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        implement.record_session_baseline(
+            rooted_repo, canonical_child, CHILD_ID, PARENT_BRANCH
+        )
+
+        assert implement.read_session_baseline(canonical_child, CHILD_ID) is not None
+        assert (
+            implement.read_session_baseline(
+                canonical_child, "SA-OTHERCHILD00001"
+            )
+            is None
+        )
+
+
+class TestNeverSpawnedChildIgnoresAmbientDirt:
+    """AC1: ambient dirt is never attributed to a child with no session."""
+
+    def test_dirty_main_and_live_sibling_do_not_block_the_next_child(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        (rooted_repo / "ambient-main.txt").write_text(
+            "in flight\n", encoding="utf-8"
+        )
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "ambient-sibling.ts").write_text("in flight\n", encoding="utf-8")
+        assert not implement.session_baseline_exists(canonical_child)
+
+        report, status_calls, invoked = _run_phase_parent(canonical_child)
+
+        assert report["success"] is True
+        assert report.get("placement_violation") is not True
+        assert report["next_child"] == CHILD_ID
+        # No unrelated sibling is named as an offender.
+        assert str(live) not in report.get("message", "")
+        # An ambient baseline is now recorded so a later pass never
+        # re-attributes the same pre-existing dirt.
+        assert implement.session_baseline_exists(canonical_child)
+        assert invoked == []
+        assert status_calls == []
+
+    def test_phase_parent_records_an_ambient_baseline_when_none_exists(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        (rooted_repo / "ambient-main.txt").write_text("x\n", encoding="utf-8")
+        assert not implement.session_baseline_exists(canonical_child)
+
+        report, _status_calls, _invoked = _run_phase_parent(canonical_child)
+
+        assert report["success"] is True
+        assert report.get("placement_violation") is not True
+        assert implement.session_baseline_exists(canonical_child)
+
+
+class TestDriveSpawnsDespiteAmbientDirt:
+    """AC3: ``drive`` spawns the next child; no sibling is blamed."""
+
+    def _drive(
+        self, rooted_repo: Path, canonical_child: Path, live: Path
+    ) -> tuple[dict, list[str], dict]:
+        child_item = _child("in-progress")
+        spawns: list[str] = []
+        at_spawn: dict = {}
+
+        def _wl_show(work_item_id: str) -> dict:
+            if work_item_id == PARENT_ID:
+                return {
+                    "id": PARENT_ID,
+                    "title": "Parent",
+                    "status": "plan_complete",
+                    "stage": "plan_complete",
+                }
+            return dict(child_item)
+
+        def _spawner(child_id, worktree_path, timeout, env, verbose=False):
+            spawns.append(child_id)
+            # The baseline must already be refreshed when the session starts.
+            at_spawn["baseline"] = implement.read_session_baseline(
+                str(canonical_child), CHILD_ID
+            )
+            return {
+                "success": False,
+                "returncode": 1,
+                "reason": SPAWN_FAILURE_REASON,
+            }
+
+        parent_report = {
+            "success": True,
+            "next_child": CHILD_ID,
+            "worktree_path": str(canonical_child),
+        }
+        with (
+            mock.patch.object(implement, "wl_show", side_effect=_wl_show),
+            mock.patch.object(
+                implement, "wl_show_children", return_value=[child_item]
+            ),
+            mock.patch.object(
+                implement, "_discover_worktree", return_value=str(canonical_child)
+            ),
+            mock.patch.object(implement, "wl_add_comment", return_value=True),
+            mock.patch.object(
+                implement,
+                "_release_provider_failed_child",
+                return_value={"released": False, "reason": "test stub"},
+            ),
+            mock.patch.object(
+                implement,
+                "_release_orphaned_child_claim",
+                return_value={"released": False, "reason": "test stub"},
+            ),
+            mock.patch.object(
+                implement, "_detect_stranded_child", return_value={"stranded": False}
+            ),
+            mock.patch.object(
+                implement, "_maybe_remove_child_worktree", return_value=None
+            ),
+        ):
+            report = implement.phase_drive(
+                PARENT_ID,
+                parent_runner=lambda *a, **k: dict(parent_report),
+                spawn_session=_spawner,
+                child_timeout=60,
+                delay=lambda _seconds: None,
+            )
+        return report, spawns, at_spawn
+
+    def test_drive_spawns_and_names_no_sibling_offender(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        (rooted_repo / "ambient-main.txt").write_text(
+            "in flight\n", encoding="utf-8"
+        )
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "ambient-sibling.ts").write_text("in flight\n", encoding="utf-8")
+
+        report, spawns, at_spawn = self._drive(
+            rooted_repo, canonical_child, live
+        )
+
+        assert spawns == [CHILD_ID]
+        assert at_spawn["baseline"] is not None
+        assert report.get("placement_violation") is not True
+        assert str(live) not in json.dumps(report)
+        assert str(rooted_repo) not in json.dumps(
+            [e.get("reason", "") for e in report.get("children_driven", [])]
+        )
+
+
+class TestBaselineAwareGenuineStray:
+    """AC2: a spawned session's post-baseline write still fails closed."""
+
+    def _violation(self, rooted_repo: Path, canonical_child: Path, baseline):
+        with _patch_wl_show({LIVE_ITEM: {"id": LIVE_ITEM, "status": "in-progress"}}):
+            return implement._child_main_checkout_violation(
+                CHILD_ID,
+                str(canonical_child),
+                PARENT_BRANCH,
+                repo_root=str(rooted_repo),
+                baseline=baseline,
+            )
+
+    def test_post_baseline_main_checkout_write_still_fails_closed(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        (rooted_repo / "preexisting-main.txt").write_text("x\n", encoding="utf-8")
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "preexisting-sibling.ts").write_text("x\n", encoding="utf-8")
+        baseline = _establish_baseline(canonical_child)
+
+        (rooted_repo / "stray-main.txt").write_text("x\n", encoding="utf-8")
+        violation = self._violation(rooted_repo, canonical_child, baseline)
+
+        assert violation is not None
+        assert "stray-main.txt" in violation
+        assert "preexisting-main.txt" not in violation
+        assert str(canonical_child) in violation
+
+    def test_post_baseline_sibling_write_still_fails_closed(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        (rooted_repo / "preexisting-main.txt").write_text("x\n", encoding="utf-8")
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "preexisting-sibling.ts").write_text("x\n", encoding="utf-8")
+        baseline = _establish_baseline(canonical_child)
+
+        (live / "stray-sibling.ts").write_text("x\n", encoding="utf-8")
+        violation = self._violation(rooted_repo, canonical_child, baseline)
+
+        assert violation is not None
+        assert "stray-sibling.ts" in violation
+        assert str(live) in violation
+        assert "preexisting-sibling.ts" not in violation
+
+    def test_preexisting_dirt_only_is_no_violation(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        (rooted_repo / "preexisting-main.txt").write_text("x\n", encoding="utf-8")
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "preexisting-sibling.ts").write_text("x\n", encoding="utf-8")
+        baseline = _establish_baseline(canonical_child)
+
+        assert self._violation(rooted_repo, canonical_child, baseline) is None
+
+    def test_sibling_commits_after_the_baseline_still_fail_closed(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        baseline = _establish_baseline(canonical_child)
+
+        _commit(live, "sibling-commit.ts", branch_tag=LIVE_ITEM)
+        violation = self._violation(rooted_repo, canonical_child, baseline)
+
+        assert violation is not None
+        assert str(live) in violation
+        assert "commits ahead of dev" in violation
+
+    def test_corrupt_baseline_falls_back_to_the_legacy_guard(
+        self, rooted_repo: Path, canonical_child: Path
+    ) -> None:
+        live = _canonical_worktree(rooted_repo, LIVE_ITEM)
+        (live / "stray.ts").write_text("x\n", encoding="utf-8")
+        # A corrupt record exists: it must never silently exempt the child.
+        path = implement._session_baseline_path(canonical_child)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not json", encoding="utf-8")
+
+        report, _status_calls, _invoked = _run_phase_parent(canonical_child)
+
+        assert report["success"] is False
+        assert report["placement_violation"] is True
+        assert str(live) in report["message"]
