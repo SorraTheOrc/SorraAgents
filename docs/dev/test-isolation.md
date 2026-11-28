@@ -908,6 +908,22 @@ commit_all(repo, "init")
   as its own, so the root-file-marker scope tests failed only inside
   `implement.py finish` (SA-0MVWJ6U3J003TLRZ). Regression coverage:
   `skill/audit/tests/test_audit_runner_launch_context.py::TestRootFileOnlyRepoManifest::test_foreign_gate_index_does_not_replace_the_repo_index`.
+- **Local-path submodules need an explicit file-transport opt-in.** Git 2.38+
+  defaults `protocol.file.allow=user`, which refuses a fixture's
+  `git submodule add` from a `tmp_path` remote with
+  `fatal: transport 'file' not allowed` (SA-0MWZY32SU00771VB). `run_git`
+  supplies `-c protocol.file.allow=always` per command, so a fixture that adds
+  a submodule through the helper needs no extra ceremony and no ambient/global
+  git config is read or written. A helper that instead spawns
+  `git submodule update --init` in a **subprocess that inherits the process
+  environment** (for example the production code path a test drives) opts in
+  per process via git's `GIT_CONFIG_*` variables — `GIT_CONFIG_COUNT=1`,
+  `GIT_CONFIG_KEY_0=protocol.file.allow`, `GIT_CONFIG_VALUE_0=always` — never a
+  global config, so the production command keeps the safer default for
+  untrusted `.gitmodules` URLs. Regression coverage:
+  `tests/test_git_sandbox_file_protocol.py` (the helper's command shape and
+  behaviour) and `tests/test_implement_submodule_ordering.py` (the inheriting
+  subprocess workaround).
 
 #### The guard
 

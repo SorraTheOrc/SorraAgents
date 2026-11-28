@@ -101,3 +101,24 @@ def test_submodule_add_without_opt_in_would_fail(tmp_path):
     if plain.returncode == 0:
         pytest.skip("git allows file transport by default in this environment")
     assert "transport 'file' not allowed" in plain.stderr
+
+
+def test_canonical_test_isolation_doc_documents_the_opt_in():
+    """The fixture-git-helper rules must document the file-transport opt-in.
+
+    Regression guard for SA-0MWZY32SU00771VB AC2: the behaviour is implemented
+    in ``run_git`` and exercised by the fixtures above, so the canonical
+    ``docs/dev/test-isolation.md`` rule section must name both the per-command
+    flag and the inheriting-subprocess ``GIT_CONFIG_*`` workaround.
+    """
+    doc = (REPO_ROOT / "docs" / "dev" / "test-isolation.md").read_text(
+        encoding="utf-8"
+    )
+    assert "protocol.file.allow=always" in doc, (
+        "test-isolation.md must document run_git's per-command opt-in"
+    )
+    assert "GIT_CONFIG_KEY_0" in doc and "GIT_CONFIG_VALUE_0" in doc, (
+        "test-isolation.md must document the inheriting-subprocess GIT_CONFIG_* "
+        "workaround"
+    )
+    assert "SA-0MWZY32SU00771VB" in doc
