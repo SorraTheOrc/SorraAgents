@@ -19,11 +19,21 @@ set -euo pipefail
 # Derived version files:
 #   After the dev merge, when package.json declares a `build` script, the
 #   script runs the build and commits regenerated tracked files (e.g.
-#   ContextHub src/version.ts) so they match the bumped version (non-fatal).
-#   Submodule pointers the build advanced are restored to their recorded
-#   commits, and any pin file the build rewrote to follow the advanced commit
-#   is restored with them (SA-0MW6LOXBO0008706); the regeneration line names
-#   the restored paths.
+#   ContextHub src/version.ts) so they match the bumped version. This
+#   *regeneration* step is non-fatal for its own purpose (committing derived
+#   files). Submodule pointers the build advanced are restored to their
+#   recorded commits, and any pin file the build rewrote to follow the advanced
+#   commit is restored with them (SA-0MW6LOXBO0008706); the regeneration line
+#   names the restored paths.
+#
+# Build gate:
+#   A separate, *fatal* build/type-check assertion runs the repository's
+#   build (`package.json` scripts.build) on the merged tree before tagging
+#   (SA-0MWKQ5TXL005CLX5). The full-suite gate runs tests, and the test
+#   runners transpile without type-checking, so a tree that does not build
+#   could otherwise pass every gate; a build failure now blocks the release.
+#   Repos without `scripts.build` are unaffected; SHIP_BUILD_SKIP=1 bypasses
+#   (logged; not recommended).
 
 # Resolve the directory where this script resides (used to find sibling scripts)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -308,15 +318,18 @@ fi
 # After the dev merge (final tree) and before tagging, run the repo's build
 # so auto-generated derived version files (e.g. ContextHub src/version.ts)
 # match the bumped package.json; then commit the regenerated tracked files
-# (SA-0MV7WAUHZ009UWY2). Non-fatal: a failed build logs a warning and the
-# release continues, mirroring the CHANGELOG step.
+# (SA-0MV7WAUHZ009UWY2). This step is non-fatal for *regeneration*: a failed
+# build logs a warning and the release continues, mirroring the CHANGELOG
+# step. A build *failure* is caught by the fatal build gate below — this
+# step's non-fatal semantics only govern committing regenerated files.
 if [[ "$DRY_RUN" != "true" && -n "${NEW_VERSION:-}" ]]; then
   REGEN_SCRIPT="${SCRIPT_DIR}/regenerate-version.js"
   if [[ -f "$REGEN_SCRIPT" ]]; then
     # Capture the regeneration report so the release log names any submodule
     # pointer / pin file the build rewrote and the step restored to the
-    # recorded commit (SA-0MW6LOXBO0008706). Non-fatal: a failed build logs a
-    # warning and the release continues, mirroring the CHANGELOG step.
+    # recorded commit (SA-0MW6LOXBO0008706). Non-fatal for regeneration: a
+    # failed build logs a warning and this step continues, mirroring the
+    # CHANGELOG step; the fatal build gate below blocks the release.
     REGEN_OUTPUT=""
     if ! REGEN_OUTPUT="$(node "$REGEN_SCRIPT" "$NEW_VERSION" 2>&1)"; then
       echo "Warning: derived version file regeneration failed (continuing with release)" >&2
@@ -327,6 +340,46 @@ if [[ "$DRY_RUN" != "true" && -n "${NEW_VERSION:-}" ]]; then
   fi
 elif [[ "$DRY_RUN" == "true" ]]; then
   echo "Dry-run: derived version files would be regenerated for v${NEW_VERSION:-<version>}"
+fi
+
+# ── Build / type-check gate on the merged dev→main tree (SA-0MWKQ5TXL005CLX5) ──
+# The full-suite gate below asserts tests, but every test runner in the
+# framework (vitest, node --test, pytest) transpiles or interprets without
+# type-checking, so a tree that does not compile can still yield a green
+# suite. This gate runs the repository's build (`package.json` scripts.build)
+# on the merged tree and BLOCKS the release on failure — the real incident
+# (ContextHub v1.0.30) shipped a merge that dropped code while leaving its
+# consumers in place (9 TS2305/TS2724 errors) because the build step was
+# non-fatal and tests do not type-check.
+#
+# Independent of the derived-version-file regeneration above: regeneration
+# keeps its own non-fatal semantics for *its* purpose (committing regenerated
+# files), while a build *failure* is always fatal here. It runs after the
+# tree-modifying steps and before the tag, alongside the full-suite gate, so
+# the asserted tree is exactly the tree that lands on main. Repos without a
+# `scripts.build` are unaffected (no-op). SHIP_BUILD_SKIP=1 bypasses (logged;
+# not recommended).
+if [[ "$DRY_RUN" != "true" && "${SHIP_BUILD_SKIP:-}" != "1" ]]; then
+  BUILD_GATE_SCRIPT="${SCRIPT_DIR}/assert-build.mjs"
+  if [[ ! -f "$BUILD_GATE_SCRIPT" ]]; then
+    echo "ERROR: build gate cannot run — assert-build.mjs not found at '$BUILD_GATE_SCRIPT'." >&2
+    echo "  Refusing to release without a build assertion on the merged tree." >&2
+    echo "  Set SHIP_BUILD_SKIP=1 to bypass (not recommended)." >&2
+    exit 1
+  fi
+  echo "Release gate: running the repository build on the merged dev→main tree..." >&2
+  if node "$BUILD_GATE_SCRIPT"; then
+    echo "Release gate: build green on the merged tree." >&2
+  else
+    echo "ERROR: Build failed on the merged dev→main tree — the release is blocked." >&2
+    echo "  The full-suite gate does not type-check; fix the build on dev and re-run the release." >&2
+    echo "  SHIP_BUILD_SKIP=1 bypasses (not recommended)." >&2
+    exit 1
+  fi
+elif [[ "$DRY_RUN" != "true" && "${SHIP_BUILD_SKIP:-}" == "1" ]]; then
+  echo "WARNING: SHIP_BUILD_SKIP=1 — the build gate is BYPASSED; a tree that does not build may be released (not recommended)." >&2
+elif [[ "$DRY_RUN" == "true" ]]; then
+  echo "Dry-run: build gate would run the repository build on the merged tree"
 fi
 
 # ── Full-suite gate on the merged dev→main tree (SA-0MVECQUGF0064U81) ──

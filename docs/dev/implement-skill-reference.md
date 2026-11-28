@@ -1449,6 +1449,16 @@ meaningful together, and both are pinned by regression tests.
    staged index (`git write-tree`), never the loose working-tree state. A
    result can therefore not be attributed to a tree whose suite never ran.
 
+> **The finish gate runs tests, not type-checks.** Every test runner in the
+> framework (vitest, `node --test`, pytest) transpiles or interprets without
+> type-checking, so a green changed-scope verdict says nothing about whether
+> the tree compiles. Type-checking is asserted at the **release gate**:
+> `merge-dev-to-main.sh` runs the repository's build (`scripts.build`) fatally
+> on the merged tree (SA-0MWKQ5TXL005CLX5). Adding a type-check assertion to
+> the `finish` gate itself is a separate work item — until then, a change that
+> touches typed code should run the repo's own `build`/`typecheck` locally
+> before finishing.
+
 #### Gate semantics: the tested tree is the would-be-commit tree (SA-0MVQHVGFR006W8LG)
 
 `phase_finish` delegates its test step to `run_gate_suite()`, which wraps

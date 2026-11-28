@@ -156,6 +156,12 @@ def _run_release(
     gate_copy = release_dir / "worklog-ref-gate.sh"
     shutil.copy(gate_source, gate_copy)
     gate_copy.chmod(0o755)
+    # The fatal build gate is a sibling helper (SA-0MWKQ5TXL005CLX5) and the
+    # real install always ships it. This fixture has no package.json, so the
+    # gate no-ops — but it must be present or the release fails closed.
+    build_gate_source = RELEASE_SCRIPT.parent / "assert-build.mjs"
+    assert build_gate_source.exists(), f"missing release helper: {build_gate_source}"
+    shutil.copy(build_gate_source, release_dir / "assert-build.mjs")
 
     env = {
         **fixture_git_env(),

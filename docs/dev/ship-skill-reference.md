@@ -28,6 +28,7 @@ All scripts below are internal implementation details — they are not exposed a
 |--------|---------|
 | `./skill/ship/scripts/run-release.js` | Release wrapper (includes gating and the verified post-release tail: verify → notify → close → cleanup → dev sync last, non-fatal) |
 | `./skill/ship/scripts/release/merge-dev-to-main.sh` | Canonical release merge script |
+| `./skill/ship/scripts/release/assert-build.mjs` | Fatal build/type-check gate on the merged dev→main tree (`readBuildScript`, `assertBuild`) — blocks the release on a build failure, independent of the non-fatal derived-file regeneration (SA-0MWKQ5TXL005CLX5) |
 | `./skill/ship/scripts/release/changelog-merge.js` | CHANGELOG.md dev→main merge helper and post-merge release-section guard (`extractReleaseSection`, `insertReleaseSection`, `mergeReleaseSection`, `guardReleaseSection`; SA-0MVXY0VPC002B0MO) |
 | `./skill/ship/scripts/release/bump-preflight.js` | Version-bump preflight (read-only): gathers `stage: in_review` release candidates, enriches each with `## Impact`/user story, type, priority and a description excerpt, and renders the review packet with the `patch`/`minor`/`major` outcomes computed by `bump-version.js` (`gatherReleaseCandidates`, `enrichCandidate`, `renderReviewPacket`, `runBumpPreflight`; SA-0MWFVQWGN006G4KA) |
 | `./skill/ship/scripts/release/bump-decision.js` | Pure version-bump decision rules for the evaluation step (`shouldAskProducer`, `buildJustification`, `resolveApproval`, `normaliseProducerDecision`) — no subprocess, no filesystem access, no mutation (SA-0MWFVQX4W0080O86) |
@@ -430,6 +431,41 @@ version field" message.
 derived-file regeneration only runs when `package.json` declares a
 `scripts.build`; both behave exactly as before for Python-only repos (the
 derived-file step is a non-fatal no-op).
+
+### Build / type-check gate (SA-0MWKQ5TXL005CLX5)
+
+`release/assert-build.mjs` is the release's **fatal** build assertion. It is
+invoked by `merge-dev-to-main.sh` after the derived-file regeneration step and
+before the tag, alongside the full-suite gate:
+
+- It reads `package.json` `scripts.build` and runs `npm run build` on the
+  merged tree. **A build failure exits non-zero and blocks the release** before
+  tagging/PR/promotion; the compiler output is streamed into the release log.
+- **No `scripts.build` → documented no-op** (exit 0), so repos without a build
+  are unaffected.
+- **Independent of regeneration.** `regenerate-version.js` runs the same build
+  **non-fatally** to commit regenerated derived files; that non-fatal contract
+  governs *committing* only. A build *failure* is always fatal here, so the
+  release can never rely on the regeneration step to catch it.
+- **Why it exists.** The full-suite gate runs tests, and every test runner
+  (vitest, `node --test`, pytest) transpiles/interprets without type-checking.
+  The v1.0.30 incident shipped a merge that dropped an export while leaving
+  its consumers (9 `TS2305`/`TS2724` errors) because the suite was green and
+  the build step was non-fatal.
+- **`SHIP_BUILD_SKIP=1`** bypasses it, mirroring `SHIP_TEST_SKIP`: explicit,
+  documented and logged loudly by the script; not recommended. A missing
+  `assert-build.mjs` sibling fails the release **closed** (like the
+  full-suite gate's missing `run_tests.py`).
+- **Project-side configuration error.** The gate is only as strong as the build
+  script. A `build`/`typecheck` command must cover the whole source tree,
+  package subtrees included: a root `tsc` whose `include` is `["src/**/*"]`
+  does **not** cover `packages/*`, and is called out as a project-side
+  configuration error rather than silently accepted.
+
+Tests: `tests/test_release_build_gate.py` (end-to-end: red build blocks before
+any tag, green proceeds through the tag, no-build no-op, bypass, dry-run,
+missing-helper fail-closed) and `tests/node/test-assert-build.mjs` (pure
+decision boundary and CLI exit codes).
 
 ### Child producer-review override (close step)
 

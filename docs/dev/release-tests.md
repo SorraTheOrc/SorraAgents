@@ -56,6 +56,28 @@ python3 -m pytest tests/dev/test_smoke.py -v -k critical
 3. The merge to `main` should **only** be performed when the full suite
    reports success.
 
+## The full suite does not type-check
+
+A green full suite is **not** evidence that the tree compiles. Every test
+runner used here (vitest, `node --test`, pytest) transpiles or interprets the
+source without type-checking, so a TypeScript tree with unresolved imports or
+type errors can still be full suite green. The release therefore runs a
+separate **fatal build/type-check gate** on the merged dev→main tree
+(`scripts/release/assert-build.mjs`, invoked by `merge-dev-to-main.sh`): it
+runs the repository's build (`package.json` `scripts.build`) and blocks the
+release on failure, before any tag is created (SA-0MWKQ5TXL005CLX5). It is a
+no-op for repositories without a `scripts.build`; `SHIP_BUILD_SKIP=1` bypasses
+it (logged; not recommended). See
+[release-process.md — Build / Type-Check Gate](./release-process.md#build--type-check-gate).
+
+Because the gate can only assert the project's build script, that script must
+cover the **whole** source tree, package subtrees included. A root `tsc` whose
+`tsconfig.json` `include` is `["src/**/*"]` does **not** cover
+`packages/*/src/**`, so type errors there would pass both gates. A build that
+misses package subtrees is a **project-side configuration error**, not a
+silently accepted release; fix the build/typecheck configuration rather than
+bypassing the gate.
+
 ## Hang abort vs host contention
 
 The runner that executes the project suite bounds every stage with a

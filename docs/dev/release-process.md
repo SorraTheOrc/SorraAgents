@@ -53,6 +53,12 @@ Before merging `dev` into `main`, the Release Manager **must** verify:
    - Smoke tests have passed locally.
    - Critical tests have passed locally.
    - The full test suite has passed locally (see [Release Tests](./release-tests.md) for commands).
+   - The repository build (`npm run build`) passes and type-checks the **full**
+     source tree, package subtrees included. Tests do not type-check, so this
+     is a separate requirement; the release's [Build / Type-Check
+     Gate](#build--type-check-gate) enforces it on the merged tree. A build
+     script whose `tsconfig`/include omits `packages/*` is a project-side
+     configuration error, not an accepted state.
 
 2. **No open merge conflicts**
    - Ensure `dev` has no unresolved conflicts with `main`.
@@ -161,14 +167,19 @@ The script will:
 4. Merge `dev` into the release branch (`dev` → `main`).
 5. **Regenerate derived version files** — when `package.json` declares a
    `build` script, run `npm run build` on the merged tree and commit the
-   regenerated tracked files (non-fatal; see [Derived Version File
-   Regeneration](#derived-version-file-regeneration)).
-6. Create an **annotated git tag** `v<new-version>` on the merge commit.
-7. Push the merge branch and the tag to `origin`.
-8. Create a **GitHub Pull Request** from the temp branch to `main`.
-9. Wait for required status checks to pass on the PR (if any are configured).
-10. Merge the PR using `gh pr merge --merge --delete-branch`.
-11. Record an audit comment in the worklog with the merge commit hash,
+   regenerated tracked files (non-fatal *for regeneration*; see [Derived
+   Version File Regeneration](#derived-version-file-regeneration)).
+6. **Build / type-check gate** — run the repository's build
+   (`package.json` `scripts.build`) on the merged tree and **block the
+   release** on failure (see [Build / Type-Check Gate](#build--type-check-gate)).
+   A tree that does not compile is never tagged or promoted. `SHIP_BUILD_SKIP=1`
+   bypasses (logged; not recommended).
+7. Create an **annotated git tag** `v<new-version>` on the merge commit.
+8. Push the merge branch and the tag to `origin`.
+9. Create a **GitHub Pull Request** from the temp branch to `main`.
+10. Wait for required status checks to pass on the PR (if any are configured).
+11. Merge the PR using `gh pr merge --merge --delete-branch`.
+12. Record an audit comment in the worklog with the merge commit hash,
     PR number, and approver identity.
 
 Example with custom bump:
@@ -366,10 +377,13 @@ Trigger and constraints:
   would-be regeneration line instead) and only when `package.json` declares a
   `build` script (`scripts.build`). Repos without a build script are
   unaffected.
-- **Non-fatal:** a failed or slow build logs
+- **Non-fatal for regeneration:** a failed or slow build logs
   `Warning: derived version file regeneration failed (continuing with release)`
-  and the release continues — mirroring the post-bump CHANGELOG step. A build
-  failure never aborts the release or changes its exit code.
+  and *this step* continues — mirroring the post-bump CHANGELOG step. This
+  non-fatal contract covers committing regenerated files only. A build
+  **failure** is separately fatal: the [Build / Type-Check
+  Gate](#build--type-check-gate) below runs the same build and blocks the
+  release, so a tree that does not compile is never tagged.
 - **Tracked files only:** regenerated files are staged with `git add -u`, so new
   untracked build droppings (e.g. `dist/`) are never committed. A derived file
   that is generated fresh (untracked/gitignored) is out of scope — the fix
@@ -392,6 +406,44 @@ Trigger and constraints:
 
 Implementation: `skill/ship/scripts/release/regenerate-version.js` (invoked by
 `merge-dev-to-main.sh` after the dev merge, before the tag).
+
+### Build / Type-Check Gate
+
+The full-suite gate runs the test suite on the merged tree, but **tests do not
+substitute for type-checking**: every test runner in the framework (vitest,
+`node --test`, pytest) transpiles or interprets the source, so a TypeScript
+tree that does not compile can still show a green suite. The release therefore
+runs a separate, **fatal** build assertion on the merged tree, between the
+derived-file regeneration step and the tag (alongside the full-suite gate):
+
+- It runs the repository's build (`package.json` `scripts.build`) via
+  `npm run build`. **A build failure blocks the release** (non-zero exit before
+  tagging, PR creation or promotion).
+- It is **independent of derived-file regeneration**, which keeps its own
+  non-fatal semantics for *its* purpose (committing regenerated files). The
+  assertion never relies on the regeneration step's outcome.
+- **Repos without a `scripts.build` are unaffected** — the assertion is a
+  documented no-op.
+- **`SHIP_BUILD_SKIP=1`** bypasses it, mirroring `SHIP_TEST_SKIP`. The bypass
+  is explicit, must be documented in the release record, and is logged loudly
+  by the script; it is not recommended.
+- A tree whose build fails is blocked **before the tag is created**, so a
+  broken build never reaches `main` (the v1.0.30 incident: a merge dropped an
+  export while leaving its consumers, producing 9 `TS2305`/`TS2724` errors that the green suite did not catch).
+
+**Project-side configuration error — package subtrees.** The gate is only as
+strong as the project's build script. A `build` (or `typecheck`) command must
+cover the **full source tree**, including package subtrees. A root `tsc` whose
+`tsconfig.json` `include` is `["src/**/*"]` does **not** cover
+`packages/*/src/**`, so type errors under `packages/*` stay invisible. Point
+the build/typecheck script at a project-wide `tsconfig` (or one `tsc -b` per
+package) that includes every package subtree. A build that misses package
+subtrees is a **project-side configuration error**, not an accepted release
+state — the release gate cannot compensate for it.
+
+Implementation: `skill/ship/scripts/release/assert-build.mjs` (invoked by
+`merge-dev-to-main.sh` after regeneration, before the tag). Tests:
+`tests/test_release_build_gate.py` and `tests/node/test-assert-build.mjs`.
 
 ### Tag Collision Handling
 

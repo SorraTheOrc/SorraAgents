@@ -16,7 +16,10 @@
  *
  * The full-suite release gate is bypassed (`SHIP_TEST_SKIP=1`) because it would
  * run *this* repository's suite against the throwaway fixture; the gate itself
- * is covered by tests/test_release_full_suite_gate.py.
+ * is covered by tests/test_release_full_suite_gate.py. The build gate
+ * (`assert-build.mjs`) is copied alongside the other helpers and is a no-op
+ * here (the fixtures declare no `scripts.build`); it is covered by
+ * tests/test_release_build_gate.py.
  */
 
 import { test, describe } from 'node:test';
@@ -67,7 +70,7 @@ function git(cwd, ...args) {
 function installReleaseScripts(repoDir) {
   const releaseDir = join(repoDir, 'skill', 'ship', 'scripts', 'release');
   mkdirSync(releaseDir, { recursive: true });
-  for (const name of ['bump-version.js', 'merge-dev-to-main.sh', 'worklog-ref-gate.sh']) {
+  for (const name of ['bump-version.js', 'merge-dev-to-main.sh', 'worklog-ref-gate.sh', 'assert-build.mjs']) {
     copyFileSync(join(RELEASE_SCRIPTS, name), join(releaseDir, name));
   }
   return releaseDir;
