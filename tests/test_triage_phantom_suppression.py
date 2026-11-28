@@ -29,7 +29,7 @@ def isolated_wl(monkeypatch):
         state["list_calls"] += 1
         return []
 
-    def fake_create(title, body, parent_id=None):
+    def fake_create(title, body, parent_id=None, **kwargs):
         state["create_calls"] += 1
         return {"id": "WL-CREATED", "workItem": {"id": "WL-CREATED"}}
 

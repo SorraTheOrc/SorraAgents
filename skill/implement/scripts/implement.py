@@ -5920,8 +5920,10 @@ def _route_post_push_failure_to_triage(
 
     Fail-soft by design: a triage hiccup must never mask the verification
     refusal that is being reported. The helper is the skill's canonical
-    ``check_or_create.py``, so an existing matching critical ``test-failure``
-    item is enhanced instead of duplicated.
+    ``check_or_create.py``, so an existing matching item is enhanced instead of
+    duplicated. A ``verdict=missing`` refusal is routed as a gate/cache
+    artefact (category ``gate_artefact``); a ``verdict=red`` refusal keeps the
+    critical test-failure routing (SA-0MWOTZ17K005RH8P).
     """
     excerpt_parts: list[str] = []
     stack_trace = ""
@@ -5940,8 +5942,18 @@ def _route_post_push_failure_to_triage(
         "stdout_excerpt": "\n".join(excerpt_parts)[:3000],
         "stack_trace": stack_trace,
         "commit_hash": commit_hash,
-        "parent_work_item_id": work_item_id,
     }
+    # A ``verdict=missing`` refusal is a gate/cache artefact, not a failing
+    # test: the triage helper must file it as a ``[gate-artefact]`` item with
+    # agent-satisfiable ACs instead of a critical ``[test-failure]`` item whose
+    # "the test passes" criteria no agent can meet (SA-0MWOTZ17K005RH8P). A
+    # ``verdict=red`` refusal keeps the critical test-failure routing and blocks
+    # the reporting work item on the created/found item.
+    if verification.get("verdict") == POST_PUSH_VERDICT_MISSING:
+        payload["category"] = "gate_artefact"
+    else:
+        payload["category"] = "test_failure"
+        payload["parent_work_item_id"] = work_item_id
     # A verification that observed a moving checkout is a mixed-tree verdict:
     # forward the explicit signal so the triage helper suppresses it instead
     # of minting a phantom critical item (WL-0MVSPZ1FH000RWET AC3). The

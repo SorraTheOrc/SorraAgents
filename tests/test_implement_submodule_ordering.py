@@ -87,6 +87,22 @@ def implement_mod():
     return mod
 
 
+@pytest.fixture(autouse=True)
+def _allow_local_file_transport(monkeypatch):
+    """Permit the hermetic fixtures' local-path submodule clone.
+
+    ``_ensure_submodules`` runs ``git submodule update --init`` in a subprocess
+    that inherits this environment. Git 2.38+ defaults
+    ``protocol.file.allow=user``, which refuses the ``tmp_path`` remotes
+    (SA-0MWZY32SU00771VB). The opt-in is supplied per process via git's
+    ``GIT_CONFIG_*`` environment, never a global config, so the production
+    command keeps the safer default for untrusted ``.gitmodules`` URLs.
+    """
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "protocol.file.allow")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "always")
+
+
 def _make_engine(tmp_path: Path) -> tuple[Path, str]:
     """Create the submodule's own repository (the engine) and its sha.
 

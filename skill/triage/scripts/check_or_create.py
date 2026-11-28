@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """check_or_create_critical_issue — triage helper.
 
-Searches Worklog for matching incomplete critical test-failure issues and creates
-a new one (using the repository template) when none exists. Returns structured
-JSON to stdout.
+Searches Worklog for matching incomplete triage issues and creates a new one
+(using the repository template) when none exists. Returns structured JSON to
+stdout.
 
-Matching heuristics (in order of preference):
-1. Exact test name match in title + test-failure tag + incomplete status.
+Two categories are filed:
+
+* ``test_failure`` (default) — a real regression: a critical ``[test-failure]``
+  item naming the failing test.
+* ``gate_artefact`` — a gate/cache artefact such as a post-push ``verdict=missing``
+  refusal (no full-suite cache entry for the pushed tree): a ``[gate-artefact]``
+  item with an agent-satisfiable remediation, never mislabelled as a failing
+  test (SA-0MWOTZ17K005RH8P).
+
+Matching heuristics (in order of preference), applied across **every** priority
+and both triage tags so an identical signature is enhanced wherever it was
+filed (SA-0MWOTZ17K005RH8P):
+1. Exact test name match in title + incomplete status.
 2. Title token overlap with test name AND matching stacktrace top-frame.
-3. CI job URL or failing commit hash matches an incomplete critical issue.
+3. CI job URL or failing commit hash matches an incomplete issue.
 
 If multiple candidates match, prefer the most recent. If ambiguity remains,
 attach a comment to the most recent candidate and alert triage.
@@ -22,6 +33,16 @@ import sys
 import traceback
 from pathlib import Path
 from typing import Any
+
+#: Tags the triage helper owns. A candidate scan unions both so a signature
+#: filed under either tag at any priority is matched (SA-0MWOTZ17K005RH8P).
+_TRIAGE_TAGS = ("test-failure", "gate-artefact")
+
+#: Payload ``category`` values. ``test_failure`` is the default (a real
+#: regression); ``gate_artefact`` is a gate/cache artefact (a ``verdict=missing``
+#: refusal, SA-0MWOTZ17K005RH8P).
+CATEGORY_TEST_FAILURE = "test_failure"
+CATEGORY_GATE_ARTEFACT = "gate_artefact"
 
 _SKILLS_ROOT = Path(__file__).resolve().parents[2]
 _SKILLS_ROOT_STR = str(_SKILLS_ROOT)
@@ -104,41 +125,68 @@ def run_wl(args: list[str]) -> str | None:
 
 
 def list_critical_issues() -> list[dict[str, Any]]:
-    """List critical test-failure issues that are still incomplete.
+    """List incomplete triage issues across **every** priority.
 
     The heuristics only accept ``open``/``in_progress`` items
-    (:func:`_is_incomplete`), so the query filters by those statuses
-    directly — the old unfiltered query downloaded every critical
-    test-failure item (52 KB today, of which 0 matched) to filter in
-    Python (SA-0MSPPI2FL005UQCR). Same result set, ~55 bytes payload.
+    (:func:`_is_incomplete`), so the query filters by those statuses directly
+    (SA-0MSPPI2FL005UQCR).
+
+    The query deliberately does **not** filter on priority
+    (SA-0MWOTZ17K005RH8P): filtering on ``--priority critical`` made the match
+    heuristics blind to an identical signature already filed on a
+    ``high``-priority item, so every recurrence created a duplicate. It also
+    unions both triage tags (:data:`_TRIAGE_TAGS`) so a signature filed as
+    either a ``test-failure`` or a ``gate-artefact`` item is matched. A row
+    carrying both tags is returned by both tag queries, so results are
+    de-duplicated by id.
     """
     items: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     for status in ("open", "in-progress"):
-        out = run_wl([
-            "list", "--priority", "critical", "--tags", "test-failure",
-            "--status", status, "--json",
-        ])
-        if not out:
-            continue
-        try:
-            data = json.loads(out)
+        for tag in _TRIAGE_TAGS:
+            out = run_wl([
+                "list", "--tags", tag, "--status", status, "--json",
+            ])
+            if not out:
+                continue
+            try:
+                data = json.loads(out)
+            except Exception as exc:  # noqa: BLE001 -- triage is best-effort; swallow to keep the scan resilient
+                print(f"[triage] wl list parse failed: {exc}", file=sys.stderr)
+                continue
             # wl list may return {"workItems": [...]}, {"items": [...]} or a bare list
             if isinstance(data, dict):
-                batch = data.get("workItems") or data.get("items")
-                if isinstance(batch, list):
-                    items.extend(batch)
+                batch = data.get("workItems") or data.get("items") or []
+                if not isinstance(batch, list):
+                    batch = []
             elif isinstance(data, list):
-                items.extend(data)
-        except Exception as exc:  # noqa: BLE001 -- triage is best-effort; swallow to keep the scan resilient
-            print(f"[triage] wl list parse failed: {exc}", file=sys.stderr)
-            continue
+                batch = data
+            else:
+                batch = []
+            for item in batch:
+                item_id = _get_id(item)
+                if item_id and item_id in seen_ids:
+                    continue
+                if item_id:
+                    seen_ids.add(item_id)
+                items.append(item)
     return items
 
 
-def create_issue(title: str, body: str, parent_id: str | None = None) -> dict[str, Any] | None:
-    """Create a critical test-failure work item via wl create.
+def create_issue(
+    title: str,
+    body: str,
+    parent_id: str | None = None,
+    *,
+    tags: tuple[str, ...] = ("test-failure",),
+    priority: str = "critical",
+) -> dict[str, Any] | None:
+    """Create a triage work item via wl create.
 
     If parent_id is provided, the created issue will be a child of the parent.
+    *tags*/*priority* distinguish a real regression (critical ``test-failure``)
+    from a gate/cache artefact (``gate-artefact``, non-critical), per
+    SA-0MWOTZ17K005RH8P.
     """
     args = [
         "create",
@@ -147,9 +195,9 @@ def create_issue(title: str, body: str, parent_id: str | None = None) -> dict[st
         "--description",
         body,
         "--priority",
-        "critical",
+        priority,
         "--tags",
-        "test-failure",
+        ",".join(tags),
         "--issue-type",
         "bug",
         "--stage",
@@ -275,6 +323,80 @@ Failing test detected by agent during automated run. May block PR creation for t
 
 - Runbook: skill/triage/resources/runbook-test-failure.md
 - CI artifacts: {ci_line}
+"""
+
+
+def render_gate_artefact_template(
+    signature: str,
+    stdout_excerpt: str,
+    stack_trace: str,
+    commit_hash: str | None,
+    ci_url: str | None,
+) -> str:
+    """Render the gate/cache-artefact template with an agent-satisfiable remedy.
+
+    Used for a post-push ``verdict=missing`` refusal, which is *not* a failing
+    test: nothing regressed, the pre-push gate simply left no valid full-suite
+    cache entry for the pushed tree (SA-0MWOTZ17K005RH8P). The acceptance
+    criteria an agent can satisfy are to populate the cache and re-run
+    ``finish``; no source change is implied.
+    """
+    commit_line = commit_hash or "(not available)"
+    ci_line = ci_url or "(not available)"
+    excerpt = stdout_excerpt[:1000] if stdout_excerpt else "(no output captured)"
+    trace_block = (
+        f"\n```\n{stack_trace}\n```\n" if stack_trace else "\n(no stack trace)\n"
+    )
+    return f"""## Gate/Cache Artefact Signature
+
+- Signature: {signature}
+- Failing commit: {commit_line}
+- CI job: {ci_line}
+
+## Evidence
+
+- Short stderr/stdout excerpt (first 1k characters):
+
+```
+{excerpt}
+```
+- Stack trace / stderr:{trace_block}
+
+## Steps To Reproduce
+
+1. Checkout the pushed commit: `git checkout {commit_line}`
+2. Inspect the post-push verification decision for that tree (finish reports the
+   verdict and the cache roots it checked).
+
+## Impact
+
+The pushed commit could not be proven green by the post-push verification
+because no valid full-suite cache entry exists for its tree. This is a
+gate/cache artefact, **not** a test regression — no test failed. It is
+remediable by re-running the full suite and finishing again.
+
+## Acceptance Criteria
+
+1. A valid full-suite cache entry exists for the pushed tree: run
+   `python3 skill/test/scripts/run_tests.py --scope full`.
+2. Re-running finish on the reporting work item records a green post-push
+   verification: `python3 skill/implement/scripts/implement.py finish <work-item-id>`.
+3. No source change is required; close once the re-run records a green verdict
+   (or the cache entry is verified present for the pushed tree).
+
+## Remediation
+
+The refusal is fail-closed by design. Populate the cache and re-run finish:
+
+```
+python3 skill/test/scripts/run_tests.py --scope full
+python3 skill/implement/scripts/implement.py finish <work-item-id>
+```
+
+## Links
+
+- Runbook: skill/triage/resources/runbook-test-failure.md (Gate/cache artefacts)
+- Root-cause tracking: SA-0MVXUCGPK003G2KV, SA-0MVCTZRZD004CE3L
 """
 
 
@@ -450,6 +572,11 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
     commit_hash = payload.get("commit_hash") or sig.get("commit_hash")
     ci_url = payload.get("ci_url") or sig.get("ci_url")
     parent_work_item_id = payload.get("parent_work_item_id")
+    category = payload.get("category") or CATEGORY_TEST_FAILURE
+    if category not in (CATEGORY_TEST_FAILURE, CATEGORY_GATE_ARTEFACT):
+        # Unknown categories fail safe as a real test failure rather than
+        # silently dropping the evidence.
+        category = CATEGORY_TEST_FAILURE
 
     if not test_name:
         return {"error": "test_name is required"}
@@ -512,20 +639,39 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
             "reason": f"matched_existing ({heuristic_name})",
         }
 
-    # No match — create a new issue using the template
-    owner_info = {"assignee": "Build", "confidence": 0.0, "reason": "no owner inference available"}
+    # No match — create a new issue using the category's template.
+    if category == CATEGORY_GATE_ARTEFACT:
+        title = f"[gate-artefact] {test_name}"
+        body = render_gate_artefact_template(
+            signature=test_name,
+            stdout_excerpt=stdout_excerpt,
+            stack_trace=stack_trace,
+            commit_hash=commit_hash,
+            ci_url=ci_url,
+        )
+        tags = ("gate-artefact",)
+        priority = "high"
+    else:
+        owner_info = {
+            "assignee": "Build",
+            "confidence": 0.0,
+            "reason": "no owner inference available",
+        }
+        title = f"[test-failure] {test_name} — failing test"
+        body = render_template(
+            test_name=test_name,
+            stdout_excerpt=stdout_excerpt,
+            stack_trace=stack_trace,
+            commit_hash=commit_hash,
+            ci_url=ci_url,
+            owner_info=owner_info,
+        )
+        tags = ("test-failure",)
+        priority = "critical"
 
-    title = f"[test-failure] {test_name} — failing test"
-    body = render_template(
-        test_name=test_name,
-        stdout_excerpt=stdout_excerpt,
-        stack_trace=stack_trace,
-        commit_hash=commit_hash,
-        ci_url=ci_url,
-        owner_info=owner_info,
+    created = create_issue(
+        title, body, parent_id=parent_work_item_id, tags=tags, priority=priority
     )
-
-    created = create_issue(title, body, parent_id=parent_work_item_id)
     if not created:
         return {"error": "failed to create issue via wl create"}
 
@@ -533,8 +679,16 @@ def check_or_create(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(created, dict):
         new_id = created.get("id") or (created.get("workItem") or {}).get("id")
 
-    emit_event("triage.issue.created", {"issueId": new_id, "testName": test_name})
-    return {"issueId": new_id, "created": True, "reason": "created_new"}
+    emit_event(
+        "triage.issue.created",
+        {"issueId": new_id, "testName": test_name, "category": category},
+    )
+    return {
+        "issueId": new_id,
+        "created": True,
+        "reason": "created_new",
+        "category": category,
+    }
 
 
 def main():
