@@ -482,7 +482,9 @@ def run_git(
     """Run ``git <args>`` in *cwd* with the repository overrides neutralised.
 
     The fixture identity is supplied with ``-c user.name=... -c user.email=...``
-    so the command never reads or writes an ambient identity.
+    so the command never reads or writes an ambient identity, and local file
+    transport is allowed per command so fixture submodules can be added from a
+    ``tmp_path`` path (SA-0MWZY32SU00771VB).
 
     Raises:
         GitSandboxError: when *check* is true and git exits non-zero.
@@ -496,6 +498,12 @@ def run_git(
         f"user.name={FIXTURE_AUTHOR_NAME}",
         "-c",
         f"user.email={FIXTURE_AUTHOR_EMAIL}",
+        # Git 2.38+ defaults ``protocol.file.allow=user``, so a fixture's
+        # local-path ``git submodule add`` fails with "transport 'file' not
+        # allowed" (SA-0MWZY32SU00771VB). Opt in per command: hermetic, and
+        # no ambient/global git configuration is read or written.
+        "-c",
+        "protocol.file.allow=always",
         *args,
     ]
     proc = subprocess.run(
