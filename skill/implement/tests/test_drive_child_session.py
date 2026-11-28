@@ -59,6 +59,10 @@ from skill.shared.tests import fake_herdr_cli as fake
 # Helpers
 # ---------------------------------------------------------------------------
 
+#: Sentinel: an omitted ``model`` must not be forwarded to the spawner (so the
+#: "caller omits the pair" backward-compatibility case stays observable).
+_UNSET = object()
+
 
 class _FakeCompleted:
     """Minimal ``subprocess.CompletedProcess`` stand-in."""
@@ -81,11 +85,15 @@ def _spawn(
     pi_bin: str | None = "/usr/local/bin/pi",
     proc: _FakeCompleted | None = None,
     raises: Exception | None = None,
+    model: object = _UNSET,
 ):
     """Invoke ``_default_session_spawner`` with external boundaries patched.
 
     Returns a ``(result, captured)`` tuple where *captured* exposes the
-    ``subprocess.run`` command and keyword arguments for assertion.
+    ``subprocess.run`` command and keyword arguments for assertion. A
+    non-sentinel *model* is forwarded as the resolved ``provider/model`` pair
+    the F4 slice adds to the spawner signature
+    (SA-0MWOVCDJ50076081).
     """
     captured: dict = {}
 
@@ -95,6 +103,10 @@ def _spawn(
         if raises is not None:
             raise raises
         return proc or _FakeCompleted()
+
+    spawn_kwargs: dict = {}
+    if model is not _UNSET:
+        spawn_kwargs["model"] = model
 
     with (
         patch(
@@ -112,6 +124,7 @@ def _spawn(
             timeout=3600,
             env={"PATH": "/usr/local/bin"},
             verbose=verbose,
+            **spawn_kwargs,
         )
 
     return result, captured
@@ -1361,3 +1374,253 @@ class TestDriveHoldsChildLockForSessionLifetime:
         )
         assert impl_mod._child_lock_global is None
         _assert_lock_free(LOCK_CHILD, store)
+
+
+# ---------------------------------------------------------------------------
+# 6. Spawn-argv model pinning for both transports (F2, SA-0MWOVC3OJ005K2NI)
+# ---------------------------------------------------------------------------
+#
+# This is the F2 *test-first* slice for the epic "drive cannot spawn headless
+# child sessions — `pi -p` fails model resolution" (parent SA-0MWOUI3Q0006TTSY).
+# F3 (SA-0MWOVCA0Z006RPIP) resolves a concrete `provider/model` pair before the
+# child loop; F4 (SA-0MWOVCDJ50076081) threads that pair into both spawners and
+# appends `--provider <p> --model <m>` to the child argv.
+#
+# The cases below are **strict xfail tracer bullets**: red against today's
+# spawners (neither accepts a `model` argument nor emits the flags) and green
+# once F4 lands. A strict marker turns the eventual unexpected pass into an
+# XPASS failure, so F4 cannot forget to remove it — that is the handoff.
+#
+# Contract pinned here (single source of truth for F4):
+#
+#   ``_default_session_spawner(..., model: str | None = None)`` appends
+#   ``["--provider", provider, "--model", model_id]`` to the headless ``pi -p``
+#   command **before** ``--approve``/``--no-extensions``:
+#
+#       [pi_bin, "-p", "/skill:implement <child>",
+#        "--provider", provider, "--model", model_id,
+#        "--approve", "--no-extensions"]
+#
+#   ``_pane_session_spawner(..., model: str | None = None)`` appends the same
+#   pair inside the ``herdr agent start … -- <args>`` argument list, again
+#   **before** ``--approve``/``--no-extensions``:
+#
+#       ["agent", "start", <agent>, "--kind", "pi", "--pane", <id>,
+#        "--timeout", <ms>, "--",
+#        "--provider", provider, "--model", model_id,
+#        "--approve", "--no-extensions"]
+#
+#   ``model`` is the resolved single ``"provider/model"`` string (F3's verdict
+#   shape). The spawner splits it at the **first** ``/`` so a model id that
+#   itself contains a slash (``MunitoAI/deepseek-ai/deepseek-v4-flash``) keeps
+#   its full model half; only the provider/model boundary splits.
+#
+#   ``model=None`` (or omitted) keeps today's command byte-for-byte unchanged
+#   for direct/manual callers. The pair is authority in **argv only** — it never
+#   travels through the environment, so ``PANE_CHILD_ENV_KEYS`` is unchanged and
+#   no credential or model material is added to the pane environment.
+#
+# Red-first observation (recorded on SA-0MWOVC3OJ005K2NI): every xfailed case
+# fails with ``TypeError: … got an unexpected keyword argument 'model'`` — the
+# spawners do not carry the resolved pair yet. The live (non-xfail) cases pin
+# the unchanged behaviour that F4 must preserve: omitting the pair, and the pane
+# env allow-list.
+
+#: The concrete pair F3 hands to a spawner for the historical "affected
+#: machine" configuration. Its provider contains a space and its model id does
+#: not — the two facts that make a naive ``split()``/``rsplit("/")`` wrong.
+_F2_MODEL = "Local Proxy/code"
+_F2_PROVIDER = "Local Proxy"
+_F2_MODEL_ID = "code"
+
+#: A concrete pair whose **model id itself contains a slash** — the case that
+#: pins "split at the first slash, not the last".
+_F2_SLASHED_MODEL = "MunitoAI/deepseek-ai/deepseek-v4-flash"
+_F2_SLASHED_PROVIDER = "MunitoAI"
+_F2_SLASHED_MODEL_ID = "deepseek-ai/deepseek-v4-flash"
+
+_F2_RED_FIRST_REASON = (
+    "F2 red-first tracer bullet (SA-0MWOVC3OJ005K2NI): the headless and pane "
+    "spawners do not accept a `model` argument or emit --provider/--model yet; "
+    "F4 (SA-0MWOVCDJ50076081) adds both, then removes this strict marker."
+)
+
+
+def _pane_spawn(*, model: object = _UNSET):
+    """Invoke ``_pane_session_spawner`` against a recording fake herdr CLI.
+
+    Returns ``(result, runner)`` so the caller can assert the exact herdr argv.
+    A non-sentinel *model* is forwarded as the resolved pair.
+    """
+    env = impl_mod._child_session_env(_pane_env(), worktree_path=PANE_WORKTREE)
+    client, runner = _pane_client(_pane_script(), env=env)
+    spawn_kwargs: dict = {}
+    if model is not _UNSET:
+        spawn_kwargs["model"] = model
+    result = impl_mod._pane_session_spawner(
+        PANE_CHILD, PANE_WORKTREE, 3600, env, client=client, **spawn_kwargs,
+    )
+    return result, runner
+
+
+class TestHeadlessSpawnerArgvModelPinning:
+    """The headless ``pi -p`` argv names the resolved pair explicitly (AC1)."""
+
+    @pytest.mark.xfail(strict=True, reason=_F2_RED_FIRST_REASON)
+    def test_resolved_pair_adds_explicit_provider_and_model_flags(self):
+        """A resolvable pair yields an exact argv naming provider and model."""
+        result, captured = _spawn(child_id="SA-CHILD", model=_F2_MODEL)
+
+        assert result["success"] is True
+        assert captured["cmd"] == [
+            "/usr/local/bin/pi",
+            "-p",
+            "/skill:implement SA-CHILD",
+            "--provider",
+            _F2_PROVIDER,
+            "--model",
+            _F2_MODEL_ID,
+            "--approve",
+            "--no-extensions",
+        ]
+
+    @pytest.mark.xfail(strict=True, reason=_F2_RED_FIRST_REASON)
+    def test_model_id_containing_a_slash_is_not_truncated(self):
+        """The provider/model split happens at the first ``/`` only.
+
+        A model id such as ``deepseek-ai/deepseek-v4-flash`` must reach the
+        child argv intact; a ``rsplit("/")`` would corrupt it into
+        ``provider="MunitoAI/deepseek-ai"``/``model="deepseek-v4-flash"``.
+        """
+        _result, captured = _spawn(
+            child_id="SA-CHILD", model=_F2_SLASHED_MODEL,
+        )
+
+        cmd = captured["cmd"]
+        assert cmd[3:8] == [
+            "--provider", _F2_SLASHED_PROVIDER,
+            "--model", _F2_SLASHED_MODEL_ID,
+        ]
+
+    @pytest.mark.xfail(strict=True, reason=_F2_RED_FIRST_REASON)
+    @pytest.mark.parametrize(
+        ("model", "provider", "model_id"),
+        [
+            (_F2_MODEL, _F2_PROVIDER, _F2_MODEL_ID),
+            (
+                _F2_SLASHED_MODEL,
+                _F2_SLASHED_PROVIDER,
+                _F2_SLASHED_MODEL_ID,
+            ),
+            ("deepseek/deepseek-flash", "deepseek", "deepseek-flash"),
+        ],
+    )
+    def test_child_argv_carries_a_concrete_pair_without_wildcards(
+        self, model, provider, model_id,
+    ):
+        """AC4: a resolved pair is always concrete — no ``*``/``?`` is forwarded.
+
+        A wildcard can only ever be resolved (F3) to a concrete catalogue
+        entry before it reaches a spawner; this pins that the argv never
+        carries the literal pattern.
+        """
+        _result, captured = _spawn(child_id="SA-CHILD", model=model)
+
+        cmd = captured["cmd"]
+        assert provider in cmd
+        assert model_id in cmd
+        assert not any("*" in arg or "?" in arg for arg in cmd), (
+            f"a glob/wildcard reached the child argv: {cmd}"
+        )
+
+    def test_omitting_the_pair_keeps_the_current_command_unchanged(self):
+        """F4 AC2: a direct/manual caller that omits the pair is unchanged.
+
+        Live (not xfail) deliberately: this behaviour holds today and must keep
+        holding after F4 adds the optional argument.
+        """
+        _result, captured = _spawn(child_id="SA-CHILD")
+
+        assert captured["cmd"] == _expected_cmd("SA-CHILD")
+
+
+class TestPaneSpawnerArgvModelPinning:
+    """The pane ``herdr agent start`` argv names the same resolved pair (AC2)."""
+
+    @pytest.mark.xfail(strict=True, reason=_F2_RED_FIRST_REASON)
+    def test_agent_start_argv_carries_provider_and_model_before_isolation(self):
+        """The pair sits inside ``herdr agent start … -- <args>``, pre-isolation."""
+        result, runner = _pane_spawn(model=_F2_MODEL)
+
+        assert result["success"] is True
+        start_argv = runner.arguments()[1]
+        assert start_argv == [
+            "agent", "start", PANE_AGENT_NAME, "--kind", "pi",
+            "--pane", "w1:p9", "--timeout", "300000",
+            "--",
+            "--provider", _F2_PROVIDER, "--model", _F2_MODEL_ID,
+            "--approve", "--no-extensions",
+        ]
+
+    @pytest.mark.xfail(strict=True, reason=_F2_RED_FIRST_REASON)
+    def test_pane_argv_carries_a_concrete_pair_without_wildcards(self):
+        """AC4 parity: the pane transport forwards no literal wildcard either."""
+        _result, runner = _pane_spawn(model=_F2_SLASHED_MODEL)
+
+        start_argv = runner.arguments()[1]
+        assert _F2_SLASHED_PROVIDER in start_argv
+        assert _F2_SLASHED_MODEL_ID in start_argv
+        assert not any("*" in arg or "?" in arg for arg in start_argv), (
+            f"a glob/wildcard reached the pane child argv: {start_argv}"
+        )
+
+    @pytest.mark.xfail(strict=True, reason=_F2_RED_FIRST_REASON)
+    def test_model_authority_is_argv_and_never_the_pane_environment(self):
+        """AC3: the pair is never smuggled through ``pane split --env``.
+
+        The pane environment stays a strict allow-list: only
+        ``PANE_CHILD_ENV_KEYS`` are forwarded, so neither the resolved model
+        pair nor credential material can ride along with it.
+        """
+        env = _pane_env(
+            DEEPSEEK_API_KEY="sk-secret",
+            PI_SESSION_ID="parent",
+            PI_SESSION_FILE="/sessions/parent.jsonl",
+        )
+        child_env = impl_mod._child_session_env(env, worktree_path=PANE_WORKTREE)
+        client, runner = _pane_client(_pane_script(), env=child_env)
+
+        impl_mod._pane_session_spawner(
+            PANE_CHILD, PANE_WORKTREE, 3600, child_env,
+            client=client, model=_F2_MODEL,
+        )
+
+        split_argv = runner.arguments()[0]
+        env_pairs = [
+            split_argv[index + 1]
+            for index, token in enumerate(split_argv)
+            if token == "--env"
+        ]
+        # Unchanged allow-list: recursion guard + worktree marker only.
+        assert env_pairs == [
+            "IMPLEMENT_DRIVE_ACTIVE=1",
+            f"IMPLEMENT_WORKTREE_PATH={PANE_WORKTREE}",
+        ]
+        for pair in env_pairs:
+            key, _, value = pair.partition("=")
+            assert key in impl_mod.PANE_CHILD_ENV_KEYS, pair
+            # No model/provider/credential material is added to the pane env.
+            assert _F2_PROVIDER not in value, pair
+            assert _F2_MODEL not in value, pair
+            assert "sk-secret" not in value, pair
+
+    def test_pane_child_env_keys_are_unchanged(self):
+        """AC3: the allow-list itself is unchanged (live regression guard).
+
+        Holds today and must keep holding: F4 adds the pair to argv only.
+        """
+        assert impl_mod.PANE_CHILD_ENV_KEYS == (
+            impl_mod.DRIVE_RECURSION_ENV,
+            impl_mod.WORKTREE_ENV,
+            impl_mod.ENV_LOCK_TOKEN,
+        )
