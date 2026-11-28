@@ -492,6 +492,28 @@ cached output rather than accepted as blocking-by-default; if the cached
 output yields no parseable failure records the runner executes the suite as on
 a miss. Strict mode keeps today's cached-red behaviour unchanged.
 
+**Tree-first red diagnostics (SA-0MWL8PX1Y004H3A8).** The red-diagnostics
+lookup (`_cached_red_failures`) consults the same cache namespace the dev-push
+gate writes to: it resolves the audited `HEAD`'s tree SHA (`_resolve_audited_tree`,
+`git rev-parse HEAD^{tree}`, mirroring `implement.py`'s `_resolve_commit_tree`)
+and queries each full-suite command tree-first
+(`query_cached(..., fingerprint=<tree>, fingerprint_kind="tree")`), falling
+back to the historical loose-worktree query only on a tree miss (legacy
+entries). A tree verdict for a *different* tree is never attributed to the
+audited `HEAD` (the cache key is the exact fingerprint). An unresolvable tree
+(repository HEAD missing, corrupt object, detached or git-subprocess failure)
+is fail-soft: the loose query runs only, and no failure is fabricated. Every
+returned failure record records machine-readable provenance —
+`fingerprint_kind` (`"tree"` or `"worktree"`), plus `tree` when tree-keyed —
+so a reused gate verdict is distinguishable from a loose-key entry. The
+changed-scope rule still applies: a `scope != "full"` entry is never red
+diagnostics (SA-0MT6CEO700058ZEN). `_cached_red_evaluation` consumes these
+records through the one lookup path; there is no second cache query.
+
+`query_cached()`'s worktree-only default is unchanged — tree-first is
+explicitly opt-in by the red-diagnostics caller, never a change to the cache
+contract (`skill/test_cache.py` is unmodified).
+
 ### Excused failures are still triaged (AC5)
 
 Triage into critical `test-failure` work items is unchanged and runs for

@@ -167,6 +167,7 @@ from test.scripts.run_tests import (
 )
 from test_cache import (
     DEFAULT_TTL_SECONDS,
+    FINGERPRINT_KIND_TREE,
     mirror_cache_entries,
     query_cached,
     run_cached,
@@ -4878,32 +4879,109 @@ def _evaluate_red_suite(
     }
 
 
+def _resolve_audited_tree(cwd: str) -> str | None:
+    """Resolve the tree SHA of the audited HEAD in *cwd*.
+
+    Mirrors ``implement.py``'s ``_resolve_commit_tree``: runs
+    ``git rev-parse HEAD^{tree}`` against the audited project root and
+    returns the tree SHA or ``None`` (fail-soft — a missing HEAD,
+    detached state, corrupt object, or git-subprocess failure all return
+    ``None`` rather than raising into the caller).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD^{tree}"],
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def _cached_red_failures(
     project_root: str | Path, commands: Sequence[str] | None = None,
 ) -> list[dict]:
     """Parse structured failures from RED cached full-suite entries (AC4).
 
     Reads the per-repo test cache READ-ONLY (``query_cached``) for each
-    full-suite command and parses the stored stdout/stderr of any non-zero
-    entry. Returns ``[]`` when no cached entry is red or none yields a
-    parseable failure record — the caller then executes the suite as on a
-    cache miss.
+    full-suite command, tree-first (the dev-push gate binds its verdict to
+    the pushed commit's tree SHA, ``git rev-parse HEAD^{tree}``), falling
+    back to the historical loose worktree query for legacy entries. Returns
+    ``[]`` when no cached entry is red or none yields a parseable failure
+    record — the caller then executes the suite as on a cache miss.
+
+    Each returned failure record carries machine-readable provenance
+    (``fingerprint_kind`` and, when tree-keyed, ``tree``) so a reused
+    gate verdict is distinguishable from a loose-key entry.
     """
     root = Path(project_root).resolve()
+    cwd_str = str(root)
     if commands is None:
         commands = full_suite_commands(root)
+
+    # Resolve the audited HEAD's tree once; a tree miss degrades to the
+    # historical loose-worktree query (fail-soft, never raises).
+    tree_sha = _resolve_audited_tree(cwd_str)
+
     failures: list[dict] = []
     for command in commands:
-        try:
-            entry = query_cached(command, cwd=str(root), ttl=AUDIT_CACHE_TTL_SECONDS)
-        except Exception:  # noqa: BLE001, S112 -- a cache error is treated as a miss
-            continue
+        entry = None
+        provenance: dict[str, str] = {}
+
+        # Tree-first: the dev-push gate binds its verdict to the pushed
+        # commit's tree SHA, so consult that key before the legacy
+        # loose-worktree key.  A hit (green or red) is authoritative; only a
+        # genuine tree miss falls back to the loose query.
+        if tree_sha is not None:
+            try:
+                entry = query_cached(
+                    command,
+                    cwd=cwd_str,
+                    ttl=AUDIT_CACHE_TTL_SECONDS,
+                    fingerprint=tree_sha,
+                    fingerprint_kind=FINGERPRINT_KIND_TREE,
+                )
+            except Exception:  # noqa: BLE001 -- cache error is a miss
+                entry = None
+            if entry is not None:
+                provenance = {
+                    "fingerprint_kind": FINGERPRINT_KIND_TREE,
+                    "tree": tree_sha,
+                }
+
+        # Legacy loose-worktree fallback — byte-for-byte today's query.
+        # A tree-keyed entry for a *different* tree cannot leak through here:
+        # the cache key matches the exact fingerprint, so a red verdict for
+        # another tree is never attributed to the audited HEAD.
+        if entry is None:
+            try:
+                entry = query_cached(
+                    command, cwd=cwd_str, ttl=AUDIT_CACHE_TTL_SECONDS,
+                )
+            except Exception:  # noqa: BLE001, S112 -- cache error is a miss
+                continue
+            if entry is not None:
+                provenance = {"fingerprint_kind": "worktree"}
+
         if not entry or int(entry.get("exit_code", 0)) == 0:
+            continue
+        # Changed-scope (partial) runs are never full-suite evidence — the
+        # same rule the green-evidence classifier applies
+        # (SA-0MT6CEO700058ZEN). A tree-keyed/loose entry that slips past the
+        # classifier gate must not become red diagnostics here either.
+        if entry.get("scope", "full") != "full":
             continue
         output = f"{entry.get('stdout', '')}\n{entry.get('stderr', '')}"
         for failure in parse_failures(command, output):
             failure["suite_command"] = command
+            failure.update(provenance)
             failures.append(failure)
+
     return failures
 
 

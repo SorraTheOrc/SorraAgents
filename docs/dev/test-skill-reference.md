@@ -273,6 +273,18 @@ TTL (and, for exactness, the recorded `scope`). Therefore:
   verification resolves the pushed commit's tree and queries that entry before
   falling back to the loose key (SA-0MWAXC5TD00461FN).
 
+**Dual-key (tree-first) audit red diagnostics (SA-0MWL8PX1Y004H3A8).** The
+same tree-first read is used by the audit's **red**-entry diagnostics
+(`_cached_red_failures`), not only green-evidence lookups. It resolves the
+audited `HEAD`'s tree SHA and queries `fingerprint_kind="tree"` first, then
+falls back to the loose worktree key on a tree miss (legacy entries). The
+per-failure provenance (`fingerprint_kind`, plus `tree` when tree-keyed) lets a
+reader tell a reused gate verdict from a loose-key entry. A tree-keyed red
+entry for a *different* tree is a miss (never attributed to the audited
+`HEAD`), an unresolvable tree degrades to the loose query only, and a
+changed-scope entry stays non-evidence — `query_cached()`'s worktree-only
+default is untouched for every other caller.
+
 ### 0.4. Pre-push gate subject binding (SA-0MVTRBT50005DUEH, tree-keyed by SA-0MW7C6BMZ00931JG)
 
 SA-0MVTRBT50005DUEH. The dev-push pre-push gate is evidence about the commit
