@@ -1261,6 +1261,7 @@ sentinel is preserved: a failure (parsed report or not) still returns
 | `ancestry_assertion` + `ancestry_failed` | `infrastructure` |
 | `tests` + `tests_failed` | `gate` |
 | `build` + `build_failed` | `gate` |
+| `push` + `post_rebase_build_failed` / `stale_shared_build` | `gate` |
 | `build_churn` + any reason | `gate` |
 | `full_suite_prelock` + any reason | `gate` |
 | `worktree_placement` + any reason | `gate` |
@@ -1983,6 +1984,24 @@ by `phase_drive`; the leaf was not):
   race; SA-0MWFJS9OL001ZTTC), so a rebase round costs seconds rather than a
   second ~5-18 min suite inside the lock. See
   [A lost push race does not re-run the full suite](#a-lost-push-race-does-not-re-run-the-full-suite-sa-0mwfjs9ol001zttc).
+- **A retry push never gates an unbuilt tree (SA-0MWMRHW01009Q22Q).** The
+  rebase that recovers a lost race pulls in `dev` commits whose source changes
+  are absent from the gitignored build output (`packages/shared/dist`), so
+  `_recover_non_fast_forward_push` **rebuilds** the rebased worktree (via the
+  same `run_build` entry point as Step 2, with its build-originated churn
+  excluded) **before** the retry push reaches the full-suite gate. A build
+  failure fails **closed**: no push, an actionable comment naming the build
+  failure and the worktree, and the item reset to `open`. A built-tree
+  **freshness guard** generalises this to any tree-changing path before a push
+  (amend, `git pull`, a rebase outside the recovery helper): the finish run
+  records `HEAD^{tree}` after the build and rebuilds when it no longer matches,
+  so the gate never measures the wrong tree. Costs one build per rebase round
+  and **none** on the uncontended path. A gate failure whose symptom is a stale
+  shared build (`TypeError: <export> is not a function`, a runtime error the
+  load-flake retry deliberately does not match) is reported as a
+  **build/resolution diagnosis** naming `packages/shared/dist` (push reason
+  `stale_shared_build`), never as a failure of the pushed change set — and it
+  still blocks, so a genuine red is never hidden.
 - **Load-flake gate failures are labelled, not misread as code failures
   (AC7).** When a gate refusal's stderr names suite *load* errors (`Cannot
   find package …`, `Cannot find module …`, `MODULE_NOT_FOUND` — a missing
@@ -2978,6 +2997,23 @@ Regression pins: `tests/test_test_cache.py` (`test_change_set_fingerprint_*`,
 (`test_rebased_push_is_served_from_the_change_set_verdict`,
 `test_rebased_push_with_a_content_change_still_executes`,
 `test_post_push_verification_accepts_a_change_set_served_push`).
+
+**The change-set reuse only hides the *cost*, never the *build staleness***
+(SA-0MWMRHW01009Q22Q). When the change-set fingerprint **also** differs — the
+concurrently landed commit edited the same hub file the item did, so the
+patch's pre-image ids differ — the key misses and the suite really re-runs.
+Run against an unbuilt rebased tree, that suite can false-red with
+`TypeError: <new export> is not a function` (the source export exists, the
+gitignored `packages/shared/dist` does not). The recovery therefore rebuilds
+the rebased worktree before the retry push (see
+[the push-robustness list](#bounded-leaf-push-loop-already-landed-short-circuit-and-push-outcomes-sa-0mw22semv00230o5-ac2ac3ac4ac5ac6ac7)),
+and a built-tree freshness guard rebuilds whenever `HEAD^{tree}` moved since
+the last build. The invariant is **never report a source-level failure for a
+tree you did not build**: with the rebuild, a *miss* is measured on a built
+tree, so the verdict is trustworthy without re-running the suite on every
+rebase (which would undo this reuse's 5–18 min saving). A stale-dist symptom
+that survives the rebuild is diagnosed as a build/resolution problem naming
+`packages/shared/dist`, never attributed to the pushed change set.
 
 The post-push fast-forward of the main checkout's local parent branch is
 **main-checkout hygiene only** (it keeps the next worktree's base up to date),

@@ -346,6 +346,16 @@ Worklog items with REFACTOR comments. Skip with `--no-refactor`. See
   proceeds when released. Run it **once** — never in a `for attempt …;
   finish; wait_for_job.py` retry loop.
 
+  **A lost push race rebuilds before the retry push.** A non-fast-forward
+  recovery rebases the feature branch and then **rebuilds** the rebased
+  worktree before the retry push, so the full-suite gate never measures a
+  stale gitignored artefact such as `packages/shared/dist`; a built-tree
+  freshness guard also rebuilds when `HEAD^{tree}` changed since the last
+  build (SA-0MWMRHW01009Q22Q). A rebuild failure **fails closed**: no push,
+  an actionable comment, the item reset to `open`. The uncontended path still
+  pays exactly one build, and a stale-shared symptom is diagnosed against
+  `packages/shared/dist`, never the pushed change set.
+
 - Follow the mandatory **build → test → commit** order.
 - **Add the `## Impact` sentence before finishing.** A newly completed item's
   description must carry an `## Impact` section: one sentence describing the user-experience impact — not a technical summary.

@@ -188,6 +188,14 @@ pre-push hook enforces it alongside the startup thresholds.
 > ~256 B to the implement brief, which sat only 7 B under the 22,000 B cap,
 > so the cap was revised to **22,500 B** (body 22,249 B). The same conscious
 > revision rule applies: this is recorded, not a silent regrowth.
+>
+> **Finish-push narrative (2026-11-28, SA-0MWMRHW01009Q22Q):** the brief must
+> state that a lost dev-push race **rebuilds the rebased worktree before the
+> retry push** and that a rebuild failure **fails closed** (an unbuilt tree is
+> never gated). The body had no headroom under the 22,500 B cap, so the cap
+> was revised to **23,150 B** and the committed `skill_implement_md` threshold
+> to **23,076 B** (the measured body). Detail stays in
+> `docs/dev/implement-skill-reference.md`; the brief carries only the rule.
 
 **Before/after composition of a cold implement turn** (chars/4 token
 estimate):

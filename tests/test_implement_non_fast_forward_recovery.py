@@ -157,9 +157,17 @@ class TestRecoveryHelper:
         assert hasattr(implement_mod, "_recover_non_fast_forward_push")
 
     def test_rebase_runs_in_worktree_not_repo_root(
-        self, implement_mod, monkeypatch, silent_comments
+        self, implement_mod, monkeypatch, silent_comments, sandbox
     ):
-        """AC1: the rebase (and fetch) must run in the worktree."""
+        """AC1: the rebase (and fetch) must run in the worktree.
+
+        A real worktree (``sandbox["wt"]``) is supplied because the recovery
+        now rebuilds the rebased tree before the retry push
+        (SA-0MWMRHW01009Q22Q), and that rebuild's Step 2 churn tracking reads
+        the real git worktree. The rebase/fetch themselves stay recorded by
+        the ``run_cmd`` stub below.
+        """
+        wt = str(sandbox["wt"])
         captured: list[tuple[list[str], str | None]] = []
 
         def fake_run_cmd(cmd, **kwargs):
@@ -189,8 +197,8 @@ class TestRecoveryHelper:
             "oldhash", "wl-branch", "rejected (non-fast-forward)", "retry",
         )
         result = implement_mod._recover_non_fast_forward_push(
-            worktree_path="/worktrees/wt",
-            repo_root="/main/checkout",
+            worktree_path=wt,
+            repo_root=str(sandbox["work"]),
             branch="wl-branch",
             commit_hash="oldhash",
             exc=exc,
@@ -200,12 +208,12 @@ class TestRecoveryHelper:
         assert result == "newhash123"
         rebase = [c for c in captured if c[0][:2] == ["git", "rebase"]]
         assert rebase, f"expected a git rebase invocation; got {captured}"
-        assert rebase[0][1] == "/worktrees/wt", (
+        assert rebase[0][1] == wt, (
             f"rebase must run in the worktree; got cwd={rebase[0][1]!r}"
         )
         fetch = [c for c in captured if c[0][:2] == ["git", "fetch"]]
         assert fetch, f"expected a git fetch before the rebase; got {captured}"
-        assert fetch[0][1] == "/worktrees/wt", (
+        assert fetch[0][1] == wt, (
             f"fetch must run in the worktree; got cwd={fetch[0][1]!r}"
         )
         # The retry push the helper issued is recorded here; *where* it must

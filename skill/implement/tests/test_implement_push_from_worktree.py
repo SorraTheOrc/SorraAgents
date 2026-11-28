@@ -250,6 +250,16 @@ def _stubbed_finish(sandbox: dict, pushed_commit: str, pushes: list[tuple]):
         stack.enter_context(
             patch.object(implement, "run_build", return_value=_build_result())
         )
+        # The built-tree freshness guard (SA-0MWMRHW01009Q22Q mechanism B)
+        # compares ``HEAD^{tree}`` with the tree recorded after the last build.
+        # The sandbox stubs ``git_commit`` (the commit is not really created),
+        # so the real ``HEAD`` never advances to the pushed commit; pin the
+        # tree SHA to the same ``abc1234`` the stubbed gate reports to keep the
+        # guard a no-op in the shared harness. Tests that exercise the guard
+        # override this patch with controlled values.
+        stack.enter_context(
+            patch.object(implement, "_head_tree_sha", return_value="abc1234")
+        )
         stack.enter_context(
             patch.object(
                 implement,

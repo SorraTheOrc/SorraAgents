@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -44,6 +44,7 @@ from shared import git_sandbox as gs
 from skill.implement.scripts import implement
 from skill.implement.tests.test_implement_push_from_worktree import (
     BRANCH,
+    _build_result,
     _stubbed_finish,
 )
 from skill.implement.tests.test_implement_push_retry import (
@@ -564,3 +565,288 @@ def test_finish_blocks_a_reproducible_load_failure(sandbox):
     assert push_step["reason"] == "unparsed", push_step
     assert push_step["outcome"] == "push_failed", push_step
     assert calls["n"] == 2, "exactly one diagnostic retry, then blocked"
+
+
+# ---------------------------------------------------------------------------
+# AC1/AC2/AC5/AC6 (SA-0MWMRHW01009Q22Q) — never gate a tree you did not build
+#
+# A non-fast-forward recovery rebases the feature branch onto a concurrently
+# advanced ``dev``. The rebased source is not reflected in gitignored build
+# output (``packages/shared/dist``), so the retry push must rebuild first:
+# otherwise the dev-push gate measures a stale artefact and false-reds on a
+# ``TypeError`` naming a function the change set never touched.
+# ---------------------------------------------------------------------------
+
+
+def _recording_build(order: list[str], *, fail_on: int | None = None, calls=None):
+    """A ``run_build`` replacement that records call order (and can fail)."""
+    counter = calls if calls is not None else {"n": 0}
+
+    def build(cwd: str) -> dict:
+        counter["n"] += 1
+        order.append("build")
+        if fail_on is not None and counter["n"] == fail_on:
+            return {
+                "success": False,
+                "stdout": "engine:sync ok",
+                "stderr": "src/index.ts(3,9): error TS2554: boom",
+                "exit_code": 2,
+                "skipped": False,
+            }
+        return _build_result()
+
+    return build
+
+
+def _recording_push(order: list[str], *, nff_rounds: int = 0):
+    """A ``git_push_to_dev`` replacement: NFF for *nff_rounds*, then success."""
+    state = {"n": 0}
+
+    def push(cwd, branch, commit_hash=None, **kwargs):
+        state["n"] += 1
+        order.append("push")
+        if state["n"] <= nff_rounds:
+            raise implement.PushNonFastForwardError(
+                commit_hash or "x",
+                branch,
+                "non-fast-forward",
+                "git rebase origin/dev",
+            )
+        evidence = kwargs.get("evidence_out")
+        if evidence is not None:
+            evidence.update(
+                {
+                    "root": str(cwd),
+                    "head": commit_hash,
+                    "pushed": commit_hash,
+                    "full_suite": "cached",
+                }
+            )
+        return True
+
+    return push
+
+
+def test_post_rebase_rebuild_runs_between_the_rebase_and_the_retry_push(sandbox):
+    """AC1: the rebuild runs after the recovery rebase and before the retry push,
+    and the recorded push verdict is green/pushed."""
+    pushes: list[tuple] = []
+    order: list[str] = []
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(implement, "run_build", side_effect=_recording_build(order)),
+        patch.object(
+            implement, "git_push_to_dev", side_effect=_recording_push(order, nff_rounds=1)
+        ),
+        patch.object(implement, "_push_retry_sleep", lambda seconds: None),
+    ):
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    assert order == ["build", "push", "build", "push"], (
+        "the tree must be rebuilt after the rebase and before the retry push; "
+        f"observed order {order}"
+    )
+    push_step = report["steps"]["push"]
+    assert push_step["outcome"] == "pushed", push_step
+    assert push_step["recovered"] == "non_fast_forward", push_step
+    rebase_build = push_step.get("rebase_build")
+    assert rebase_build is not None, push_step
+    assert rebase_build["reason"] == "post_rebase", rebase_build
+    assert rebase_build["success"] is True, rebase_build
+
+
+def test_uncontended_push_pays_exactly_one_build(sandbox):
+    """AC6: the normal (no-rebase) path keeps exactly one build per finish and
+    never re-enters the changed-scope gate (Step 3)."""
+    pushes: list[tuple] = []
+    order: list[str] = []
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(implement, "run_build", side_effect=_recording_build(order)),
+    ):
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    assert order.count("build") == 1, order
+    assert len(pushes) == 1, pushes
+    assert len(report["steps"]["tests"]) == 1, report["steps"]["tests"]
+    assert report["steps"]["push"].get("freshness_builds") is None
+
+
+def test_finish_fails_closed_when_the_post_rebase_rebuild_fails(sandbox):
+    """AC5: a rebuild that itself fails after the rebase fails closed — no
+    retry push, an actionable comment naming the build failure and the
+    worktree, and the item reset to ``open``."""
+    pushes: list[tuple] = []
+    order: list[str] = []
+    comments: list[str] = []
+    status_mock = MagicMock()
+
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(
+            implement, "run_build", side_effect=_recording_build(order, fail_on=2)
+        ),
+        patch.object(
+            implement, "git_push_to_dev", side_effect=_recording_push(order, nff_rounds=99)
+        ),
+        patch.object(
+            implement,
+            "wl_add_comment",
+            side_effect=lambda *args, **kwargs: comments.append(args[1]) or True,
+        ),
+        patch.object(implement.StatusLifecycle, "update_status", status_mock),
+        patch.object(implement, "_push_retry_sleep", lambda seconds: None),
+    ):
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is False, report["message"]
+    push_step = report["steps"]["push"]
+    assert push_step["outcome"] == "push_failed", push_step
+    assert push_step["reason"] == "post_rebase_build_failed", push_step
+    assert push_step["build"]["exit_code"] == 2, push_step["build"]
+    # Only the initial (rejected) push ran; the retry push was never attempted.
+    assert order == ["build", "push", "build"], order
+    combined = "\n".join(comments)
+    assert "TS2554" in combined, combined
+    assert str(sandbox["wt"]) in combined, combined
+    reset_calls = [
+        call for call in status_mock.call_args_list
+        if len(call.args) > 1 and call.args[1] == "open"
+    ]
+    assert reset_calls, f"item was not reset to open: {status_mock.call_args_list}"
+
+
+# ---------------------------------------------------------------------------
+# AC2 — a stale shared build is a build/resolution diagnosis, never a failure
+# of the pushed change set
+# ---------------------------------------------------------------------------
+
+
+class TestStaleSharedBuildSymptom:
+    def test_runtime_typeerror_is_stale_shared_build(self) -> None:
+        assert implement._is_stale_shared_build_failure(
+            "TypeError: isNotStarted is not a function\n"
+            "  at src/workflow.ts:42:9"
+        )
+
+    def test_load_error_is_not_stale_shared_build(self) -> None:
+        # A load flake (missing module) must stay in the load-flake taxonomy.
+        assert not implement._is_stale_shared_build_failure(
+            "Cannot find package '@worklog/shared/worklog-paths'"
+        )
+
+    def test_unrelated_typeerror_is_not_stale_shared_build(self) -> None:
+        assert not implement._is_stale_shared_build_failure(
+            "TypeError: Cannot read properties of undefined (reading 'x')"
+        )
+
+
+def test_stale_dist_gate_failure_is_not_attributed_to_the_change_set(sandbox):
+    """AC2: a gate refusal whose symptom is a stale shared build is reported as
+    a build/resolution diagnosis naming ``packages/shared/dist`` (never
+    ``test_failure``), and the push stays blocked."""
+    pushes: list[tuple] = []
+    comments: list[str] = []
+    stale_stderr = (
+        "TypeError: normalizeStartOn is not a function\n"
+        "  at packages/workflow/src/start.ts:17:5"
+    )
+
+    def gate_fails(cwd, branch, commit_hash=None, **kwargs):
+        evidence = kwargs.get("evidence_out")
+        evidence.update(
+            {
+                "success": False,
+                "gate_reason": "test_failure",
+                "stderr_tail": stale_stderr,
+                "attempts": 1,
+                "retry_trail": [],
+            }
+        )
+        return False
+
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(implement, "git_push_to_dev", side_effect=gate_fails),
+        patch.object(
+            implement,
+            "wl_add_comment",
+            side_effect=lambda *args, **kwargs: comments.append(args[1]) or True,
+        ),
+        patch.object(implement, "_push_retry_sleep", lambda seconds: None),
+    ):
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is False, report["message"]
+    push_step = report["steps"]["push"]
+    assert push_step["reason"] == "stale_shared_build", push_step
+    assert push_step["reason"] != "test_failure", push_step
+    assert push_step["outcome"] == "push_failed", push_step
+    assert push_step["stale_shared_build"]["artefact"] == "packages/shared/dist"
+    assert "packages/shared/dist" in push_step["stale_shared_build"]["artefact_path"]
+    combined = "\n".join(comments)
+    assert "packages/shared/dist" in combined, combined
+    assert "not by the pushed" in combined.lower(), combined
+
+
+# ---------------------------------------------------------------------------
+# AC2 mechanism B — built-tree freshness guard
+# ---------------------------------------------------------------------------
+
+
+def test_freshness_guard_rebuilds_a_tree_newer_than_the_last_build(sandbox):
+    """AC2/B: when ``HEAD^{tree}`` no longer matches the built tree (a rebase,
+    amend or ``git pull`` after the build), the guard rebuilds before the push
+    and records it."""
+    pushes: list[tuple] = []
+    order: list[str] = []
+    # Step 3 records the built tree as the stubbed gate tree ("abc1234"); the
+    # guard then observes a different HEAD tree, forcing exactly one rebuild.
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(implement, "_head_tree_sha", return_value="rebuilt-tree"),
+        patch.object(implement, "run_build", side_effect=_recording_build(order)),
+    ):
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is True, report["message"]
+    assert order == ["build", "build"], order
+    assert len(pushes) == 1, pushes
+    builds = report["steps"]["push"].get("freshness_builds")
+    assert builds, report["steps"]["push"]
+    assert builds[0]["reason"] == "freshness_guard", builds[0]
+    assert builds[0]["success"] is True, builds[0]
+
+
+def test_freshness_guard_fails_closed_with_a_stale_dist_diagnosis(sandbox):
+    """AC2/B: when the freshness rebuild itself fails, the run fails closed
+    with a stale-build diagnosis naming ``packages/shared/dist`` and no push."""
+    pushes: list[tuple] = []
+    order: list[str] = []
+    comments: list[str] = []
+
+    with (
+        _stubbed_finish(sandbox, sandbox["feature_short"], pushes),
+        patch.object(implement, "_head_tree_sha", return_value="rebuilt-tree"),
+        patch.object(
+            implement, "run_build", side_effect=_recording_build(order, fail_on=2)
+        ),
+        patch.object(
+            implement,
+            "wl_add_comment",
+            side_effect=lambda *args, **kwargs: comments.append(args[1]) or True,
+        ),
+    ):
+        report = implement.phase_finish("SA-TEST", json_output=True, no_refactor=True)
+
+    assert report["success"] is False, report["message"]
+    assert pushes == [], "an unbuilt tree must never be pushed"
+    push_step = report["steps"]["push"]
+    assert push_step["reason"] == "post_rebase_build_failed", push_step
+    assert push_step["build"]["stale_shared_build"]["artefact"] == (
+        "packages/shared/dist"
+    ), push_step["build"]
+    combined = "\n".join(comments)
+    assert "packages/shared/dist" in combined, combined

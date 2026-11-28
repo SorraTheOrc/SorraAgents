@@ -73,10 +73,13 @@ def test_context_budget_thresholds_file_is_valid() -> None:
 #: by SA-0MW74IL6B001AMQN so the mandatory no-op finish / --verification-only
 #: contract can live in the brief the agent reads; raised to 22,500 B by
 #: SA-0MUUI6ZCX001RO8V to carry the mandatory skill-session vs work-item AC
-#: semantics note required on every report-rendering skill. The cap still
-#: ratchets: a further increase is a conscious budget revision, not a silent
-#: regrowth.
-SKILL_IMPLEMENT_MD_CAP = 22500
+#: semantics note required on every report-rendering skill; raised to 23,150 B
+#: by SA-0MWMRHW01009Q22Q for the mandatory finish-push narrative (a lost push
+#: race rebuilds the rebased tree before the retry push and a rebuild failure
+#: fails closed), which cannot live only in the reference because the agent
+#: reads the brief, not the reference, while finishing. The cap still ratchets:
+#: a further increase is a conscious budget revision, not a silent regrowth.
+SKILL_IMPLEMENT_MD_CAP = 23150
 
 
 def test_skill_implement_md_is_gated_at_or_below_cap() -> None:

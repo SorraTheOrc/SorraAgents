@@ -4362,6 +4362,48 @@ def _path_state_token(
     return "unhashed"
 
 
+def _head_tree_sha(cwd: str) -> str | None:
+    """The git tree SHA of ``HEAD`` (``git rev-parse HEAD^{tree}``).
+
+    The finish run records this after a build so a later check can prove the
+    tree being pushed is the tree that was built (mechanism B of
+    SA-0MWMRHW01009Q22Q AC2): a rebase, amend or ``git pull`` that changes
+    ``HEAD`` without a rebuild changes this SHA, so the freshness guard can
+    rebuild before the push instead of gating stale build output.
+
+    Args:
+        cwd: Worktree root.
+
+    Returns:
+        The tree SHA, or ``None`` when it cannot be resolved (the guard then
+        fails open — it never blocks a push it cannot reason about).
+    """
+    proc = _run_git_plumbing(cwd, ["rev-parse", "HEAD^{tree}"])
+    tree = proc.stdout.strip() if proc.returncode == 0 else ""
+    return tree or None
+
+
+def _record_built_tree(cwd: str, tree: str | None = None) -> str | None:
+    """Record the git tree the last successful build's output corresponds to.
+
+    The value rides the existing :func:`_set_finish_progress` surface (no new
+    file format) and is compared by :func:`_ensure_built_tree_current` before
+    every dev push (SA-0MWMRHW01009Q22Q AC2, mechanism B).
+
+    Args:
+        cwd: Worktree root.
+        tree: The tree the build served; ``None`` resolves ``HEAD^{tree}``
+            (the post-rebase/guard rebuild has a clean worktree at HEAD).
+
+    Returns:
+        The recorded tree SHA (or ``None`` when unresolved).
+    """
+    resolved = tree or _head_tree_sha(cwd)
+    if resolved:
+        _set_finish_progress(built_tree=resolved)
+    return resolved
+
+
 def _build_churn_baseline(cwd: str) -> dict[str, Any]:
     """Snapshot the item's own change set immediately before the build runs.
 
@@ -4662,6 +4704,204 @@ def _build_churn_refusal_message(churn: dict[str, Any]) -> str:
         "genuinely this item's, make it part of the change set *before* the "
         "build (stage or modify it yourself) so it is preserved."
     )
+
+
+def _rebuild_tree_for_push(
+    worktree_path: str,
+    work_item_id: str,
+    *,
+    reason: str,
+    rebase_round: int | None = None,
+    stale_hint: bool = False,
+) -> dict[str, Any]:
+    """Rebuild *worktree_path* immediately before a dev push.
+
+    The single rebuild entry point used by both freshness mechanisms of
+    SA-0MWMRHW01009Q22Q:
+
+    * **A — after a recovery rebase** (``reason="post_rebase"``): the rebase
+      pulled in ``dev`` commits whose source changes are absent from the
+      gitignored build output, so the retry push would gate a stale
+      ``packages/shared/dist`` and false-red.
+    * **B — the built-tree freshness guard** (``reason="freshness_guard"``):
+      any other tree-changing path (amend, ``git pull``, a rebase outside the
+      recovery helper) that leaves ``HEAD^{tree}`` different from the last
+      build.
+
+    Reuses the existing single build entry point :func:`run_build` (no parallel
+    build path: disk-backed ``TMPDIR``, 300 s timeout, no-build-script no-op)
+    and the Step 2 churn handling, so build-originated tracked churn is
+    excluded rather than attributed to the item and the push-subject guard is
+    never tripped by churn finish itself caused.
+
+    Args:
+        worktree_path: Worktree to rebuild.
+        work_item_id: Work item to comment on when the rebuild fails.
+        reason: Short reason tag recorded in the report (``post_rebase`` /
+            ``freshness_guard``).
+        rebase_round: Recovery rebase round number, when applicable.
+        stale_hint: When True, a failed rebuild's message/diagnosis names the
+            stale ``packages/shared/dist`` artefact (the freshness backstop).
+
+    Returns:
+        A report-shaped rebuild record (``reason``, ``round``, ``worktree_path``,
+        ``success``, ``exit_code``, ``skipped``, ``duration_seconds``, ``churn``,
+        ``built_tree``).
+
+    Raises:
+        PostRebaseBuildFailureError: when the build fails or its churn cannot
+            be excluded — the caller must not push (fail closed, AC5).
+    """
+    baseline = _build_churn_baseline(worktree_path)
+    started = time.monotonic()
+    result = run_build(worktree_path)
+    duration = round(time.monotonic() - started, 2)
+    entry: dict[str, Any] = {
+        "reason": reason,
+        "round": rebase_round,
+        "worktree_path": worktree_path,
+        "success": bool(result.get("success")),
+        "exit_code": result.get("exit_code"),
+        "skipped": bool(result.get("skipped")),
+        "duration_seconds": duration,
+    }
+    if not result.get("success"):
+        # A failed rebuild is a hard stop (AC5), never a retryable transport
+        # condition: retrying the same tree cannot help. Mirror the Step 2
+        # build-failure diagnosis (engine lag + both stream tails).
+        engine_lag = _engine_lag(worktree_path, baseline)
+        entry["engine_lag"] = engine_lag
+        entry["stdout_tail"] = _build_output_tail(result.get("stdout") or "")
+        entry["stderr_tail"] = _build_output_tail(result.get("stderr") or "")
+        detail = _build_failure_message(result, engine_lag)
+        if stale_hint:
+            detail = (
+                _stale_shared_build_comment(
+                    entry["stderr_tail"], worktree_path
+                )
+                + "\n\n"
+                + detail
+            )
+            entry["stale_shared_build"] = _stale_shared_build_diagnosis(
+                entry["stderr_tail"], worktree_path
+            )
+        entry["message"] = detail
+        _add_rebuild_failure_comment(
+            work_item_id, reason, rebase_round, worktree_path, detail
+        )
+        raise PostRebaseBuildFailureError(
+            f"Rebuild {reason} failed (exit code "
+            f"{result.get('exit_code')}) — the dev push was not attempted "
+            f"(an unbuilt tree is never gated).",
+            entry,
+        )
+    # Build-originated tracked churn is excluded exactly as in Step 2 so the
+    # subsequent ``_assert_push_subject`` cannot refuse the retry push for
+    # churn finish itself caused (item Risks: rebuild churn vs the
+    # push-subject guard).
+    churn = _exclude_build_originated_churn(worktree_path, baseline)
+    entry["churn"] = churn
+    if churn.get("restore_failed"):
+        detail = _build_churn_refusal_message(churn)
+        entry["success"] = False
+        entry["message"] = detail
+        _add_rebuild_failure_comment(
+            work_item_id, reason, rebase_round, worktree_path, detail
+        )
+        raise PostRebaseBuildFailureError(
+            f"Rebuild {reason} produced churn that could not be excluded — "
+            "the dev push was not attempted (fail closed).",
+            entry,
+        )
+    entry["built_tree"] = _record_built_tree(worktree_path)
+    LOG.info(
+        "Rebuilt the worktree before the dev push (reason=%s round=%s, "
+        "built_tree=%s).",
+        reason,
+        rebase_round,
+        entry["built_tree"],
+    )
+    return entry
+
+
+def _ensure_built_tree_current(
+    worktree_path: str,
+    work_item_id: str,
+    *,
+    rebase_round: int | None = None,
+) -> dict[str, Any] | None:
+    """Rebuild before a dev push when the built tree is stale (mechanism B).
+
+    Compares ``HEAD^{tree}`` with the tree recorded after the last successful
+    build. A mismatch means a tree-changing operation (amend, ``git pull``, a
+    rebase outside the recovery helper) ran since the build, so the push would
+    gate an unbuilt tree — rebuild first. When there is no recorded marker or
+    the tree SHA cannot be resolved the guard fails open (no rebuild) so it
+    never adds a build it cannot justify (AC6).
+
+    Args:
+        worktree_path: Worktree about to be pushed.
+        work_item_id: Work item to comment on when the rebuild fails.
+        rebase_round: Recovery round number, when applicable.
+
+    Returns:
+        The rebuild record when a rebuild happened, else ``None``.
+
+    Raises:
+        PostRebaseBuildFailureError: when a required rebuild fails — the
+            caller must not push.
+    """
+    expected = _finish_progress_global.get("built_tree")
+    if not expected:
+        return None
+    current = _head_tree_sha(worktree_path)
+    if current is None or current == expected:
+        return None
+    LOG.warning(
+        "Built-tree freshness guard: HEAD^{tree} %s no longer matches the "
+        "built tree %s — rebuilding before the dev push so the gate never "
+        "measures a stale build (SA-0MWMRHW01009Q22Q).",
+        current,
+        expected,
+    )
+    return _rebuild_tree_for_push(
+        worktree_path,
+        work_item_id,
+        reason="freshness_guard",
+        rebase_round=rebase_round,
+        stale_hint=True,
+    )
+
+
+def _add_rebuild_failure_comment(
+    work_item_id: str,
+    reason: str,
+    rebase_round: int | None,
+    worktree_path: str,
+    detail: str,
+) -> None:
+    """Post the fail-closed rebuild-failure comment (AC5).
+
+    Mirrors the Step 2 build-failure comment: the reason, the round, the
+    retained worktree and the build diagnosis (stderr/stdout tails, engine
+    lag, or churn refusal) so the operator can act without re-running.
+    """
+    round_line = f" (rebase round {rebase_round})" if rebase_round else ""
+    body = (
+        f"Dev push **not attempted**: the rebuild after {reason}{round_line} "
+        "failed, so the tree is unbuilt. An unbuilt tree is never gated "
+        "(fail closed).\n\n"
+        f"- Worktree: {worktree_path} (retained)\n\n"
+        f"{detail}\n\n"
+        f"Manual recovery: ``cd {worktree_path} && npm run build`` and re-run "
+        "finish once the build passes."
+    )
+    try:
+        wl_add_comment(work_item_id, body)
+    except Exception:  # noqa: BLE001 - never mask the build failure itself
+        LOG.error(
+            "Failed to post the rebuild-failure comment on %s", work_item_id
+        )
 
 
 def _engine_lag(cwd: str, baseline: dict[str, Any]) -> dict[str, Any]:
@@ -6164,6 +6404,24 @@ PUSH_GATE_LOAD_FLAKE_PATTERNS: tuple[str, ...] = (
 #: (AC6).
 PUSH_GATE_LOAD_FLAKE_RETRY_LIMIT = 1
 
+#: Symptom of a **stale shared build** in a refused gate's output
+#: (SA-0MWMRHW01009Q22Q AC2). When a gitignored artefact such as
+#: ``packages/shared/dist`` predates the source that exports a new function,
+#: importing code loads fine (the package resolves) and then fails at call
+#: time with ``TypeError: <export> is not a function``. That is a *runtime*
+#: error, so :data:`PUSH_GATE_LOAD_FLAKE_PATTERNS` deliberately does not match
+#: it (retrying the identical unbuilt tree could not help). The symptom is
+#: classified as a build/resolution condition — never the pushed change set —
+#: so a stale-dist false red can never be attributed to the item's own work.
+STALE_SHARED_BUILD_SYMPTOMS: tuple[str, ...] = (
+    "is not a function",
+)
+
+#: The gitignored build artefact whose staleness the symptom names. Reported
+#: in the diagnosis so the operator knows exactly what to rebuild
+#: (SA-0MWMRHW01009Q22Q AC2).
+STALE_SHARED_BUILD_ARTEFACT = "packages/shared/dist"
+
 #: SSH keepalive options injected into the dev-push child environment
 #: (SA-0MVWNHLQQ002TFZR AC1/AC2). ``.githooks/pre-push`` runs the full suite
 #: *after* git has opened the SSH connection and produces no SSH traffic for
@@ -6268,6 +6526,29 @@ class PushGateFailureError(RuntimeError):
         )
 
 
+class PostRebaseBuildFailureError(RuntimeError):
+    """A rebuild that must precede a dev push failed — fail closed (AC5).
+
+    An unbuilt tree is never gated (SA-0MWMRHW01009Q22Q): when the rebuild
+    after a recovery rebase (mechanism A) or the built-tree freshness guard
+    (mechanism B) fails, the push loop stops immediately. A build failure is
+    a content/config condition, not a retryable transport one, so this never
+    consumes a rebase/transport retry round; the classified ``finish``
+    failure path resets the item to ``open`` with the comment the raiser
+    already posted.
+
+    Attributes:
+        build_entry: Report-shaped record of the failed rebuild (reason,
+            round, worktree, exit code, ``stderr``/``stdout`` tails and the
+            message), attached to ``report["steps"]["push"]["build"]`` by
+            the caller so the failure is auditable after the fact.
+    """
+
+    def __init__(self, message: str, build_entry: dict[str, Any]) -> None:
+        self.build_entry = dict(build_entry or {})
+        super().__init__(message)
+
+
 def classify_push_failure(stderr: str) -> str:
     """Classify a failed ``git push`` stderr into a stable outcome (pure).
 
@@ -6335,6 +6616,79 @@ def _is_gate_load_flake(stderr: str | None) -> bool:
     """
     lower = (stderr or "").lower()
     return any(pattern in lower for pattern in PUSH_GATE_LOAD_FLAKE_PATTERNS)
+
+
+def _is_stale_shared_build_failure(stderr: str | None) -> bool:
+    """Whether a refused gate's output shows a stale **shared build** (AC2).
+
+    ``TypeError: <export> is not a function`` is the runtime signature of a
+    gitignored artefact (``packages/shared/dist``) that predates the source
+    exporting the new function: the module loads, so the suite is *not* a
+    load flake (see :func:`_is_gate_load_flake`), and the failure is a
+    build/resolution condition rather than a failure of the pushed change set
+    (SA-0MWMRHW01009Q22Q). The gate still blocks — only the *attribution*
+    changes — so a genuine red is never hidden (AC3).
+    """
+    lower = (stderr or "").lower()
+    return "typeerror" in lower and any(
+        symptom in lower for symptom in STALE_SHARED_BUILD_SYMPTOMS
+    )
+
+
+def _stale_shared_build_diagnosis(
+    stderr_tail: str | None, worktree_path: str
+) -> dict[str, Any]:
+    """Machine-readable stale-shared-build diagnosis for the finish report.
+
+    Args:
+        stderr_tail: The refused gate's captured output tail.
+        worktree_path: Worktree whose gitignored build output is suspect.
+
+    Returns:
+        A dict naming the kind, the stale artefact path and the symptom, with
+        the observed tail kept for the operator (never fabricated).
+    """
+    dist_path = str(Path(worktree_path) / STALE_SHARED_BUILD_ARTEFACT)
+    return {
+        "kind": "stale_shared_build",
+        "artefact": STALE_SHARED_BUILD_ARTEFACT,
+        "artefact_path": dist_path,
+        "symptom": "TypeError: <export> is not a function",
+        "stderr_tail": _build_output_tail(stderr_tail or ""),
+    }
+
+
+def _stale_shared_build_comment(
+    stderr_tail: str | None, worktree_path: str
+) -> str:
+    """Actionable comment for a stale-shared-build gate failure (AC2).
+
+    Names the stale artefact and the exact remediation, and states plainly
+    that the failure is a build/resolution condition — never the pushed change
+    set — so the item is not chased as a code regression.
+    """
+    dist_path = str(Path(worktree_path) / STALE_SHARED_BUILD_ARTEFACT)
+    detail = _stale_shared_build_diagnosis(stderr_tail, worktree_path)
+    tail = detail.get("stderr_tail") or ""
+    sections = [
+        (
+            "Dev push blocked by a stale shared build, not by the pushed "
+            "change set. The gate failed with "
+            "`TypeError: <export> is not a function` — the runtime symptom "
+            "of a `packages/shared` export present in source but missing "
+            "from the gitignored build output."
+        ),
+        f"- Stale artefact: {dist_path}\n- Worktree: {worktree_path}",
+        (
+            "Remediation: rebuild the worktree (`npm run build`) so "
+            "`packages/shared/dist` matches the checked-out source, then "
+            "re-run finish. The push stays blocked until the built tree "
+            "passes — the gate is not weakened."
+        ),
+    ]
+    if tail:
+        sections.append("**gate stderr (tail)**\n```\n" + tail + "\n```")
+    return "\n\n".join(sections)
 
 
 def _is_retryable_push_transport(stderr: str) -> bool:
@@ -9199,6 +9553,16 @@ FINISH_GATE_REFUSALS: frozenset[tuple[str, str]] = frozenset({
     # consume the finish-attempt budget and never be retried as a transient
     # infrastructure refusal.
     ("full_suite_prelock", FINISH_REASON_WILDCARD),
+    # A dev-push rebuild that must precede the retry push failed
+    # (SA-0MWMRHW01009Q22Q AC5): a content/build condition, never
+    # infrastructure — it consumes the finish-attempt budget and is never
+    # retried as a transient refusal.
+    ("push", "post_rebase_build_failed"),
+    # A gate refusal whose symptom is a stale shared build
+    # (SA-0MWMRHW01009Q22Q AC2): a build/resolution condition, not a
+    # change-set failure — classified as a genuine gate failure (blocks,
+    # consumes the budget), never as infrastructure.
+    ("push", "stale_shared_build"),
 })
 
 #: Consultation order for the structured ``steps`` payload of a failing
@@ -13371,6 +13735,8 @@ def _recover_non_fast_forward_push(
     evidence_out: dict[str, Any] | None = None,
     parent_branch: str = DEFAULT_PARENT_BRANCH,
     ff_retry_out: dict[str, Any] | None = None,
+    rebase_round: int = 1,
+    rebase_build_out: dict[str, Any] | None = None,
 ) -> str:
     """Recover from a non-fast-forward push by rebasing and retrying.
 
@@ -13400,6 +13766,12 @@ def _recover_non_fast_forward_push(
         ff_retry_out: Optional dict populated with the post-rebase
             fast-forward retry result, recorded by ``finish``
             (SA-0MW3H07A8004Q54C AC1).
+        rebase_round: The 1-based recovery round (for the rebuild report and
+            the fail-closed comment).
+        rebase_build_out: Optional dict populated with the post-rebase rebuild
+            record (or the failure record). ``finish`` attaches it to
+            ``report["steps"]["push"]`` so the rebuild is auditable
+            (SA-0MWMRHW01009Q22Q AC1/AC5).
 
     Returns:
         The (possibly rewritten) commit hash that was pushed.
@@ -13470,6 +13842,26 @@ def _recover_non_fast_forward_push(
         ff_retry.get("method"),
         ff_retry.get("advanced"),
     )
+
+    # 1b. Rebuild the rebased tree BEFORE the retry push reaches the full-suite
+    #     gate (SA-0MWMRHW01009Q22Q mechanism A, AC1). The rebase pulled in
+    #     ``dev`` commits whose source is not reflected in gitignored build
+    #     output (``packages/shared/dist``); without a rebuild the gate would
+    #     measure a stale artefact and false-red on a ``TypeError`` naming a
+    #     function this change set never touched. The rebuild is a hard stop on
+    #     failure (never a consumed retry round): an unbuilt tree is never
+    #     gated (AC5). It reuses :func:`_rebuild_tree_for_push` (the single
+    #     build entry point + Step 2 churn exclusion), so build churn can never
+    #     trip the push-subject guard below.
+    rebuild_entry = _rebuild_tree_for_push(
+        worktree_path,
+        work_item_id,
+        reason="post_rebase",
+        rebase_round=rebase_round,
+    )
+    if rebase_build_out is not None:
+        rebase_build_out.clear()
+        rebase_build_out.update(rebuild_entry)
 
     # 2. Retry the push from the worktree that now holds the rebased commit —
     #    never from the main checkout, which still holds the pre-rebase commit
@@ -14069,6 +14461,15 @@ def phase_finish(
             _gate_attempt_record(test_attempts + 1, test_result)
         )
 
+    # Record the tree the build corresponds to (SA-0MWMRHW01009Q22Q AC2,
+    # mechanism B). The build ran on the working content that stages into this
+    # exact would-be-commit tree (``stage_tested_tree`` proves it below), so
+    # after the commit ``HEAD^{tree}`` equals ``gate_tree["tree"]``. The
+    # built-tree freshness guard compares against this marker before each dev
+    # push and rebuilds when a rebase/amend/`git pull` changed the tree since
+    # the build — and only then (AC6: no extra build on the uncontended path).
+    _record_built_tree(worktree_path, (gate_tree or {}).get("tree"))
+
     # Working-tree churn attributed to a concurrent session is excluded from
     # the guard's verdict but is never silent: surface the note in the finish
     # output and the JSON report so the operator can tell an excluded foreign
@@ -14543,9 +14944,24 @@ def phase_finish(
                 #   when it reproduces).
                 nff_retries = 0
                 push_attempt = 0
+                freshness_builds: list[dict[str, Any]] = []
                 while True:
                     push_attempt += 1
                     try:
+                        # AC2 (mechanism B, SA-0MWMRHW01009Q22Q): never push a
+                        # tree newer than the last build. A rebase/amend/
+                        # ``git pull`` that changed ``HEAD^{tree}`` since the
+                        # build forces a rebuild here; on the uncontended
+                        # path the marker already matches, so no extra build
+                        # is paid (AC6). A failed rebuild raises
+                        # ``PostRebaseBuildFailureError`` (fail closed, AC5).
+                        freshness_build = _ensure_built_tree_current(
+                            worktree_path,
+                            work_item_id,
+                            rebase_round=nff_retries or None,
+                        )
+                        if freshness_build:
+                            freshness_builds.append(freshness_build)
                         # AC1/AC2: the dev push runs from the checkout that
                         # holds the pushed commit (the worktree), so
                         # ``.githooks/pre-push`` resolves its
@@ -14592,6 +15008,31 @@ def phase_finish(
                                     int(push_evidence.get("attempts") or 1),
                                 )
                             raise RuntimeError("git push to dev failed.")
+                    except PostRebaseBuildFailureError as build_exc:
+                        # Fail closed (AC5, SA-0MWMRHW01009Q22Q): the
+                        # freshness-guard rebuild failed, so the tree is
+                        # unbuilt — push nothing and report the build
+                        # diagnosis (the helper already posted the
+                        # actionable comment). This is a hard stop, not a
+                        # retryable transport condition, so no rebase/retry
+                        # round is consumed.
+                        report["steps"]["push"] = {
+                            "success": False,
+                            "outcome": "push_failed",
+                            "reason": "post_rebase_build_failed",
+                            "hash": commit_hash,
+                            "worktree_path": worktree_path,
+                            "rebase_round": nff_retries,
+                            "build": dict(build_exc.build_entry or {}),
+                        }
+                        report["steps"]["local_dev_restore"] = (
+                            _restore_local_dev_after_failed_push(
+                                repo_root, local_dev_fast_forward, parent_branch
+                            )
+                        )
+                        raise RuntimeError(
+                            f"git push to dev not attempted: {build_exc}"
+                        ) from build_exc
                     except PushSubjectMismatchError as exc:
                         # Fail closed (AC2): nothing was pushed. Restore local
                         # dev off the unpushed commit and preserve recovery
@@ -14730,6 +15171,7 @@ def phase_finish(
                             DEFAULT_INFRA_RETRY_LIMIT,
                         )
                         ff_retry: dict[str, Any] = {}
+                        rebase_build: dict[str, Any] = {}
                         try:
                             commit_hash = _recover_non_fast_forward_push(
                                 worktree_path=worktree_path,
@@ -14741,7 +15183,36 @@ def phase_finish(
                                 evidence_out=push_evidence,
                                 parent_branch=parent_branch,
                                 ff_retry_out=ff_retry,
+                                rebase_round=nff_retries,
+                                rebase_build_out=rebase_build,
                             )
+                        except PostRebaseBuildFailureError as build_exc:
+                            # Fail closed (AC5, SA-0MWMRHW01009Q22Q): the
+                            # rebuild after the recovery rebase failed, so the
+                            # retry push is never attempted — an unbuilt tree
+                            # is never gated. The rebuild helper posted the
+                            # actionable comment already; record the failure
+                            # for the report and stop (no retry round).
+                            report["steps"]["push"] = {
+                                "success": False,
+                                "outcome": "push_failed",
+                                "reason": "post_rebase_build_failed",
+                                "hash": commit_hash,
+                                "worktree_path": worktree_path,
+                                "rebase_round": nff_retries,
+                                "build": dict(build_exc.build_entry or {}),
+                            }
+                            report["steps"]["local_dev_restore"] = (
+                                _restore_local_dev_after_failed_push(
+                                    repo_root,
+                                    local_dev_fast_forward,
+                                    parent_branch,
+                                )
+                            )
+                            raise RuntimeError(
+                                "git push to dev not attempted: "
+                                f"{build_exc}"
+                            ) from build_exc
                         except PushNonFastForwardError:
                             # AC2: dev advanced *again* during the recovery
                             # push — bounded rebase-and-retry rather than a
@@ -14779,6 +15250,13 @@ def phase_finish(
                             "hash": commit_hash,
                             "gate_evidence": push_evidence,
                         }
+                        if rebase_build:
+                            # AC1 (SA-0MWMRHW01009Q22Q): record the rebuild the
+                            # retry push was gated on, so the report proves the
+                            # tree was built between the rebase and the retry.
+                            report["steps"]["push"]["rebase_build"] = (
+                                rebase_build
+                            )
                         report["steps"]["push"].update(
                             _push_retry_trail_fields(push_evidence)
                         )
@@ -14918,6 +15396,49 @@ def phase_finish(
                             )
                             _push_retry_sleep(_drive_infra_backoff_delay(1))
                             continue
+                        # AC2 (SA-0MWMRHW01009Q22Q): a gate failure whose
+                        # symptom is a stale shared build (``TypeError: <new
+                        # export> is not a function``) is a build/resolution
+                        # condition, not a failure of the pushed change set.
+                        # Mechanism A rebuilt the tree before this push, so a
+                        # stale-dist symptom here means the gitignored artefact
+                        # still does not match source: report it as such
+                        # (never as ``test_failure``) and keep the push blocked
+                        # — the gate is not weakened, a genuine red still
+                        # blocks (AC3).
+                        if _is_stale_shared_build_failure(exc.stderr_tail):
+                            stale_diag = _stale_shared_build_diagnosis(
+                                exc.stderr_tail, worktree_path
+                            )
+                            report["steps"]["push"] = {
+                                "success": False,
+                                "outcome": "push_failed",
+                                "reason": "stale_shared_build",
+                                "hash": commit_hash,
+                                "gate_stderr_tail": exc.stderr_tail,
+                                "stale_shared_build": stale_diag,
+                            }
+                            report["steps"]["push"].update(
+                                _push_retry_trail_fields(push_evidence)
+                            )
+                            report["steps"]["local_dev_restore"] = (
+                                _restore_local_dev_after_failed_push(
+                                    repo_root,
+                                    local_dev_fast_forward,
+                                    parent_branch,
+                                )
+                            )
+                            wl_add_comment(
+                                work_item_id,
+                                _stale_shared_build_comment(
+                                    exc.stderr_tail, worktree_path
+                                ),
+                            )
+                            raise RuntimeError(
+                                "git push to dev blocked by a stale shared "
+                                f"build ({STALE_SHARED_BUILD_ARTEFACT}): "
+                                f"{exc.stderr_tail[:300]}"
+                            ) from exc
                         # AC2: the pre-push gate said *why* the push failed.
                         # Report the machine-readable reason in the finish
                         # report and post it on the work item with the
@@ -15007,6 +15528,13 @@ def phase_finish(
                         # mistaken for unpublished work.
                         _set_finish_progress(commit=commit_hash, pushed=True)
                         break
+                if freshness_builds:
+                    # AC2 (mechanism B): record any freshness-guard rebuild the
+                    # push was gated on, so the report proves no unbuilt tree
+                    # was pushed.
+                    report["steps"]["push"]["freshness_builds"] = (
+                        freshness_builds
+                    )
             LOG.info("Push to dev succeeded")
 
             # ── Step 6a: Post-push ancestry assertion (AC2) ───────────────
