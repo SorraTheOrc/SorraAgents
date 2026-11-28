@@ -283,15 +283,14 @@ fail-open to the headless `pi -p` spawner (default for the downtime worker,
 audit dispatch and CI).
 
 **Blocked children are re-validated (SA-0MVTUFL0U0000NV2).** A `blocked`
-child is re-checked each run against its `wl dep` edges and explicit
-`Blocked by …` line: a non-terminal or unresolvable blocker ⇒
-`skip-blocked` with `blocking_ids`, never started; all blockers terminal ⇒
-the block is stale and the child starts. Precedence: `skip-terminal` →
-`skipped-held` → `skip-in-progress` → `skip-blocked` → `implement`. `drive`
-never spawns a `skip-blocked` or already-terminal child. Vocabulary
-(`blocking_ids`,
-`blocker_details`, `stale_blocks`, `unvalidated_blocks`,
-`unresolved_blockers`, extended `blocked_children` entries) and parsing rule:
+child is re-checked against its `wl dep` edges and `Blocked by …` line: a
+non-terminal/unresolvable blocker ⇒ `skip-blocked` (with `blocking_ids`);
+all terminal ⇒ the block is stale and the child starts. A future `startOn`
+is a `skip-not-before` soft wait (`not_before_children`). Precedence:
+`skip-terminal` → `skipped-held` → `skip-in-progress` → `skip-not-before` →
+`skip-blocked` → `implement`. Vocabulary (`blocking_ids`, `blocker_details`,
+`stale_blocks`, `unvalidated_blocks`, `unresolved_blockers`, extended
+`blocked_children` entries) and parsing rule:
 [reference](../../docs/dev/implement-skill-reference.md).
 
 **Driven-session lock holder (SA-0MW7LMUUQ00701KJ).** The long-lived driver,

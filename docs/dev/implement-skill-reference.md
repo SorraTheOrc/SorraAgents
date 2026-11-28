@@ -4631,7 +4631,12 @@ Guards (deterministic, in `phase_parent`):
     defaults to startable).
 
   Classification precedence is exactly `skip-terminal` → `skipped-held` →
-  `skip-in-progress` → `skip-blocked` → `implement`. A child whose blocker is
+  `skip-in-progress` → `skip-not-before` → `skip-blocked` → `implement`. A
+  future `startOn` (run-not-before) is a scheduling hold: the child is
+  reported in `not_before_children` with the instant, never started and never
+  a `failed_child`, so a measurement window is not opened before its evidence
+  exists (LP-0MWZO40DI00701SY; absent or unparseable `startOn` fails open). A
+  child whose blocker is
   a same-project item outside the epic is unchanged: reported `blocked` with
   its `blocked_by` payload.
 - **No premature parent advance** — if any non-terminal child remains

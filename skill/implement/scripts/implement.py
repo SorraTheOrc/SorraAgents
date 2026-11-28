@@ -478,6 +478,13 @@ ACTION_SKIPPED_HELD = "skipped-held"
 #: (SA-0MVTUFL0U0000NV2 AC1). A stale block — every blocker terminal — is
 #: re-evaluated and the child becomes startable again.
 ACTION_SKIP_BLOCKED = "skip-blocked"
+#: Report action for a child whose ``startOn`` (run-not-before) instant has
+#: not been reached. ``startOn`` is the worklog claim guard's schedule — the
+#: same instant the ``[run-not-before …]`` title marker restates — so a
+#: measurement window is never opened before its own evidence can exist
+#: (LP-0MWZO40DI00701SY). Like ``skipped-held`` this is a soft wait: the
+#: child is reported, never spawned, and never counted as a failure.
+ACTION_SKIP_NOT_BEFORE = "skip-not-before"
 #: Transport labels recorded on every ``children_driven`` entry, so a
 #: ``--json`` consumer can tell a pane-driven child from a headless one
 #: (SA-0MVPHZ1CI0045QR0 AC5). ``pane_id`` is ``None`` for the headless path.
@@ -2315,6 +2322,41 @@ def _classify_child_worktree(
     return CHILD_CLEAN
 
 
+def _start_on_holds(
+    child: dict[str, Any], now: datetime | None = None,
+) -> datetime | None:
+    """Return the child's ``startOn`` instant while it is still in the future.
+
+    ``startOn`` is the worklog run-not-before schedule (the worklog claim
+    guard, WL-0MWMGEUT10056MUI, and the ``[run-not-before …]`` title marker
+    restate the same instant). A child whose window has not closed cannot
+    produce the evidence its ACs require, so the parent/drive phases must not
+    open a session (or a worktree) for it.
+
+    Fails open: an absent or unparseable ``startOn`` returns ``None`` (no
+    hold) — a scheduling hint must never wedge the whole chain.
+
+    Args:
+        child: A child work-item dict from ``wl show --children``.
+        now: Reference instant (defaults to the current UTC time); injected
+            by tests so the boundary is deterministic.
+
+    Returns:
+        The parsed ``startOn`` when it lies ahead of *now*, else ``None``.
+    """
+    raw = str(child.get("startOn", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    reference = now or datetime.now(timezone.utc)
+    return parsed if parsed > reference else None
+
+
 def _classify_child(
     child: dict[str, Any],
     blockers: list[dict[str, Any]] | None = None,
@@ -2327,14 +2369,16 @@ def _classify_child(
       - ``"skipped-held"`` — a live holder owns the child's per-work-item
         lock (another driver/session); reported, never raced.
       - ``"skip-in-progress"`` — claimed by another agent; reported, not clobbered.
+      - ``"skip-not-before"`` — its ``startOn`` (run-not-before) instant is
+        still in the future; reported, never started (LP-0MWZO40DI00701SY).
       - ``"skip-blocked"`` — ``status: blocked`` and the block **still
         holds** after re-validation against the outbound dependency edges;
         reported with its ``blocking_ids``, never started (AC1).
       - ``"implement"`` — the standard workflow should run on this child.
 
     Precedence is deliberate and is stated once, here: ``skip-terminal`` →
-    ``skipped-held`` → ``skip-in-progress`` → ``skip-blocked`` →
-    ``implement``. A terminal child is never re-implemented (even with a
+    ``skipped-held`` → ``skip-in-progress`` → ``skip-not-before`` →
+    ``skip-blocked`` → ``implement``. A terminal child is never re-implemented (even with a
     stale lock file lying around), and a live holder outranks the
     status-based ``in-progress`` guess because it is a fact about a running
     process, not a lifecycle claim (SA-0MVQ5AXLF002PAQ3, AC3). A ``blocked``
@@ -2364,6 +2408,8 @@ def _classify_child(
         return ACTION_SKIPPED_HELD
     if status in ("in-progress", "in_progress"):
         return "skip-in-progress"
+    if _start_on_holds(child) is not None:
+        return ACTION_SKIP_NOT_BEFORE
     if status == "blocked":
         state = _blocked_child_state(child, blockers, children)
         if state["holds"]:
@@ -2483,6 +2529,8 @@ def _next_child_to_implement(
             continue  # a live holder owns it; never a second session
         if action == "skip-in-progress":
             continue  # never clobber another agent's claim
+        if action == ACTION_SKIP_NOT_BEFORE:
+            continue  # its run-not-before window is still open
         if action == ACTION_SKIP_BLOCKED:
             continue  # a still-valid blocked hold; never started (AC1)
         in_chain_blockers = [
@@ -16087,7 +16135,10 @@ def phase_parent(
        are reported as coordination notes.
     5. Classify children: terminal → skip; a live lock holder →
        ``skipped-held`` (report the holder and stop cleanly); in_progress
-       elsewhere → skip+report; ``status: blocked`` → re-validated against
+       elsewhere → skip+report; a future ``startOn`` (run-not-before) →
+       ``skip-not-before`` (reported, never spawned — a measurement window
+       is not opened before its evidence can exist, LP-0MWZO40DI00701SY);
+       ``status: blocked`` → re-validated against
        the outbound dependency edges (``skip-blocked`` with ``blocking_ids``
        while the block holds, a ``stale_blocks`` entry and a startable child
        once every blocker is terminal, ``unvalidated_blocks`` when no edge
@@ -16440,6 +16491,7 @@ def phase_parent(
     pending_ids: list[str] = []
     blocked_ids: list[str] = []
     no_work_ids: list[str] = []
+    not_before_ids: list[str] = []
 
     def _in_chain_blockers(child_id: str) -> list[str]:
         return [
@@ -16694,6 +16746,23 @@ def phase_parent(
                 print(f"\n\u23f3 {report['message']}\n")
             return report
 
+        if action == ACTION_SKIP_NOT_BEFORE:
+            # A future ``startOn`` is a scheduling hold: the child's window
+            # has not closed, so a session could only no-op. Report it as a
+            # soft wait and keep scanning for an independent sibling that is
+            # already runnable (LP-0MWZO40DI00701SY).
+            not_before_ids.append(cid)
+            not_before_at = _start_on_holds(child)
+            child_results.append({
+                "id": cid, "title": title,
+                "action": ACTION_SKIP_NOT_BEFORE,
+                "status": child.get("status", ""),
+                "start_on": (
+                    not_before_at.isoformat() if not_before_at else ""
+                ),
+            })
+            continue
+
         worktree_path = _discover_worktree(cid)
         has_changes = bool(
             worktree_path and _has_worktree_changes(worktree_path, parent_branch)
@@ -16823,13 +16892,28 @@ def phase_parent(
         )
 
     # ── Step 7: Advance only when every child is terminal ──────────
-    if pending_ids or no_work_ids:
+    if pending_ids or no_work_ids or not_before_ids:
         reasons: list[str] = []
         if no_work_ids:
             reasons.append(
                 f"{len(no_work_ids)} child(ren) classified as not-finalisable "
                 f"(no attributable work)"
             )
+        if not_before_ids:
+            # Name the instant so an unattended operator knows what to wait
+            # for without re-reading the child's description (the same
+            # contract the ``skip-blocked`` reason list follows).
+            scheduled = []
+            for cid in not_before_ids:
+                child = next(
+                    (c for c in children if str(c.get("id")) == cid), {}
+                )
+                at = _start_on_holds(child)
+                scheduled.append(
+                    f"{cid} (run-not-before {at.isoformat()})" if at
+                    else f"{cid} (run-not-before)"
+                )
+            reasons.append("scheduled children: " + "; ".join(scheduled))
         if pending_ids:
             reasons.append(
                 "non-terminal children not in progress are blocked by "
@@ -16866,6 +16950,8 @@ def phase_parent(
         )
         if blocked_ids:
             report["blocked_children"] = blocked_ids
+        if not_before_ids:
+            report["not_before_children"] = not_before_ids
         if no_work_ids:
             report["not_finalisable_children"] = no_work_ids
         report["children_processed"] = child_results
@@ -19395,10 +19481,12 @@ def _revalidate_child_startable(
 
     Returns:
         A JSON-friendly verdict: ``id``, ``startable`` (bool), ``action``
-        (``"implement"`` / ``"skip-terminal"`` / ``"skip-blocked"``), the
-        fetched ``status`` / ``stage``, a human-readable ``reason`` when the
-        spawn is refused, and for a ``blocked`` child its ``blocking_ids``,
-        ``stale_block_ids`` and ``unvalidated`` flag.
+        (``"implement"`` / ``"skip-terminal"`` / ``"skip-not-before"`` /
+        ``"skip-blocked"``), the fetched ``status`` / ``stage``, a
+        human-readable ``reason`` when the spawn is refused, the
+        ``not_before`` instant for a future-dated child, and for a
+        ``blocked`` child its ``blocking_ids``, ``stale_block_ids`` and
+        ``unvalidated`` flag.
     """
     verdict: dict[str, Any] = {
         "id": child_id,
@@ -19442,6 +19530,19 @@ def _revalidate_child_startable(
             reason=(
                 "it is already terminal (status="
                 f"{status or 'unknown'}, stage={stage})"
+            ),
+        )
+        return verdict
+
+    not_before = _start_on_holds(child)
+    if not_before is not None:
+        verdict.update(
+            startable=False,
+            action=ACTION_SKIP_NOT_BEFORE,
+            not_before=not_before.isoformat(),
+            reason=(
+                "its run-not-before schedule has not been reached "
+                f"(startOn={not_before.isoformat()})"
             ),
         )
         return verdict
@@ -20426,6 +20527,12 @@ def phase_drive(
                 report["blocked_children"] = list(
                     parent_report["blocked_children"]
                 )
+            if parent_report.get("not_before_children"):
+                # Carry the scheduled children so the drive report names what
+                # the chain is waiting for (LP-0MWZO40DI00701SY).
+                report["not_before_children"] = list(
+                    parent_report["not_before_children"]
+                )
             if parent_report.get("children_processed"):
                 report["children_processed"] = parent_report[
                     "children_processed"
@@ -20501,6 +20608,11 @@ def phase_drive(
                     )
                 report["blocked_children"] = [child_id]
                 report["blocked_child_details"] = [detail]
+            if revalidation["action"] == ACTION_SKIP_NOT_BEFORE:
+                # A scheduled child is a separate bucket: it is not a
+                # failure and must not stop the chain
+                # (LP-0MWZO40DI00701SY).
+                report["not_before_children"] = [child_id]
             report["message"] = (
                 f"No session spawned for {child_id}: the pre-spawn "
                 f"re-validation found {revalidation['reason']}. "
