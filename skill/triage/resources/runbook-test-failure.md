@@ -30,6 +30,36 @@ Some failures are caused by the host, not the tested code. Recognise and treat t
   - Remediation: free space under `/tmp` (remove stale test artefacts, e.g. `find /tmp -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +` run by an operator) and **fix the leaking harness** so it removes its temp dirs (route via the shared `tests/helpers/temp-dir.mjs` helper). Not a code regression — do not treat `-122` as a product defect.
   - Reference incidents: SA-0MVTSV5SO008625I and SA-0MVTSV8GO005KZ5V (2026-10-29). A single quota exhaustion surfaced as **several** failing node tests in the same full-suite run, all in the `run-release` harness family (`run-release: --help is side-effect free`, `run-release: post-release gated on a newly created tag`), because whichever harness wrote next hit the quota. Treat a cluster of unrelated node failures in one run as one environmental incident, not several product regressions.
 
+Gate/cache artefacts
+--------------------
+
+A gate/cache artefact is a **refusal that is not a test regression**. The most common one is the post-push verification's
+`verdict=missing`: after a successful push, `implement.py finish` reads the full-suite cache for the pushed commit's
+tree and finds **no valid entry** (absent, expired, unkeyable, or a bypassed pre-push gate), so it cannot prove a green
+verdict and refuses the terminal transition (fail-closed by design). No test failed — the suite simply was not recorded
+against that tree.
+
+- **Signature:** `post-push full-suite verification: no valid full-suite cache entry` (reported as
+  `Finish refused: post-push verification is missing.`).
+- **Possible causes:** the pre-push gate was bypassed (`WORKLOG_SKIP_PRE_PUSH=1`), the cache key ignores worktree/
+  environment identity (SA-0MVCTZRZD004CE3L), the pre-push gate verdict is not keyed on the pushed tree
+  (SA-0MVXUCGPK003G2KV), or an entry expired.
+- **Filed as:** a non-critical `[gate-artefact] …` item tagged `gate-artefact` — **never** a critical
+  `[test-failure] … — failing test`. Its acceptance criteria are agent-satisfiable (populate the cache, re-run finish).
+- **Remediation (agent-satisfiable):** run the full suite through the test skill, then re-run `finish`:
+
+  ```
+  python3 skill/test/scripts/run_tests.py --scope full
+  python3 skill/implement/scripts/implement.py finish <work-item-id>
+  ```
+
+  The no-diff finish path converges: once a valid green entry exists for the pushed tree, the verification passes and the
+  item advances. No source change is implied, so do not look for a failing test or a product defect.
+- **Dedupe:** an identical signature is matched across **all priorities** and both triage tags, so a recurring cache miss
+  adds a comment to the existing item instead of filing a new one (SA-0MWOTZ17K005RH8P).
+- **Contrast with a real failure:** a `verdict=red` refusal names the failing test from the cached suite output and files
+  a **critical** `[test-failure]` item — treat that as a genuine regression.
+
 PR unblock guidance
 -------------------
 
