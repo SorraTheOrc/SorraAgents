@@ -2096,3 +2096,319 @@ class TestSpawnInfraRetryOrdering:
             entry.get("result") == "infra-retry"
             for entry in report["children_driven"]
         )
+
+
+# ---------------------------------------------------------------------------
+# F1: drive model resolution — catalogue parsing + fast-fail pre-flight
+# (SA-0MWOVAOMY008DESN, parent SA-0MWOUI3Q0006TTSY)
+# ---------------------------------------------------------------------------
+#
+# This is the F1 *test-first* slice for the epic "drive cannot spawn headless
+# child sessions — `pi -p` fails model resolution". The production helpers the
+# cases below exercise are introduced by the sibling implementation slices:
+#
+#   F3 (SA-0MWOVCA0Z006RPIP) — _parse_model_catalogue, _available_providers,
+#       _resolve_child_session_model, _resolve_drive_model and the phase_drive
+#       pre-flight refusal (before the child loop, no lock/spawn/retry);
+#   F4 (SA-0MWOVCDJ50076081) — wire the resolved pair into both spawners.
+#
+# Until those land every case is a **strict xfail tracer bullet**: it fails
+# against the current code, the failure is the recorded red observation, and
+# F3/F4 remove the markers once the helpers exist (a strict marker turns an
+# unexpected pass into an XPASS failure, so the handoff cannot be forgotten).
+#
+# Contract pinned here (single source of truth for F3/F4):
+#
+# ``_parse_model_catalogue(text) -> tuple[tuple[str, str], ...]``
+#     Parses the captured ``pi --list-models`` table (``provider  model
+#     context  max-out  thinking  images``) into ordered ``(provider, model)``
+#     pairs. Drops the header, ignores stderr-style ``Warning: …`` lines, blank
+#     lines and malformed rows, and keeps providers whose display name contains
+#     spaces (``Local Proxy``).
+#
+# ``_available_providers(catalogue) -> tuple[str, ...]``
+#     Unique providers in first-appearance catalogue order.
+#
+# ``_resolve_child_session_model(candidates, catalogue) -> dict``
+#     ``candidates`` is an ordered list of ``{"source", "provider", "model"}``
+#     dicts (precedence order). The first candidate that maps to exactly one
+#     concrete catalogue entry wins and yields
+#     ``{"resolved": "provider/model", "source", "pattern", "error": ""}``.
+#     A glob must match exactly one model; zero or multiple matches are
+#     unresolvable (never a literal wildcard forwarded to ``pi``). When no
+#     candidate resolves: ``{"resolved": None, "source": None, "pattern":
+#     <first attempted>, "error": <actionable message>}``.
+#
+# ``phase_drive(..., resolve_drive_model=<callable>(env, worktree_path))``
+#     Injectable resolution seam (mirrors ``parent_runner`` / ``spawn_session``
+#     so the pre-flight is hermetic — no ``pi --list-models`` subprocess, no
+#     host settings). The real default is ``_resolve_drive_model``. The
+#     resolver runs **once** before the child loop; an unresolved model stops
+#     the drive with ``success: False``, ``sessions_spawned: 0``, an empty
+#     ``infra_retries`` counter, the resolution recorded under
+#     ``report["model_resolution"]``, and a ``message`` naming both the
+#     unresolvable pattern and the available providers.
+#
+# Hermetic by construction: the catalogue comes from a captured fixture and the
+# resolver is injected — nothing shells out to ``pi`` or reads the host's
+# ``~/.pi/agent/models.json``.
+
+_RED_FIRST_REASON = (
+    "F1 red-first tracer bullet (SA-0MWOVAOMY008DESN): drive model "
+    "resolution/pre-flight is implemented by F3 (SA-0MWOVCA0Z006RPIP) and "
+    "F4 (SA-0MWOVCDJ50076081); F3/F4 remove this strict marker when it lands."
+)
+
+#: Captured ``pi --list-models`` stdout (columns: provider, model, context,
+#: max-out, thinking, images). The two ``MunitoAI`` rows make the historical
+#: ``MunitoAI/*`` glob ambiguous (the exactly-one rule then reports it
+#: unresolvable); ``Local Proxy/code`` is the concrete pair that resolves.
+_CAPTURED_LIST_MODELS = """\
+provider        model                                 context  max-out  thinking  images
+deepseek        deepseek-flash                        1.0M     393.2K   yes       yes
+deepseek        deepseek-v4-pro                       1.0M     393.2K   yes       no
+Local Proxy     author                                128K     16.4K    no        no
+Local Proxy     code                                  128K     16.4K    no        no
+Local Proxy     plan                                  128K     16.4K    no        no
+MunitoAI        deepseek-ai/deepseek-v4-flash         400K     16.4K    no        no
+MunitoAI        deepseek-ai/deepseek-v4.1-flash-1017  400K     16.4K    no        no
+opencode        beam-free                             1.0M     131.1K   yes       no
+"""
+
+#: The table preceded by the stderr-style warning Pi emits for an unservable
+#: ``enabledModels`` entry, plus a trailing blank line — the parser must skip
+#: both rather than treating them as catalogue rows.
+_CAPTURED_LIST_MODELS_WITH_WARNING = (
+    'Warning: No models match pattern "MunitoAI/*"\n'
+    + _CAPTURED_LIST_MODELS
+    + "\n"
+)
+
+
+def _require_helper(mod, name: str):
+    """Return ``mod.<name>`` or fail with an F3-attributed message.
+
+    A missing helper is the red observation this slice records; raising a
+    plain ``pytest.fail`` keeps the strict-``xfail`` marker meaningful and the
+    reason legible instead of an opaque ``AttributeError``.
+    """
+    helper = getattr(mod, name, None)
+    if helper is None:
+        pytest.fail(
+            f"implement.py does not expose {name} yet — it is introduced by "
+            "F3 (SA-0MWOVCA0Z006RPIP). Red-first tracer bullet until then."
+        )
+    return helper
+
+
+def _candidates(*triples: tuple[str, str, str]) -> list[dict]:
+    """Build ordered ``_resolve_child_session_model`` candidates."""
+    return [
+        {"source": source, "provider": provider, "model": model}
+        for source, provider, model in triples
+    ]
+
+
+class TestParseModelCatalogue:
+    """``pi --list-models`` → ``(provider, model)`` pairs (F1 AC4)."""
+
+    @pytest.mark.xfail(strict=True, reason=_RED_FIRST_REASON)
+    def test_parses_provider_model_pairs_from_captured_catalogue(
+        self, implement_mod,
+    ):
+        parse = _require_helper(implement_mod, "_parse_model_catalogue")
+        catalogue = parse(_CAPTURED_LIST_MODELS)
+
+        # Providers whose display name contains a space are preserved whole.
+        assert ("Local Proxy", "code") in catalogue
+        assert ("deepseek", "deepseek-flash") in catalogue
+        assert ("MunitoAI", "deepseek-ai/deepseek-v4-flash") in catalogue
+        # Every entry is a (provider, model) pair and order is preserved.
+        assert all(len(pair) == 2 for pair in catalogue)
+        assert catalogue[0] == ("deepseek", "deepseek-flash")
+
+    @pytest.mark.xfail(strict=True, reason=_RED_FIRST_REASON)
+    def test_ignores_header_warning_and_blank_lines(self, implement_mod):
+        parse = _require_helper(implement_mod, "_parse_model_catalogue")
+        catalogue = parse(_CAPTURED_LIST_MODELS_WITH_WARNING)
+
+        providers = {provider for provider, _ in catalogue}
+        # The header and the stderr warning never become catalogue rows.
+        assert "provider" not in providers
+        assert "" not in providers
+        assert not any("Warning:" in provider for provider in providers)
+        # Exactly the eight real rows survive.
+        assert len(catalogue) == 8
+        assert ("opencode", "beam-free") in catalogue
+
+    @pytest.mark.xfail(strict=True, reason=_RED_FIRST_REASON)
+    def test_available_providers_are_unique_in_catalogue_order(
+        self, implement_mod,
+    ):
+        parse = _require_helper(implement_mod, "_parse_model_catalogue")
+        available = _require_helper(implement_mod, "_available_providers")
+
+        providers = available(parse(_CAPTURED_LIST_MODELS))
+
+        assert tuple(providers) == (
+            "deepseek", "Local Proxy", "MunitoAI", "opencode",
+        )
+
+
+class TestResolveChildSessionModel:
+    """Exactly-one-concrete-match rule and precedence (F1 ACs 1, 3)."""
+
+    @staticmethod
+    def _resolve(mod, candidates):
+        parse = _require_helper(mod, "_parse_model_catalogue")
+        resolve = _require_helper(mod, "_resolve_child_session_model")
+        return resolve(candidates, parse(_CAPTURED_LIST_MODELS))
+
+    @pytest.mark.xfail(strict=True, reason=_RED_FIRST_REASON)
+    def test_resolves_an_exact_concrete_pair(self, implement_mod):
+        result = self._resolve(
+            implement_mod,
+            _candidates(("env:IMPLEMENT_DRIVE", "Local Proxy", "code")),
+        )
+
+        assert result["resolved"] == "Local Proxy/code"
+        assert result["source"] == "env:IMPLEMENT_DRIVE"
+        assert result["pattern"] == "Local Proxy/code"
+        assert not result["error"]
+
+    @pytest.mark.xfail(strict=True, reason=_RED_FIRST_REASON)
+    def test_resolves_a_glob_that_matches_exactly_one(self, implement_mod):
+        result = self._resolve(
+            implement_mod,
+            _candidates(("settings", "Local Proxy", "co*")),
+        )
+
+        assert result["resolved"] == "Local Proxy/code"
+        # A concrete pair is returned, never the literal wildcard.
+        assert "*" not in result["resolved"]
+        assert "?" not in result["resolved"]
+
+    @pytest.mark.xfail(strict=True, reason=_RED_FIRST_REASON)
+    def test_glob_matching_multiple_is_unresolvable(self, implement_mod):
+        # The historical `MunitoAI/*` matches two concrete models.
+        result = self._resolve(
+            implement_mod,
+            _candidates(("settings", "MunitoAI", "*")),
+        )
+
+        assert result["resolved"] is None
+        assert result["pattern"] == "MunitoAI/*"
+        assert result["error"]
+
+    @pytest.mark.xfail(strict=True, reason=_RED_FIRST_REASON)
+    def test_glob_matching_nothing_is_unresolvable(self, implement_mod):
+        result = self._resolve(
+            implement_mod,
+            _candidates(("settings", "DoesNotExist", "*")),
+        )
+
+        assert result["resolved"] is None
+        assert result["pattern"] == "DoesNotExist/*"
+        assert result["error"]
+
+    @pytest.mark.xfail(strict=True, reason=_RED_FIRST_REASON)
+    def test_precedence_first_resolvable_candidate_wins(self, implement_mod):
+        result = self._resolve(
+            implement_mod,
+            _candidates(
+                # Highest precedence candidate is ambiguous → skipped.
+                ("env:IMPLEMENT_DRIVE", "MunitoAI", "*"),
+                # Lower precedence candidate resolves concretely → wins.
+                ("env:PI", "Local Proxy", "code"),
+            ),
+        )
+
+        assert result["resolved"] == "Local Proxy/code"
+        assert result["source"] == "env:PI"
+
+
+#: Resolution verdicts injected through the ``resolve_drive_model`` seam.
+_RESOLVED_MODEL = {
+    "resolved": "Local Proxy/code",
+    "source": "settings",
+    "pattern": "Local Proxy/code",
+    "error": "",
+    "available_providers": (
+        "deepseek", "github-copilot", "Local Proxy", "MunitoAI", "opencode",
+    ),
+}
+
+_UNRESOLVED_MODEL = {
+    "resolved": None,
+    "source": "settings",
+    "pattern": "MunitoAI/*",
+    "error": (
+        'Model pattern "MunitoAI/*" matches no single concrete model in the '
+        "available catalogue."
+    ),
+    "available_providers": (
+        "deepseek", "github-copilot", "Local Proxy", "MunitoAI", "opencode",
+    ),
+}
+
+
+class TestDriveModelFastFail:
+    """``phase_drive`` refuses before spawning when the model is unresolvable.
+
+    F1 AC1/AC2/AC3: the fast-fail message names the pattern and the available
+    providers; no session is spawned and no infrastructure retry is consumed.
+    """
+
+    @pytest.mark.xfail(strict=True, reason=_RED_FIRST_REASON)
+    def test_unresolvable_model_fails_fast_without_spawning(
+        self, implement_mod,
+    ):
+        m = implement_mod
+        _require_helper(m, "_resolve_drive_model")
+        # An empty script: any parent call raises, proving the refusal ran
+        # before the child loop was ever entered.
+        runner = ScriptedParent([])
+        spawner = RecordingSpawner()
+        resolver = mock.Mock(return_value=dict(_UNRESOLVED_MODEL))
+
+        report = _run(
+            m, runner, spawner, [{"id": "SA-C1"}],
+            resolve_drive_model=resolver,
+        )
+
+        assert report["success"] is False
+        assert report["sessions_spawned"] == 0
+        assert spawner.calls == []
+        assert runner.calls == []
+        assert report["infra_retries"] == {}
+        assert report["model_resolution"] == _UNRESOLVED_MODEL
+
+        message = report["message"]
+        assert "MunitoAI/*" in message
+        for provider in _UNRESOLVED_MODEL["available_providers"]:
+            assert provider in message
+
+    @pytest.mark.xfail(strict=True, reason=_RED_FIRST_REASON)
+    def test_drive_resolves_the_model_once_before_spawning(
+        self, implement_mod,
+    ):
+        m = implement_mod
+        _require_helper(m, "_resolve_drive_model")
+        runner = ScriptedParent([
+            _child_report("SA-C1"),
+            {"success": True, "parent_advanced": True},
+        ])
+        spawner = RecordingSpawner()
+        resolver = mock.Mock(return_value=dict(_RESOLVED_MODEL))
+
+        report = _run(
+            m, runner, spawner, [{"id": "SA-C1"}],
+            resolve_drive_model=resolver,
+        )
+
+        # One catalogue-backed resolution per drive invocation, then the
+        # child is spawned normally on the resolved pair.
+        assert resolver.call_count == 1
+        assert report["success"] is True
+        assert report["sessions_spawned"] == 1
+        assert [call["id"] for call in spawner.calls] == ["SA-C1"]
